@@ -90,9 +90,6 @@ int parseArguments(int argc, char **argv) {
 
 int main(int argc, char *argv[]) {
     int idx = parseArguments(argc, argv);
-    for (auto &a : ranges) {
-        printf("%d -  %d\n", a.first, a.second);
-    }
     FSEQFile *src = FSEQFile::openFSEQFile(argv[idx]);
     if (src) {
         
