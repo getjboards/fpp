@@ -331,7 +331,7 @@ FrameData *V1FSEQFile::getFrame(uint32_t frame) {
     
     UncompressedFrameData *data = new UncompressedFrameData(frame, m_dataBlockSize, m_rangesToRead);
     if (fseeko(m_seqFile, offset, SEEK_SET)) {
-        LogErr(VB_SEQUENCE, "Failed to seek to proper offset for channel data for frame %d! %lld\n", frame, offset);
+        LogErr(VB_SEQUENCE, "Failed to seek to proper offset for channel data for frame %d! %" PRIu64 "\n", frame, offset);
         return data;
     }
     uint32_t sz = 0;
@@ -615,7 +615,7 @@ FrameData *V2FSEQFile::getFrameNone(uint32_t frame) {
     offset *= frame;
     offset += m_seqChanDataOffset;
     if (fseeko(m_seqFile, offset, SEEK_SET)) {
-        LogErr(VB_SEQUENCE, "Failed to seek to proper offset for channel data! %lld\n", offset);
+        LogErr(VB_SEQUENCE, "Failed to seek to proper offset for channel data! %" PRIu64 "\n", offset);
         return data;
     }
     if (m_sparseRanges.empty()) {
@@ -665,7 +665,7 @@ FrameData *V2FSEQFile::getFrameZSTD(uint32_t frame) {
         m_inBuffer.size = len;
         int bread = fread((void*)m_inBuffer.src, 1, len, m_seqFile);
         if (bread != len) {
-            LogErr(VB_SEQUENCE, "Failed to read channel data!   Needed to read %d but read %d\n", len, (int)bread);
+            LogErr(VB_SEQUENCE, "Failed to read channel data for frame %d!   Needed to read %" PRIu64 " but read %d\n", frame, len, (int)bread);
         }
         
         if (m_curBlock < m_frameOffsets.size() - 2) {
