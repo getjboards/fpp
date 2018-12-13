@@ -84,6 +84,7 @@ OBJECTS_fppd = \
 	channeltester/RGBChase.o \
 	channeltester/RGBFill.o \
 	channeltester/SingleChase.o \
+    fseq/FSEQFile.o \
     ping.o \
 	command.o \
 	common.o \
@@ -134,6 +135,7 @@ OBJECTS_fppd = \
 	$(NULL)
 LIBS_fppd = \
 	-lpthread \
+    -lzstd \
 	-ljsoncpp \
 	-lm \
 	-lmosquitto \

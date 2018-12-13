@@ -20,19 +20,30 @@ public:
 };
 
 
+class FrameData {
+public:
+    FrameData(uint32_t f) : frame(f) {};
+    virtual ~FrameData() {};
+    
+    virtual void readFrame(uint8_t *data) = 0;
+    
+    uint32_t frame;
+};
+
+
 class FSEQFile {
 public:
-    
+    enum CompressionType {
+        none,
+        zstd,
+        zlib
+    };
+
 protected:
     //open file for reading
     FSEQFile(const std::string &fn, FILE *file, const std::vector<uint8_t> &header);
     //open file for writing
-    FSEQFile(const std::string &fn,
-             uint32_t     seqNumFrames,
-             uint32_t     seqStartChannel,
-             uint32_t     seqChannelCount,
-             int          seqStepTime,
-             const std::vector<VariableHeader> &headers);
+    FSEQFile(const std::string &fn);
     
 public:
     
@@ -42,20 +53,25 @@ public:
     
     static FSEQFile* createFSEQFile(const std::string &fn,
                                     int version,
-                                    uint32_t     seqNumFrames,
-                                    uint32_t     seqStartChannel,
-                                    uint32_t     seqChannelCount,
-                                    int          seqStepTime,
-                                    const std::vector<VariableHeader> &headers);
+                                    CompressionType ct = CompressionType::zstd,
+                                    int level = 10);
     
     void parseVariableHeaders(const std::vector<uint8_t> &header, int start);
     
-    //For reading data from the fseq file
-    virtual void readFrame(uint32_t frame,
-                           uint8_t *data,
-                           const std::vector<std::pair<uint32_t, uint32_t>> ranges) = 0;
+    
+    //prepare to start reading. The ranges will be the list of channel ranges that
+    //are acutally needed for each frame.   The reader can optimize to only
+    //read those frames.
+    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) {}
+    
+    //For reading data from the fseq file, returns an object can
+    //provide the necessary data in a timely fassion for the given frame
+    //It may not be used right away and will be deleted at some point in the future
+    virtual FrameData *getFrame(uint32_t frame) = 0;
     
     //For writing to the fseq file
+    virtual void initializeFromFSEQ(const FSEQFile& fseq);
+    virtual void writeHeader() = 0;
     virtual void addFrame(uint32_t frame,
                           uint8_t *data) = 0;
     virtual void finalize() = 0;
@@ -71,7 +87,6 @@ public:
     uint64_t      m_uniqueId;
 
     uint32_t      m_seqNumFrames;
-    uint32_t      m_seqStartChannel;
     uint32_t      m_seqChannelCount;
     int           m_seqStepTime;
     int           m_seqVersionMajor;
@@ -85,59 +100,55 @@ public:
 class V1FSEQFile : public FSEQFile {
 public:
     V1FSEQFile(const std::string &fn, FILE *file, const std::vector<uint8_t> &header);
-    V1FSEQFile(const std::string &fn,
-             uint32_t     seqNumFrames,
-             uint32_t     seqStartChannel,
-             uint32_t     seqChannelCount,
-               int          seqStepTime,
-               const std::vector<VariableHeader> &headers);
+    V1FSEQFile(const std::string &fn);
 
     virtual ~V1FSEQFile();
   
-    virtual void readFrame(uint32_t frame,
-                           uint8_t *data,
-                           const std::vector<std::pair<uint32_t, uint32_t>> ranges);
-    
+    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) override;
+    virtual FrameData *getFrame(uint32_t frame) override;
+
+    virtual void writeHeader() override;
     virtual void addFrame(uint32_t frame,
-                          uint8_t *data);
-    virtual void finalize();
-
-
+                          uint8_t *data) override;
+    virtual void finalize() override;
+    
+    //The ranges to read and the data size needed to read the ranges
+    std::vector<std::pair<uint32_t, uint32_t>> m_rangesToRead;
+    uint32_t m_dataBlockSize;
 };
 
 class V2FSEQFile : public FSEQFile {
 
 public:
     V2FSEQFile(const std::string &fn, FILE *file, const std::vector<uint8_t> &header);
-    V2FSEQFile(const std::string &fn,
-               uint32_t     seqNumFrames,
-               uint32_t     seqStartChannel,
-               uint32_t     seqChannelCount,
-               int          seqStepTime,
-               const std::vector<VariableHeader> &headers);
+    V2FSEQFile(const std::string &fn, CompressionType ct, int cl);
 
     virtual ~V2FSEQFile();
     
-    virtual void readFrame(uint32_t frame,
-                           uint8_t *data,
-                           const std::vector<std::pair<uint32_t, uint32_t>> ranges);
-
+    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) override;
+    virtual FrameData *getFrame(uint32_t frame) override;
     
+    virtual void writeHeader() override;
     virtual void addFrame(uint32_t frame,
-                          uint8_t *data);
-    virtual void finalize();
+                          uint8_t *data) override;
+    virtual void finalize() override;
 
     
-    enum CompressionType {
-        none,
-        zstd,
-        zlib
-    };
     CompressionType m_compressionType;
-    
+    int             m_compressionLevel;
     std::vector<std::pair<uint32_t, uint64_t>> m_frameOffsets;
+    std::vector<std::pair<uint32_t, uint32_t>> m_sparseRanges;
     
+    std::vector<std::pair<uint32_t, uint32_t>> m_rangesToRead;
+    uint32_t m_dataBlockSize;
+private:
+    void addFrameZSTD(uint32_t frame, uint8_t *data);
+    void addFrameNone(uint32_t frame, uint8_t *data);
+
+    FrameData *getFrameNone(uint32_t frame);
+    FrameData *getFrameZSTD(uint32_t frame);
     
+    // for compressed files, this is the compression data
     uint32_t m_framesPerBlock;
     uint32_t m_curFrameInBlock;
     uint32_t m_curBlock;
