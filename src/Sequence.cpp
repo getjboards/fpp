@@ -127,7 +127,7 @@ void Sequence::ReadFramesLoop() {
         int cacheSize = frameCache.size();
         if (frameCache.size() < SEQUENCE_CACHE_FRAMECOUNT && m_seqStarting < 2 && m_seqFile && !m_doneRead) {
             uint64_t frame = m_lastFrameRead + 1;
-            if (frame <= m_seqFile->m_seqNumFrames) {
+            if (frame < m_seqFile->m_seqNumFrames) {
                 lock.unlock();
                 
                 std::unique_lock<std::mutex> readlock(readFileLock);
@@ -141,17 +141,19 @@ void Sequence::ReadFramesLoop() {
                 readlock.unlock();
                 
                 lock.lock();
-                if (m_lastFrameRead == (frame - 1)) {
-                    m_lastFrameRead = frame;
-                    frameCache.push_back(fd);
+                if (fd) {
+                    if (m_lastFrameRead == (frame - 1)) {
+                        m_lastFrameRead = frame;
+                        frameCache.push_back(fd);
 
-                    lock.unlock();
-                    frameLoadedSignal.notify_all();
-                    std::this_thread::sleep_for(5ms);
-                    lock.lock();
-                } else {
-                    //a skip is in progress, we don't need this frame anymore
-                    delete fd;
+                        lock.unlock();
+                        frameLoadedSignal.notify_all();
+                        std::this_thread::sleep_for(5ms);
+                        lock.lock();
+                    } else {
+                        //a skip is in progress, we don't need this frame anymore
+                        delete fd;
+                    }
                 }
             } else {
                 frameLoadedSignal.notify_all();

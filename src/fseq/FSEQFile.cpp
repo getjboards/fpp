@@ -331,7 +331,7 @@ FrameData *V1FSEQFile::getFrame(uint32_t frame) {
     
     UncompressedFrameData *data = new UncompressedFrameData(frame, m_dataBlockSize, m_rangesToRead);
     if (fseeko(m_seqFile, offset, SEEK_SET)) {
-        LogErr(VB_SEQUENCE, "Failed to seek to proper offset for channel data! %lld\n", offset);
+        LogErr(VB_SEQUENCE, "Failed to seek to proper offset for channel data for frame %d! %lld\n", frame, offset);
         return data;
     }
     uint32_t sz = 0;
@@ -344,7 +344,8 @@ FrameData *V1FSEQFile::getFrame(uint32_t frame) {
             fseeko(m_seqFile, doffset, SEEK_SET);
             size_t bread = fread(&data->m_data[sz], 1, toRead, m_seqFile);
             if (bread != toRead) {
-                LogErr(VB_SEQUENCE, "Failed to read channel data!   Needed to read %d but read %d\n", toRead, (int)bread);
+                LogErr(VB_SEQUENCE, "Failed to read channel data for frame %d!   Needed to read %d but read %d\n",
+                       frame, toRead, (int)bread);
             }
             sz += toRead;
         }
@@ -600,6 +601,9 @@ void V2FSEQFile::prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &r
     }
 }
 FrameData *V2FSEQFile::getFrame(uint32_t frame) {
+    if (frame >= m_seqNumFrames) {
+        return nullptr;
+    }
     if (m_compressionType == CompressionType::none) {
         return getFrameNone(frame);
     }
