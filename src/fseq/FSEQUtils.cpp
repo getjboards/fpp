@@ -18,11 +18,14 @@ void usage(char *appname) {
     printf("   -f #                   - FSEQ Version\n");
     printf("   -c (none|zstd)         - Compession type\n");
     printf("   -l #                   - Compession level\n");
+    printf("   -r (#-# | #+#)         - Channel Range.  Use - to separate start/end channel\n");
+    printf("                                Use + to separate start channel + num channels\n");
     printf("   -h                     - This help output\n");
 }
 const char *outputFilename = nullptr;
 static int fseqVersion = 2;
 static int compressionLevel = 10;
+std::vector<std::pair<uint32_t, uint32_t>> ranges;
 static V2FSEQFile::CompressionType compressionType = V2FSEQFile::CompressionType::zstd;
 
 int parseArguments(int argc, char **argv) {
@@ -39,12 +42,25 @@ int parseArguments(int argc, char **argv) {
             {0,                0,                    0, 0}
         };
         
-        c = getopt_long(argc, argv, "c:l:o:f:hV", long_options, &option_index);
+        c = getopt_long(argc, argv, "c:l:o:f:r:hV", long_options, &option_index);
         if (c == -1) {
             break;
         }
         
         switch (c) {
+            case 'r': {
+                    char *end = optarg;
+                    int startc = strtol(optarg, &end, 10);
+                    int r = *end == '-';
+                    end++;
+                    int endc = strtol(end, &end, 10);
+                    if (r) {
+                        ranges.push_back(std::pair<uint32_t, uint32_t>(startc, endc-startc+1));
+                    } else {
+                        ranges.push_back(std::pair<uint32_t, uint32_t>(startc, endc));
+                    }
+                }
+                break;
             case 'c':
                 compressionType = strcmp(optarg, "none")
                     ? V2FSEQFile::CompressionType::zstd : V2FSEQFile::CompressionType::none;
@@ -74,17 +90,24 @@ int parseArguments(int argc, char **argv) {
 
 int main(int argc, char *argv[]) {
     int idx = parseArguments(argc, argv);
-    std::vector<std::pair<uint32_t, uint32_t>> ranges;
-    ranges.push_back(std::pair<uint32_t, uint32_t>(0, 999999999));
-    
+    for (auto &a : ranges) {
+        printf("%d -  %d\n", a.first, a.second);
+    }
     FSEQFile *src = FSEQFile::openFSEQFile(argv[idx]);
     if (src) {
-        src->prepareRead(ranges);
         
         FSEQFile *dest = FSEQFile::createFSEQFile(outputFilename,
                                                   fseqVersion,
                                                   compressionType,
                                                   compressionLevel);
+        if (ranges.empty()) {
+            ranges.push_back(std::pair<uint32_t, uint32_t>(0, 999999999));
+        } else if (fseqVersion == 2) {
+            V2FSEQFile *f = (V2FSEQFile*)dest;
+            f->m_sparseRanges = ranges;
+        }
+        src->prepareRead(ranges);
+
         dest->initializeFromFSEQ(*src);
         dest->writeHeader();
         
