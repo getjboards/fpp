@@ -4,10 +4,23 @@ ifneq ($(wildcard /usr/bin/ccache),)
 	CCACHE = ccache
 endif
 
-TARGETS = fpp fppmm fppd
+TARGETS = fpp fppmm fsequtils fppd
 SUBMODULES =
 
 INSTALL_PROGRAM = install -m 755 -p
+
+OBJECTS_fsequtils = \
+	fppversion.o \
+	common.o \
+	log.o \
+    fseq/FSEQUtils.o \
+    fseq/FSEQFile.o \
+	$(NULL)
+LIBS_fsequtils = \
+    -lzstd \
+	-ljsoncpp \
+	-lpthread \
+	$(NULL)
 
 OBJECTS_fpp = \
 	fpp.o \
@@ -350,6 +363,9 @@ fppmm: $(OBJECTS_fppmm)
 	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
 
 fppd: $(DEPS_fppd) $(OBJECTS_fppd)
+	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
+
+fsequtils: $(OBJECTS_fsequtils)
 	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
 
 fppversion.c: fppversion.sh force
