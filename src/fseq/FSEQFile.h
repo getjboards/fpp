@@ -76,7 +76,7 @@ public:
                           uint8_t *data) = 0;
     virtual void finalize() = 0;
     
-    
+    virtual void dumpInfo(bool indent = false);
     
     std::string filename;
     
@@ -132,6 +132,8 @@ public:
     virtual void addFrame(uint32_t frame,
                           uint8_t *data) override;
     virtual void finalize() override;
+
+    virtual void dumpInfo(bool indent = false) override;
 
     
     CompressionType m_compressionType;

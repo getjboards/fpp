@@ -122,19 +122,7 @@ FSEQFile* FSEQFile::openFSEQFile(const std::string &fn) {
         
         return nullptr;
     }
-    
-    LogDebug(VB_SEQUENCE, "Sequence File Information\n");
-    LogDebug(VB_SEQUENCE, "seqFilename           : %s\n", fn.c_str());
-    LogDebug(VB_SEQUENCE, "seqVersion            : %d.%d\n", seqVersionMajor, seqVersionMinor);
-    LogDebug(VB_SEQUENCE, "seqFormatID           : %c%c%c%c\n", tmpData[0], tmpData[1], tmpData[2], tmpData[3]);
-    LogDebug(VB_SEQUENCE, "seqChanDataOffset     : %d\n", seqChanDataOffset);
-    LogDebug(VB_SEQUENCE, "seqChannelCount       : %d\n", file->m_seqChannelCount);
-    LogDebug(VB_SEQUENCE, "seqNumPeriods         : %d\n", file->m_seqNumFrames);
-    LogDebug(VB_SEQUENCE, "seqStepTime           : %dms\n", file->m_seqStepTime);
-
-    if (seqVersionMajor == 2) {
-        //FIXME log v2 stuff
-    }
+    file->dumpInfo();
     return file;
 }
 FSEQFile* FSEQFile::createFSEQFile(const std::string &fn,
@@ -156,10 +144,26 @@ FSEQFile::FSEQFile(const std::string &fn)
     m_seqStepTime(50),
     m_variableHeaders(),
     m_uniqueId(0),
-    m_seqFileSize(0)
+    m_seqFileSize(0),
+    m_seqVersionMajor(1),
+    m_seqVersionMinor(1)
 {
     m_seqFile = fopen((const char *)fn.c_str(), "w");
 }
+void FSEQFile::dumpInfo(bool indent) {
+    char ind[5] = "    ";
+    if (!indent) {
+        ind[0] = 0;
+    }
+    LogDebug(VB_SEQUENCE, "%sSequence File Information\n", ind);
+    LogDebug(VB_SEQUENCE, "%sseqFilename           : %s\n", ind, filename.c_str());
+    LogDebug(VB_SEQUENCE, "%sseqVersion            : %d.%d\n", ind, m_seqVersionMajor, m_seqVersionMinor);
+    LogDebug(VB_SEQUENCE, "%sseqChanDataOffset     : %d\n", ind, m_seqChanDataOffset);
+    LogDebug(VB_SEQUENCE, "%sseqChannelCount       : %d\n", ind, m_seqChannelCount);
+    LogDebug(VB_SEQUENCE, "%sseqNumPeriods         : %d\n", ind, m_seqNumFrames);
+    LogDebug(VB_SEQUENCE, "%sseqStepTime           : %dms\n", ind, m_seqStepTime);
+}
+
 
 void FSEQFile::initializeFromFSEQ(const FSEQFile& fseq) {
     m_seqNumFrames = fseq.m_seqNumFrames;
@@ -370,6 +374,8 @@ V2FSEQFile::V2FSEQFile(const std::string &fn, CompressionType ct, int cl)
     m_compressionType(ct),
     m_compressionLevel(cl)
 {
+    m_seqVersionMajor = 2;
+    m_seqVersionMinor = 0;
     m_outBuffer.pos = 0;
     m_outBuffer.size = 1024*1024;
     m_outBuffer.dst = malloc(m_outBuffer.size);
@@ -445,6 +451,9 @@ void V2FSEQFile::writeHeader() {
         m_curBlock = 0;
         
         numBlocks = m_seqNumFrames / m_framesPerBlock + 1;
+        if (numBlocks > 255) {
+            numBlocks = 255;
+        }
         m_maxBlocks = numBlocks;
     } else {
         m_maxBlocks = 0;
@@ -464,6 +473,7 @@ void V2FSEQFile::writeHeader() {
     }
     dataOffset = roundTo4(dataOffset);
     write2ByteUInt(&header[4], dataOffset);
+    m_seqChanDataOffset = dataOffset;
     
     fwrite(header, 1, V2FSEQ_HEADER_SIZE, m_seqFile);
     for (int x = 0; x < m_maxBlocks; x++) {
@@ -491,11 +501,14 @@ void V2FSEQFile::writeHeader() {
         char buf[4] = {0,0,0,0};
         fwrite(buf, 1, dataOffset - pos, m_seqFile);
     }
+    LogDebug(VB_SEQUENCE, "Setup for writing v2 FSEQ\n");
+    dumpInfo(true);
 }
 
 
 V2FSEQFile::V2FSEQFile(const std::string &fn, FILE *file, const std::vector<uint8_t> &header)
-: FSEQFile(fn, file, header), m_compressionType(none),
+: FSEQFile(fn, file, header),
+m_compressionType(none),
 m_cctx(nullptr),
 m_dctx(nullptr)
 {
@@ -567,6 +580,25 @@ V2FSEQFile::~V2FSEQFile() {
         ZSTD_freeDStream(m_dctx);
     }
 }
+void V2FSEQFile::dumpInfo(bool indent) {
+    FSEQFile::dumpInfo(indent);
+    char ind[5] = "    ";
+    if (!indent) {
+        ind[0] = 0;
+    }
+
+    LogDebug(VB_SEQUENCE, "%sSequence File Information\n", ind);
+    LogDebug(VB_SEQUENCE, "%scompressionType       : %d\n", ind, m_compressionType);
+    LogDebug(VB_SEQUENCE, "%snumBlocks             : %d\n", ind, m_maxBlocks);
+    for (auto &a : m_frameOffsets) {
+        LogDebug(VB_SEQUENCE, "%s      %d              : %" PRIu64 "\n", ind, a.first, a.second);
+    }
+    LogDebug(VB_SEQUENCE, "%snumRanges             : %d\n", ind, m_sparseRanges.size());
+    for (auto &a : m_sparseRanges) {
+        LogDebug(VB_SEQUENCE, "%s      Start: %d    Len: %d\n", ind, a.first, a.second);
+    }
+}
+
 
 void V2FSEQFile::prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) {
     if (m_sparseRanges.empty()) {

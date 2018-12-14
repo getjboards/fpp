@@ -6,6 +6,7 @@
 
 #include "fppversion.h"
 #include "common.h"
+#include "log.h"
 
 #include "FSEQFile.h"
 
@@ -14,6 +15,7 @@ void usage(char *appname) {
     printf("\n");
     printf("  Options:\n");
     printf("   -V                - Print version information\n");
+    printf("   -v                - verbose\n");
     printf("   -o OUTPUTFILE     - Filename for Output FSEQ\n");
     printf("   -f #              - FSEQ Version\n");
     printf("   -c (none|zstd)    - Compession type\n");
@@ -26,6 +28,7 @@ void usage(char *appname) {
 const char *outputFilename = nullptr;
 static int fseqVersion = 2;
 static int compressionLevel = 10;
+static bool verbose = false;
 static std::vector<std::pair<uint32_t, uint32_t>> ranges;
 static bool sparse = true;
 static V2FSEQFile::CompressionType compressionType = V2FSEQFile::CompressionType::zstd;
@@ -44,7 +47,7 @@ int parseArguments(int argc, char **argv) {
             {0,                0,                    0, 0}
         };
         
-        c = getopt_long(argc, argv, "c:l:o:f:r:hVn", long_options, &option_index);
+        c = getopt_long(argc, argv, "c:l:o:f:r:hVvn", long_options, &option_index);
         if (c == -1) {
             break;
         }
@@ -62,6 +65,9 @@ int parseArguments(int argc, char **argv) {
                         ranges.push_back(std::pair<uint32_t, uint32_t>(startc, endc));
                     }
                 }
+                break;
+            case 'v':
+                verbose = true;
                 break;
             case 'c':
                 compressionType = strcmp(optarg, "none")
@@ -95,6 +101,9 @@ int parseArguments(int argc, char **argv) {
 
 int main(int argc, char *argv[]) {
     int idx = parseArguments(argc, argv);
+    if (verbose) {
+        SetLogLevel("debug");
+    }
     FSEQFile *src = FSEQFile::openFSEQFile(argv[idx]);
     if (src) {
         
