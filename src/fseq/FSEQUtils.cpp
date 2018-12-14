@@ -13,19 +13,21 @@ void usage(char *appname) {
     printf("Usage: %s [OPTIONS] FileName.fseq\n", appname);
     printf("\n");
     printf("  Options:\n");
-    printf("   -V                     - Print version information\n");
-    printf("   -o OUTPUTFILE          - Filename for Output FSEQ\n");
-    printf("   -f #                   - FSEQ Version\n");
-    printf("   -c (none|zstd)         - Compession type\n");
-    printf("   -l #                   - Compession level\n");
-    printf("   -r (#-# | #+#)         - Channel Range.  Use - to separate start/end channel\n");
-    printf("                                Use + to separate start channel + num channels\n");
-    printf("   -h                     - This help output\n");
+    printf("   -V                - Print version information\n");
+    printf("   -o OUTPUTFILE     - Filename for Output FSEQ\n");
+    printf("   -f #              - FSEQ Version\n");
+    printf("   -c (none|zstd)    - Compession type\n");
+    printf("   -l #              - Compession level\n");
+    printf("   -r (#-# | #+#)    - Channel Range.  Use - to separate start/end channel\n");
+    printf("                            Use + to separate start channel + num channels\n");
+    printf("   -n                - No Sparse. -r will only read the range, but the resulting fseq is not sparse.\n");
+    printf("   -h                - This help output\n");
 }
 const char *outputFilename = nullptr;
 static int fseqVersion = 2;
 static int compressionLevel = 10;
-std::vector<std::pair<uint32_t, uint32_t>> ranges;
+static std::vector<std::pair<uint32_t, uint32_t>> ranges;
+static bool sparse = true;
 static V2FSEQFile::CompressionType compressionType = V2FSEQFile::CompressionType::zstd;
 
 int parseArguments(int argc, char **argv) {
@@ -42,7 +44,7 @@ int parseArguments(int argc, char **argv) {
             {0,                0,                    0, 0}
         };
         
-        c = getopt_long(argc, argv, "c:l:o:f:r:hV", long_options, &option_index);
+        c = getopt_long(argc, argv, "c:l:o:f:r:hVn", long_options, &option_index);
         if (c == -1) {
             break;
         }
@@ -74,6 +76,9 @@ int parseArguments(int argc, char **argv) {
             case 'o':
                 outputFilename = optarg;
                 break;
+            case 'n':
+                sparse = false;
+                break;
             case 'V':
                 printVersionInfo();
                 exit(0);
@@ -99,7 +104,7 @@ int main(int argc, char *argv[]) {
                                                   compressionLevel);
         if (ranges.empty()) {
             ranges.push_back(std::pair<uint32_t, uint32_t>(0, 999999999));
-        } else if (fseqVersion == 2) {
+        } else if (fseqVersion == 2 && sparse) {
             V2FSEQFile *f = (V2FSEQFile*)dest;
             f->m_sparseRanges = ranges;
         }
