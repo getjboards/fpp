@@ -103,8 +103,10 @@ FSEQFile* FSEQFile::openFSEQFile(const std::string &fn) {
     fseeko(seqFile, 0L, SEEK_SET);
     unsigned char tmpData[48];
     int bytesRead = fread(tmpData, 1, 48, seqFile);
+#ifndef PLATFORM_UNKNOWN
     posix_fadvise(fileno(seqFile), 0, 0, POSIX_FADV_RANDOM);
     posix_fadvise(fileno(seqFile), 0, 1024*1024, POSIX_FADV_WILLNEED);
+#endif
 
     if ((bytesRead < 4)
         || (tmpData[0] != 'P' && tmpData[0] != 'F')
@@ -400,7 +402,8 @@ void V1FSEQFile::finalize() {
 
 
 static const int V2FSEQ_HEADER_SIZE = 32;
-
+static const int V2FSEQ_OUT_BUFFER_SIZE = 1024*1024; //1M output buffer
+static const int V2FSEQ_OUT_BUFFER_FLUSH_SIZE = 900 * 1024; //90% full, flush it
 V2FSEQFile::V2FSEQFile(const std::string &fn, CompressionType ct, int cl)
     : FSEQFile(fn),
     m_cctx(nullptr),
@@ -411,7 +414,7 @@ V2FSEQFile::V2FSEQFile(const std::string &fn, CompressionType ct, int cl)
     m_seqVersionMajor = 2;
     m_seqVersionMinor = 0;
     m_outBuffer.pos = 0;
-    m_outBuffer.size = 1024*1024;
+    m_outBuffer.size = V2FSEQ_OUT_BUFFER_SIZE;
     m_outBuffer.dst = malloc(m_outBuffer.size);
     m_inBuffer.src = nullptr;
     m_inBuffer.size = 0;
@@ -470,25 +473,29 @@ void V2FSEQFile::writeHeader() {
     if (m_compressionType != CompressionType::none) {
         //determine a good number of compression blocks
         uint64_t datasize = m_seqChannelCount * m_seqNumFrames;
-        uint64_t blockSize = 131072; //at least 128K per block
-        uint64_t numBlocks = datasize / blockSize;
-        while (numBlocks > 255) {
-            if (blockSize < 2028*1024) {
-                blockSize *= 2;
-            } else {
-                blockSize += 1024*1024;
-            }
-            numBlocks = datasize / blockSize;
+        uint64_t numBlocks = datasize;
+        numBlocks /= (64*2014); //at least 64K per block
+        if (numBlocks > 255) {
+            //need a lot of blocks, use as many as we can
+            numBlocks = 255;
+        } else if (numBlocks < 1) {
+            numBlocks = 1;
         }
-        if (numBlocks < 1) numBlocks = 1;
         m_framesPerBlock = m_seqNumFrames / numBlocks;
         if (m_framesPerBlock < 10) m_framesPerBlock = 10;
         m_curFrameInBlock = 0;
         m_curBlock = 0;
-        
+
         numBlocks = m_seqNumFrames / m_framesPerBlock + 1;
-        if (numBlocks > 255) {
-            numBlocks = 255;
+        while (numBlocks > 255) {
+            m_framesPerBlock++;
+            numBlocks = m_seqNumFrames / m_framesPerBlock + 1;
+        }
+        // first block is going to be smaller, so add some blocks
+        if (numBlocks < 254) {
+            numBlocks += 2;
+        } else if (numBlocks < 255) {
+            numBlocks++;
         }
         m_maxBlocks = numBlocks;
     } else {
@@ -537,6 +544,7 @@ void V2FSEQFile::writeHeader() {
         char buf[4] = {0,0,0,0};
         fwrite(buf, 1, dataOffset - pos, m_seqFile);
     }
+    m_curBlock = 0;
     LogDebug(VB_SEQUENCE, "Setup for writing v2 FSEQ\n");
     dumpInfo(true);
 }
@@ -549,7 +557,7 @@ m_cctx(nullptr),
 m_dctx(nullptr)
 {
     m_outBuffer.pos = 0;
-    m_outBuffer.size = 1024*1024;
+    m_outBuffer.size = V2FSEQ_OUT_BUFFER_SIZE;
     m_outBuffer.dst = malloc(m_outBuffer.size);
     m_inBuffer.src = nullptr;
     m_inBuffer.size = 0;
@@ -587,10 +595,12 @@ m_dctx(nullptr)
             m_frameOffsets.push_back(std::pair<uint32_t, uint64_t>(frame, offset));
             offset += dlen;
         }
+#ifndef PLATFORM_UNKNOWN
         if (x == 0) {
             uint64_t doff = m_seqChanDataOffset;
             posix_fadvise(fileno(m_seqFile), doff, dlen, POSIX_FADV_WILLNEED);
         }
+#endif
     }
     
     m_frameOffsets.push_back(std::pair<uint32_t, uint64_t>(99999999, offset));
@@ -736,12 +746,14 @@ FrameData *V2FSEQFile::getFrameZSTD(uint32_t frame) {
             LogErr(VB_SEQUENCE, "Failed to read channel data for frame %d!   Needed to read %" PRIu64 " but read %d\n", frame, len, (int)bread);
         }
         
+#ifndef PLATFORM_UNKNOWN
         if (m_curBlock < m_frameOffsets.size() - 2) {
             //let the kernel know that we'll likely need the next block in the near future
             uint64_t len = m_frameOffsets[m_curBlock + 2].second;
             len -= m_frameOffsets[m_curBlock+1].second;
             posix_fadvise(fileno(m_seqFile), ftello(m_seqFile), len, POSIX_FADV_WILLNEED);
         }
+#endif
 
         free(m_outBuffer.dst);
         int numFrames = (m_frameOffsets[m_curBlock + 1].first > m_seqNumFrames ? m_seqNumFrames :  m_frameOffsets[m_curBlock + 1].first) - m_frameOffsets[m_curBlock].first;
@@ -836,26 +848,26 @@ void V2FSEQFile::addFrameZSTD(uint32_t frame, uint8_t *data) {
         }
     }
 
-    if (m_outBuffer.pos) {
+    if (m_outBuffer.pos > V2FSEQ_OUT_BUFFER_FLUSH_SIZE) {
+        //buffer is getting full, better flush it
         fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
         m_outBuffer.pos = 0;
     }
     
     m_curFrameInBlock++;
-    if (m_curFrameInBlock == m_framesPerBlock && m_frameOffsets.size() < m_maxBlocks) {
-        while (ZSTD_flushStream(m_cctx, &m_outBuffer) > 0) {
+    //if we hit the max per block OR we're in the first block and hit frame #10
+    //we'll start a new block.  We want the first block to be small so startup is
+    //quicker and we can get the first few frames as fast as possible.
+    if ((m_curBlock == 0 && m_curFrameInBlock == 10)
+        || (m_curFrameInBlock == m_framesPerBlock && m_frameOffsets.size() < m_maxBlocks)) {
+        while(ZSTD_endStream(m_cctx, &m_outBuffer) > 0) {
             fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
             m_outBuffer.pos = 0;
         }
-        if (m_outBuffer.pos) {
-            fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
-            m_outBuffer.pos = 0;
-        }
-        ZSTD_endStream(m_cctx, &m_outBuffer);
         fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
         m_outBuffer.pos = 0;
         m_curFrameInBlock = 0;
-        m_curBlock = 0;
+        m_curBlock++;
     }
 }
 void V2FSEQFile::finalize() {
@@ -863,19 +875,14 @@ void V2FSEQFile::finalize() {
         //don't need to do anything
     } else {
         if (m_curFrameInBlock) {
-            while (ZSTD_flushStream(m_cctx, &m_outBuffer) > 0) {
+            while(ZSTD_endStream(m_cctx, &m_outBuffer) > 0) {
                 fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
                 m_outBuffer.pos = 0;
             }
-            if (m_outBuffer.pos) {
-                fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
-                m_outBuffer.pos = 0;
-            }
-            ZSTD_endStream(m_cctx, &m_outBuffer);
             fwrite(m_outBuffer.dst, 1, m_outBuffer.pos, m_seqFile);
             m_outBuffer.pos = 0;
             m_curFrameInBlock = 0;
-            m_curBlock = 0;
+            m_curBlock++;
         }
         
         uint64_t curr = ftello(m_seqFile);
@@ -893,6 +900,7 @@ void V2FSEQFile::finalize() {
             uint32_t len = len64;
             write4ByteUInt(&buf[4], len);
             fwrite(buf, 1, 8, m_seqFile);
+            //printf("%d    %d: %d\n", x, frame, len);
         }
         m_frameOffsets.pop_back();
     }

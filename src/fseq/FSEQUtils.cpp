@@ -5,7 +5,6 @@
 #include <stdlib.h>
 
 #include "fppversion.h"
-#include "common.h"
 #include "log.h"
 
 #include "FSEQFile.h"

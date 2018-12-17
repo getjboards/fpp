@@ -17,7 +17,6 @@ OBJECTS_fsequtils = \
 	$(NULL)
 LIBS_fsequtils = \
     -lzstd \
-	-ljsoncpp \
 	-lpthread \
 	$(NULL)
 
@@ -305,7 +304,14 @@ else
 # do something Linux-y
 CFLAGS += \
 	-DNOROOT \
+	-DPLATFORM_UNKNOWN \
 	$(NULL)
+LDFLAGS_fppd += \
+    -L. \
+	$(NULL)
+LDFLAGS_fsequtils += \
+    -L. \
+    $(NULL)
 endif
 
 ##############################################################################
