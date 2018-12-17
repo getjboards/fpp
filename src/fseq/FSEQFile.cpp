@@ -11,11 +11,43 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "FSEQFile.h"
-#include "common.h"
 #include "log.h"
+
+
+inline void DumpHeader(const char *title, unsigned char data[], int len) {
+    int x = 0;
+    char tmpStr[128];
+
+    sprintf( tmpStr, "%s: (%d bytes)\n", title, len);
+    LogInfo(VB_ALL, tmpStr);
+    
+    for (int y = 0; y < len; y++) {
+        if ( x == 0 ) {
+            sprintf( tmpStr, "%06x: ", y);
+        }
+        sprintf( tmpStr + strlen(tmpStr), "%02x ", (int)(data[y] & 0xFF) );
+        x++;
+        if (x == 16) {
+            x = 0;
+            sprintf( tmpStr + strlen(tmpStr), "\n" );
+            LogInfo(VB_ALL, tmpStr);
+        }
+    }
+    if (x != 0) {
+        sprintf( tmpStr + strlen(tmpStr), "\n" );
+        LogInfo(VB_ALL, tmpStr);
+    }
+}
+
+inline uint64_t GetTime(void) {
+    struct timeval now_tv;
+    gettimeofday(&now_tv, NULL);
+    return now_tv.tv_sec * 1000000LL + now_tv.tv_usec;
+}
 
 inline long roundTo4(long i) {
     long remainder = i % 4;
@@ -81,14 +113,14 @@ FSEQFile* FSEQFile::openFSEQFile(const std::string &fn) {
         || tmpData[3] != 'Q') {
         LogErr(VB_SEQUENCE, "Error opening sequence file: %s. Incorrect File Format header: '%s', bytesRead: %d\n",
                fn.c_str(), tmpData, bytesRead);
-        HexDump("Sequence File head:", tmpData, bytesRead);
+        DumpHeader("Sequence File head:", tmpData, bytesRead);
         fclose(seqFile);
         return nullptr;
     }
     
     if (bytesRead < 8) {
         LogErr(VB_SEQUENCE, "Sequence file %s too short, unable to read FSEQ version fields\n", fn.c_str());
-        HexDump("Sequence File head:", tmpData, bytesRead);
+        DumpHeader("Sequence File head:", tmpData, bytesRead);
         fclose(seqFile);
         return nullptr;
     }
@@ -104,7 +136,7 @@ FSEQFile* FSEQFile::openFSEQFile(const std::string &fn) {
     bytesRead = fread(&header[0], 1, seqChanDataOffset, seqFile);
     if (bytesRead != seqChanDataOffset) {
         LogErr(VB_SEQUENCE, "Error opening sequence file: %s. Could not read header.\n", fn.c_str());
-        HexDump("Sequence File head:", &header[0], bytesRead);
+        DumpHeader("Sequence File head:", &header[0], bytesRead);
         fclose(seqFile);
     }
     
@@ -117,7 +149,7 @@ FSEQFile* FSEQFile::openFSEQFile(const std::string &fn) {
     } else {
         LogErr(VB_SEQUENCE, "Error opening sequence file: %s. Unknown FSEQ version %d-%d\n",
                fn.c_str(), seqVersionMajor, seqVersionMinor);
-        HexDump("Sequence File head:", tmpData, bytesRead);
+        DumpHeader("Sequence File head:", tmpData, bytesRead);
         fclose(seqFile);
         
         return nullptr;
@@ -186,7 +218,7 @@ FSEQFile::FSEQFile(const std::string &fn, FILE *file, const std::vector<uint8_t>
     m_seqVersion      = (m_seqVersionMajor * 256) + m_seqVersionMinor;
     m_seqChannelCount = read4ByteUInt(&header[10]);
     m_seqNumFrames = read4ByteUInt(&header[14]);
-    m_seqStepTime = read2ByteUInt(&header[18]);
+    m_seqStepTime = header[18];
 }
 FSEQFile::~FSEQFile() {
     fclose(m_seqFile);
@@ -239,7 +271,9 @@ void V1FSEQFile::writeHeader() {
     // Number of Steps
     write4ByteUInt(&header[14], m_seqNumFrames);
     // Step time in ms
-    write2ByteUInt(&header[18], m_seqStepTime);
+    header[18] = m_seqStepTime;
+    //flags
+    header[19] = 0;
     // universe count
     write2ByteUInt(&header[20], 0);
     // universe Size
@@ -413,7 +447,9 @@ void V2FSEQFile::writeHeader() {
     // Number of Steps
     write4ByteUInt(&header[14], m_seqNumFrames);
     // Step time in ms
-    write2ByteUInt(&header[18], m_seqStepTime);
+    header[18] = m_seqStepTime;
+    //flags
+    header[19] = 0;
 
     // compression type
     header[20] = m_compressionType == CompressionType::none ? 0 : 1;

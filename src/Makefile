@@ -11,7 +11,6 @@ INSTALL_PROGRAM = install -m 755 -p
 
 OBJECTS_fsequtils = \
 	fppversion.o \
-	common.o \
 	log.o \
     fseq/FSEQUtils.o \
     fseq/FSEQFile.o \
