@@ -17,8 +17,8 @@ void usage(char *appname) {
     printf("   -v                - verbose\n");
     printf("   -o OUTPUTFILE     - Filename for Output FSEQ\n");
     printf("   -f #              - FSEQ Version\n");
-    printf("   -c (none|zstd)    - Compession type\n");
-    printf("   -l #              - Compession level\n");
+    printf("   -c (none|zstd|zlib) - Compession type\n");
+    printf("   -l #              - Compession level (-1 for default)\n");
     printf("   -r (#-# | #+#)    - Channel Range.  Use - to separate start/end channel\n");
     printf("                            Use + to separate start channel + num channels\n");
     printf("   -n                - No Sparse. -r will only read the range, but the resulting fseq is not sparse.\n");
@@ -26,7 +26,7 @@ void usage(char *appname) {
 }
 const char *outputFilename = nullptr;
 static int fseqVersion = 2;
-static int compressionLevel = 10;
+static int compressionLevel = -1;
 static bool verbose = false;
 static std::vector<std::pair<uint32_t, uint32_t>> ranges;
 static bool sparse = true;
@@ -69,8 +69,13 @@ int parseArguments(int argc, char **argv) {
                 verbose = true;
                 break;
             case 'c':
-                compressionType = strcmp(optarg, "none")
-                    ? V2FSEQFile::CompressionType::zstd : V2FSEQFile::CompressionType::none;
+                if (strcmp(optarg, "none") == 0) {
+                    compressionType = V2FSEQFile::CompressionType::none;
+                } else if (strcmp(optarg, "zlib") == 0) {
+                    compressionType = V2FSEQFile::CompressionType::zlib;
+                } else {
+                    compressionType = V2FSEQFile::CompressionType::zstd;
+                }
                 break;
             case 'l':
                 compressionLevel = strtol(optarg, NULL, 10);

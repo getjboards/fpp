@@ -4,8 +4,6 @@
 #include <string>
 #include <vector>
 
-#include <zstd.h>
-
 class VariableHeader {
 public:
     VariableHeader() { code[0] = code[1] = 0; }
@@ -117,6 +115,9 @@ public:
     uint32_t m_dataBlockSize;
 };
 
+
+class V2Handler;
+
 class V2FSEQFile : public FSEQFile {
 
 public:
@@ -138,27 +139,15 @@ public:
     
     CompressionType m_compressionType;
     int             m_compressionLevel;
-    std::vector<std::pair<uint32_t, uint64_t>> m_frameOffsets;
     std::vector<std::pair<uint32_t, uint32_t>> m_sparseRanges;
-    
     std::vector<std::pair<uint32_t, uint32_t>> m_rangesToRead;
+    std::vector<std::pair<uint32_t, uint64_t>> m_frameOffsets;
     uint32_t m_dataBlockSize;
 private:
-    void addFrameZSTD(uint32_t frame, uint8_t *data);
-    void addFrameNone(uint32_t frame, uint8_t *data);
-
-    FrameData *getFrameNone(uint32_t frame);
-    FrameData *getFrameZSTD(uint32_t frame);
     
-    // for compressed files, this is the compression data
-    uint32_t m_framesPerBlock;
-    uint32_t m_curFrameInBlock;
-    uint32_t m_curBlock;
-    uint32_t m_maxBlocks;
-    ZSTD_CStream* m_cctx;
-    ZSTD_DStream* m_dctx;
-    ZSTD_outBuffer_s m_outBuffer;
-    ZSTD_inBuffer_s m_inBuffer;
+    void createHandler();
+    
+    V2Handler *m_handler;
 };
 
 

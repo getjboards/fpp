@@ -16,7 +16,7 @@ OBJECTS_fsequtils = \
     fseq/FSEQFile.o \
 	$(NULL)
 LIBS_fsequtils = \
-    -lzstd \
+    -lzstd -lz \
 	-lpthread \
 	$(NULL)
 
@@ -133,7 +133,7 @@ OBJECTS_fppd = \
 	$(NULL)
 LIBS_fppd = \
 	-lpthread \
-    -lzstd \
+    -lzstd -lz \
 	-ljsoncpp \
 	-lm \
 	-lmosquitto \
