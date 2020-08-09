@@ -23,11 +23,13 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "fpp-pch.h"
 #include "PlaylistEntryPlugin.h"
 
 PlaylistEntryPlugin::PlaylistEntryPlugin(PlaylistEntryBase *parent)
   : PlaylistEntryBase(parent)
 {
+    m_type = "plugin";
 }
 
 PlaylistEntryPlugin::~PlaylistEntryPlugin()

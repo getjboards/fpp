@@ -74,6 +74,8 @@ $(document).ready(function() {
              DialogError("Save E1.31 Universes", "Validation Failed");
          }
 	});
+
+    $(document).tooltip();
 });
 
 <?
@@ -162,43 +164,6 @@ $(document).ready(function(){
     border: solid 2px #888888;
     text-align:center;
 }
-tr.rowUniverseDetails
-{
-    border:thin solid;
-    border-color:#CCC;
-}
-
-tr.rowUniverseDetails td
-{
-    padding:1px 5px;
-}
-
-.channelInputTable
-{
-    border:thin;
-    border-color:#333;
-    border-collapse: collapse;
-}
-
-#tblUniverses th {
-	vertical-align: bottom;
-	text-align: center;
-	border: solid 2px #888888;
-}
-
-#tblUniverses td {
-	text-align: center;
-}
-
-#tblUniverses input[type=text] {
-	text-align: center;
-	width: 100%;
-}
-#tblUniverses input[type=number] {
-    text-align: center;
-    width: 100%;
-}
-
 </style>
 
 <title><? echo $pageTitle; ?></title>
@@ -212,7 +177,7 @@ tr.rowUniverseDetails td
 		<div class='title'>Channel Inputs</div>
 		<div id="tabs">
 			<ul>
-				<li><a href="#tab-e131">E1.31 Bridge</a></li>
+				<li><a href="#tab-e131">E1.31/ArtNet Bridge</a></li>
 			</ul>
 
 <!-- --------------------------------------------------------------------- -->
@@ -220,7 +185,7 @@ tr.rowUniverseDetails td
 			<div id='tab-e131'>
 				<div id='divE131'>
 					<fieldset class="fs">
-						<legend> E1.31 Bridge Mode Universes </legend>
+						<legend> E1.31/ArtNet Bridge Mode Universes </legend>
 						<div id='divE131Data'>
 
   <div style="overflow: hidden; padding: 10px;">
@@ -228,7 +193,7 @@ tr.rowUniverseDetails td
 
     <div>
       <form>
-        Universe Count: <input id="txtUniverseCount" class="default-value" type="text" value="Enter Universe Count" size="3" maxlength="3" /><input id="btnUniverseCount" onclick="SetUniverseCount(1);" type="button"  class="buttons" value="Set" />
+        Inputs Count: <input id="txtUniverseCount" class="default-value" type="text" value="Enter Universe Count" size="3" maxlength="3" /><input id="btnUniverseCount" onclick="SetUniverseCount(1);" type="button"  class="buttons" value="Set" />
       </form>
     </div>
     <form id="frmUniverses">
@@ -242,13 +207,31 @@ tr.rowUniverseDetails td
       	<td width = "70 px"><input id="btnDeleteUniverses" class="buttons" type="button" value = "Delete" onClick="DeleteUniverse(1);" /></td>
       </tr>
     </table>
-    
-		<table id="tblUniverses" class='channelInputTable'>
-			<thead id='tblUniversesHead'>
-			</thead>
-			<tbody id='tblUniversesBody'>
-			</tbody>
-    </table>
+
+    <div class='fppTableWrapper'>
+        <div class='fppTableContents'>
+            <table id="tblUniverses" class='universeTable fullWidth'>
+                <thead id='tblUniversesHead'>
+                    <th rowspan=2 title='Input Number'>Input</th>
+                        <th rowspan=2 title='Input Enabled/Disabled status'>Active</th>
+                        <th rowspan=2 title='User Description'>Description</th>
+                        <th rowspan=2 title='Input Type'>Input<br>Type</th>
+                        <th colspan=2>FPP Channel</th>
+                        <th colspan=3>Universe</th>
+                    </tr>
+                    <tr>
+                        <th title='FPP Start Channel'>Start</th>
+                        <th title='FPP End Channel'>End</th>
+                        <th title='Universe Number'>#</th>
+                        <th title='Universe Count for this controller'>Count</th>
+                        <th title='Universe size'>Size</th>
+                    </tr>
+                </thead>
+                <tbody id='tblUniversesBody'>
+                </tbody>
+            </table>
+        </div>
+    </div>
 		<span style="font-size:12px; font-family:Arial; margin-left:15px;">(Drag entry to reposition) </span>
 		</form>
 	</div>

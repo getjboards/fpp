@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   libav/SDL player driver for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _SDLOUT_H
-#define _SDLOUT_H
-
 #include "MediaOutputBase.h"
 
 class SDLInternalData;
@@ -35,7 +33,7 @@ class SDLOutput : public MediaOutputBase {
     SDLOutput(const std::string &mediaFilename, MediaOutputStatus *status, const std::string &videoOut);
 	virtual ~SDLOutput();
 
-	virtual int  Start(void) override;
+	virtual int  Start(int msTime = 0) override;
 	virtual int  Stop(void) override;
 	virtual int  Process(void) override;
     virtual int  Close(void) override;
@@ -47,5 +45,3 @@ class SDLOutput : public MediaOutputBase {
   private:
     SDLInternalData *data;
 };
-
-#endif

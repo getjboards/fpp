@@ -22,29 +22,30 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <unistd.h>
 #include <sys/wait.h>
-#include <fstream>
 
 #define BBB_PRU  0
 //  #define USING_PRU_RAM
 
-#include <pruss_intc_mapping.h>
-#include <prussdrv.h>
 
 // FPP includes
-#include "common.h"
-#include "log.h"
 #include "BBBSerial.h"
-#include "BBBUtils.h"
-#include "settings.h"
+
+#include "util/BBBUtils.h"
+
 
 //reserve the TOP 84K for DMX/PixelNet data
 #define DDR_RESERVED 84*1024
+
+
+extern "C" {
+    BBBSerialOutput *createOutputBBBSerial(unsigned int startChannel,
+                                  unsigned int channelCount) {
+        return new BBBSerialOutput(startChannel, channelCount);
+    }
+}
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -80,17 +81,23 @@ BBBSerialOutput::~BBBSerialOutput()
 
 
 static void compileSerialPRUCode(std::vector<std::string> &sargs) {
+
     pid_t compilePid = fork();
     if (compilePid == 0) {
+        std::string log;
         char * args[sargs.size() + 3];
         args[0] = (char *)"/bin/bash";
         args[1] = (char *)"/opt/fpp/src/pru/compileSerial.sh";
+
+        log = args[1];
         
         for (int x = 0; x < sargs.size(); x++) {
             args[x + 2] = (char*)sargs[x].c_str();
+            log += " " + sargs[x];
         }
         args[sargs.size() + 2] = NULL;
-        
+        LogDebug(VB_CHANNELOUT, "BBBSerial::compilePRUCode() args: %s\n", log.c_str());
+
         execvp("/bin/bash", args);
     } else {
         wait(NULL);
@@ -152,7 +159,7 @@ int BBBSerialOutput::Init(Json::Value config)
 
     int pruNumber = BBB_PRU;
 
-    string pru_program = "/tmp/FalconSerial.bin";
+    string pru_program = "/tmp/FalconSerial.out";
 
     const char *mode = BBB_PRU ? "gpio" : "pruout";
     if (BBB_PRU) {
@@ -172,7 +179,6 @@ int BBBSerialOutput::Init(Json::Value config)
     if (config["pinoutVersion"].asString() == "3.x") {
         verPostf = "-v3";
     }
-    Json::Reader reader;
     Json::Value root;
     char filename[256];
     std::string device = config["device"].asString();
@@ -183,8 +189,7 @@ int BBBSerialOutput::Init(Json::Value config)
     int maxOut = 8;
     int countOut = 0;
     if (FileExists(filename)) {
-        std::ifstream t(filename);
-        if (!reader.parse(t, root)) {
+        if (!LoadJsonFromFile(filename, root)) {
             LogErr(VB_CHANNELOUT, "Could not read pin configuration for %s%s\n", device.c_str(), verPostf.c_str());
             return 0;
         }
@@ -194,14 +199,14 @@ int BBBSerialOutput::Init(Json::Value config)
         
         maxOut = root["serial"].size();
         for (int x = 0; x < root["serial"].size(); x++)  {
-            const PinCapabilities &pin = getBBBPinByName(root["serial"][x]["pin"].asString());
+            const PinCapabilities &pin = PinCapabilities::getPinByName(root["serial"][x]["pin"].asString());
             if (m_startChannels[x] >= 0) {
                 pin.configPin(mode);
                 countOut++;
             }
-            outputFile << "#define ser" << std::to_string(x + 1) << "_gpio  " << std::to_string(pin.gpio) << "\n";
-            outputFile << "#define ser" << std::to_string(x + 1) << "_pin  " << std::to_string(pin.pin) << "\n\n";
-            outputFile << "#define ser" << std::to_string(x + 1) << "_pru30  " << std::to_string(pin.prupin) << "\n\n";
+            outputFile << "#define ser" << std::to_string(x + 1) << "_gpio  " << std::to_string(pin.gpioIdx) << "\n";
+            outputFile << "#define ser" << std::to_string(x + 1) << "_pin  " << std::to_string(pin.gpio) << "\n\n";
+            outputFile << "#define ser" << std::to_string(x + 1) << "_pru30  " << std::to_string(pin.pruPin) << "\n\n";
         }
         
         outputFile.close();
@@ -265,13 +270,10 @@ int BBBSerialOutput::Init(Json::Value config)
     return ThreadedChannelOutputBase::Init(config);
 }
 
-void BBBSerialOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
+void BBBSerialOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
     for (int i = 0; i < m_outputs; i++) {
         if (m_startChannels[i] >= 0) {
-            min = std::min(min, m_startChannels[i] + 1);
-            max = std::max(max, m_pixelnet ? m_startChannels[i] + 4095 : m_startChannels[i] + 511);
+            addRange(m_startChannels[i] + 1, m_pixelnet ? m_startChannels[i] + 4095 : m_startChannels[i] + 511);
         }
     }
 }
@@ -290,12 +292,14 @@ int BBBSerialOutput::Close(void)
         
         __asm__ __volatile__("":::"memory");
         int cnt = 0;
-        while (wait && cnt < 25 && m_serialData->response != 0xFFFF) {
+        while (wait && cnt < 50 && m_serialData->response != 0xFFFF) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            __asm__ __volatile__("":::"memory");
             cnt++;
         }
-        m_pru->stop(m_serialData->response != 0xFFFF ? 0 : 1);
-        
+        m_pru->stop();
+        m_serialData->command = 0;
+
         delete m_pru;
         m_pru = NULL;
     }

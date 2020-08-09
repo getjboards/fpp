@@ -1,12 +1,8 @@
+#pragma once
 /*
  *   Renard USB handler for Falcon Player (FPP)
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
+ *   Copyright (C) 2013-2019 the Falcon Player Developers
  *      For additional credits and developers, see credits.php.
  *
  *   The Falcon Player (FPP) is free software; you can redistribute it
@@ -23,12 +19,25 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _USBRENARD_H
-#define _USBRENARD_H
+#include "ChannelOutputBase.h"
 
-#include "channeloutput.h"
+class USBRenardOutputData;
 
-extern FPPChannelOutput USBRenardOutput;
-int USBRenard_MaxChannels(void *data);
+class USBRenardOutput : public ChannelOutputBase {
+public:
+    USBRenardOutput(unsigned int startChannel, unsigned int channelCount);
+    virtual ~USBRenardOutput();
+    
+    virtual int Init(Json::Value config) override;
+    
+    virtual int Close(void) override;
+    
+    virtual int SendData(unsigned char *channelData) override;
+    
+    virtual void DumpConfig(void) override;
+    
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
-#endif /* _USBRENARD_H */
+private:
+    USBRenardOutputData *data;
+};

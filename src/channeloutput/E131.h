@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   E131 output handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _E131_H
-#define _E131_H
-
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <vector>
@@ -35,24 +33,23 @@
 
 class E131OutputData : public UDPOutputData {
 public:
-    E131OutputData(const Json::Value &config);
+    explicit E131OutputData(const Json::Value &config);
     virtual ~E131OutputData();
     
-    virtual bool IsPingable();
-    virtual void PrepareData(unsigned char *channelData);
-    virtual void CreateMessages(std::vector<struct mmsghdr> &ipMsgs);
-    virtual void DumpConfig();
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual bool IsPingable() override;
+    
+    virtual void PrepareData(unsigned char *channelData, UDPOutputMessages &msgs) override;
+    
+    virtual void DumpConfig() override;
+    virtual void GetRequiredChannelRange(int &min, int & max) override;
 
+    virtual const std::string &GetOutputTypeString() const override;
 
     int           universe;
     int           universeCount;
     int           priority;
-    char          E131sequenceNumber;
 
-    sockaddr_in   e131Address;
+    std::vector<sockaddr_in>   e131Addresses;
     std::vector<struct iovec>  e131Iovecs;
     std::vector<unsigned char *> e131Headers;
 };
-
-#endif

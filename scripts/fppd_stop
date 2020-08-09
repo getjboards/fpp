@@ -7,8 +7,6 @@ BINDIR=$(cd $(dirname $0) && pwd)
 
 logOutput
 
-stopWebSocketServer
-
 runPreStopScripts
 
 echo "Stopping fppd"
@@ -38,6 +36,4 @@ then
 fi
 
 runPostStopScripts
-
-stopOLADaemonIfUnused
 

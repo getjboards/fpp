@@ -17,57 +17,63 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <unistd.h>
+#include "fpp-pch.h"
 #include <sys/wait.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <string>
-#include <cmath>
-#include <iostream>
-#include <fstream>
-
-
 #include "BBBMatrix.h"
-#include "BBBUtils.h"
-#include "common.h"
-#include "log.h"
 
+#include "util/BBBUtils.h"
+
+extern "C" {
+    BBBMatrix *createOutputLEDscapeMatrix(unsigned int startChannel,
+                                  unsigned int channelCount) {
+        return new BBBMatrix(startChannel, channelCount);
+    }
+}
 
 // These are the number of clock cycles it takes to clock out a single "row" of bits (1 bit) for 32x16 1/8 P10 scan panels.  Other
 // panel types and scan rates and stuff are proportional to these
-uint32_t v1Timings[8][16] = {
+static const uint32_t v1Timings[8][16] = {
     { 0xA65, 0x14EA, 0x1F6F, 0x29ED, 0x346E, 0x3EEE, 0x496C, 0x53EB, 0x5E6B, 0x68ED, 0x7374, 0x7DF0, 0x887B, 0x92F4, 0x9D75, 0xA7FB},
     { 0xA69, 0x14EA, 0x1F6F, 0x29ED, 0x346E, 0x3EEE, 0x496C, 0x53EB, 0x5E6B, 0x68ED, 0x7374, 0x7DF0, 0x887B, 0x92F4, 0x9D75, 0xA7FB},
     { 0xA6A, 0x14EA, 0x1F6F, 0x29ED, 0x346E, 0x3EEE, 0x496C, 0x53EB, 0x5E6B, 0x68ED, 0x7374, 0x7DF0, 0x887B, 0x92F4, 0x9D75, 0xA7FB},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC90, 0x190D, 0x2590, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D}
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC90, 0x190D, 0x2590, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D}
 };
-uint32_t v2Timings[8][16] = {
+static const uint32_t v2Timings[8][16] = {
     { 0x347,  0x64F,  0x95F,  0xC70,  0xF80, 0x129E, 0x15B3, 0x18CB, 0x1BE4, 0x1EFB, 0x2211, 0x252C, 0x2786, 0x2A88, 0x2D85, 0x3088},
     { 0x864, 0x10ED, 0x196C, 0x21EA, 0x2A6C, 0x32E9, 0x3B6A, 0x43EC, 0x4C6A, 0x54EA, 0x5D6B, 0x65EB, 0x6E6D, 0x76ED, 0x7F6E, 0x87EE},
     { 0x864, 0x10ED, 0x196C, 0x21EA, 0x2A6C, 0x32E9, 0x3B6A, 0x43EC, 0x4C6A, 0x54EA, 0x5D6B, 0x65EB, 0x6E6D, 0x76ED, 0x7F6E, 0x87EE},
     { 0xA69, 0x14EA, 0x1F6F, 0x29ED, 0x346E, 0x3EEE, 0x496C, 0x53EB, 0x5E6B, 0x68ED, 0x7374, 0x7DF0, 0x887B, 0x92F4, 0x9D75, 0xA7FB},
     { 0xA6A, 0x14EA, 0x1F6F, 0x29ED, 0x346E, 0x3EEE, 0x496C, 0x53EB, 0x5E6B, 0x68ED, 0x7374, 0x7DF0, 0x887B, 0x92F4, 0x9D75, 0xA7FB},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
 };
-uint32_t psTimings[8][16] = {
+static const uint32_t psTimings[8][16] = {
     { 0x440,  0x820,  0xC30, 0x1000, 0x1400, 0x17F1, 0x1C00, 0x2000, 0x2400, 0x2800, 0x2C00, 0x3000, 0x3400, 0x3800, 0x3C00, 0x4000},
     { 0x940, 0x12C0, 0x1C80, 0x25C0, 0x2F40, 0x3900, 0x4240, 0x4C00, 0x5540, 0x5EC0, 0x6850, 0x71C0, 0x7B40, 0x84C0, 0x8E80, 0x97CE},
     { 0xB70, 0x1700, 0x2280, 0x2E00, 0x3A00, 0x4500, 0x5080, 0x5C00, 0x6780, 0x7320, 0x7E80, 0x8A00, 0x9580, 0xA100, 0xAC80, 0xB7F0},
     { 0xB80, 0x1700, 0x2280, 0x2E00, 0x3A00, 0x4500, 0x5080, 0x5C00, 0x6780, 0x7320, 0x7E80, 0x8A00, 0x9580, 0xA100, 0xAC80, 0xB800},
     { 0xB90, 0x1700, 0x2280, 0x2E00, 0x3A00, 0x4500, 0x5080, 0x5C00, 0x6780, 0x7320, 0x7E80, 0x8A00, 0x9580, 0xA100, 0xAC80, 0xB800},
     { 0xB90, 0x1700, 0x2280, 0x2E00, 0x3A00, 0x4500, 0x5080, 0x5C00, 0x6780, 0x7320, 0x7E80, 0x8A00, 0x9580, 0xA100, 0xAC80, 0xB800},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
-    { 0xC88, 0x1906, 0x2588, 0x320D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
+    { 0xC88, 0x1906, 0x2588, 0x340D, 0x3E8D, 0x4B10, 0x5790, 0x6410, 0x7090, 0x7D10, 0x8990, 0x9610, 0xA291, 0xAF0D, 0xBB90, 0xC80D},
 };
 
-
+static std::map<int, std::vector<int>> BIT_ORDERS =
+{
+    {6, {5, 2, 1, 4, 3, 0}},
+    {7, {6, 2, 1, 4, 5, 3, 0}},
+    {8, {7, 3, 5, 1, 2, 6, 4, 0}},
+    //{8, {7, 6, 5, 4, 3, 2, 1, 0}},
+    {9, {8, 3, 5, 1, 7, 2, 6, 4, 0}},
+    {10, {9, 4, 1, 6, 3, 8, 2, 7, 5, 0}},
+    {11, {10, 4, 7, 2, 3, 1, 6, 9, 8, 5, 0}},
+    {12, {11, 5, 8, 2, 4, 1, 7, 10, 3, 9, 6, 0}}
+};
 static void compilePRUMatrixCode(std::vector<std::string> &sargs) {
     pid_t compilePid = fork();
     if (compilePid == 0) {
@@ -107,38 +113,60 @@ void BBBMatrix::calcBrightnessFlags(std::vector<std::string> &sargs) {
     //timings are based on 32 pixel wide panels
     max *= m_panelWidth;
     max /= 32;
-    
+
     // 1/4 scan we need to double the time since we have twice the number of pixels to clock out
     max *= m_panelHeight;
     max /= (m_panelScan * 2);
 
-
     uint32_t origMax = max;
-    if (max < 0x4500) {
+    if (m_colorDepth >= 11 && max < 0x9000) {
+        //for depth 10, we'll need a little more on time
+        //or the last bit will be on far too short
+        max = 0x9000;
+    } else if (m_colorDepth >= 10 && max < 0x8000) {
+        //for depth 10, we'll need a little more on time
+        //or the last bit will be on far too short
+        max = 0x8000;
+    } else if (m_colorDepth == 9 && max < 0x6800) {
+        //for depth 9, we'll need a little more on time
+        max = 0x6800;
+    } else if (max < 0x4500) {
         //if max is too low, the low bit time is too short and
         //extra ghosting occurs
         // At this point, framerate will be supper high anyway >100fps
         max = 0x4500;
     }
+
     uint32_t origMax2 = max;
 
     max *= m_brightness;
     max /= 10;
 
     uint32_t delay = origMax2 - max;
-    if (max < origMax) {
-        delay = origMax2 - origMax;
+    if ((origMax2 > origMax) && (origMax > max)) {
+        delay = origMax - max;
     }
     
-    for (int x = 0; x < 8; x++) {
+    int maxBit = 8;
+    if (m_colorDepth > 8) {
+        maxBit = m_colorDepth;
+    }
+    //printf("Delay : %d      Max:  %d       OrigMax:   %d      OrigMax2:  %d\n", delay, max, origMax, origMax2);
+    for (int x = 0; x < maxBit; x++) {
         LogDebug(VB_CHANNELOUT, "Brightness %d:  %X\n", x, max);
         delayValues[x] = delay;
-        brightnessValues[x] = max + delay;
+        brightnessValues[x] = max;
         max >>= 1;
         origMax >>= 1;
     }
-    
-    m_printStats = false;
+    // low value cannot be less than 20 or ghosting
+    if (brightnessValues[maxBit - 1] < 20) {
+        brightnessValues[maxBit - 1] = 20;
+    }
+    if (brightnessValues[maxBit - 2] < brightnessValues[maxBit - 1]) {
+        brightnessValues[maxBit - 2] = brightnessValues[maxBit - 2] + 5;
+    }
+
     if (FileExists("/home/fpp/media/config/ledscape_dimming")) {
         FILE *file = fopen("/home/fpp/media/config/ledscape_dimming", "r");
         
@@ -172,12 +200,27 @@ void BBBMatrix::calcBrightnessFlags(std::vector<std::string> &sargs) {
         }
     }
     
-    for (int x = 0; x < m_colorDepth; x++) {
-        char buf[100];
-        sprintf(buf, "-DBRIGHTNESS%d=%d", (m_colorDepth-x), brightnessValues[x]);
+    char buf[255];
+    
+    int x = m_colorDepth;
+    m_bitOrder.clear();
+    if (m_outputByRow) {
+        //if outputing by row, we have to keep in decending order
+        for (int x = m_colorDepth; x > 0; --x) {
+            m_bitOrder.push_back(x-1);
+        }
+    } else {
+        m_bitOrder = BIT_ORDERS[m_colorDepth];
+    }
+    
+    for (auto b : m_bitOrder) {
+        int idx = m_colorDepth - b - 1;
+        sprintf(buf, "-DBRIGHTNESS%d=%d", x, brightnessValues[idx]);
+        
         sargs.push_back(buf);
-        sprintf(buf, "-DDELAY%d=%d", (m_colorDepth-x), delayValues[x]);
+        sprintf(buf, "-DDELAY%d=%d", x, delayValues[idx]);
         sargs.push_back(buf);
+        x--;
     }
 }
 
@@ -199,22 +242,29 @@ public:
     NoInterleaveHandler() {}
     virtual ~NoInterleaveHandler() {}
     
-    virtual void mapRow(int &y) {}
-    virtual void mapCol(int y, int &x) {}
+    virtual void mapRow(int &y) override {}
+    virtual void mapCol(int y, int &x) override {}
 };
 class SimpleInterleaveHandler : public InterleaveHandler {
 public:
-    SimpleInterleaveHandler(int interleave, int ph, int pw, int ps)
-        : InterleaveHandler(), m_interleave(interleave), m_panelHeight(ph), m_panelWidth(pw), m_panelScan(ps) {}
+    SimpleInterleaveHandler(int interleave, int ph, int pw, int ps, bool flip)
+        : InterleaveHandler(), m_interleave(interleave), m_panelHeight(ph), m_panelWidth(pw), m_panelScan(ps), m_flipRows(flip) {}
     virtual ~SimpleInterleaveHandler() {}
 
-    virtual void mapRow(int &y) {
+    virtual void mapRow(int &y) override {
         while (y >= m_panelScan) {
             y -= m_panelScan;
         }
     }
-    virtual void mapCol(int y, int &x) {
+    virtual void mapCol(int y, int &x) override {
         int whichInt = x / m_interleave;
+        if (m_flipRows) {
+            if (y & m_panelScan) {
+                y &= !m_panelScan;
+            } else {
+                y |= m_panelScan;
+            }
+        }
         int offInInt = x % m_interleave;
         int mult = (m_panelHeight / m_panelScan / 2) - 1 - y / m_panelScan;
         x = m_interleave * (whichInt * m_panelHeight / m_panelScan / 2 + mult)  + offInInt;
@@ -225,7 +275,57 @@ private:
     const int m_panelWidth;
     const int m_panelHeight;
     const int m_panelScan;
+    const bool m_flipRows;
 };
+
+class ZigZagClusterInterleaveHandler : public InterleaveHandler {
+public:
+    ZigZagClusterInterleaveHandler(int interleave, int ph, int pw, int ps)
+        : InterleaveHandler(), m_interleave(interleave), m_panelHeight(ph), m_panelWidth(pw), m_panelScan(ps) {}
+    virtual ~ZigZagClusterInterleaveHandler() {}
+
+    virtual void mapRow(int &y) override {
+        while (y >= m_panelScan) {
+            y -= m_panelScan;
+        }
+    }
+    virtual void mapCol(int y, int &x) override {
+        int whichInt = x / m_interleave;
+        int offInInt = x % m_interleave;
+        int mult = y / m_panelScan;
+
+        if (m_panelScan == 2) {
+            // AC_MAPPING code - stealing codepath for scan 1/2 and zigzag8
+            // cluster -- the ordinal number of a group of 8 linear lights on a half-frame
+            // starting in the top left corner of a half-module; bits 3,2 from y, 1,0 from x
+            int tc = whichInt | (y << 1) & 0xc;
+            // mapped cluster - this reverses the effects of unusual wiring on this panel
+            // address bits are shifted around and bit3 is negated to achieve linear counting
+            uint8_t map_cb = (~tc & 8) | (tc & 4) >> 2 | (tc & 2) << 1 | (tc & 1) << 1;
+            // scale up from cluster to pixel counts and account for reverse-running clusters
+            x = map_cb * 8 + (x & 0x7 ^ (((~y >> 1) & 1) * 7) );
+            return;
+        } else if (m_interleave == 4) {
+            if ((whichInt & 0x1) == 1) {
+                mult = (y < m_panelScan ? y + m_panelScan : y - m_panelScan) / m_panelScan;
+            }
+        } else {
+            int tmp = (y * 2) / m_panelScan;
+            if ((tmp & 0x2) == 0) {
+                offInInt = m_interleave - 1 - offInInt;
+            }
+        }
+        x = m_interleave * (whichInt * m_panelHeight / m_panelScan / 2 + mult) + offInInt;
+    }
+
+private:
+    const int m_interleave;
+    const int m_panelWidth;
+    const int m_panelHeight;
+    const int m_panelScan;
+};
+
+
 
 class ZigZagInterleaveHandler : public InterleaveHandler {
 public:
@@ -233,12 +333,12 @@ public:
         : InterleaveHandler(), m_interleave(interleave), m_panelHeight(ph), m_panelWidth(pw), m_panelScan(ps) {}
     virtual ~ZigZagInterleaveHandler() {}
     
-    virtual void mapRow(int &y) {
+    virtual void mapRow(int &y) override {
         while (y >= m_panelScan) {
             y -= m_panelScan;
         }
     }
-    virtual void mapCol(int y, int &x) {
+    virtual void mapCol(int y, int &x) override {
         int whichInt = x / m_interleave;
         int offInInt = x % m_interleave;
         int mult = y / m_panelScan;
@@ -275,7 +375,7 @@ BBBMatrix::BBBMatrix(unsigned int startChannel, unsigned int channelCount)
 	m_matrix(nullptr),
 	m_panelMatrix(nullptr),
     m_outputs(0),
-    m_outputFrame(nullptr),
+    m_gpioFrame(nullptr),
     m_longestChain(0),
     m_panelWidth(32),
     m_panelHeight(16),
@@ -286,7 +386,9 @@ BBBMatrix::BBBMatrix(unsigned int startChannel, unsigned int channelCount)
     m_panelScan(8),
     m_timing(0),
     m_printStats(false),
-    m_handler(nullptr)
+    m_handler(nullptr),
+    m_outputByRow(false),
+    m_outputBlankData(false)
 {
 	LogDebug(VB_CHANNELOUT, "BBBMatrix::BBBMatrix(%u, %u)\n",
 		startChannel, channelCount);
@@ -295,7 +397,7 @@ BBBMatrix::BBBMatrix(unsigned int startChannel, unsigned int channelCount)
 BBBMatrix::~BBBMatrix()
 {
     LogDebug(VB_CHANNELOUT, "BBBMatrix::~BBBMatrix()\n");
-    if (m_outputFrame) delete [] m_outputFrame;
+    if (m_gpioFrame) delete [] m_gpioFrame;
     if (m_pru) delete m_pru;
     if (m_pruCopy) delete m_pruCopy;
     if (m_handler) delete m_handler;
@@ -303,36 +405,62 @@ BBBMatrix::~BBBMatrix()
     if (m_panelMatrix) delete m_panelMatrix;
 }
 
-static void configureControlPin(const std::string &ctype, Json::Value &root, std::ofstream &outputFile) {
+bool BBBMatrix::configureControlPin(const std::string &ctype, Json::Value &root, std::ofstream &outputFile) {
     std::string type = root["controls"][ctype]["type"].asString();
     if (type != "none") {
-        const PinCapabilities &pin = getBBBPinByName(root["controls"][ctype]["pin"].asString());
-        pin.configPin(type);
-        if (type == "pruout") {
-            outputFile << "#define pru_" << ctype << " " << std::to_string(pin.prupin) << "\n";
+        std::string pinName = root["controls"][ctype]["pin"].asString();
+        const PinCapabilities &pin = PinCapabilities::getPinByName(pinName);
+        if (ctype == "oe" && pin.pwm >= 99)  {
+            outputFile << "#define oe_pwm_address " << std::to_string(pin.getPWMRegisterAddress()) << "\n";
+            outputFile << "#define oe_pwm_output " << std::to_string(pin.subPwm) << "\n";
+            int max = 300*255;
+            //FIXME - adjust max for brightess
+            pin.setupPWM(max);
+            pin.setPWMValue(0);
+            return true;
         } else {
-            outputFile << "#define gpio_" << ctype << " " << std::to_string(pin.pin) << "\n";
+            pin.configPin(type);
+            if (type == "pruout") {
+                outputFile << "#define pru_" << ctype << " " << std::to_string(pin.pruPin) << "\n";
+            } else {
+                outputFile << "#define gpio_" << ctype << " " << std::to_string(pin.gpio) << "\n";
+            }
         }
+        m_usedPins.push_back(pinName);
+    }
+    return false;
+}
+
+void BBBMatrix::configurePanelPin(int x, const std::string &color, int row, Json::Value &root, std::ofstream &outputFile, int *minPort) {
+    std::string pinName = root["outputs"][x]["pins"][color + std::to_string(row)].asString();
+    const PinCapabilities &pin = PinCapabilities::getPinByName(pinName);
+    pin.configPin();
+    m_usedPins.push_back(pinName);
+    int gpioIdx = pin.gpioIdx;
+    minPort[gpioIdx] = std::min(minPort[gpioIdx], (int)pin.gpio);
+    outputFile << "#define " << color << std::to_string(x+1) << std::to_string(row) << "_gpio " << std::to_string(pin.gpioIdx) << "\n";
+    outputFile << "#define " << color << std::to_string(x+1) << std::to_string(row) << "_pin  " << std::to_string(pin.gpio) << "\n";
+    
+    if (color == "r") {
+        m_pinInfo[x].row[row-1].r_gpio = pin.gpioIdx;
+        m_pinInfo[x].row[row-1].r_pin = 1UL << pin.gpio;
+    } else if (color == "g") {
+        m_pinInfo[x].row[row-1].g_gpio = pin.gpioIdx;
+        m_pinInfo[x].row[row-1].g_pin = 1UL << pin.gpio;
+    } else {
+        m_pinInfo[x].row[row-1].b_gpio = pin.gpioIdx;
+        m_pinInfo[x].row[row-1].b_pin = 1UL << pin.gpio;
     }
 }
 
-static void configurePanelPin(int x, const std::string &color, const std::string& row, Json::Value &root, std::ofstream &outputFile, int *minPort) {
-    const PinCapabilities &pin = getBBBPinByName(root["outputs"][x]["pins"][color + row].asString());
-    pin.configPin();
-    int gpio = pin.gpio;
-    minPort[gpio] = std::min(minPort[gpio], (int)pin.pin);
-    outputFile << "#define " << color << std::to_string(x+1) << row << "_gpio " << std::to_string(pin.gpio) << "\n";
-    outputFile << "#define " << color << std::to_string(x+1) << row << "_pin  " << std::to_string(pin.pin) << "\n";
-}
-
-static void configurePanelPins(int x, Json::Value &root, std::ofstream &outputFile, int *minPort) {
-    configurePanelPin(x, "r", "1", root, outputFile, minPort);
-    configurePanelPin(x, "g", "1", root, outputFile, minPort);
-    configurePanelPin(x, "b", "1", root, outputFile, minPort);
+void BBBMatrix::configurePanelPins(int x, Json::Value &root, std::ofstream &outputFile, int *minPort) {
+    configurePanelPin(x, "r", 1, root, outputFile, minPort);
+    configurePanelPin(x, "g", 1, root, outputFile, minPort);
+    configurePanelPin(x, "b", 1, root, outputFile, minPort);
     outputFile << "\n";
-    configurePanelPin(x, "r", "2", root, outputFile, minPort);
-    configurePanelPin(x, "g", "2", root, outputFile, minPort);
-    configurePanelPin(x, "b", "2", root, outputFile, minPort);
+    configurePanelPin(x, "r", 2, root, outputFile, minPort);
+    configurePanelPin(x, "g", 2, root, outputFile, minPort);
+    configurePanelPin(x, "b", 2, root, outputFile, minPort);
     outputFile << "\n";
 }
 
@@ -407,16 +535,22 @@ int BBBMatrix::Init(Json::Value config)
     if (config.isMember("panelColorDepth")) {
         m_colorDepth = config["panelColorDepth"].asInt();
     }
-    bool drop = false;
-    if (m_colorDepth < 0) {
-        drop = true;
-        m_colorDepth = -m_colorDepth;
-        m_colorDepth++;
+    if (config.isMember("panelOutputOrder")) {
+        m_outputByRow = config["panelOutputOrder"].asBool();
     }
-    if (m_colorDepth > 8 || m_colorDepth < 6) {
+    if (config.isMember("panelOutputBlankRow")) {
+        m_outputBlankData = config["panelOutputBlankRow"].asBool();
+    }
+    if (m_colorDepth < 0) {
+        m_colorDepth = -m_colorDepth;
+        m_outputBlankData = true;
+    }
+    if (m_colorDepth > 12 || m_colorDepth < 6) {
         m_colorDepth = 8;
     }
     bool zigZagInterleave = false;
+    bool zigZagClusterInterleave = false;
+    bool flipRows = false;
     if (config.isMember("panelInterleave")) {
         if (config["panelInterleave"].asString() == "8z") {
             m_interleave = 8;
@@ -427,8 +561,23 @@ int BBBMatrix::Init(Json::Value config)
         } else if (config["panelInterleave"].asString() == "4z") {
             m_interleave = 4;
             zigZagInterleave = true;
+        } else if (config["panelInterleave"].asString() == "8f") {
+            m_interleave = 8;
+            flipRows = true;
+        } else if (config["panelInterleave"].asString() == "16f") {
+            m_interleave = 16;
+            flipRows = true;
+        } else if (config["panelInterleave"].asString() == "32f") {
+            m_interleave = 32;
+            flipRows = true;
+        } else if (config["panelInterleave"].asString() == "64f") {
+            m_interleave = 64;
+            flipRows = true;
+        } else if (config["panelInterleave"].asString() == "8c") {
+            m_interleave = 8;
+            zigZagClusterInterleave = true;
         } else {
-            m_interleave = std::stoi(config["panelInterleave"].asString());
+            m_interleave = std::atoi(config["panelInterleave"].asString().c_str());
         }
     } else {
         m_interleave = 0;
@@ -461,7 +610,13 @@ int BBBMatrix::Init(Json::Value config)
     }
     
     m_rowSize = m_longestChain * m_panelWidth * 3;
-    m_outputFrame = new uint8_t[m_outputs * m_longestChain * m_panelHeight * m_panelWidth * 3];
+    int maxBits = 8;
+    if (m_colorDepth > 8) {
+        maxBits = m_colorDepth;
+    }
+    int gpioFrameLen = m_longestChain * m_panelWidth * maxBits * (m_panelHeight / 2) * 4;
+    m_gpioFrame = new uint32_t[gpioFrameLen];
+    memset(m_gpioFrame, 0, gpioFrameLen);
 
     std::vector<std::string> compileArgs;
     
@@ -478,7 +633,6 @@ int BBBMatrix::Init(Json::Value config)
     if (config["wiringPinout"] == "v3") {
         name += "-v3";
     }
-    Json::Reader reader;
     Json::Value root;
     char filename[256];
     int minPort[4] = {99, 99, 99, 99};
@@ -487,13 +641,13 @@ int BBBMatrix::Init(Json::Value config)
     if (!FileExists(filename)) {
         sprintf(filename, "/opt/fpp/capes/%s/panels/%s.json", dirname.c_str(), name.c_str());
     }
+    bool isPWM = false;
     if (!FileExists(filename)) {
-        LogErr(VB_CHANNELOUT, "No output pin configuration for %s\n", name.c_str());
+        LogErr(VB_CHANNELOUT, "No output pin configuration for %s - %s\n", name.c_str(), filename);
         return 0;
     } else {
-        std::ifstream t(filename);
-        if (!reader.parse(t, root)) {
-            LogErr(VB_CHANNELOUT, "Could not read pin configuration for %s\n", name.c_str());
+        if (!LoadJsonFromFile(filename, root)) {
+            LogErr(VB_CHANNELOUT, "Could not read pin configuration for %s - %s\n", name.c_str(), filename);
             return 0;
         }
         std::string longName = root["longName"].asString();
@@ -508,7 +662,7 @@ int BBBMatrix::Init(Json::Value config)
         pru = root["pru"].asInt();
         configureControlPin("latch", root, outputFile);
         outputFile << "\n";
-        configureControlPin("oe", root, outputFile);
+        isPWM = configureControlPin("oe", root, outputFile);
         outputFile << "\n";
         configureControlPin("clock", root, outputFile);
         outputFile << "\n";
@@ -540,7 +694,13 @@ int BBBMatrix::Init(Json::Value config)
         outputFile << "\n";
         for (int x = 0; x < 4; x++) {
             if (minPort[x] != 99) {
-                outputFile << "#define PANEL_USE_GPIO" << std::to_string(x) << "\n";
+                if (x == controlGpio) {
+                    outputFile << "#define OUTPUT_GPIO_" << std::to_string(x) << "(a, b, c, d) OUTPUT_GPIO_FORCE_CLEAR a, b, c, d\n";
+                } else {
+                    outputFile << "#define OUTPUT_GPIO_" << std::to_string(x) << "(a, b, c, d) OUTPUT_GPIO a, b, c, d\n";
+                }
+            } else {
+                outputFile << "#define OUTPUT_GPIO_" << std::to_string(x) << "(a, b, c, d)\n";
             }
         }
         outputFile << "\n";
@@ -557,13 +717,15 @@ int BBBMatrix::Init(Json::Value config)
     char buf[200];
     sprintf(buf, "-DRUNNING_ON_PRU%d", pru);
     compileArgs.push_back(buf);
+    sprintf(buf, "-DRUNNING_ON_PRU=%d", pru);
+    compileArgs.push_back(buf);
     sprintf(buf, "-DOUTPUTS=%d", m_outputs);
     compileArgs.push_back(buf);
     sprintf(buf, "-DROWS=%d", m_panelScan);
     compileArgs.push_back(buf);
     sprintf(buf, "-DBITS=%d", m_colorDepth);
     compileArgs.push_back(buf);
-    int tmp = m_longestChain * m_panelWidth / 8;
+    int tmp = m_longestChain * m_panelWidth;
     if (m_panelScan * 4 == m_panelHeight) {
         tmp *= 2;
     } else if (m_panelScan * 8 == m_panelHeight) {
@@ -571,6 +733,9 @@ int BBBMatrix::Init(Json::Value config)
     }
     sprintf(buf, "-DROW_LEN=%d", tmp);
     compileArgs.push_back(buf);
+    if (isPWM) {
+        compileArgs.push_back("-DUSING_PWM");
+    }
 
     if (addressingType == 1) {
         // 1/2 scan panel that uses 2 bits, bit one for scan row 1 and bit two for row 2
@@ -584,8 +749,16 @@ int BBBMatrix::Init(Json::Value config)
         compileArgs.push_back("-DENABLESTATS=1");
     }
 
+    if (m_outputByRow) {
+        compileArgs.push_back("-DOUTPUTBYROW");
+        if (m_outputBlankData) {
+            compileArgs.push_back("-DOUTPUTBLANKROW");
+        }
+    } else {
+        compileArgs.push_back("-DOUTPUTBYDEPTH");
+    }
     compilePRUMatrixCode(compileArgs);
-    std::string pru_program = "/tmp/FalconMatrix.bin";
+    std::string pru_program = "/tmp/FalconMatrix.out";
 
     m_pruCopy = new BBBPru(pru ? 0 : 1);
     memset(m_pruCopy->data_ram, 0, 24);
@@ -596,20 +769,25 @@ int BBBMatrix::Init(Json::Value config)
     m_pruData->command = 0;
     m_pruData->response = 0;
 
+    for (int x = 0; x < 8; x++) {
+        m_pruData->pwmBrightness[x] = 0;
+    }
+    
     for (int x = 0; x < MAX_STATS; x++) {
         m_pruData->stats[x * 3] = 0;
         m_pruData->stats[x * 3 + 1] = 0;
         m_pruData->stats[x * 3 + 1] = 0;
     }
-    
-    m_pruCopy->run("/tmp/FalconMatrixPRUCpy.bin");
+    m_pruCopy->run("/tmp/FalconMatrixPRUCpy.out");
     m_pru->run(pru_program);
     
     if (m_interleave && ((m_panelScan * 2) != m_panelHeight)) {
         if (zigZagInterleave) {
             m_handler = new ZigZagInterleaveHandler(m_interleave, m_panelHeight, m_panelWidth, m_panelScan);
+        } else if (zigZagClusterInterleave) {
+            m_handler = new ZigZagClusterInterleaveHandler(m_interleave, m_panelHeight, m_panelWidth, m_panelScan);
         } else {
-            m_handler = new SimpleInterleaveHandler(m_interleave, m_panelHeight, m_panelWidth, m_panelScan);
+            m_handler = new SimpleInterleaveHandler(m_interleave, m_panelHeight, m_panelWidth, m_panelScan, flipRows);
         }
     } else {
         m_handler = new NoInterleaveHandler();
@@ -625,33 +803,83 @@ int BBBMatrix::Init(Json::Value config)
     }
     for (int x = 0; x < 256; x++) {
         int v = x;
-        if (drop) {
-            if (m_colorDepth == 7) {
-                if (v > 0 && v < 4) v = 4;
-                v &= 0xFC;
-            } else {
-                if (v > 0 && v < 2) v = 2;
-                v &= 0xFE;
-            }
-        } else {
-            if (m_colorDepth == 6 && (v == 3 || v == 2)) {
-                v = 4;
-            } else if (m_colorDepth == 7 && v == 1) {
-                v = 2;
-            }
+        if (m_colorDepth == 6 && (v == 3 || v == 2)) {
+            v = 4;
+        } else if (m_colorDepth == 7 && v == 1) {
+            v = 2;
         }
-        
+        float max = 255.0f;
+        switch (m_colorDepth) {
+            case 12:
+                max = 4095.0f;
+            break;
+            case 11:
+                max = 2047.0f;
+            break;
+            case 10:
+                max = 1023.0f;
+            break;
+            case 9:
+                max = 511.0f;
+            break;
+        }
         float f = v;
-        f = 255.0 * pow(f / 255.0f, gamma);
-        if (f > 255.0) {
-            f = 255.0;
+        f = max * pow(f / 255.0f, gamma);
+        if (f > max) {
+            f = max;
         }
         if (f < 0.0) {
             f = 0.0;
         }
         gammaCurve[x] = round(f);
+        if (gammaCurve[x] == 0 && f > 0.25)  {
+            //don't drop as much of the low end to 0
+            gammaCurve[x] = 1;
+        }
+        //printf("%d   %d  (%f)\n", x, gammaCurve[x], f);
     }
+
+    if (isPWM) {
+        //need to calculate the clock counts for the PWM subsystem
+        int i = m_pruData->pwmBrightness[0];
+        while (i == 0) {
+            i = m_pruData->pwmBrightness[0];
+        }
+        printf("PERIOD: %X\n", i);
+        
+        int f = i;
+        //f *= 300;
+        //f /= 500;
+        i = f;
+        printf("New PERIOD: %X\n", i);
+
+        i *= m_brightness;
+        i /= 10;
+        for (int x = 0; x < 8; x++) {
+            printf("%d: %X\n", x, i);
+            m_pruData->pwmBrightness[7-x] = i;
+            i /= 2;
+        }
+        
+    }
+    /*
+    for (int x = 0; x < 8; x++) {
+        printf("%d  R1:   %d   %8X\n",x,  m_pinInfo[x].row[0].r_gpio, m_pinInfo[x].row[0].r_pin);
+        printf("    G1:   %d   %8X\n", m_pinInfo[x].row[0].g_gpio, m_pinInfo[x].row[0].g_pin);
+        printf("    B1:   %d   %8X\n", m_pinInfo[x].row[0].b_gpio, m_pinInfo[x].row[0].b_pin);
+        printf("    R2:   %d   %8X\n", m_pinInfo[x].row[1].r_gpio, m_pinInfo[x].row[1].r_pin);
+        printf("    G2:   %d   %8X\n", m_pinInfo[x].row[1].g_gpio, m_pinInfo[x].row[1].g_pin);
+        printf("    B2:   %d   %8X\n", m_pinInfo[x].row[1].b_gpio, m_pinInfo[x].row[1].b_pin);
+    }
+    */
     
+    //make sure the PRU starts outputting a blank frame to remove any random noise
+    //from the panels
+    memcpy(m_pru->ddr, m_gpioFrame, gpioFrameLen);
+    m_pruData->address_dma = m_pru->ddr_addr;
+    //make sure memory is flushed before command is set to 1
+    __asm__ __volatile__("":::"memory");
+    m_pruData->command = 1;
     return ChannelOutputBase::Init(config);
 }
 
@@ -661,17 +889,21 @@ int BBBMatrix::Close(void)
     // Send the stop command
     m_pruData->command = 0xFF;
     if (m_pru) {
-        m_pru->stop(true);
+        m_pru->stop();
         delete m_pru;
         m_pru = nullptr;
     }
     
     if (m_pruCopy) {
-        m_pruCopy->stop(true);
+        m_pruCopy->stop();
         delete m_pruCopy;
         m_pruCopy = nullptr;
     }
-    
+    for (auto &pinName : m_usedPins) {
+        
+        const PinCapabilities &pin = PinCapabilities::getPinByName(pinName);
+        pin.configPin("default", false);
+    }
     return ChannelOutputBase::Close();
 }
 
@@ -698,11 +930,10 @@ void BBBMatrix::printStats() {
     //printf("0x%X\n", (total / count));
     fclose(rfile);
 }
-void BBBMatrix::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = m_startChannel + m_channelCount - 1;
-}
 
+void BBBMatrix::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    addRange(m_startChannel, m_startChannel + m_channelCount - 1);
+}
 
 void BBBMatrix::PrepData(unsigned char *channelData)
 {
@@ -720,10 +951,13 @@ void BBBMatrix::PrepData(unsigned char *channelData)
 
     channelData += m_startChannel;
     
-    size_t rowLen = m_panelWidth * m_longestChain * m_outputs * 3 * 2 * m_panelHeight / (m_panelScan * 2);
-    rowLen /= 8;
     
-    memset(m_outputFrame, 0, m_outputs * m_longestChain * m_panelHeight * m_panelWidth * 3);
+    //number of uint32_t per row for each bit
+    size_t rowLen = m_panelWidth * m_longestChain * m_panelHeight / (m_panelScan * 2) * 4; //4 GPIO's
+    //number of uint32_t per full row (all bits)
+    size_t fullRowLen = rowLen * m_colorDepth;
+    memset(m_gpioFrame, 0, sizeof(uint32_t) * fullRowLen * m_panelScan);
+
     for (int output = 0; output < m_outputs; output++) {
         int panelsOnOutput = m_panelMatrix->m_outputPanels[output].size();
         
@@ -738,46 +972,52 @@ void BBBMatrix::PrepData(unsigned char *channelData)
                 
                 int yOut = y;
                 m_handler->mapRow(yOut);
-                int offset = yOut * rowLen * m_colorDepth + output * 2 * 3
-                    + (m_longestChain - chain - 1) * m_panelWidth/8 * m_outputs * 3 * 2 * m_panelHeight / (m_panelScan * 2);
+                
+                int offset = yOut * fullRowLen + (m_longestChain - chain - 1) * 4 * m_panelWidth * m_panelHeight / m_panelScan / 2;
+                if (!m_outputByRow) {
+                    offset = yOut * rowLen + (m_longestChain - chain - 1) * 4 * m_panelWidth * m_panelHeight / m_panelScan / 2;
+                }
                 
                 for (int x = 0; x < m_panelWidth; ++x) {
-                    uint8_t r1 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw1 + x*3]]];
-                    uint8_t g1 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw1 + x*3 + 1]]];
-                    uint8_t b1 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw1 + x*3 + 2]]];
+                    uint16_t r1 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw1 + x*3]]];
+                    uint16_t g1 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw1 + x*3 + 1]]];
+                    uint16_t b1 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw1 + x*3 + 2]]];
                     
-                    uint8_t r2 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw2 + x*3]]];
-                    uint8_t g2 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw2 + x*3 + 1]]];
-                    uint8_t b2 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw2 + x*3 + 2]]];
+                    uint16_t r2 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw2 + x*3]]];
+                    uint16_t g2 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw2 + x*3 + 1]]];
+                    uint16_t b2 = gammaCurve[channelData[m_panelMatrix->m_panels[panel].pixelMap[yw2 + x*3 + 2]]];
 
-                    
                     int xOut = x;
                     m_handler->mapCol(y, xOut);
-                    int bitPos = 1 << (xOut % 8);
-                    int xOff = xOut / 8 * (m_outputs * 2 * 3);
                     
-                    for (int bit = 8; bit > (8-m_colorDepth); ) {
-                        --bit;
-                        uint8_t mask = 1 << bit;
+                    int xOff = xOut * 4;
+                    
+                    for (auto bit : m_bitOrder) {
+
+                        uint16_t mask = 1 << bit;
                         if (r1 & mask) {
-                            m_outputFrame[offset + xOff] |= bitPos;
+                            m_gpioFrame[offset + xOff + m_pinInfo[output].row[0].r_gpio] |= m_pinInfo[output].row[0].r_pin;
                         }
                         if (g1 & mask) {
-                            m_outputFrame[offset + xOff + 1] |= bitPos;
+                            m_gpioFrame[offset + xOff + m_pinInfo[output].row[0].g_gpio] |= m_pinInfo[output].row[0].g_pin;
                         }
                         if (b1 & mask) {
-                            m_outputFrame[offset + xOff + 2] |= bitPos;
+                            m_gpioFrame[offset + xOff + m_pinInfo[output].row[0].b_gpio] |= m_pinInfo[output].row[0].b_pin;
                         }
                         if (r2 & mask) {
-                            m_outputFrame[offset + xOff + 3] |= bitPos;
+                            m_gpioFrame[offset + xOff + m_pinInfo[output].row[1].r_gpio] |= m_pinInfo[output].row[1].r_pin;
                         }
                         if (g2 & mask) {
-                            m_outputFrame[offset + xOff + 4] |= bitPos;
+                            m_gpioFrame[offset + xOff + m_pinInfo[output].row[1].g_gpio] |= m_pinInfo[output].row[1].g_pin;
                         }
                         if (b2 & mask) {
-                            m_outputFrame[offset + xOff + 5] |= bitPos;
+                            m_gpioFrame[offset + xOff + m_pinInfo[output].row[1].b_gpio] |= m_pinInfo[output].row[1].b_pin;
                         }
-                        xOff += rowLen;
+                        if (m_outputByRow) {
+                            xOff += rowLen;
+                        } else {
+                            xOff += rowLen * m_panelScan;
+                        }
                     }
                 }
             }
@@ -788,20 +1028,21 @@ int BBBMatrix::SendData(unsigned char *channelData)
 {
     LogExcess(VB_CHANNELOUT, "BBBMatrix::SendData(%p)\n", channelData);
     
-    int len = m_outputs * m_longestChain * m_panelHeight * m_panelWidth * 3;
+    size_t rowLen = m_panelWidth * m_longestChain * m_panelHeight / (m_panelScan * 2) * 4; //4 GPIO's
+    size_t len = sizeof(uint32_t) * rowLen * m_colorDepth * m_panelScan;
+    
     if (len < (m_pru->ddr_size / 2)) {
         //we can flip frames
-        memcpy(m_pru->ddr + (m_evenFrame ? (m_pru->ddr_size / 2) : 0), m_outputFrame, len);
+        memcpy(m_pru->ddr + (m_evenFrame ? (m_pru->ddr_size / 2) : 0), m_gpioFrame, len);
         m_pruData->address_dma = m_pru->ddr_addr + (m_evenFrame ? (m_pru->ddr_size / 2) : 0);
         m_evenFrame = !m_evenFrame;
     } else {
-        memcpy(m_pru->ddr, m_outputFrame, len);
+        memcpy(m_pru->ddr, m_gpioFrame, len);
         m_pruData->address_dma = m_pru->ddr_addr;
     }
     
     //make sure memory is flushed before command is set to 1
     __asm__ __volatile__("":::"memory");
-
     m_pruData->command = 1;
     
     /*

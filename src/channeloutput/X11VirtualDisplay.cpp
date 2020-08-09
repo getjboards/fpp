@@ -22,17 +22,19 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include "common.h"
-#include "log.h"
 #include "serialutil.h"
-#include "Sequence.h"
 #include "X11VirtualDisplay.h"
+
+
+extern "C" {
+    X11VirtualDisplayOutput *createX11VirtualDisplayOutput(unsigned int startChannel,
+                                                           unsigned int channelCount) {
+        return new X11VirtualDisplayOutput(startChannel, channelCount);
+    }
+}
+
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -46,7 +48,8 @@ X11VirtualDisplayOutput::X11VirtualDisplayOutput(unsigned int startChannel,
 	LogDebug(VB_CHANNELOUT, "X11VirtualDisplayOutput::X11VirtualDisplayOutput(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = FPPD_MAX_CHANNELS;
+	XInitThreads();
+
 	m_bytesPerPixel = 4;
 	m_bpp = 32;
 }
@@ -70,6 +73,10 @@ int X11VirtualDisplayOutput::Init(Json::Value config)
 
 	if (!VirtualDisplayOutput::Init(config))
 		return 0;
+
+    if (m_virtualDisplay) {
+        free(m_virtualDisplay);
+    }
 
 	m_virtualDisplay = new unsigned char[m_width * m_height * m_bytesPerPixel];
 	if (!m_virtualDisplay)
@@ -106,8 +113,8 @@ int X11VirtualDisplayOutput::Init(Json::Value config)
 		m_width, m_height, 24);
 
 	m_gc = XCreateGC(m_display, m_pixmap, 0, &values);
-	if (m_gc < 0)
-	{
+    int32_t tgc = reinterpret_cast<uintptr_t>(m_gc);
+    if (tgc < 0) {
 		LogDebug(VB_CHANNELOUT, "Unable to create GC\n");
 		return 0;
 	}
@@ -143,6 +150,7 @@ int X11VirtualDisplayOutput::Close(void)
 	XCloseDisplay(m_display);
 	XUnlockDisplay(m_display);
 	delete [] m_virtualDisplay;
+    m_virtualDisplay = nullptr;
 
 	return ChannelOutputBase::Close();
 }
@@ -150,11 +158,19 @@ int X11VirtualDisplayOutput::Close(void)
 /*
  *
  */
-int X11VirtualDisplayOutput::RawSendData(unsigned char *channelData)
+void X11VirtualDisplayOutput::PrepData(unsigned char *channelData)
 {
-	LogExcess(VB_CHANNELOUT, "X11VirtualDisplayOutput::RawSendData(%p)\n", channelData);
+	LogExcess(VB_CHANNELOUT, "X11VirtualDisplayOutput::PrepData(%p)\n", channelData);
 
 	DrawPixels(channelData);
+}
+
+/*
+ *
+ */
+int X11VirtualDisplayOutput::SendData(unsigned char *channelData)
+{
+	LogExcess(VB_CHANNELOUT, "X11VirtualDisplayOutput::SendData(%p)\n", channelData);
 
 	XLockDisplay(m_display);
 

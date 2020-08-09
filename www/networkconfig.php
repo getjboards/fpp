@@ -1,22 +1,109 @@
-<?php require_once('common.php'); ?>
-<?php include 'common/menuHead.inc'; ?>
 <!DOCTYPE html>
 <html>
 <head>
+<?php require_once('common.php'); ?>
+<?php include 'common/menuHead.inc'; ?>
+
 <title><? echo $pageTitle; ?></title>
 </head>
 <body>
+
+
 <?php
     
 $wifiDrivers = Array();
 $wifiDrivers['External'] = "External";
 $wifiDrivers['Linux Kernel'] = "Kernel";
-    
 $defaultWifiDrivers = "External";
-if ($settings['wifiDrivers'] == "Realtek") {
+if (isset($settings['wifiDrivers']) && $settings['wifiDrivers'] == "Realtek") {
     $settings['wifiDrivers'] == "External";
 }
-    
+
+    // list from https://www.arubanetworks.com/techdocs/InstantWenger_Mobile/Advanced/Content/Instant%20User%20Guide%20-%20volumes/Country_Codes_List.htm#regulatory_domain_3737302751_1017918
+    $wifiDomains = Array();
+    $wifiDomains['United States'] = 'US';
+    $wifiDomains['Canada'] = 'CA';
+    $wifiDomains['Japan'] = 'JP3';
+    $wifiDomains['Germany'] = 'DE';
+    $wifiDomains['Netherlands'] = 'NL';
+    $wifiDomains['Italy'] = 'IT';
+    $wifiDomains['Portugal'] = 'PT';
+    $wifiDomains['Luxembourg'] = 'LU';
+    $wifiDomains['Norway'] = 'NO';
+    $wifiDomains['Finland'] = 'FI';
+    $wifiDomains['Denmark'] = 'DK';
+    $wifiDomains['Switzerland'] = 'CH';
+    $wifiDomains['Czech Republic'] = 'CZ';
+    $wifiDomains['Spain'] = 'ES';
+    $wifiDomains['United Kingdom'] = 'GB';
+    $wifiDomains['Republic of Korea (South Korea)'] = 'KR';
+    $wifiDomains['China'] = 'CN';
+    $wifiDomains['France'] = 'FR';
+    $wifiDomains['Hong Kong'] = 'HK';
+    $wifiDomains['Singapore'] = 'SG';
+    $wifiDomains['Taiwan'] = 'TW';
+    $wifiDomains['Brazil'] = 'BR';
+    $wifiDomains['Israel'] = 'IL';
+    $wifiDomains['Saudi Arabia'] = 'SA';
+    $wifiDomains['Lebanon'] = 'LB';
+    $wifiDomains['United Arab Emirates'] = 'AE';
+    $wifiDomains['South Africa'] = 'ZA';
+    $wifiDomains['Argentina'] = 'AR';
+    $wifiDomains['Australia'] = 'AU';
+    $wifiDomains['Austria'] = 'AT';
+    $wifiDomains['Bolivia'] = 'BO';
+    $wifiDomains['Chile'] = 'CL';
+    $wifiDomains['Greece'] = 'GR';
+    $wifiDomains['Iceland'] = 'IS';
+    $wifiDomains['India'] = 'IN';
+    $wifiDomains['Ireland'] = 'IE';
+    $wifiDomains['Kuwait'] = 'KW';
+    $wifiDomains['Liechtenstein'] = 'LI';
+    $wifiDomains['Lithuania'] = 'LT';
+    $wifiDomains['Mexico'] = 'MX';
+    $wifiDomains['Morocco'] = 'MA';
+    $wifiDomains['New Zealand'] = 'NZ';
+    $wifiDomains['Poland'] = 'PL';
+    $wifiDomains['Puerto Rico'] = 'PR';
+    $wifiDomains['Slovak Republic'] = 'SK';
+    $wifiDomains['Slovenia'] = 'SI';
+    $wifiDomains['Thailand'] = 'TH';
+    $wifiDomains['Uruguay'] = 'UY';
+    $wifiDomains['Panama'] = 'PA';
+    $wifiDomains['Russia'] = 'RU';
+    $wifiDomains['Egypt'] = 'EG';
+    $wifiDomains['Trinidad and Tobago'] = 'TT';
+    $wifiDomains['Turkey'] = 'TR';
+    $wifiDomains['Costa Rica'] = 'CR';
+    $wifiDomains['Ecuador'] = 'EC';
+    $wifiDomains['Honduras'] = 'HN';
+    $wifiDomains['Kenya'] = 'KE';
+    $wifiDomains['Ukraine'] = 'UA';
+    $wifiDomains['Vietnam'] = 'VN';
+    $wifiDomains['Bulgaria'] = 'BG';
+    $wifiDomains['Cyprus'] = 'CY';
+    $wifiDomains['Estonia'] = 'EE';
+    $wifiDomains['Mauritius'] = 'MU';
+    $wifiDomains['Romania'] = 'RO';
+    $wifiDomains['Serbia and Montenegro'] = 'CS';
+    $wifiDomains['Indonesia'] = 'ID';
+    $wifiDomains['Peru'] = 'PE';
+    $wifiDomains['Venezuela'] = 'VE';
+    $wifiDomains['Jamaica'] = 'JM';
+    $wifiDomains['Bahrain'] = 'BH';
+    $wifiDomains['Oman'] = 'OM';
+    $wifiDomains['Jordan'] = 'JO';
+    $wifiDomains['Bermuda'] = 'BM';
+    $wifiDomains['Colombia'] = 'CO';
+    $wifiDomains['Dominican Republic'] = 'DO';
+    $wifiDomains['Guatemala'] = 'GT';
+    $wifiDomains['Philippines'] = 'PH';
+    $wifiDomains['Sri Lanka'] = 'LK';
+    $wifiDomains['El Salvador'] = 'SV';
+    $wifiDomains['Tunisia'] = 'TN';
+    $wifiDomains['Islamic Republic of Pakistan'] = 'PK';
+    $wifiDomains['Qatar'] = 'QA';
+    $wifiDomains['Algeria'] = 'DZ';
 
 function PopulateInterfaces()
 {
@@ -39,7 +126,37 @@ function printTetheringSelect() {
     $tetherValues["Disabled"] = 2;
     PrintSettingSelect("Enable Tethering", "EnableTethering", 0, 1, "0", $tetherValues);
 }
-
+function printTetheringTechnology() {
+    $tetherValues = array();
+    $tetherValues["Hostapd"] = 0;
+    $tetherValues["ConnMan"] = 1;
+    PrintSettingSelect("Tether Technology", "TetherTechnology", 0, 1, "0", $tetherValues);
+}
+function printTetheringInterfaces() {
+    $tinterfacesRaw = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v ^$ | grep wlan | colrm 6")));
+    $tingerfaces = Array();
+    foreach ($tinterfacesRaw as $iface) {
+        $tinterfaces[$iface] = $iface;
+        echo "<!-- $iface -->\n";
+    }
+    $tiface = ReadSettingFromFile("TetherInterface");
+    if (!isset($tiface) || $tiface == "") {
+        $tiface = "wlan0";
+    }
+    PrintSettingSelect("Tether Interface", "TetherInterface", 0, 1, $tiface, $tinterfaces);
+}
+function printWifiNetworks() {
+    $networksRaw = explode("\n",trim(shell_exec("connmanctl services  | colrm 1 4")));
+    echo "<datalist id='eth_ssids'>\n";
+    foreach ($networksRaw as $iface) {
+        $if2 = explode(" ", $iface);
+        if ($if2[0] != "" && $if2[0] != "Wired") {
+            echo "<option value='$if2[0]'>\n";
+        }
+    }
+    echo "</datalist>\n";
+}
+    
 ?>
 <script>
 
@@ -223,19 +340,60 @@ function SaveNetworkConfig()
 	{
 		data.SSID = encodeURIComponent($('#eth_ssid').val());
 		data.PSK = encodeURIComponent($('#eth_psk').val());
-        data.Hidden = $('#eth_hidden').is(':checked');
+        data.HIDDEN = $('#eth_hidden').is(':checked');
 	}
 
 	var postData = "command=setInterfaceInfo&data=" + JSON.stringify(data);
 
 	$.post("fppjson.php", postData
-	).done(function(data) {
+	).done(function(rc) {
 		LoadNetworkConfig();
 		$.jGrowl(iface + " network interface configuration saved");
 		$('#btnConfigNetwork').show();
+
+		if (data.PROTO == 'static' && $('#dns1').val() == "" && $('#dns2').val() == "") {
+			DialogOK("Check DNS", "Don't forget to set a DNS IP address. You may use 8.8.8.8 or 1.1.1.1 if you are not sure.")
+		}
 	}).fail(function() {
 		DialogError("Save Network Config", "Save Failed");
 	});
+}
+
+function CreatePersistentNames() {
+    $('#dialog-create-persistent').dialog({
+        resizeable: false,
+        height: 300,
+        width: 500,
+        modal: true,
+        buttons: {
+            "Yes" : function() {
+                $(this).dialog("close");
+                SetRebootFlag();
+                $.get("fppjson.php?command=createPersistentNetNames", "", function() {location.reload(true);});
+            },
+            "No" : function() {
+            $(this).dialog("close");
+            }
+        }
+    });
+}
+function ClearPersistentNames() {
+    $('#dialog-clear-persistent').dialog({
+        resizeable: false,
+        height: 300,
+        width: 500,
+        modal: true,
+        buttons: {
+            "Yes" : function() {
+                $(this).dialog("close");
+                SetRebootFlag();
+                $.get("fppjson.php?command=clearPersistentNetNames", "", function() {location.reload(true);});
+            },
+            "No" : function() {
+            $(this).dialog("close");
+            }
+        }
+    });
 }
 
 function LoadNetworkConfig() {
@@ -380,7 +538,7 @@ function setHostName() {
 		+ $('#hostName').val()
 	).done(function() {
 		$.jGrowl("HostName Saved");
-		refreshFPPSystems();
+        SetRebootFlag();
 	}).fail(function() {
 		DialogError("Save HostName", "Save Failed");
 	});
@@ -391,6 +549,7 @@ function setHostDescription() {
         + $('#hostDescription').val()
     ).done(function() {
         $.jGrowl("HostDescription Saved");
+        SetRestartFlag(2);
     }).fail(function() {
         DialogError("Save HostDescription", "Save Failed");
     });
@@ -414,6 +573,12 @@ if (file_exists("/etc/modprobe.d/wifi-disable-power-management.conf")) {
 <td width = "45%">WIFI Drivers:</td>
 <td width = "55%">
 <?php PrintSettingSelect("WIFI Drivers", "wifiDrivers", 0, 1, isset($settings['wifiDrivers']) ? $settings['wifiDrivers'] : $defaultWifiDrivers, $wifiDrivers, "", "reloadPage"); ?>
+</td>
+</tr>
+<tr>
+<td width = "45%">WIFI Regulatory Domain:</td>
+<td width = "55%">
+<?php PrintSettingSelect("WIFI Regulatory Domain", "WifiRegulatoryDomain", 0, 1, isset($settings['WifiRegulatoryDomain']) ? $settings['WifiRegulatoryDomain'] : "US", $wifiDomains); ?>
 </td>
 </tr>
 </table>
@@ -462,18 +627,19 @@ if (file_exists("/etc/modprobe.d/wifi-disable-power-management.conf")) {
           <table width = "100%" border="0" cellpadding="1" cellspacing="1">
             <tr>
               <td width = "25%">WPA SSID:</td>
-              <td width = "75%"><input type="text" name="eth_ssid" id="eth_ssid" size="32" maxlength="32">&nbsp;<input type="checkbox" name="eth_hidden" id="eth_hidden" value="Hidden">Hidden</td>
+              <td width = "75%"><input list="eth_ssids" name="eth_ssid" id="eth_ssid" size="32" maxlength="32"><? printWifiNetworks(); ?>&nbsp;<input type="checkbox" name="eth_hidden" id="eth_hidden" value="Hidden">Hidden</td>
             </tr>
             <tr>
-              <td>WPA Pre Shared key (PSK):</td>
-<td><input type="text" name="eth_psk" id="eth_psk" size="32" maxlength="64"></td>
-            </tr>
+              <td>WPA Pre Shared key (PSK):</td><td><input type="text" name="eth_psk" id="eth_psk" size="32" maxlength="64"></td>
             </tr>
           </table>
           </div>
           <br>
           <input name="btnSetInterface" type="" style="margin-left:190px; width:135px;" class = "buttons" value="Update Interface" onClick="SaveNetworkConfig();">        
           <input id="btnConfigNetwork" type="" style="width:135px; display: none;" class = "buttons" value="Restart Network" onClick="ApplyNetworkConfig();">
+
+        &nbsp; &nbsp; &nbsp;<input id="btnConfigNetworkPersist" type="" style="width:145px;" class = "buttons" value="Create Persistent Names" onClick="CreatePersistentNames();">
+        &nbsp;<input id="btnConfigNetworkPersistClear" type="" style="width:145px; " class = "buttons" value="Clear Persistent Names" onClick="ClearPersistentNames();">
         </fieldset>
         </div>
         <div id="DNS_Servers">
@@ -528,6 +694,14 @@ if (file_exists("/etc/modprobe.d/wifi-disable-power-management.conf")) {
                 <td width = "75%"><? printTetheringSelect(); ?></td>
             </tr>
             <tr>
+                <td width = "25%">Tethering Interface:</td>
+                <td width = "75%"><? printTetheringInterfaces(); ?></td>
+            </tr>
+            <tr>
+                <td width = "25%">Tethering Technology:</td>
+                <td width = "75%"><? printTetheringTechnology(); ?></td>
+            </tr>
+            <tr>
                 <td width = "25%">Tethering SSID:</td>
                 <td width = "75%"><? PrintSettingTextSaved("TetherSSID", 0, 1, 32, 32, "", "FPP"); ?></td>
             </tr>
@@ -538,12 +712,18 @@ if (file_exists("/etc/modprobe.d/wifi-disable-power-management.conf")) {
             </tr>
             </table>
                 <br>
-                <b>Warning:</b> Turning on tethering may make FPP unavailable. Many WIFI adapters do not support
-                simultaneous tethering and client modes. Having multiple WIFI adapters will work, but it's relatively
-                unpredictable as to which WIFI adapter CONNMAN will bring tethering up on. Also, enabling tethering
-                disables the automatic IP assignment on the USB0/1 interfaces on the BeagleBones and thus connecting to
-                the BeagleBone via a USB cable will require you to manually set the IP address to 192.168.6.1
-                (OSX/Linux) or 192.168.7.1 (Windows).
+                <b>Warning:</b> Turning on tethering may make FPP unavailable.   The WIFI adapter will be used for
+        tethering and will thus not be usable for normal network operations.   The WIFI tether IP address will be
+192.168.8.1 for Hostapd tethering, but unpredictable for ConnMan (although likely 192.168.0.1).
+<p>
+<? if ($settings['Platform'] == "BeagleBone Black") { ?>
+    On BeagleBones, USB tethering is available unless ConnMan tethering is enabled.  The IP address for USB tethering would be 192.168.6.2
+        (OSX/Linux) or 192.168.7.2 (Windows).
+<? } ?>
+<? if ($settings['Platform'] == "Raspberry Pi") { ?>
+    On the Pi Zero and Pi Zero W devices, USB tethering is available if using an appropriate USB cable plugged into the USB port, not the power-only port.  Don't plug anything into the power port for this.  The IP address for USB tethering would be 192.168.7.2.
+<? } ?>
+
             </fieldset>
             <br>
 
@@ -557,6 +737,12 @@ if (file_exists("/etc/modprobe.d/wifi-disable-power-management.conf")) {
 
 <div id="dialog-confirm" style="display: none">
 	<p><span class="ui-icon ui-icon-alert" style="flat:left; margin: 0 7px 20px 0;"></span>Reconfiguring the network will cause you to lose your connection and have to reconnect if you have changed the IP address.  Do you wish to proceed?</p>
+</div>
+<div id="dialog-clear-persistent" style="display: none">
+<p><span class="ui-icon ui-icon-alert" style="flat:left; margin: 0 7px 20px 0;"></span>Clearing out persistent device names can cause interfaces to use different configuration and become unavailable.  Do you wish to proceed?</p>
+</div>
+<div id="dialog-create-persistent" style="display: none">
+    <p><span class="ui-icon ui-icon-alert" style="flat:left; margin: 0 7px 20px 0;"></span>Creating persisten device names can make it harder to add new network devices or replace existing devices in the future.  Do you wish to proceed?</p>
 </div>
 <?php include 'common/footer.inc'; ?>
 </div>

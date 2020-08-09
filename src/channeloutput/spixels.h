@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   spixels library Channel Output for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _SPIXELS_H
-#define _SPIXELS_H
-
 #include <vector>
 
 #include "../../external/spixels/include/led-strip.h"
@@ -38,17 +36,17 @@ using namespace spixels;
 class SpixelsOutput : public ThreadedChannelOutputBase {
   public:
 	SpixelsOutput(unsigned int startChannel, unsigned int channelCount);
-	~SpixelsOutput();
+	virtual ~SpixelsOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	void PrepData(unsigned char *channelData);
-	int  RawSendData(unsigned char *channelData);
+	virtual void PrepData(unsigned char *channelData) override;
+	virtual int  RawSendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-	virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	MultiSPI    *m_spi;
@@ -56,5 +54,3 @@ class SpixelsOutput : public ThreadedChannelOutputBase {
 	std::vector<LEDStrip*>    m_strips;
 	std::vector<PixelString*> m_strings;
 };
-
-#endif

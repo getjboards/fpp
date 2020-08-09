@@ -23,19 +23,19 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
-#include <string.h>
+#include "fpp-pch.h"
+
 #include <sys/stat.h>
 
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/predicate.hpp>
-#include "boost/filesystem.hpp"
+#if __GNUC__ >= 8
+#  include <filesystem>
+using namespace std::filesystem;
+#else
+#  include <experimental/filesystem>
+using namespace std::experimental::filesystem;
+#endif
 
-#include "common.h"
-#include "log.h"
 #include "PlaylistEntryImage.h"
-
-using namespace boost::filesystem;
 
 void StartPrepLoopThread(PlaylistEntryImage *fb);
 
@@ -217,22 +217,10 @@ void PlaylistEntryImage::SetFileList(void)
 
 	if (is_directory(m_imagePath))
 	{
-		namespace fs = boost::filesystem;
-
-		fs::path apk_path(m_imagePath);
-		fs::recursive_directory_iterator end;
-
-		for (fs::recursive_directory_iterator i(apk_path); i != end; ++i)
-		{
-			const fs::path cp = (*i);
-			std::string entry = cp.string();
-			if ((boost::iends_with(entry, ".gif")) ||
-				(boost::iends_with(entry, ".bmp")) ||
-				(boost::iends_with(entry, ".jpeg")) ||
-				(boost::iends_with(entry, ".jpg")) ||
-				(boost::iends_with(entry, ".png")))
-				m_files.push_back(entry);
-		}
+        for (auto &cp : recursive_directory_iterator(m_imagePath)) {
+            std::string entry = cp.path().string();
+            m_files.push_back(entry);
+        }
 
 		LogDebug(VB_PLAYLIST, "%d images in directory\n", m_files.size());
 

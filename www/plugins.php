@@ -3,15 +3,14 @@
 <head>
 <?php
 require_once('config.php');
-require_once('fppversion.php');
 
 writeFPPVersionJavascriptFunctions();
     
 include 'common/menuHead.inc';
 ?>
-<script type="text/javascript" src="/js/fpp.js"></script>
-<script type="text/javascript" src="/jquery/Spin.js/spin.js"></script>
-<script type="text/javascript" src="/jquery/Spin.js/jquery.spin.js"></script>
+<script type="text/javascript" src="js/fpp.js?ref=<?php echo filemtime('js/fpp.js'); ?>"></script>
+<script type="text/javascript" src="jquery/Spin.js/spin.js"></script>
+<script type="text/javascript" src="jquery/Spin.js/jquery.spin.js"></script>
 <script>
 var installedPlugins = [];
 var pluginInfos = [];
@@ -26,17 +25,25 @@ function PluginIsInstalled(plugin) {
 	return 0;
 }
 
+function PluginProgressDialogDone() {
+    $('#closeDialogButton').show();
+}
+function ClosePluginProgressDialog() {
+    $('#pluginsProgressPopup').dialog('close');
+    location.reload(true);
+}
+
 function GetInstalledPlugins() {
 	var url = 'api/plugin';
 	$.ajax({
 		url: url,
 		dataType: 'json',
 		success: function(data) {
-			installedPlugins = data.installedPlugins;
+			installedPlugins = data;
 			LoadInstalledPlugins();
 			GetPluginList();
 		},
-		fail: function() {
+		error: function() {
 			GetPluginList();
 			alert('Error, failed to get list of installed plugins.');
 		}
@@ -51,7 +58,7 @@ function GetPluginList() {
 		success: function(data) {
 			LoadPlugins(data.pluginList);
 		},
-		fail: function() {
+		error: function() {
 			alert('Error, failed to get pluginList.json');
 		}
 	});
@@ -60,11 +67,13 @@ function GetPluginList() {
 function CheckPluginForUpdates(plugin) {
 	var url = 'api/plugin/' + plugin + '/updates';
 
+	$('html,body').css('cursor','wait');
 	$.ajax({
 		url: url,
 		type: 'POST',
 		dataType: 'json',
 		success: function(data) {
+			$('html,body').css('cursor','auto');
 			if (data.Status == 'OK')
 			{
 				if (data.updatesAvailable)
@@ -75,37 +84,28 @@ function CheckPluginForUpdates(plugin) {
 			else
 				alert('ERROR: ' + data.Message);
 		},
-		fail: function() {
+		error: function() {
+			$('html,body').css('cursor','auto');
 			alert('Error, API call failed when checking plugin for updates');
 		}
 	});
 }
 
-function UpgradePlugin(plugin) {
-	var url = 'api/plugin/' + plugin + '/upgrade';
 
-	$.ajax({
-		url: url,
-		type: 'POST',
-		dataType: 'json',
-		success: function(data) {
-			if (data.Status == 'OK')
-				$('#row-' + plugin).find('.updatesAvailable').hide();
-			else
-				alert('ERROR: ' + data.Message);
-		},
-		fail: function() {
-			alert('Error, API call failed when upgrading plugin');
-		}
-	});
+function UpgradePlugin(plugin) {
+	var url = 'api/plugin/' + plugin + '/upgrade?stream=true';
+    
+    $('#pluginsProgressPopup').dialog({ height: 600, width: 900, title: "Upgrade Plugin", dialogClass: 'no-close' });
+    $('#pluginsProgressPopup').dialog( "moveToTop" );
+    document.getElementById('pluginsText').value = '';
+    StreamURL(url, 'pluginsText', 'PluginProgressDialogDone', 'PluginProgressDialogDone');
 }
 
 function InstallPlugin(plugin, branch, sha) {
-	var url = 'api/plugin';
+	var url = 'api/plugin?stream=true';
 	var i = FindPluginInfo(plugin);
 
-	if (i < -1)
-	{
+	if (i < -1) {
 		alert('Could not find plugin ' + plugin + ' in pluginInfo cache.');
 		return;
 	}
@@ -116,37 +116,29 @@ function InstallPlugin(plugin, branch, sha) {
 	pluginInfo['infoURL'] = pluginInfoURLs[plugin];
 
 	var postData = JSON.stringify(pluginInfo);
-	$.ajax({
-		url: url,
-		type: 'POST',
-		contentType: 'application/json',
-		data: postData,
-		dataType: 'json',
-		success: function(data) {
-			if (data.Status == 'OK')
-				location.reload(true);
-			else
-				alert('ERROR: ' + data.Message);
-		},
-		fail: function() {
-			alert('Error, API call to install plugin failed');
-		}
-	});
+    
+    $('#pluginsProgressPopup').dialog({ height: 600, width: 900, title: "Install Plugin", dialogClass: 'no-close' });
+    $('#pluginsProgressPopup').dialog( "moveToTop" );
+    document.getElementById('pluginsText').value = '';
+    StreamURL(url, 'pluginsText', 'PluginProgressDialogDone', 'PluginProgressDialogDone', 'POST', postData, 'application/json');
 }
 
 function UninstallPlugin(plugin) {
 	var url = 'api/plugin/' + plugin;
+	$('html,body').css('cursor','wait');
 	$.ajax({
 		url: url,
 		type: 'DELETE',
 		dataType: 'json',
 		success: function(data) {
+			$('html,body').css('cursor','auto');
 			if (data.Status == 'OK')
 				location.reload(true);
 			else
 				alert('ERROR: ' + data.Message);
 		},
-		fail: function() {
+		error: function() {
+			$('html,body').css('cursor','auto');
 			alert('Error, API call to uninstall plugin failed');
 		}
 	});
@@ -166,7 +158,7 @@ var firstInstalled = 1;
 var firstCompatible = 1;
 var firstUntested = 1;
 var firstIncompatible = 1;
-function LoadPlugin(data) {
+function LoadPlugin(data, insert = false) {
 	var html = '';
 	var infoURL = pluginInfoURLs[data.repoName];
 
@@ -192,9 +184,11 @@ function LoadPlugin(data) {
 	var compatibleVersion = -1;
 	for (var i = 0; i < data.versions.length; i++)
 	{
-		if ((CompareFPPVersions(data.versions[i].minFPPVersion, getFPPVersionFloatStr()) < 0) &&
+		if ((CompareFPPVersions(data.versions[i].minFPPVersion, getFPPVersionTriplet()) <= 0) &&
 			((data.versions[i].maxFPPVersion == "0") || (data.versions[i].maxFPPVersion == "0.0") ||
-			 (CompareFPPVersions(data.versions[i].maxFPPVersion, getFPPVersionFloatStr()) > 0)))
+			 (CompareFPPVersions(data.versions[i].maxFPPVersion, getFPPVersionTriplet()) > 0)) &&
+            ((!data.versions[i].hasOwnProperty('platforms')) ||
+             (data.versions[i].platforms.includes(settings['Platform']))))
 		{
 			compatibleVersion = i;
 		}
@@ -242,6 +236,7 @@ function LoadPlugin(data) {
 	html += '</td></tr>';
 	html += '<tr><td colspan="7">' + data.description;
 	html += '<br><b>By:</b> ' + data.author;
+	html += '<br><b>Repo:</b> ' + data.homeURL;
 
 	if (compatibleVersion == -1)
 	{
@@ -258,6 +253,22 @@ function LoadPlugin(data) {
 				html += ' &gt; v' + data.versions[i].minFPPVersion;
 			else if (data.versions[i].maxFPPVersion > 0)
 				html += ' &lt; v' + data.versions[i].maxFPPVersion;
+
+            if (data.versions[i].hasOwnProperty('platforms')) {
+                var platforms = data.versions[i].platforms;
+                html += " ";
+                for (var p = 0; p < platforms.length; p++) {
+                    if (p != 0)
+                        html += "/";
+                    if (platforms[p] == 'Raspberry Pi') {
+                        html += "Pi";
+                    } else if (platforms[p] == 'BeagleBone Black') {
+                        html += "BBB";
+                    } else {
+                        html += platforms[p];
+                    }
+                }
+            }
 		}
 	}
 
@@ -275,14 +286,14 @@ function LoadPlugin(data) {
 		$('#installedPlugins').append(html);
 
 		if (compatibleVersion == -1)
-			$('#installedPlugins').append('<tr><td colspan="7" class="bad">WARNING: This plugin is already installed, but may be incompatible with this FPP version.</td></tr>');
+			$('#installedPlugins').append('<tr><td colspan="7" class="bad">WARNING: This plugin is already installed, but may be incompatible with this FPP version or platform.</td></tr>');
 	}
 	else if (data.repoName == 'fpp-plugin-Template')
 	{
 		$('#templatePlugin').show();
 		$('#templatePlugin').append(html);
 	}
-	else if (infoURL.indexOf("/fpp-pluginList/oldplugins/") >= 0)
+	else if (infoURL && infoURL.indexOf("/fpp-pluginList/oldplugins/") >= 0)
 	{
 		if (firstUntested)
 		{
@@ -296,12 +307,21 @@ function LoadPlugin(data) {
 	}
 	else if (compatibleVersion != -1)
 	{
-		if (firstCompatible)
+		if (firstCompatible) {
 			firstCompatible = 0;
-		else
-			$('#pluginTable').append('<tr><td colspan="7"><hr></td></tr>');
+		} else {
+			if (insert)
+				$('#pluginTable').find('tr:nth-child(2)').after('<tr><td colspan="7"><hr></td></tr>');
+			else
+				$('#pluginTable').append('<tr><td colspan="7"><hr></td></tr>');
+		}
 
-		$('#pluginTable').append(html);
+		if (insert) {
+			$('#pluginTable').find('tr:nth-child(2)').after(html);
+			document.getElementById("pluginTable").scrollIntoView();
+		} else {
+			$('#pluginTable').append(html);
+		}
 	}
 	else
 	{
@@ -327,7 +347,7 @@ function LoadInstalledPlugins() {
 			success: function(data) {
 				LoadPlugin(data);
 			},
-			fail: function() {
+			error: function() {
 				alert('Error, failed to fetch ' + installedPlugins[i]);
 			}
 		});
@@ -343,13 +363,16 @@ function LoadPlugins(pluginList) {
 
 			pluginInfoURLs[pluginList[i][0]] = url;
 
+			$('html,body').css('cursor','wait');
 			$.ajax({
 				url: url,
 				dataType: 'json',
 				success: function(data) {
+					$('html,body').css('cursor','auto');
 					LoadPlugin(data);
 				},
-				fail: function() {
+				error: function() {
+					$('html,body').css('cursor','auto');
 					alert('Error, failed to fetch ' + pluginList[i]);
 				}
 			});
@@ -362,13 +385,17 @@ function ManualLoadInfo() {
 
 	if (url.indexOf('://') > -1)
 	{
+		$('html,body').css('cursor','wait');
 		$.ajax({
 			url: url,
 			dataType: 'json',
 			success: function(data) {
-				LoadPlugin(data);
+				$('html,body').css('cursor','auto');
+				pluginInfoURLs[data.repoName] = url;
+				LoadPlugin(data, true);
 			},
-			fail: function() {
+			error: function() {
+				$('html,body').css('cursor','auto');
 				alert('Error, failed to fetch ' + pluginInfos[i]);
 			}
 		});
@@ -430,5 +457,15 @@ pluginInfo.json URL: <input id='pluginInfoURL' size=90 maxlength=255><br>
 
 <?php	include 'common/footer.inc'; ?>
 </div>
+
+
+<div id='pluginsProgressPopup' title='FPP Plugins' style="display: none">
+    <textarea style='width: 99%; height: 94%;' disabled id='pluginsText'>
+    </textarea>
+    <input id='closeDialogButton' type='button' class='buttons' value='Close' onClick='ClosePluginProgressDialog();' style='display: none;'>
+</div>
 </body>
 </html>
+
+
+

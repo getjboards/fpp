@@ -22,49 +22,28 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <stdlib.h>
-
-#include "common.h"
 #include "GPIO.h"
-#include "log.h"
 
-#ifdef USEWIRINGPI
-#   include "wiringPi.h"
-#   include <softPwm.h>
-#   define supportsPWM(a) 1
-#elif defined(PLATFORM_BBB)
-#   include "channeloutput/BBBUtils.h"
-#   define INPUT "in"
-#   define OUTPUT "out"
-#   define HIGH   1
-#   define LOW   0
-#   define pinMode(a, b)         configBBBPin(a, "gpio", b)
-#   define digitalWrite(a,b)     setBBBPinValue(a, b)
-#   define softPwmCreate(a, b, c) setupBBBPinPWM(a)
-#   define softPwmWrite(a, b)    setBBBPinPWMValue(a, b)
-#   define supportsPWM(a)        supportsPWMOnBBBPin(a)
-#else
-#   define pinMode(a, b)
-#   define digitalWrite(a, b)
-#   define softPwmCreate(a, b, c)
-#   define softPwmWrite(a, b)
-#   define supportsPWM(a) 0
-#endif
+extern "C" {
+    GPIOOutput *createGPIOOutput(unsigned int startChannel,
+                                       unsigned int channelCount) {
+        return new GPIOOutput(startChannel, channelCount);
+    }
+}
 
 /*
  *
  */
 GPIOOutput::GPIOOutput(unsigned int startChannel, unsigned int channelCount)
   : ChannelOutputBase(startChannel, channelCount),
-	m_GPIOPin(-1),
+	m_GPIOPin(nullptr),
 	m_invertOutput(0),
-	m_softPWM(0)
+	m_pwm(0)
 {
 	LogDebug(VB_CHANNELOUT, "GPIOOutput::GPIOOutput(%u, %u)\n",
 		startChannel, channelCount);
-
-	m_maxChannels = 1;
 }
 
 /*
@@ -74,60 +53,44 @@ GPIOOutput::~GPIOOutput()
 {
 	LogDebug(VB_CHANNELOUT, "GPIOOutput::~GPIOOutput()\n");
 }
+int GPIOOutput::Init(Json::Value config) {
+    LogDebug(VB_CHANNELOUT, "GPIOOutput::Init()\n");
+    int gpio = config["gpio"].asInt();
+    m_invertOutput = config["invert"].asInt();
+    if (config.isMember("softPWM")) {
+        m_pwm = config["softPWM"].asInt();
+    }
+    if (config.isMember("pwm")) {
+        m_pwm = config["pwm"].asInt();
+    }
 
-/*
- *
- */
-int GPIOOutput::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "GPIOOutput::Init('%s')\n", configStr);
+    m_GPIOPin = PinCapabilities::getPinByGPIO(gpio).ptr();
+    if (m_GPIOPin == nullptr) {
+        LogErr(VB_CHANNELOUT, "GPIO Pin not configured\n");
+        return 0;
+    }
 
-	std::vector<std::string> configElems = split(configStr, ';');
-
-	for (int i = 0; i < configElems.size(); i++)
-	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
-
-		if (elem[0] == "gpio")
-			m_GPIOPin = atoi(elem[1].c_str());
-		else if (elem[0] == "invert")
-			m_invertOutput = atoi(elem[1].c_str());
-		else if (elem[0] == "softPWM")
-			m_softPWM = atoi(elem[1].c_str());
-	}
-
-	if (m_GPIOPin < 0)
-	{
-		LogErr(VB_CHANNELOUT, "GPIO Pin not configured\n");
-		return 0;
-	}
-
-	if (m_softPWM)
-	{
-        if (!supportsPWM(m_GPIOPin)) {
+    if (m_pwm) {
+        if (!m_GPIOPin->supportPWM()) {
             LogErr(VB_CHANNELOUT, "GPIO Pin does now support PWM\n");
             return 0;
         }
-		softPwmCreate(m_GPIOPin, 0, 255);
+        m_GPIOPin->setupPWM(25500);
 
-		if (m_invertOutput)
-			softPwmWrite(m_GPIOPin, 255);
-		else
-			softPwmWrite(m_GPIOPin, 0);
-	}
-	else
-	{
-		pinMode(m_GPIOPin, OUTPUT);
+        if (m_invertOutput)
+            m_GPIOPin->setPWMValue(25500);
+        else
+            m_GPIOPin->setPWMValue(0);
+    } else {
+        m_GPIOPin->configPin("gpio", true);
 
-		if (m_invertOutput)
-			digitalWrite(m_GPIOPin, HIGH);
-		else
-			digitalWrite(m_GPIOPin, LOW);
-	}
+        if (m_invertOutput)
+            m_GPIOPin->setValue(1);
+        else
+            m_GPIOPin->setValue(0);
+    }
 
-	return ChannelOutputBase::Init(configStr);
+    return ChannelOutputBase::Init(config);
 }
 
 /*
@@ -147,19 +110,18 @@ int GPIOOutput::SendData(unsigned char *channelData)
 {
 	LogExcess(VB_CHANNELOUT, "GPIOOutput::SendData(%p)\n", channelData);
 
-	if (m_softPWM)
+	if (m_pwm)
 	{
 		if (m_invertOutput)
-			softPwmWrite(m_GPIOPin, (int)(255-channelData[0]));
+            m_GPIOPin->setPWMValue(100 * (int)(255-channelData[0]));
 		else
-			softPwmWrite(m_GPIOPin, (int)(channelData[0]));
-	}
-	else
-	{
+            m_GPIOPin->setPWMValue(100 * (int)(channelData[0]));
+    } else {
+
 		if (m_invertOutput)
-			digitalWrite(m_GPIOPin, !channelData[0]);
+			m_GPIOPin->setValue(!channelData[0]);
 		else
-			digitalWrite(m_GPIOPin, channelData[0]);
+			m_GPIOPin->setValue(channelData[0]);
 	}
 
 	return m_channelCount;
@@ -172,9 +134,9 @@ void GPIOOutput::DumpConfig(void)
 {
 	LogDebug(VB_CHANNELOUT, "GPIOOutput::DumpConfig()\n");
 
-	LogDebug(VB_CHANNELOUT, "    GPIO Pin       : %d\n", m_GPIOPin);
+    LogDebug(VB_CHANNELOUT, "    GPIO Pin       : %d\n", m_GPIOPin ? m_GPIOPin->kernelGpio : -1);
 	LogDebug(VB_CHANNELOUT, "    Inverted Output: %s\n", m_invertOutput ? "Yes" : "No");
-	LogDebug(VB_CHANNELOUT, "    Soft PWM       : %s\n", m_softPWM ? "Yes" : "No");
+	LogDebug(VB_CHANNELOUT, "    PWM            : %s\n", m_pwm ? "Yes" : "No");
 
 	ChannelOutputBase::DumpConfig();
 }

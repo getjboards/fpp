@@ -22,35 +22,25 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <unistd.h>
 #include <sys/wait.h>
-
-#include <ctime>
-#include <set>
-#include <thread>
-#include <chrono>
-#include <iostream>
-#include <fstream>
-#include <sstream>
 
 #define BBB_PRU  1
 
 //  #define PRINT_STATS
 
-
-#include <pruss_intc_mapping.h>
-#include <prussdrv.h>
-
 // FPP includes
-#include "common.h"
-#include "log.h"
-#include "BBBUtils.h"
 #include "BBB48String.h"
-#include "settings.h"
+#include "util/BBBUtils.h"
+
+
+extern "C" {
+    BBB48StringOutput *createOutputBBB48String(unsigned int startChannel,
+                            unsigned int channelCount) {
+        return new BBB48StringOutput(startChannel, channelCount);
+    }
+}
 
 /*
  *
@@ -159,27 +149,26 @@ inline void mapSize(int max, int maxString, int &newHeight, std::vector<std::str
     args.push_back("-DOUTPUTS=" + std::to_string(newHeight));
 }
 static void createOutputLengths(std::vector<PixelString*> &m_strings,
-                                int maxStringLen) {
+                                int maxStringLen,
+                                std::vector<std::string> &args) {
     
     std::ofstream outputFile;
     outputFile.open("/tmp/OutputLengths.hp", std::ofstream::out | std::ofstream::trunc);
     
-#ifdef PRINT_STATS
-    outputFile << "#define RECORD_STATS\n\n";
-#endif
-    std::set<int> sizes;
+    std::map<int, std::vector<GPIOCommand>> sizes;
     for (int x = 0; x < m_strings.size(); x++) {
         int pc = m_strings[x]->m_outputChannels;
         if (pc != 0) {
-            sizes.insert(pc);
+            for (auto &a : m_strings[x]->m_gpioCommands) {
+                sizes[a.channelOffset].push_back(a);
+            }
         }
     }
     
-    outputFile << ".macro CheckOutputLengths\n";
-    outputFile << "    QBNE skip_end, cur_data, next_check\n";
     auto i = sizes.begin();
     while (i != sizes.end()) {
-        int min = *i;
+        int min = i->first;
+        outputFile << "\nCHECK_" << std::to_string(min) << ":\n";
         if (min != maxStringLen) {
             if (min <= 255) {
                 outputFile << "    QBNE skip_"
@@ -188,38 +177,44 @@ static void createOutputLengths(std::vector<PixelString*> &m_strings,
                 << std::to_string(min)
                 << "\n";
             } else {
-                outputFile << "    LDI r8, " << std::to_string(min) << "\n";
+                if (min <= 0xFFFF) {
+                    outputFile << "    LDI r8, " << std::to_string(min) << "\n";
+                } else {
+                    outputFile << "    LDI32 r8, " << std::to_string(min) << "\n";
+                }
                 outputFile << "    QBNE skip_"
                 << std::to_string(min)
                 << ", cur_data, r8\n";
             }
             
-            for (int y = 0; y < m_strings.size(); y++) {
-                int pc = m_strings[y]->m_outputChannels;
-                if (pc == min) {
-                    std::string o = std::to_string(y + 1);
-                    outputFile << "        CLR GPIO_MASK(o" << o << "_gpio), o" << o << "_pin\n";
+            for (auto &cmd : i->second) {
+                int y = cmd.port;
+                std::string o = std::to_string(y + 1);
+                if (cmd.type) {
+                    outputFile << "        SET GPIO_MASK(o" << o << "_gpio), GPIO_MASK(o" << o << "_gpio), o" << o << "_pin\n";
+                } else {
+                    outputFile << "        CLR GPIO_MASK(o" << o << "_gpio), GPIO_MASK(o" << o << "_gpio), o" << o << "_pin\n";
                 }
             }
             i++;
-            int next = *i;
-            outputFile << "    LDI next_check, " << std::to_string(next) << "\n";
-            outputFile << "    skip_"
-            << std::to_string(min)
-            << ":\n";
+            int next = i->first;
+            outputFile << "        LDI next_check, $CODE(CHECK_" << std::to_string(next) << ")\n";
+            outputFile << "skip_" << std::to_string(min) << ":\n        RET\n";
+            
         } else {
+            outputFile << "    RET\n\n";
             i++;
         }
     }
-    outputFile << "    skip_end:\n";
-    outputFile << ".endm\n";
+    
     if (sizes.empty()) {
-        outputFile << "#define SET_FIRST_CHECK \\\n    LDI next_check, 10000\n";
+        args.push_back("-DFIRST_CHECK=NO_PIXELS_CHECK");
     } else {
-        int sz = *sizes.begin();
-        outputFile << "#define SET_FIRST_CHECK \\\n    LDI next_check, " << std::to_string(sz) << "\n";
+        int sz = sizes.begin()->first;
+        std::string v = "-DFIRST_CHECK=CHECK_";
+        v += std::to_string(sz);
+        args.push_back(v);
     }
-
     outputFile.close();
 }
 
@@ -234,21 +229,14 @@ static int getMaxChannelsPerPort() {
     if (model == "TI AM335x PocketBeagle") {
         return 999999;
     }
-    std::string file = "/home/fpp/media/tmp/cape-info.json";
-    if (FileExists(file)) {
-        std::ifstream t(file);
-        std::stringstream buffer;
-        buffer << t.rdbuf();
-        std::string config = buffer.str();
-        Json::Value root;
-        Json::Reader reader;
-        bool success = reader.parse(buffer.str(), root);
-        if (success) {
-            if (root["id"].asString() == "Unsupported") {
-                return 600;
-            }
+
+    Json::Value root;
+    if (LoadJsonFromFile("/home/fpp/media/tmp/cape-info.json", root)) {
+        if (root["id"].asString() == "Unsupported") {
+            return 600;
         }
     }
+
     return 999999;
 }
 
@@ -267,7 +255,7 @@ int BBB48StringOutput::Init(Json::Value config)
     
     for (int i = 0; i < config["outputs"].size(); i++) {
         Json::Value s = config["outputs"][i];
-        PixelString *newString = new PixelString;
+        PixelString *newString = new PixelString(true);
 
         if (!newString->Init(s))
             return 0;
@@ -282,16 +270,18 @@ int BBB48StringOutput::Init(Json::Value config)
         m_strings.push_back(newString);
     }
     
-    if (m_maxStringLen == 0) {
-        LogErr(VB_CHANNELOUT, "No pixels configured in any string\n");
-        return 0;
-    }
     m_numStrings = 48;
 
     int retVal = ChannelOutputBase::Init(config);
     if (retVal == 0) {
         return 0;
     }
+    if (m_maxStringLen == 0) {
+        m_numStrings = 0;
+        LogErr(VB_CHANNELOUT, "No pixels configured in any string\n");
+        return 1;
+    }
+    
     int maxString = -1;
     for (int s = 0; s < m_strings.size(); s++) {
         PixelString *ps = m_strings[s];
@@ -303,8 +293,17 @@ int BBB48StringOutput::Init(Json::Value config)
     
     std::vector<std::string> args;
     std::vector<std::string> split0args;
-    split0args.push_back("-DRUNNING_ON_PRU0");
+    split0args.push_back("-DRUNNING_ON_PRU" + std::to_string(BBB_PRU ? 0 : 1));
     std::vector<std::string> split1args;
+    split1args.push_back("-DRUNNING_ON_PRU" + std::to_string(BBB_PRU ? 1 : 0));
+    
+    if (config.isMember("pixelTiming")) {
+        int pixelTiming = config["pixelTiming"].asInt();
+        if (pixelTiming) {
+            args.push_back("-DPIXELTYPE_SLOW");
+        }
+    }
+
     std::string dirname = "bbb";
     std::string verPostf = "";
     if (getBeagleBoneType() == PocketBeagle) {
@@ -321,7 +320,6 @@ int BBB48StringOutput::Init(Json::Value config)
     if (config.isMember("serialInUse")) {
         hasSerial = config["serialInUse"].asBool();
     }
-    Json::Reader reader;
     Json::Value root;
     char filename[256];
     sprintf(filename, "/home/fpp/media/tmp/strings/%s%s.json", m_subType.c_str(), verPostf.c_str());
@@ -332,8 +330,7 @@ int BBB48StringOutput::Init(Json::Value config)
     int maxGPIO13 = 0;
     
     if (FileExists(filename)) {
-        std::ifstream t(filename);
-        if (!reader.parse(t, root)) {
+        if (!LoadJsonFromFile(filename, root)) {
             LogErr(VB_CHANNELOUT, "Could not read pin configuration for %s%s\n", m_subType.c_str(), verPostf.c_str());
             return 0;
         }
@@ -348,9 +345,9 @@ int BBB48StringOutput::Init(Json::Value config)
                 args.push_back(v);
             } else {
                 //need to output this pin, configure it
-                const PinCapabilities &pin = getBBBPinByName(root["outputs"][x]["pin"].asString());
+                const PinCapabilities &pin = PinCapabilities::getPinByName(root["outputs"][x]["pin"].asString());
                 pin.configPin();
-                if (pin.gpio == 0) {
+                if (pin.gpioIdx == 0) {
                     maxGPIO0 = std::max(maxGPIO0, m_strings[x]->m_outputChannels);
                     std::string v = "-DNOOUT";
                     v += std::to_string(x+1);
@@ -361,8 +358,8 @@ int BBB48StringOutput::Init(Json::Value config)
                     v += std::to_string(x+1);
                     split0args.push_back(v);
                 }
-                outputFile << "#define o" << std::to_string(x + 1) << "_gpio  " << std::to_string(pin.gpio) << "\n";
-                outputFile << "#define o" << std::to_string(x + 1) << "_pin  " << std::to_string(pin.pin) << "\n\n";
+                outputFile << "#define o" << std::to_string(x + 1) << "_gpio  " << std::to_string(pin.gpioIdx) << "\n";
+                outputFile << "#define o" << std::to_string(x + 1) << "_pin  " << std::to_string(pin.gpio) << "\n\n";
             }
         }
         outputFile.close();
@@ -370,8 +367,11 @@ int BBB48StringOutput::Init(Json::Value config)
         LogErr(VB_CHANNELOUT, "No output pin configuration for %s%s\n", m_subType.c_str(), verPostf.c_str());
         return 0;
     }
-    
-    createOutputLengths(m_strings, m_maxStringLen);
+#ifdef PRINT_STATS
+    args.push_back("-DRECORD_STATS");
+#endif
+
+    createOutputLengths(m_strings, m_maxStringLen, args);
     
     if (!maxGPIO0) {
         //no GPIO0 output so no need for the second PRU to be used
@@ -412,14 +412,14 @@ int BBB48StringOutput::StartPRU(bool both)
     m_pruData = (BBB48StringData*)m_pru->data_ram;
     m_pruData->command = 0;
     m_pruData->address_dma = m_pru->ddr_addr;
-    m_pru->run("/tmp/FalconWS281x.bin");
+    m_pru->run("/tmp/FalconWS281x.out");
     
     if (both) {
         m_pru0 = new BBBPru(!pruNumber, true, true);
         m_pru0Data = (BBB48StringData*)m_pru0->data_ram;
         m_pru0Data->command = 0;
         m_pru0Data->address_dma = m_pru0->ddr_addr;
-        m_pru0->run("/tmp/FalconWS281x_gpio0.bin");
+        m_pru0->run("/tmp/FalconWS281x_gpio0.out");
     }
     
     return 1;
@@ -440,8 +440,7 @@ void BBB48StringOutput::StopPRU(bool wait)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         cnt++;
     }
-    printf("%X   %d\n", m_pruData->response, cnt);
-    m_pru->stop(m_pruData->response != 0xFFFF ? !wait : 1);
+    m_pru->stop();
     delete m_pru;
     
     if (m_pru0) {
@@ -450,8 +449,7 @@ void BBB48StringOutput::StopPRU(bool wait)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             cnt++;
         }
-        printf("%X   %d\n", m_pru0Data->response, cnt);
-        m_pru0->stop(m_pru0Data->response != 0xFFFF ? !wait : 1);
+        m_pru0->stop();
         delete m_pru0;
     }
     m_pru = NULL;
@@ -463,25 +461,29 @@ void BBB48StringOutput::StopPRU(bool wait)
 int BBB48StringOutput::Close(void)
 {
     LogDebug(VB_CHANNELOUT, "BBB48StringOutput::Close()\n");
-    StopPRU();
+    if (m_numStrings) {
+        StopPRU();
+    }
     return ChannelOutputBase::Close();
 }
 
 
-void BBB48StringOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
-    
+void BBB48StringOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
     PixelString *ps = NULL;
     for (int s = 0; s < m_strings.size(); s++) {
         ps = m_strings[s];
         int inCh = 0;
+        int min = FPPD_MAX_CHANNELS;
+        int max = -1;
         for (int p = 0; p < ps->m_outputChannels; p++) {
             int ch = ps->m_outputMap[inCh++];
-            if (ch < (FPPD_MAX_CHANNELS - 3)) {
+            if (ch < FPPD_MAX_CHANNELS) {
                 min = std::min(min, ch);
                 max = std::max(max, ch);
             }
+        }
+        if (min < max) {
+            addRange(min, max);
         }
     }
 }
@@ -491,12 +493,13 @@ void BBB48StringOutput::GetRequiredChannelRange(int &min, int & max) {
  */
 void BBB48StringOutput::PrepData(unsigned char *channelData)
 {
-    LogExcess(VB_CHANNELOUT, "BBB48StringOutput::PrepData(%p)\n",
-              channelData);
+    LogExcess(VB_CHANNELOUT, "BBB48StringOutput::PrepData(%p)\n", channelData);
+    if (!m_numStrings) {
+        return;
+    }
 
     m_curFrame++;
 
-    
 #ifdef PRINT_STATS
     int max = 0;
     for (int x = 0; x < MAX_WS2811_TIMINGS; x++) {
@@ -522,12 +525,11 @@ void BBB48StringOutput::PrepData(unsigned char *channelData)
     int inCh;
 
     int numStrings = m_numStrings;
-
     for (int s = 0; s < m_strings.size(); s++) {
         ps = m_strings[s];
         c = out + ps->m_portNumber;
         inCh = 0;
-        
+
         for (int p = 0; p < ps->m_outputChannels; p++) {
             uint8_t *brightness = ps->m_brightnessMaps[p];
             *c = brightness[channelData[ps->m_outputMap[inCh++]]];
@@ -539,6 +541,9 @@ int BBB48StringOutput::SendData(unsigned char *channelData)
 {
     LogExcess(VB_CHANNELOUT, "BBB48StringOutput::SendData(%p)\n",
               channelData);
+    if (!m_numStrings) {
+        return 0;
+    }
 
     /*
     while this would be nice to do, reading from the pruData can take 15-20ms by itself due
@@ -590,7 +595,7 @@ int BBB48StringOutput::SendData(unsigned char *channelData)
             }
             // second 7.5K to other PRU ram
             memcpy(m_pru->other_data_ram + 512, m_curData + 7628, outsize);
-            fullsize -= outsize;
+            fullsize -= 7628;
         }
         if (fullsize > 0) {
             int outsize = fullsize;
@@ -599,11 +604,10 @@ int BBB48StringOutput::SendData(unsigned char *channelData)
             }
             memcpy(m_pru->shared_ram, m_curData + 7628 + 7628, outsize);
         }
-        int off = 7628 * 2 + 12188;
+        int off = 7628 * 2 + 12188 - 100;
         if (off < m_frameSize) {
             // more than what fits in the SRAMs
             //don't need to copy the first part as that's in sram, just copy the last parts
-            off -= 100;
             uint8_t * const realout = (uint8_t *)m_pru->ddr + m_frameSize * frame + off;
             memcpy(realout, m_curData + off, m_frameSize - off);
         }

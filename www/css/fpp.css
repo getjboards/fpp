@@ -3,7 +3,7 @@
 	font-size: 14px;
 	text-align: center;
 	#background: rgb(240, 240, 240);
-	width: 1200px;
+	width: 95%;
 	margin-left: auto;
 	margin-right: auto;
 }
@@ -29,7 +29,11 @@
 	text-align: center;
 	text-shadow: 0 1px 0 #eee;
 	width: 90px;
-	height: 20px;
+	height: 18px;
+}
+
+.smallButton {
+    width: 60px;
 }
 
 .buttons:hover
@@ -79,7 +83,7 @@
 	text-align: center;
 	text-shadow: 0 1px 0 #eee;
 	width: 90px;
-	height: 20px;
+	height: 18px;
 }
 
 .disableButtons:active
@@ -99,13 +103,13 @@
 
 #bodyWrapper
 {
-	width: 1200px;
+    width: 95%;
 	margin-left: auto;
 	margin-right: auto;
 	background: rgb(240, 240,240);
 }
 
-#daemoncontrol, #playerstats
+#playerstats
 {
 	background: rgb(240, 240, 240);
 	margin:10px;
@@ -125,13 +129,7 @@
 
 #nextPlaylist
 {
-	margin-top:10px;
-	padding:5px;
-	background:#DDD;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
-
+    white-space: nowrap;
 }
 
 #rebootShutdown
@@ -147,6 +145,12 @@
 	text-align: center;
 }
 
+.centerCenter
+{
+	text-align: center !important;
+	vertical-align: middle !important;
+}
+
 .ui-front
 {
 	z-index: 1001;
@@ -156,10 +160,99 @@
  	z-index: 10000;
 }	
 
+.statusDiv {
+    width: 100%;
+}
+
+.statusHr {
+    clear: both;
+}
+
+#daemonControl td {
+    white-space: nowrap;
+}
+
+.sensorTable td {
+    white-space: nowrap;
+}
+
+.schedulerExtend {
+    text-align: center;
+}
+
+.dayMask input {
+    margin: 1px;
+}
+
+.statusTable th {
+    text-align: left;
+    padding-right: 10px;
+}
+
+.statusTable td {
+    padding-right: 10px;
+}
+
+.statusBoxLeft {
+    float: left;
+    width: 75%;
+}
+
+.statusBoxRight {
+    float: left;
+    width: 25%;
+}
+
+.settingsTableWrapper td {
+    padding: 0px;
+    vertical-align: top;
+    white-space: nowrap;
+}
+
+.settingsTable {
+	border-collapse: collapse;
+    border-spacing: 0px;
+}
+
+.settingsTable th {
+    padding: 0px;
+    padding-right: 5px;
+    padding-bottom: 2px;
+    white-space: nowrap;
+    text-align: left;
+    vertical-align: text-top;
+    font-weight: normal;
+}
+
+.settingsTable td {
+    padding: 0px;
+    padding-right: 5px;
+    padding-bottom: 2px;
+    vertical-align: text-top;
+}
+
+.settingsTable td input {
+    vertical-align: text-top;
+}
+
+.settingsTable td img {
+    vertical-align: text-top;
+}
+
+.settingsGroupTable th {
+    padding-left: 15px;
+}
+
+.pageContent {
+    width: 95%;
+    margin-top: 0;
+	margin-left: auto;
+	margin-right: auto;
+}
 
 .settings
 {
-	width: 1100px;
+    width: 95%;
 	margin-left: auto;
 	margin-right: auto;
 }
@@ -191,19 +284,13 @@
 	width: 5%;
 }
 .eventTblName{
-	width: 30%;
-}
-.eventTblEffect{
 	width: 20%;
 }
-.eventTblStartCh{
-	width: 5%;
-}
-.eventTblScript{
+.eventTblCommand{
 	width: 20%;
 }
-.eventTblScriptArgs{
-	width: 20%;
+.eventTblArgs{
+	width: 55%;
 }
 
 .aboutLeft{
@@ -218,6 +305,11 @@
 	float: left;
 	width: 47%;
 }
+.aboutAll{
+    float: left;
+    width: 95%;
+}
+
 
 html
 {
@@ -230,11 +322,11 @@ html
 
 #divEthernet, #divEffectLibrary{
 	min-height: 200px;
-	width: 383px;
+	width: 483px;
 	float: left;
 }
 
-#divSeqData, #divMusicData, #divVideoData, #divEffectsData, #divScriptsData, #divLogsData, #divUploadsData {
+#divSeqData, #divMusicData, #divVideoData, #divImageData, #divEffectsData, #divScriptsData, #divLogsData, #divUploadsData {
 	overflow: auto;
 	min-height: 120px;
 	max-height: 120px;
@@ -246,7 +338,7 @@ html
 	display: table;
 	min-height: 200px;
 	max-height: 300px;
-	width: 383px;
+	width: 483px;
 	float: right;
 }
 
@@ -284,15 +376,35 @@ html
 	min-height: 30px;
 	width: 100%;
 }
-
+#unsupportedBrowser {
+	display: none;
+	background-color: #AA0000;
+	color: #FFFFFF;
+	padding-top: 5px;
+	font-size: 20px;
+	font-weight: bold;
+	text-align: center;
+	min-height: 30px;
+	width: 100%;
+}
+#compileFPPDBanner {
+	background-color: #AA0000;
+	color: #FFFFFF;
+	padding-top: 5px;
+	font-size: 20px;
+	font-weight: bold;
+	text-align: center;
+	min-height: 30px;
+	width: 100%;
+}
 legend
 {
 	font-weight: bold;
 	padding: 0.1em 0.4em;
 	text-align: left;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
+	-moz-border-radius: 6px;
+	border-radius: 6px;
+	-webkit-border-radius: 6px;
 	margin-left: auto;
 	margin-right: auto;
 	border: solid 2px rgb(0,0,0);
@@ -300,21 +412,27 @@ legend
 
 fieldset
 {
-	-moz-border-radius:5px;
-    border-radius: 5px;
-    -webkit-border-radius: 5px;
+    border: solid 2px;
+	-moz-border-radius:6px;
+    border-radius: 6px;
+    -webkit-border-radius: 6px;
 }
+
+.right {
+    text-align: right;
+}
+
 .header{padding: 10px; }
 .headerLeft , .headerRight
 {
-	width:200px;
+	width:20%;
 	text-align:center;
 	float:left;
 }
 
 .headerCenter
 {
-	width:770px;
+	width: 60%;
 	text-align:center;
 	float:left;
 }
@@ -322,33 +440,37 @@ fieldset
 .siteName{font-size: 200%; padding-top: 13px; }
 
 
-.colPlaylistNumberDrag {
+.colPlaylistNumberDrag, .colNumberDrag {
 	background-image: url(../images/vertdrag.png);
 	background-repeat:no-repeat;
 	background-size:7px 14px;
 	background-position:0 2px;
-	padding-left:20px;
+	padding-left:20px !important;
 }
-.colPlaylistNumber {
-	text-align:right;
-	padding-right:0px;
-//	width: 5%;
+.colPlaylistNumberHeader, .colNumberHeader {
+    text-align: center;
+}
+.colPlaylistNumber, .colNumber {
+    text-align:right;
+    vertical-align: top;
+    padding: 1px;
+    padding-right:0px;
+    width: 2%;
 }
 .colPlaylistType {
 	text-align:left;
 	padding-left:5px;
-//	width: 10%;
 }
 .colPlaylistData1 {
-	text-align:left;
+	text-align:center;
 	padding-left:5px;
-//	width: 40%;
 }
 .colPlaylistData2 {
 	text-align:left;
 	padding-left:5px;
-//	width: 40%;
 }
+
+
 
 .volumeButton {
 	float: left;
@@ -410,57 +532,154 @@ fieldset
 	border-radius: 25px;
 }
 
-#statusPlaylistContents{
-	height:220px;
-	min-height:220px;
-	max-height:220px;
-	overflow:auto
+.playlistRow {
+    border: thin solid;
 }
 
-#statusPlaylistContents table {
+.playlistRow td {
+    padding: 1px;
+    padding-right: 5px;
+}
+
+.PlaylistRowPlaying{
+	background:#D1E0FF;
+}
+
+.playlistRowNumber {
+    padding: 1px;
+}
+
+.psi {
+    width: 100%;
+    overflow: hidden;
+    padding: 0px;
+    display: flex;
+}
+
+.psiHeader {
+    text-align: left;
+    font-weight: bold;
+    padding: 0px;
+    padding-right: 5px;
+    vertical-align: top;
+    white-space: nowrap;
+    width: 10%;
+}
+
+.psiDuration {
+    padding: 0px;
+    vertical-align: top;
+    width: 10%;
+}
+
+.psiDurationSeconds {
+    display: none;
+}
+
+.psiDataSimple {
+    flex: 1;
+    padding: 0px;
+    vertical-align: top;
+    width: 80%;
+}
+
+.psiData {
+    flex: 1;
+    padding: 0px;
+    vertical-align: top;
+    width: 80%;
+    display: none;
+}
+
+.psiDetailsWrapper {
+    width: 100%;
+    float: left;
+}
+
+.psiDetails {
+    width: 100%;
+    overflow: hidden;
+    display: flex;
+    flex-wrap: wrap;
+}
+
+.psiDetailsArg {
+    width: 100%;
+    display: flex;
+    flex-wrap: wrap;
+}
+
+.psiDetailsHeader {
+    text-align: left;
+    font-weight: bold;
+    padding: 0px;
+    padding-right: 5px;
+    vertical-align: top;
+    white-space: nowrap;
+    width: 15%;
+}
+
+.psiDetailsData {
+    flex: 1;
+    padding: 0px;
+    vertical-align: top;
+    width: 74%;
+}
+
+.psiDetailsLF {
+    flex-basis: 100%;
+    height: 0px;
+}
+
+#playlistDetailsContents{
+	min-height:250px;
+	overflow: auto;
+}
+
+#playlistDetailsContents table {
 	border-collapse:collapse;
 } 
 
-#eventListContents, #effectListContents{
-	height:120px;
-	min-height:120px;
-	max-height:120px;
-	overflow:auto
+.playlistDetailsSelect {
+    max-width: 300px;
 }
 
-#statusPlaylist, #eventList, #effectList, #effectLibrary, #runningEffects{
-	border:thin solid;	
+.playlistDetailsSelect option {
+    overflow: hidden;
+    white-space: no-wrap;
+    text-overflow: ellipsis;
+}
+
+#playlistDetails, #effectList, .genericTableWrapper {
+	border: solid 2px;
 	margin-top: 5px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
+	-moz-border-radius: 6px;
+	border-radius: 6px;
+	-webkit-border-radius: 6px;
 	min-height: 65px;
+    overflow: hidden;
 }
 
 #playerStatus{
 }
 
-.playerStatusHeader{
-	width: 40%;
-}
-.playerStatusLeft{
-	width: 50%;
-	float: left;
-}
-.playerStatusRight{
-	width: 50%;
-	float: left;
-}
-
-#tblStatusPlaylist {
+#tblPlaylistDetails {
 	 width:100%;
 }
 
-#tblStatusPlaylist tbody tr th{
+.evenRow {
+    background: #F0F0F0;
+}
+
+.oddRow {
+    background: #ffffff;
+}
+
+.tblPlaylistDetailsHeader {
 	background: #aaaaaa;
 }
 
-#tblStatusPlaylistEntries{
+#tblPlaylistDetailsEntries{
 	 width:100%;
 	 border-collapse:collapse;
 }
@@ -478,9 +697,21 @@ fieldset
 	background:#CCC;
 }
 
-.playlistHeader, .eventListHeader, .effectListHeader{
+.playlistHeader {
 	background:#DDD;
 	text-align:center;
+}
+
+.playlistBoxLeft {
+    float: left;
+    min-width: 300px;
+    padding-right: 50px;
+    padding-bottom: 15px;
+}
+
+.playlistBoxRight {
+    float: left;
+    min-width: 300px;
 }
 
 .textRight{
@@ -497,16 +728,8 @@ fieldset
 	text-align:center;
 	}	
 
-.playlistSelectedEntry, .eventSelectedEntry, .effectSelectedEntry{
+.playlistSelectedEntry, .eventSelectedEntry, .effectSelectedEntry, .selectedTableRow {
 	background:#CCC;
-}
-
-.unselectable {
-   -moz-user-select: -moz-none;
-   -khtml-user-select: none;
-   -webkit-user-select: none;
-  -ms-user-select: none;
-   user-select: none;
 }
 
 
@@ -516,10 +739,6 @@ fieldset
 	background-repeat:no-repeat;
 	background-position: 4px 4px;
 }
-
-.PlaylistRowPlaying{
-	background:#D1E0FF;
-}	
 
 #MusicOptions{
 	display:none;
@@ -551,19 +770,29 @@ fieldset
   padding:10px;
 	border:thin solid;	
 	font-size:12px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
+	-moz-border-radius: 6px;
+	border-radius: 6px;
+	-webkit-border-radius: 6px;
 }
 
-#bytesTransferred{
+.playlistItemCountLeadIn, .playlistItemCountMainPlaylist, .playlistItemCountLeadOut {
+    text-align: right;
+    padding-right: 5px;
+}
+
+.playlistDurationLeadIn, .playlistDurationMainPlaylist, .playlistDurationLeadOut {
+    text-align: right;
+    padding-left: 5px;
+}
+
+#bridgeModeInfo {
   margin:10px;
   padding:10px;
 	border:thin solid;	
 	font-size:12px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
+	-moz-border-radius: 6px;
+	border-radius: 6px;
+	-webkit-border-radius: 6px;
 	min-height:200px;
 	text-align:center;
 	display:none;
@@ -604,9 +833,22 @@ fieldset
 	min-height: 20px;
 }
 
-.pl_title {
-	font-size: larger;
+.playlistEditButton, .playlistDetailsEditButton, .genericButton {
+    margin-right: 10px;
+    margin-top: 5px;
 }
+
+.pl_title {
+    font-size: larger;
+    text-align: center;
+    min-width: 300px;
+}
+
+.pl_description {
+    font-size: larger;
+    min-width: 300px;
+}
+
 
 .title {
 	font-size: larger;
@@ -641,13 +883,8 @@ fieldset
 	height: 60px;
 }
 
-.channelOutputTable {
-	width: 100%;
-}
-
 #fileManager, #channelOutputManager, #channelTester, .fppTabs {
-	min-width: 1068px;
-	width: 1160px;
+	min-width: 955px;
 	margin-left: auto;
 	margin-right: auto;
 }
@@ -670,14 +907,43 @@ fieldset
 	border: 2px solid #000000;
 }
 
+.genericTableContents {
+	min-height:400px;
+	overflow: auto;
+}
+
+.fppTable {
+    border-collapse: collapse;
+}
+
+.fppTable > tbody > tr {
+}
+
+.fppTable > tbody > tr > td {
+    vertical-align: top;
+}
+
+.mac-os ::-webkit-scrollbar {
+  -webkit-appearance: none;
+  width: 7px;
+  height: 7px;
+}
+
+.mac-os ::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background-color: rgba(0, 0, 0, .5);
+  box-shadow: 0 0 1px rgba(255, 255, 255, .5);
+}
+
 .fppTableWrapper {
-	border:thin solid;
-	font-size:12px;
+	border: solid 2px;
 	margin-top: 5px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
+	-moz-border-radius: 6px;
+	border-radius: 6px;
+	-webkit-border-radius: 6px;
 	min-height: 65px;
+    overflow-y: hidden;
+    overflow-x: auto;
 
 	-moz-user-select: -moz-none;
 	-khtml-user-select: none;
@@ -686,14 +952,96 @@ fieldset
 	user-select: none;
 }
 
-.fppTableHeader {
-	background:#DDD;
-	text-align:center;
-	font-weight: bold;
+.fppTableWrapperAsTable {
+    display: table;
+}
+
+.fppTableWrapperHighlighted {
+    border: solid 10px;
+    border-color: #BA4A00;
+}
+
+.fppTableWrapperErrored {
+    border: solid 10px;
+    border-color: #FF0000;
+}
+
+.fppTableWrapper input {
+	-moz-user-select: -moz-auto;
+	-khtml-user-select: auto;
+	-webkit-user-select: auto;
+	-ms-user-select: auto;
+	user-select: auto;
+}
+
+.fppTableRowTemplate {
+    display: none;
+}
+
+.fppTableContents {
+}
+
+.fppTableContents > table {
+    background: #F0F0F0;
+    border: thin;
+    border-color:#333;
+    border-spacing: 0px;
+    border-collapse: collapse;
+    margin: 0px !important;
+    width: 100%;
+}
+
+.fullWidth {
+    width: 100%;
+}
+
+.fppTableContents > table > thead > tr, .fppTableContents > table > tbody > tr {
+    border: thin solid;
+    border-color: #CCC;
+}
+
+.fppTableContents > table > thead > tr > th {
+    vertical-align: bottom;
+    text-align: center;
+    color: #000000;
+    border-top: thin solid #888888;
+    border-left: thin solid #888888;
+    border-right: thin solid #888888;
+    border-bottom: thin solid #888888;
+    font-size: 12pt;
+    font-family: Verdana,Arial,sans-serif;
+    background-color:#CCC;
+}
+
+.fppTableContents > table > tbody > tr > td {
+    font-size: 12pt;
+    padding-left: 2px;
+    padding-right: 2px;
+    padding-top: 1px;
+    padding-bottom: 1px;
 }
 
 .fppTableSelectedEntry {
 	background:#CCC;
+}
+
+.universeTable td {
+    text-align: center;
+}
+
+.universeTable input[type=text] {
+    text-align: center;
+    width: 100%;
+}
+
+.universeTable input[type=number] {
+    text-align: center;
+    width: 100%;
+}
+
+.serialOutputContents > table {
+    width: 120px;
+    text-align: center;
 }
 
 #restoreSuccessFlag{
@@ -743,6 +1091,24 @@ pre
 	cursor:pointer;
 }
 
+.addButton {
+    background-image: url(../images/addicon.gif);
+    width: 12px;
+    height: 12px;
+    display: block;
+    background-size: 12px 12px;
+    background-repeat: no-repeat;
+}
+
+.deleteButton {
+    background-image: url(../images/deleteicon.gif);
+    width: 12px;
+    height: 12px;
+    display: block;
+    background-size: 12px 12px;
+    background-repeat: no-repeat;
+}
+
 .pluginTitle
 {
 	font-weight: bold;
@@ -752,7 +1118,7 @@ pre
 
 .pluginTable
 {
-	width: 800px;
+	width: 100%;
 }
 
 .pluginTable td
@@ -851,22 +1217,30 @@ td.bgDarkOrange {
 	border-radius: 0px;
 	-moz-border-radius:0;
 	-webkit-border-radius:0;
-	border: none; }
+	border: none;
+}
 
 #fppMenu li ul:before, #fppMenu li ul:after {
-	border: none; }
+	border: none;
+}
 
 #fppMenu li ul li {
-	border-bottom: 1px solid #888; }
+	border-bottom: 1px solid #888;
+    padding-left: 2em;
+    padding-right: 2em;
+    text-align: left !important;
+}
 
 #fppMenu li ul li:last-child {
-	border: none; }
+	border: none;
+}
 
 #fppMenu li ul li a {
-	font-weight: normal; }
+	font-weight: normal;
+}
 
-#hostnameColumn{
-	max-width: 50px;
+.hostnameColumn{
+	max-width: 100px;
 }
 
 .hostDescriptionSM{
@@ -877,27 +1251,34 @@ td.bgDarkOrange {
 	font-size: 0.8em;
 }
 
+.tablesorter thead .disabled {
+    display: none;
+}
+
+.tablesorter .tablesorter-filter-row .disabled {
+    display: none;
+}
 
 .multiSyncadvancedView{
 	float: right;
 	font-weight: bold;
 }
 
-.advancedViewHeaderSpacer{
-	min-width: 20px;
+.multiSyncVerboseTable {
+    border: 0px !important;
+	border-collapse: collapse;
 }
+
+.multiSyncVerboseTable > tbody > tr > td {
+    border: 0px;
+    padding: 0px;
+    background-color: unset;
+}
+
 
 .advancedViewHeader {
 	color: #fff;
 	background-color: #414141;
-}
-
-.advancedViewRow{
-	font-size: 0.8em;
-	color: #fff;
-	background-color: #414141;
-	text-align: center;
-	min-width: 90px;
 }
 
 .updateAvailable {
@@ -905,7 +1286,46 @@ td.bgDarkOrange {
 	font-weight: bold;
 }
 
-@media screen and (max-width: 950px) {
+.warning {
+    color: #FF0000;
+    font-weight: bold;
+}
+
+.jsString { color: blue; }
+.jsNumber { color: black; }
+.jsBoolean { color: darkorange; }
+.jsNull { color: magenta; }
+.jsKey { color: red; }
+
+@media screen and (max-width: 980px) {
+    #bodyWrapper
+    {
+        width: 96%;
+    }
+}
+
+@media screen and (max-width: 960px) {
+    #bodyWrapper
+    {
+        width: 97%;
+    }
+}
+
+@media screen and (max-width: 940px) {
+    #bodyWrapper
+    {
+        width: 98%;
+    }
+}
+
+@media screen and (max-width: 920px) {
+    #bodyWrapper
+    {
+        width: 99%;
+    }
+}
+
+@media screen and (max-width: 900px) {
 	html {
 		background: #f0f0f0;
 	}
@@ -940,3 +1360,162 @@ td.bgDarkOrange {
 	#fppMenu li ul li {
 		background: #555; }
 }
+
+.selectable {
+   -moz-user-select: -moz-auto;
+   -khtml-user-select: auto;
+   -webkit-user-select: auto;
+   -ms-user-select: auto;
+   user-select: auto;
+}
+
+.unselectable {
+   -moz-user-select: -moz-none;
+   -khtml-user-select: none;
+   -webkit-user-select: none;
+   -ms-user-select: none;
+   user-select: none;
+}
+
+.hidden {
+    display: none;
+}
+
+.no-close .ui-dialog-titlebar-close {display: none }
+
+.ui-datepicker {
+    z-index: 9999 !important;
+}
+
+.AwesomeFree {
+   font-family: "Font Awesome 5 Free" !important;
+}
+
+.AwesomeFreeLink {
+    cursor: pointer;
+}
+
+/* Default Font Awesome CSS for .php URLs */
+a[href*=".php"]:before{
+    font-family: "Font Awesome 5 Free" !important;
+    display: inline-block;
+    font-weight: 900;
+    text-align: center;
+    width: 2.5em;
+}
+
+/* .php URLs that use the default Font Awesome CSS and just need content */
+a[href="index.php"]:before{
+   content: "\f129";
+}
+a[href="networkconfig.php"]:not(.headerLink):before{
+   content: "\f6ff";
+}
+a[href="multisync.php"]:before{
+   content: "\f085";
+}
+a[href="settings.php"]:before{
+   content: "\f013";
+}
+a[href="backup.php"]:before{
+   content: "\f7c4";
+}
+a[href="proxies.php"]:before{
+   content: "\f0ac";
+}
+a[href="events.php"]:before{
+   content: "\f073";
+}
+a[href="uploadfile.php?tab=4"]:before{
+   content: "\f0d0";
+}
+a[href="effects.php"]:before{
+   content: "\f0d0";
+}
+a[href="testing.php"]:before{
+   content: "\f46c";
+}
+a[href="uploadfile.php"]:before{
+   content: "\f093";
+}
+a[href="uploadfile.php?tab=0"]:before{
+   content: "\f093";
+}
+a[href="uploadfile.php?tab=1"]:before{
+   content: "\f001";
+}
+a[href="uploadfile.php?tab=2"]:before{
+   content: "\f03d";
+}
+a[href="uploadfile.php?tab=5"]:before{
+   content: "\f70e";
+}
+a[href="playlists.php"]:before{
+   content: "\f0cb";
+}
+a[href="scheduler.php"]:before{
+   content: "\f017";
+}
+a[href="scriptbrowser.php"]:before{
+   content: "\f70e";
+}
+a[href="plugins.php"]:before{
+   content: "\f12e";
+}
+a[href="channelinputs.php"]:before{
+   content: "\f542";
+   color:red;
+}
+a[href="channeloutputs.php"]:before{
+   content: "\f542";
+   color: green;
+}
+a[href="outputprocessors.php"]:before{
+   content: "\f2db";
+}
+a[href="pixeloverlaymodels.php"]:before{
+   content: "\f1b3";
+}
+a[href="gpio.php"]:before{
+   content: "\f362";
+}
+a[href="http://falconchristmas.com/wiki/index.php/Falcon_FPP"]:before{
+   content: "\f360";
+}
+a[href="help.php"]:before{
+   content: "\f059";
+}
+a[href="cliHelp.php"]:before{
+   content: "\f1cd";
+}
+a[href="troubleshooting.php"]:before{
+   content: "\f121";
+}
+a[href="about.php"]:not(.headerLink):before{
+   content: "\f05a";
+}
+a[href="credits.php"]:before{
+   content: "\f550";
+}
+a[href="apihelp.php"]:before{
+    content: "\f236";
+}
+
+/* Non-.php URLs that need the full Font Awesome CSS */
+a[href$=":4200"]:before{
+    font-family: "Font Awesome 5 Free" !important;
+    content: "\f120";
+    display: inline-block;
+    font-weight: 900;
+    text-align: center;
+    width: 2.5em;
+}
+a[href*="https://falconchristmas.github.io/FPP_Manual"]:before{
+    font-family: "Font Awesome 5 Free" !important;
+    content: "\f02d";
+    display: inline-block;
+    font-weight: 900;
+    text-align: center;
+    width: 2.5em;
+}
+

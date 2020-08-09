@@ -30,14 +30,14 @@
 #       Raspberry Pi
 #           - URL: https://www.raspberrypi.org/downloads/
 #           - Image
-#             - 2017-11-29-raspbian-stretch-lite.zip
+#             - 2020-02-13-raspbian-buster-lite.zip
 #           - Login/Password
 #             - pi/raspberry
 #
 #       BeagleBone Black
-#           - URL: http://beagleboard.org/latest-images
+#           - URL: https://debian.beagleboard.org/images/2020-04-06/buster-console/
 #           - Images
-#             - bone-debian-9.3-iot-armhf-2018-03-05-4gb.img
+#             - bone-debian-10.3-console-armhf-2020-04-06-1gb.img.xz
 #           - Login/Password
 #             - debian/temppwd
 #
@@ -48,31 +48,14 @@
 #############################################################################
 # Other platforms which may be functioning:
 #
-# NOTE: FPP Development is based on the latest *bian Stretch images, so
-#       hardware which does not support Stretch may have issues.
-#
-#       ODROID C1
-#           http://oph.mdrjr.net/meveric/images/
-#           - Jessie/Debian-Jessie-1.1-20170526-C1.img.xz
-#           - Login/Password
-#             - root/odroid
-#           - When building a FPP image from this stock image, we will need
-#             to do something about the image size so we don't bloat the
-#             the FPP download.
-#
-#       Pine64
-#           http://wiki.pine64.org/index.php/Pine_A64_Software_Release
-#           - "Debian Base (3.10.102 BSP 2)" image
-#           - Login/Password
-#             - debian/debian
-#           - This image has very little free space after installing FPP,
-#             so you may want to expand the root partition by a few hundred MB.
+# NOTE: FPP Development is based on the latest *bian Buster images, so
+#       hardware which does not support Buster may have issues.
 #
 #############################################################################
-SCRIPTVER="1.0"
+SCRIPTVER="4.0"
 FPPBRANCH=${FPPBRANCH:-"master"}
-FPPIMAGEVER="2.6"
-FPPCFGVER="31"
+FPPIMAGEVER="4.0"
+FPPCFGVER="61"
 FPPPLATFORM="UNKNOWN"
 FPPDIR=/opt/fpp
 FPPUSER=fpp
@@ -95,7 +78,7 @@ checkTimeAgainstUSNO () {
 
 		# allow clocks to differ by 24 hours to handle time zone differences
 		THRESHOLD=86400
-		USNOSECS=$(wget -q -O - http://www.usno.navy.mil/cgi-bin/time.pl | sed -e "s/.*\">//" -e "s/<\/t.*//" -e "s/...$//")
+		USNOSECS=$(wget --timeout=10 --tries=1 -q -O - http://www.usno.navy.mil/cgi-bin/time.pl | sed -e "s/.*\">//" -e "s/<\/t.*//" -e "s/...$//")
 
         if [ "x${USNOSECS}" != "x" ]
         then
@@ -149,16 +132,29 @@ then
 fi
 
 # Parse build options as arguments
-build_ola=false
-build_omxplayer=false
+clone_fpp=true
+build_vlc=true
+skip_apt_install=false
+desktop=true
+isimage=false;
+
 while [ -n "$1" ]; do
 	case $1 in
-		--build-ola)
-			build_ola=true
+		--skip-clone)
+			clone_fpp=false
 			shift
 			;;
-		--build-omxplayer)
-			build_omxplayer=true
+		--skip-vlc)
+			build_vlc=false
+			shift
+			;;
+		--skip-apt-install)
+			skip_apt_install=true
+			shift
+			;;
+		--img)
+			desktop=false
+            isimage=true
 			shift
 			;;
 		*)
@@ -190,6 +186,12 @@ then
 elif [ "x${OSID}" = "xdebian" ]
 then
 	FPPPLATFORM="Debian"
+elif [ "x${OSID}" = "xubuntu" ]
+then
+	FPPPLATFORM="Ubuntu"
+elif [ "x${OSID}" = "xfedora" ]
+then
+    FPPPLATFORM="Fedora"
 else
 	FPPPLATFORM="UNKNOWN"
 fi
@@ -206,10 +208,6 @@ echo "FPP Branch       : ${FPPBRANCH}"
 echo "Operating System : ${PRETTY_NAME}"
 echo "Platform         : ${FPPPLATFORM}"
 echo "OS Version       : ${OSVER}"
-echo "Build OLA        : $build_ola"
-if [ "x${FPPPLATFORM}" = "xRaspberry Pi" ]; then
-echo "Build omxplayer  : $build_omxplayer"
-fi
 echo "============================================================"
 #############################################################################
 
@@ -220,9 +218,11 @@ echo ""
 echo "WARNINGS:"
 echo "- This install expects to be run on a clean freshly-installed system."
 echo "  The script is not currently designed to be re-run multiple times."
-echo "- This installer will take over your system.  It will disable any"
-echo "  existing 'pi' or 'debian' user and create a '${FPPUSER}' user.  If the system"
-echo "  has an empty root password, remote root login will be disabled."
+if $isimage; then
+    echo "- This installer will take over your system.  It will disable any"
+    echo "  existing 'pi' or 'debian' user and create a '${FPPUSER}' user.  If the system"
+    echo "  has an empty root password, remote root login will be disabled."
+fi
 echo ""
 
 echo -n "Do you wish to proceed? [N/y] "
@@ -261,6 +261,11 @@ mkdir /etc/fpp
 echo "${FPPPLATFORM}" > /etc/fpp/platform
 echo "v${FPPIMAGEVER}" > /etc/fpp/rfs_version
 echo "${FPPCFGVER}" > /etc/fpp/config_version
+if $desktop; then
+    echo "1" > /etc/fpp/desktop
+else
+# Bunch of configuration we wont do if installing onto desktop
+# We shouldn't set the hostname or muck with the issue files, keyboard, etc...
 
 #######################################
 # Setting hostname
@@ -284,9 +289,19 @@ cat >> /etc/issue.new <<EOF
 Falcon Player OS Image v${FPPIMAGEVER}
 
 EOF
-cp /etc/issue.new /etc/issue
 cp /etc/issue.new /etc/issue.net
 rm /etc/issue.new
+
+head -1 /etc/issue > /etc/issue.new
+cat >> /etc/issue.new <<EOF
+
+Falcon Player OS Image v${FPPIMAGEVER}
+My IP address: \4
+
+EOF
+cp /etc/issue.new /etc/issue
+rm /etc/issue.new
+
 
 #######################################
 # Setup for U.S. users mainly
@@ -294,18 +309,14 @@ echo "FPP - Setting US keyboard layout and locale"
 sed -i "s/XKBLAYOUT=".*"/XKBLAYOUT="us"/" /etc/default/keyboard
 echo "LANG=en_US.UTF-8" > /etc/default/locale
 
+# end of if desktop
+fi
+
+
 #######################################
 # Make sure /opt exists
 echo "FPP - Checking for existence of /opt"
 cd /opt 2> /dev/null || mkdir /opt
-
-#######################################
-# Remove old /opt/fpp if it exists
-if [ -e "/opt/fpp" ]
-then
-	echo "FPP - Removing old /opt/fpp"
-	rm -rf /opt/fpp
-fi
 
 
 #######################################
@@ -314,7 +325,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 
 case "${OSVER}" in
-	debian_9)
+	debian_9 | debian_10 | ubuntu_20.04)
 		case $FPPPLATFORM in
 			'CHIP'|'BeagleBone Black')
 				echo "FPP - Skipping non-free for $FPPPLATFORM"
@@ -326,23 +337,34 @@ case "${OSVER}" in
 				;;
 		esac
 
-		echo "FPP - Marking unneeded packages for removal to save space"
-		case "${OSVER}" in
-			debian_9)
-				systemctl disable network-manager.service
 
-				# This list is based on the Stretch Lite SD image which we base our image on
-				for package in libxmuu1 xauth network-manager
-				do
-					echo "$package deinstall" | dpkg --set-selections
-				done
-				;;
-		esac
-
-		echo "FPP - Make things cleaner by removing unneeded packages"
-		dpkg --get-selections | grep deinstall | while read package deinstall; do
-			apt-get -y purge $package
-		done
+        #remove a bunch of packages that aren't neeeded, free's up space
+        PACKAGE_REMOVE="nginx nginx-full nginx-common python3-numpy python3-opencv python3-pip python3-pkg-resources python3-scipy python3-setuptools python3-smbus\
+            python3-werkzeug python3-click python3-colorama python3-decorator python3-dev python3-distro \
+            python3-distutils python3-flask python3-itsdangerous python3-jinja2 python3-lib2to3 python3-libgpiod python3-markupsafe \
+            gfortran glib-networking libxmuu1 xauth network-manager"
+        if [ "$FPPPLATFORM" == "BeagleBone Black" ]; then
+            PACKAGE_REMOVE="$PACKAGE_REMOVE roboticscape nodejs c9-core-installer \
+                doc-beaglebone-getting-started bonescript bone101 bb-node-red-installer ardupilot-copter-bbbmini ardupilot-copter-blue \
+                ardupilot-plane-bbbmini ardupilot-plane-blue ardupilot-rover-bbbmini ardupilot-rover-blue \
+                ardupilot-copter-3.6-bbbmini ardupilot-copter-3.6-blue ardupilot-copter-3.6-pocket \
+                ardupilot-rover-3.4-bbbmini ardupilot-rover-3.4-blue ardupilot-rover-3.4-pocket"
+        fi
+        if $desktop; then
+            #don't remove anything from a desktop
+            PACKAGE_REMOVE=""
+        else
+            echo "FPP - Marking unneeded packages for removal to save space"
+            systemctl disable network-manager.service
+        fi
+        
+        if $skip_apt_install; then
+            PACKAGE_REMOVE=""
+        fi
+        if [ "x${PACKAGE_REMOVE}" != "x" ]; then
+            apt-get remove -y --purge --autoremove --allow-change-held-packages ${PACKAGE_REMOVE}
+        fi
+        
 
 		echo "FPP - Removing anything left that wasn't explicity removed"
 		apt-get -y --purge autoremove
@@ -353,11 +375,16 @@ case "${OSVER}" in
 		echo "FPP - Upgrading apt if necessary"
 		apt-get install --only-upgrade apt
 
-		echo "FPP - Sleeping 60 seconds to make sure any apt upgrade is quiesced"
-		sleep 60
+		echo "FPP - Sleeping 5 seconds to make sure any apt upgrade is quiesced"
+		sleep 5
 
 		echo "FPP - Upgrading other installed packages"
 		apt-get -y upgrade
+  
+        echo "FPP - Cleanup caches"
+        apt-get -y clean
+        apt-get -y --purge autoremove
+        apt-get -y clean
 
 		# remove gnome keyring module config which causes pkcs11 warnings
 		# when trying to do a git pull
@@ -365,60 +392,42 @@ case "${OSVER}" in
 
 		echo "FPP - Installing required packages"
 		# Install 10 packages, then clean to lower total disk space required
-		PACKAGE_LIST=""
-		case "${OSVER}" in
-			debian_9)
-				PACKAGE_LIST="alsa-base alsa-utils arping avahi-daemon \
-								apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php7.0 \
-								zlib1g-dev libpcre3 libpcre3-dev libbz2-dev libssl-dev \
-								avahi-discover avahi-utils bash-completion bc btrfs-tools build-essential \
-								bzip2 ca-certificates ccache connman curl device-tree-compiler \
-								dh-autoreconf ethtool exfat-fuse fbi fbset file flite gdb \
-								gdebi-core git hdparm i2c-tools ifplugd imagemagick less \
-								libboost-dev libconvert-binary-c-perl \
-								libdbus-glib-1-dev libdevice-serialport-perl libjs-jquery \
-								libjs-jquery-ui libjson-perl libjsoncpp-dev liblo-dev libmicrohttpd-dev libnet-bonjour-perl \
-								libpam-smbpass libsdl2-dev libssh-4 libtagc0-dev libtest-nowarnings-perl locales lsof \
-								mp3info mailutils mpg123 mpg321 mplayer nano nginx node ntp perlmagick \
-								php-cli php-common php-curl php-dom php-fpm php-mcrypt \
-								php-sqlite3 php-zip python-daemon python-smbus rsync samba \
-								samba-common-bin shellinabox sudo sysstat tcpdump time usbmount vim \
-								vim-common vorbis-tools vsftpd firmware-realtek gcc g++\
-								dhcp-helper hostapd parprouted bridge-utils cpufrequtils \
-								firmware-atheros firmware-ralink firmware-brcm80211 \
-								dos2unix libmosquitto-dev mosquitto-clients librtmidi-dev \
-                                libavcodec-dev libavformat-dev libswresample-dev libsdl2-dev libswscale-dev libavdevice-dev libavfilter-dev \
-								wireless-tools libcurl4-openssl-dev resolvconf sqlite3 php7.0-zip"
-				;;
-		esac
 
-		let packages=0
-		for package in ${PACKAGE_LIST}
-		do
-			apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ${package}
-			let packages=$((${packages}+1))
-			if [ $packages -gt 10 ]; then
-				let packages=0
-				apt-get -y clean
-			fi
-		done
+        PACKAGE_LIST="alsa-utils arping avahi-daemon avahi-utils locales nano net-tools \
+                      apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php \
+                      bc bash-completion btrfs-progs exfat-fuse lsof ethtool curl zip unzip bzip2 wireless-tools dos2unix \
+                      fbi fbset file flite ca-certificates lshw \
+                      build-essential ffmpeg gcc g++ gdb ccache vim vim-common bison flex device-tree-compiler dh-autoreconf \
+                      git git-core hdparm i2c-tools ifplugd less sysstat tcpdump time usbutils usb-modeswitch \
+                      samba rsync connman sudo shellinabox dnsmasq hostapd vsftpd ntp sqlite3 at haveged samba samba-common-bin \
+                      mp3info mailutils dhcp-helper parprouted bridge-utils libiio-utils \
+                      php php-cli php-common php-curl php-pear php-sqlite3 php-zip php-xml \
+                      libavcodec-dev libavformat-dev libswresample-dev libswscale-dev libavdevice-dev libavfilter-dev libtag1-dev \
+                      vorbis-tools libgraphicsmagick++1-dev graphicsmagick-libmagick-dev-compat libmicrohttpd-dev \
+                      libmosquitto-dev mosquitto-clients mosquitto libzstd-dev lzma zstd gpiod libgpiod-dev libjsoncpp-dev libcurl4-openssl-dev \
+                      fonts-freefont-ttf flex bison pkg-config libasound2-dev"
 
-		echo "FPP - Configuring shellinabox to use /var/tmp"
-		echo "SHELLINABOX_DATADIR=/var/tmp/" >> /etc/default/shellinabox
-		sed -i -e "s/SHELLINABOX_ARGS.*/SHELLINABOX_ARGS=\"--no-beep -t\"/" /etc/default/shellinabox
+        if [ "$FPPPLATFORM" == "Raspberry Pi" -o "$FPPPLATFORM" == "BeagleBone Black" ]; then
+            PACKAGE_LIST="$PACKAGE_LIST firmware-realtek firmware-atheros firmware-ralink firmware-brcm80211 firmware-iwlwifi firmware-libertas firmware-zd1211 firmware-ti-connectivity python-daemon python-smbus"
+        fi
 
-		echo "FPP - Cleaning up after installing packages"
-		apt-get -y clean
+        if $skip_apt_install; then
+            PACKAGE_LIST=""
+        else
+            apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ${PACKAGE_LIST}
+        fi
 
-		echo "FPP - Installing libhttpserver SHA bd08772"
-		(cd /opt/ && git clone https://github.com/etr/libhttpserver && cd libhttpserver && git checkout bd08772 && ./bootstrap && mkdir build && cd build && CXXFLAGS=-std=c++98 ../configure --prefix=/usr && make && make install && cd /opt/ && rm -rf /opt/libhttpserver)
+        echo "FPP - Cleaning up after installing packages"
+        apt-get -y clean
 
-		echo "FPP - Installing non-packaged Perl modules via App::cpanminus"
-		curl -L https://cpanmin.us | perl - --sudo App::cpanminus
-		echo "yes" | cpanm -fi Test::Tester File::Map Net::WebSocket::Server Net::PJLink
 
-		echo "FPP - Disabling any stock 'debian' user, use the '${FPPUSER}' user instead"
-		sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
+		echo "FPP - Installing libhttpserver 0.17.5"
+		(cd /opt/ && git clone https://github.com/etr/libhttpserver && cd libhttpserver && git checkout 0.17.5 && ./bootstrap && mkdir build && cd build && ../configure --prefix=/usr && make && make install && cd /opt/ && rm -rf /opt/libhttpserver)
+
+        echo "FPP - Configuring shellinabox to use /var/tmp"
+        echo "SHELLINABOX_DATADIR=/var/tmp/" >> /etc/default/shellinabox
+        sed -i -e "s/SHELLINABOX_ARGS.*/SHELLINABOX_ARGS=\"--no-beep -t\"/" /etc/default/shellinabox
+
 
 		if [ -f /bin/systemctl ]
 		then
@@ -429,74 +438,58 @@ case "${OSVER}" in
 			systemctl disable cloud9.socket
 		fi
 
-		echo "FPP - Disabling GUI"
-		update-rc.d -f gdm remove
-		update-rc.d -f gdm3 remove
-		update-rc.d -f lightdm remove
-		update-rc.d -f wdm remove
-		update-rc.d -f xdm remove
+        if $isimage; then
+            echo "FPP - Disabling GUI"
+            systemctl disable gdm
+            systemctl disable gdm3
+            systemctl disable lightdm
+            systemctl disable wdm
+            systemctl disable xdm
+            systemctl disable display-manager.service
+            
+            echo "FPP - Disabling dhcp-helper and hostapd from automatically starting"
+            systemctl disable dhcp-helper
+            systemctl disable hostapd
+        fi
 
-		echo "FPP - Disabling dhcp-helper and hostapd from automatically starting"
-		update-rc.d -f dhcp-helper remove
-		update-rc.d -f hostapd remove
-
-		if [ "x${OSVER}" == "xdebian_9" ]; then
-			systemctl disable display-manager.service
-		fi
-
-		;;
-	ubuntu_14.04)
-		echo "FPP - Updating package list"
-		apt-get update
-		echo "FPP - FIXME, should be installing required Ubuntu packages"
 		;;
 	*)
 		echo "FPP - Unknown distro"
 		;;
 esac
 
+if [ ! -f "/usr/include/SDL2/SDL.h" ]; then
+    # we don't want to "apt-get install libsdl2-dev" as that brings in wayland, a bunch
+    # of X libraries, mesa, some OpenGL libs, etc... A bunch of things we DON'T need
+    # Thus, we'll grab the .deb file, modify it to remove those deps, and install
+    echo "FPP - Installing SDL2"
+    cd /tmp
+    apt-get download libsdl2-dev
+    mkdir deb
+    dpkg-deb -R ./libsdl2*.deb  deb
+    sed -i -e "s/Version\(.*\)+\(.*\)/Version\1~fpp/g" deb/DEBIAN/control
+    sed -i -e "s/Depends: \(.*\)/Depends: libsdl2-2.0-0, libasound2-dev, libdbus-1-dev, libsndio-dev, libudev-dev/g" deb/DEBIAN/control
+    dpkg-deb -b deb ./libsdl2-dev.deb
+    apt -y install ./libsdl2-dev.deb
+    apt-mark hold libsdl2-dev
+    apt-get clean
+fi
+ 
 #######################################
 # Platform-specific config
 case "${FPPPLATFORM}" in
 	'BeagleBone Black')
+        echo "blacklist spidev" > /etc/modprobe.d/blacklist-spidev.conf
+        echo "# allocate 3M instead of the default 256K" > /etc/modprobe.d/uio_pruss.conf
+        echo "options uio_pruss extram_pool_sz=3145728" >> /etc/modprobe.d/uio_pruss.conf
 
-		case "${OSVER}" in
-			debian_9)
-				echo "FPP - Disabling HDMI for Falcon and LEDscape cape support"
-				sed -i -e 's/#dtb=am335x-boneblack-emmc-overlay.dtb/dtb=am335x-boneblack-emmc-overlay.dtb/' /boot/uEnv.txt
-
-				echo "FPP - Installing BeagleBone Overlays"
-				cd /opt/ && git clone https://github.com/beagleboard/bb.org-overlays && cd /opt/bb.org-overlays && make && make install && cd /opt/ && rm -rf bb.org-overlays
-
-				echo "FPP - Installing OLA"
-				apt-get -y install ola ola-python libola-dev libola1 libprotobuf-dev libprotobuf9
-				update-rc.d olad remove
-
-				echo "FPP - Updating locale"
-				sed -i -e 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
-				dpkg-reconfigure --frontend=noninteractive locales
-				update-locale LANG=en_US.UTF-8
-
-				# Bind mount /tmp over /var/tmp because the default 10G /var/tmp is not
-				# big enough to rebuild the initrd when the kernel is updated
-				mount -o bind /tmp /var/tmp
-
-				# We need the 'bone' kernel so LEDscape PRU code can work
-				BBB_KERNEL_VER=4.1.19-bone-rt-r20
-				echo "FPP - Switching to Bone kernel"
-				cd /opt/scripts/tools && ./update_kernel.sh --bone-rt-kernel --lts-4_1 --kernel=${BBB_KERNEL_VER}
-
-				echo "FPP - Installing updated 8192cu module"
-				# FIXME, get this in github once kernel version is finalized
-				wget -O /lib/modules/${BBB_KERNEL_VER}/kernel/drivers/net/wireless/8192cu.ko http://fpp.bc2va.org/modules/8192cu-${BBB_KERNEL_VER}.ko
-				sudo depmod ${BBB_KERNEL_VER}
-				#wget -O /lib/modules/${BBB_KERNEL_VER}/kernel/drivers/net/wireless/8192cu.ko https://github.com/FalconChristmas/fpp/releases/download/1.5/8192cu-${BBB_KERNEL_VER}.ko
-				;;
-		esac
-
-
-		echo "FPP - Fixing potential ping issue"
-		chmod u+s /bin/ping
+        # need to blacklist the gyroscope and barometer on the SanCloud enhanced or it consumes some pins
+        echo "blacklist st_pressure_i2c" > /etc/modprobe.d/blacklist-gyro.conf
+        echo "blacklist st_pressure" >> /etc/modprobe.d/blacklist-gyro.conf
+        echo "blacklist inv_mpu6050_i2c" >> /etc/modprobe.d/blacklist-gyro.conf
+        echo "blacklist st_sensors_i2c" >> /etc/modprobe.d/blacklist-gyro.conf
+        echo "blacklist inv_mpu6050" >> /etc/modprobe.d/blacklist-gyro.conf
+        echo "blacklist st_sensors" >> /etc/modprobe.d/blacklist-gyro.conf
 
 		;;
 
@@ -510,173 +503,173 @@ case "${FPPPLATFORM}" in
         echo "FPP - Install kernel headers so modules can be compiled later"
         apt-get -y install raspberrypi-kernel-headers
 
-		# TODO: Shouldn't this stuff go somewhere besides the Pi section?  I
-		# believe OLA is supported across most linux systems.  It can probably
-		# go in another location.
-		if $build_ola; then
-			echo "FPP - Installing OLA from source"
-			apt-get -y --force-yes install libcppunit-dev uuid-dev pkg-config libncurses5-dev libtool autoconf automake libmicrohttpd-dev protobuf-compiler python-protobuf libprotobuf-dev libprotoc-dev bison flex libftdi-dev libftdi1 libusb-1.0-0-dev liblo-dev
-			apt-get -y clean
-			git clone https://github.com/OpenLightingProject/ola.git /opt/ola
-			(cd /opt/ola && autoreconf -i && ./configure --enable-rdm-tests --enable-python-libs && make && make install && ldconfig)
-			rm -rf /opt/ola
-		else
-			echo "FPP - Installing OLA"
-			case "${OSVER}" in
-				debian_9)
-					apt-get -y install ola ola-python libola-dev libola1
-				;;
-			esac
-		fi
+        if $isimage; then
+            echo "FPP - Disabling dhcpcd"
+            systemctl disable dhcpcd.service
 
-		echo "FPP - Installing wiringPi"
-		cd /opt/ && git clone git://git.drogon.net/wiringPi && cd /opt/wiringPi && ./build
+            echo "FPP - Configuring connman"
+            mv /etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf.orig
+            mkdir /etc/connman
+            chmod 755 /etc/connman
 
-		if $build_omxplayer; then
-			echo "FPP - Building omxplayer from source with our patch"
-			apt-get -y install git-core libssl1.0-dev libssh-dev libsmbclient-dev
-            cd /opt
-			git clone https://github.com/popcornmix/omxplayer.git
-			cd omxplayer
-			# get the latest and greatest to support ALSA
-			#git reset --hard 4d8ffd13153bfef2966671cb4fb484afeaf792a8
-			wget -O- https://raw.githubusercontent.com/FalconChristmas/fpp/master/external/omxplayer/FPP_omxplayer.diff | patch -p1
-			./prepare-native-raspbian.sh
-			make omxplayer.bin
-            cp omxplayer.bin /usr/bin/omxplayer.bin
-			cd ..
-			rm -rf /opt/omxplayer
-		else
-			# TODO: need to test this binary on jessie
-			echo "FPP - Installing patched omxplayer.bin for FPP MultiSync"
-			case "${OSVER}" in
-				debian_9)
-					wget -O- https://github.com/FalconChristmas/fpp-binaries/raw/master/Pi/omxplayer-dist-stretch.tgz | tar xzpv -C /
-					;;
-				*)
-					echo "WARNING: Unable to install patched omxplayer for this release"
-					;;
-			esac
-		fi
+            cat <<-EOF > /var/lib/connman/settings
+[global]
+OfflineMode=false
 
-		echo "FPP - Disabling dhcpcd"
-		systemctl disable dhcpcd.service
+[WiFi]
+Enable=true
+Tethering=false
 
-		echo "FPP - Configuring connman"
-		mv /etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf.orig
-		cat <<-EOF > /var/lib/connman/settings
-		[global]
-		OfflineMode=false
+[Bluetooth]
+Enable=false
+Tethering=false
 
-		[WiFi]
-		Enable=true
-		Tethering=false
+[Wired]
+Enable=true
+Tethering=false
+EOF
 
-		[Bluetooth]
-		Enable=false
-		Tethering=false
+cat <<-EOF >> /etc/connman/main.conf
+[General]
+PreferredTechnologies=wifi,ethernet
+SingleConnectedTechnology=false
+AllowHostnameUpdates=false
+PersistentTetheringMode=true
+EOF
 
-		[Wired]
-		Enable=true
-		Tethering=false
-		EOF
+            echo "FPP - Disabling stock users (pi, odroid, debian), use the '${FPPUSER}' user instead"
+            sed -i -e "s/^pi:.*/pi:*:16372:0:99999:7:::/" /etc/shadow
+            sed -i -e "s/^odroid:.*/odroid:*:16372:0:99999:7:::/" /etc/shadow
+            sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
 
-		mkdir /etc/connman
-		chmod 755 /etc/connman
-		cat <<-EOF >> /etc/connman/main.conf
-		[General]
-		PreferredTechnologies=wifi,ethernet
-		SingleConnectedTechnology=false
-		AllowHostnameUpdates=false
-		PersistentTetheringMode=true
-		EOF
+            echo "FPP - Disabling auto mount of USB drives"
+            sed -i -e "s/ENABLED=1/ENABLED=0/" /etc/usbmount/usbmount.conf 2> /dev/null
 
-		echo "FPP - Disabling stock users (pi, odroid, debian), use the '${FPPUSER}' user instead"
-		sed -i -e "s/^pi:.*/pi:*:16372:0:99999:7:::/" /etc/shadow
-		sed -i -e "s/^odroid:.*/odroid:*:16372:0:99999:7:::/" /etc/shadow
-		sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
+            echo "FPP - Disabling the hdmi force hotplug setting"
+            sed -i -e "s/hdmi_force_hotplug/#hdmi_force_hotplug/" /boot/config.txt
 
+            echo "FPP - Disabling the VC4 OpenGL driver"
+            sed -i -e "s/dtoverlay=vc4-fkms-v3d/#dtoverlay=vc4-fkms-v3d/" /boot/config.txt
+
+            echo "FPP - Enabling SPI in device tree"
+            echo >> /boot/config.txt
+
+            echo "# Enable SPI in device tree" >> /boot/config.txt
+            echo "dtparam=spi=on" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "FPP - Updating SPI buffer size and enabling HDMI audio devices"
+            sed -i 's/$/ spidev.bufsiz=102400 snd_bcm2835.enable_hdmi=1 snd_bcm2835.enable_compat_alsa=1/' /boot/cmdline.txt
+
+            echo "FPP - Updating root partition device"
+            sed -i 's/root=PARTUUID=[A-Fa-f0-9-]* /root=\/dev\/mmcblk0p2 /g' /boot/cmdline.txt
+            sed -i 's/PARTUUID=[A-Fa-f0-9]*-01/\/dev\/mmcblk0p1/g' /etc/fstab
+            sed -i 's/PARTUUID=[A-Fa-f0-9]*-02/\/dev\/mmcblk0p2/g' /etc/fstab
+
+            echo "FPP - Disabling fancy network interface names"
+            sed -e 's/rootwait/rootwait net.ifnames=0 biosdevname=0/' /boot/cmdline.txt
+
+            echo "# Enable I2C in device tree" >> /boot/config.txt
+            echo "dtparam=i2c_arm=on,i2c_arm_baudrate=400000" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "# Setting kernel scaling framebuffer method" >> /boot/config.txt
+            echo "scaling_kernel=8" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "# Enable audio" >> /boot/config.txt
+            echo "dtparam=audio=on" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "# Allow more current through USB" >> /boot/config.txt
+            echo "max_usb_current=1" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "# Setup UART clock to allow DMX output" >> /boot/config.txt
+            echo "init_uart_clock=16000000" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "# Swap Pi 3 and Zero W UARTs with BT" >> /boot/config.txt
+            echo "dtoverlay=pi3-miniuart-bt" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "dtoverlay=dwc2" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "# GPU memory set to 128 to deal with error in omxplayer with hi-def videos" >> /boot/config.txt
+            echo "[pi4]" >> /boot/config.txt
+            echo "gpu_mem=128" >> /boot/config.txt
+            echo "[pi3]" >> /boot/config.txt
+            echo "gpu_mem=128" >> /boot/config.txt
+            echo "[pi0]" >> /boot/config.txt
+            echo "gpu_mem=64" >> /boot/config.txt
+            echo "[pi1]" >> /boot/config.txt
+            echo "gpu_mem=64" >> /boot/config.txt
+            echo "[pi2]" >> /boot/config.txt
+            echo "gpu_mem=64" >> /boot/config.txt
+            echo >> /boot/config.txt
+
+            echo "FPP - Freeing up more space by removing unnecessary packages"
+            apt-get -y purge wolfram-engine sonic-pi minecraft-pi
+            apt-get -y --purge autoremove
+
+            echo "FPP - Make things cleaner by removing configuration from unnecessary packages"
+            dpkg --get-selections | grep deinstall | while read package deinstall; do
+                apt-get -y purge $package
+            done
+
+            echo "FPP - Disabling Swap to save SD card"
+            systemctl disable dphys-swapfile
+
+            echo "FPP - Kernel doesn't support cgroups so remove to silence warnings on boot"
+            update-rc.d -f cgroup-bin remove
+
+            echo "FPP - Remove dhcpcd since we start DHCP interfaces on our own"
+            update-rc.d -f dhcpcd remove
+
+            echo "FPP - Setting locale"
+            sed -i 's/^\(en_GB.UTF-8\)/# \1/;s/..\(en_US.UTF-8\)/\1/' /etc/locale.gen
+            locale-gen en_US.UTF-8
+            dpkg-reconfigure --frontend=noninteractive locales
+            export LANG=en_US.UTF-8
+
+            echo "FPP - Fix ifup/ifdown scripts for manual dns"
+            sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n/;p}' /etc/network/if-up.d/000resolvconf
+            sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n\n/;p}' /etc/network/if-down.d/resolvconf
+
+            cat <<-EOF > /etc/dnsmasq.d/usb.conf
+interface=usb0
+interface=usb1
+port=53
+dhcp-authoritative
+domain-needed
+bogus-priv
+expand-hosts
+cache-size=2048
+dhcp-range=usb0,192.168.7.1,192.168.7.1,2m
+dhcp-range=usb1,192.168.6.1,192.168.6.1,2m
+listen-address=127.0.0.1
+listen-address=192.168.7.2
+listen-address=192.168.6.2
+dhcp-option=usb0,3
+dhcp-option=usb0,6
+dhcp-option=usb1,3
+dhcp-option=usb1,6
+dhcp-leasefile=/var/run/dnsmasq.leases
+EOF
+
+            echo "FPP - Removing extraneous blacklisted modules"
+            rm -f /etc/modprobe.d/blacklist-rtl8192cu.conf
+            rm -f /etc/modprobe.d/blacklist-rtl8xxxu.conf
+        fi
+        
 		echo "FPP - Disabling getty on onboard serial ttyAMA0"
-		if [ "x${OSVER}" == "xdebian_9" ]; then
+		if [ "x${OSVER}" == "xdebian_9" ] || [ "x${OSVER}" == "xdebian_10" ]; then
 			systemctl disable serial-getty@ttyAMA0.service
 			sed -i -e "s/console=serial0,115200 //" /boot/cmdline.txt
 			sed -i -e "s/autologin pi/autologin ${FPPUSER}/" /etc/systemd/system/autologin@.service
 		fi
 
-		echo "FPP - Disabling auto mount of USB drives"
-		sed -i -e "s/ENABLED=1/ENABLED=0/" /etc/usbmount/usbmount.conf 2> /dev/null
-
-		echo "FPP - Disabling the hdmi force hotplug setting"
-		sed -i -e "s/hdmi_force_hotplug/#hdmi_force_hotplug/" /boot/config.txt
-
-		echo "FPP - Enabling SPI in device tree"
-		echo >> /boot/config.txt
-
-		echo "# Enable SPI in device tree" >> /boot/config.txt
-		echo "dtparam=spi=on" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "FPP - Updating SPI buffer size"
-		sed -i 's/$/ spidev.bufsiz=102400/' /boot/cmdline.txt
-
-		echo "FPP - Disabling fancy network interface names"
-		sed -e 's/rootwait/rootwait net.ifnames=0 biosdevname=0/' /boot/cmdline.txt
-
-		echo "# Enable I2C in device tree" >> /boot/config.txt
-		echo "dtparam=i2c=on" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "# Setting kernel scaling framebuffer method" >> /boot/config.txt
-		echo "scaling_kernel=8" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "# Enable audio" >> /boot/config.txt
-		echo "dtparam=audio=on" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "# Allow more current through USB" >> /boot/config.txt
-		echo "max_usb_current=1" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "# Setup UART clock to allow DMX output" >> /boot/config.txt
-		echo "init_uart_clock=16000000" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "# Swap Pi 3 and Zero W UARTs with BT" >> /boot/config.txt
-		echo "dtoverlay=pi3-miniuart-bt" >> /boot/config.txt
-		echo >> /boot/config.txt
-
-		echo "FPP - Freeing up more space by removing unnecessary packages"
-		apt-get -y purge wolfram-engine sonic-pi minecraft-pi
-		apt-get -y --purge autoremove
-
-		echo "FPP - Make things cleaner by removing configuration from unnecessary packages"
-		dpkg --get-selections | grep deinstall | while read package deinstall; do
-			apt-get -y purge $package
-		done
-
-		echo "FPP - Disabling Swap to save SD card"
-		update-rc.d -f dphys-swapfile remove
-
-		echo "FPP - Kernel doesn't support cgroups so remove to silence warnings on boot"
-		update-rc.d -f cgroup-bin remove
-
-		echo "FPP - Remove dhcpcd since we start DHCP interfaces on our own"
-		update-rc.d -f dhcpcd remove
-
-		echo "FPP - Setting locale"
-		sed -i 's/^\(en_GB.UTF-8\)/# \1/;s/..\(en_US.UTF-8\)/\1/' /etc/locale.gen
-		locale-gen en_US.UTF-8
-		dpkg-reconfigure --frontend=noninteractive locales
-		export LANG=en_US.UTF-8
-
-		echo "FPP - Fix ifup/ifdown scripts for manual dns"
-		sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n/;p}' /etc/network/if-up.d/000resolvconf
-		sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n\n/;p}' /etc/network/if-down.d/resolvconf
-
-        echo "FPP - Removing extraneous blacklisted modules"
-        rm -f /etc/modprobe.d/blacklist-rtl8192cu.conf
-        rm -f /etc/modprobe.d/blacklist-rtl8xxxu.conf
 		;;
 	#TODO
 	'CHIP')
@@ -695,10 +688,6 @@ case "${FPPPLATFORM}" in
 	'ODROID')
 		echo "FPP - Installing wiringPi"
 		cd /opt/ && git clone https://github.com/hardkernel/wiringPi && cd /opt/wiringPi && ./build
-
-		echo "FPP - Installing patched omxplayer.bin for FPP MultiSync"
-		cp /usr/bin/omxplayer.bin /usr/bin/omxplayer.bin.orig
-		wget -O /usr/bin/omxplayer.bin https://github.com/FalconChristmas/fpp-binaries/raw/master/Pi/omxplayer.bin
 		;;
 	'Pine64')
 		echo "FPP - Pine64"
@@ -709,16 +698,12 @@ case "${FPPPLATFORM}" in
 		echo "FPP - Installing wiringOP (wiringPi port)"
 		cd /opt/ && git clone https://github.com/zhaolei/WiringOP && cd /opt/WiringOP && ./build
 
-		echo "FPP - Installing OLA from source"
-		apt-get -y --force-yes install libcppunit-dev uuid-dev pkg-config libncurses5-dev libtool autoconf automake libmicrohttpd-dev protobuf-compiler python-protobuf libprotobuf-dev libprotoc-dev bison flex libftdi-dev libftdi1 libusb-1.0-0-dev liblo-dev
-		apt-get -y clean
-		git clone https://github.com/OpenLightingProject/ola.git /opt/ola
-		(cd /opt/ola && autoreconf -i && ./configure --enable-rdm-tests --enable-python-libs && make && make install && ldconfig)
-		rm -rf /opt/ola
-
 		echo "FPP - Disabling stock users, use the '${FPPUSER}' user instead"
 		sed -i -e "s/^orangepi:.*/orangepi:*:16372:0:99999:7:::/" /etc/shadow
 
+		;;
+	'Ununtu')
+		echo "FPP - Ununtu"
 		;;
 	'Debian')
 		echo "FPP - Debian"
@@ -727,12 +712,33 @@ case "${FPPPLATFORM}" in
 		echo "FPP - Unknown platform"
 		;;
 esac
-	
+
 #######################################
 # Clone git repository
-echo "FPP - Cloning git repository into /opt/fpp"
 cd /opt
-git clone https://github.com/FalconChristmas/fpp fpp
+if $clone_fpp; then
+
+    #######################################
+    # Remove old /opt/fpp if it exists
+    if [ -e "/opt/fpp" ]
+    then
+        echo "FPP - Removing old /opt/fpp"
+        rm -rf /opt/fpp
+    fi
+
+    echo "FPP - Cloning git repository into /opt/fpp"
+    git clone https://github.com/FalconChristmas/fpp fpp
+fi
+
+#######################################
+# Build VLC
+if $build_vlc; then
+    echo "FPP - Building VLC"
+    cd /opt/fpp/SD
+    ./buildVLC.sh
+    rm -rf /opt/vlc/
+fi
+
 
 #######################################
 # Switch to desired code branch
@@ -741,40 +747,38 @@ cd /opt/fpp
 git checkout ${FPPBRANCH}
 
 #######################################
-echo "FPP - Installing PHP composer"
-cd /tmp/
-curl -sS https://getcomposer.org/installer | php
-mv ./composer.phar /usr/local/bin/composer
-chmod 755 /usr/local/bin/composer
+# Upgrade the config if needed
+sh scripts/upgrade_config -notee
+
 
 #######################################
-PHPDIR="/etc/php/7.0"
-
-echo "FPP - Setting up for UI"
-sed -i -e "s/^user =.*/user = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/^group =.*/group = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/.*listen.owner =.*/listen.owner = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/.*listen.group =.*/listen.group = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/.*listen.mode =.*/listen.mode = 0660/" ${PHPDIR}/fpm/pool.d/www.conf
+PHPDIR="/etc/php/7.3"
+if [ -d "/etc/php/7.4" ]; then
+    PHPDIR="/etc/php/7.4"
+fi
 
 echo "FPP - Allowing short tags in PHP"
-FILES="cli/php.ini fpm/php.ini"
+FILES="cli/php.ini apache2/php.ini"
 for FILE in ${FILES}
 do
-	sed -i -e "s/^short_open_tag.*/short_open_tag = On/" ${PHPDIR}/${FILE}
-	sed -i -e "s/max_execution_time.*/max_execution_time = 300/" ${PHPDIR}/${FILE}
-	sed -i -e "s/max_input_time.*/max_input_time = 300/" ${PHPDIR}/${FILE}
-	sed -i -e "s/default_socket_timeout.*/default_socket_timeout = 300/" ${PHPDIR}/${FILE}
-	sed -i -e "s/post_max_size.*/post_max_size = 4G/" ${PHPDIR}/${FILE}
-	sed -i -e "s/upload_max_filesize.*/upload_max_filesize = 4G/" ${PHPDIR}/${FILE}
-	sed -i -e "s/;upload_tmp_dir =.*/upload_tmp_dir = \/home\/${FPPUSER}\/media\/upload/" ${PHPDIR}/${FILE}
-	sed -i -e "s/^; max_input_vars.*/max_input_vars = 5000/" ${PHPDIR}/${FILE}
+    if [ -f ${PHPDIR}/${FILE} ]; then
+        sed -i -e "s/^short_open_tag.*/short_open_tag = On/" ${PHPDIR}/${FILE}
+        sed -i -e "s/max_execution_time.*/max_execution_time = 1000/" ${PHPDIR}/${FILE}
+        sed -i -e "s/max_input_time.*/max_input_time = 900/" ${PHPDIR}/${FILE}
+        sed -i -e "s/default_socket_timeout.*/default_socket_timeout = 900/" ${PHPDIR}/${FILE}
+        sed -i -e "s/post_max_size.*/post_max_size = 4G/" ${PHPDIR}/${FILE}
+        sed -i -e "s/upload_max_filesize.*/upload_max_filesize = 4G/" ${PHPDIR}/${FILE}
+        sed -i -e "s/;upload_tmp_dir =.*/upload_tmp_dir = \/home\/${FPPUSER}\/media\/upload/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^;max_input_vars.*/max_input_vars = 5000/" ${PHPDIR}/${FILE}
+    fi
 done
 
-#######################################
-echo "FPP - Copying rsync daemon config files into place"
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsync > /etc/default/rsync
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsyncd.conf > /etc/rsyncd.conf
+if $isimage; then
+    #######################################
+    echo "FPP - Copying rsync daemon config files into place"
+    sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsync > /etc/default/rsync
+    sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsyncd.conf > /etc/rsyncd.conf
+fi
 
 #######################################
 # Add the ${FPPUSER} user and group memberships
@@ -786,16 +790,31 @@ adduser ${FPPUSER} sudo
 case "${FPPPLATFORM}" in
 	'Raspberry Pi'|'BeagleBone Black')
 		adduser ${FPPUSER} spi
+		adduser ${FPPUSER} gpio
+		adduser ${FPPUSER} i2c
 		;;
 esac
 adduser ${FPPUSER} video
+adduser ${FPPUSER} audio
 # FIXME, use ${FPPUSER} here instead of hardcoding
 sed -i -e 's/^fpp:\*:/fpp:\$6\$rA953Jvd\$oOoLypAK8pAnRYgQQhcwl0jQs8y0zdx1Mh77f7EgKPFNk\/jGPlOiNQOtE.ZQXTK79Gfg.8e3VwtcCuwz2BOTR.:/' /etc/shadow
 
+if $isimage; then
+    echo "FPP - Disabling any stock 'debian' user, use the '${FPPUSER}' user instead"
+    sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
+    
+    #######################################
+    echo "FPP - Fixing empty root passwd"
+    sed -i -e 's/root::/root:*:/' /etc/shadow
 
-#######################################
-echo "FPP - Fixing empty root passwd"
-sed -i -e 's/root::/root:*:/' /etc/shadow
+    echo "FPP - Setting up ssh to disallow root login"
+    sed -i -e "s/#PermitRootLogin .*/PermitRootLogin prohibit-password/" /etc/ssh/sshd_config
+    sed -i -e "s/#\?Banner .*/Banner \/etc\/issue.net/g" /etc/ssh/sshd_config
+
+    echo "FPP - Cleaning up /root/.cpanm to save space on the SD image"
+    rm -rf /root/.cpanm
+fi
+
 
 #######################################
 echo "FPP - Populating ${FPPHOME}"
@@ -805,14 +824,12 @@ chmod 700 ${FPPHOME}/.ssh
 
 mkdir ${FPPHOME}/media
 chown ${FPPUSER}.${FPPUSER} ${FPPHOME}/media
-chmod 770 ${FPPHOME}/media
-chmod a+s ${FPPHOME}/media
-touch ${FPPHOME}/media/.auto_update_disabled
-chmod 644 ${FPPHOME}/media/.auto_update_disabled
+chmod 775 ${FPPHOME}/media
 
 cat > ${FPPHOME}/.vimrc <<-EOF
 set tabstop=4
 set shiftwidth=4
+set expandtab
 set autoindent
 set ignorecase
 set mouse=r
@@ -825,6 +842,9 @@ echo >> ${FPPHOME}/.bashrc
 echo ". /opt/fpp/scripts/common" >> ${FPPHOME}/.bashrc
 echo >> ${FPPHOME}/.bashrc
 
+mkdir ${FPPHOME}/media/logs
+chown fpp.fpp ${FPPHOME}/media/logs
+
 #######################################
 # Configure log rotation
 echo "FPP - Configuring log rotation"
@@ -835,14 +855,18 @@ sed -i -e "s/rotate .*/rotate 2/" /etc/logrotate.conf
 #######################################
 # Configure ccache
 echo "FPP - Configuring ccache"
-ccache -M 50M
+ccache -M 250M
+ccache --set-config=temporary_dir=/tmp
+ccache --set-config=sloppiness=pch_defines,time_macros
 
-#######################################
-echo "FPP - Configuring FTP server"
-sed -i -e "s/.*anonymous_enable.*/anonymous_enable=NO/" /etc/vsftpd.conf
-sed -i -e "s/.*local_enable.*/local_enable=YES/" /etc/vsftpd.conf
-sed -i -e "s/.*write_enable.*/write_enable=YES/" /etc/vsftpd.conf
-service vsftpd restart
+if $isimage; then
+    #######################################
+    echo "FPP - Configuring FTP server"
+    sed -i -e "s/.*anonymous_enable.*/anonymous_enable=NO/" /etc/vsftpd.conf
+    sed -i -e "s/.*local_enable.*/local_enable=YES/" /etc/vsftpd.conf
+    sed -i -e "s/.*write_enable.*/write_enable=YES/" /etc/vsftpd.conf
+    service vsftpd restart
+fi
 
 #######################################
 echo "FPP - Configuring Samba"
@@ -851,6 +875,8 @@ cat <<-EOF >> /etc/samba/smb.conf
 [FPP]
   comment = FPP Media Share
   path = ${FPPHOME}/media
+  veto files = /._*/.DS_Store/
+  delete veto files = yes
   writeable = Yes
   only guest = Yes
   create mask = 0777
@@ -860,17 +886,26 @@ cat <<-EOF >> /etc/samba/smb.conf
   force user = ${FPPUSER}
 
 EOF
+
 case "${OSVER}" in
-	debian_9)
+	debian_9 |  debian_10 | ubuntu_20.04)
 		systemctl restart smbd.service
 		systemctl restart nmbd.service
 		;;
 esac
 
+
 #######################################
-# Setup mail
-echo "FPP - Updating exim4 config file"
-cat <<-EOF > /etc/exim4/update-exim4.conf.conf
+# Fix sudoers to not require password
+echo "FPP - Giving ${FPPUSER} user sudo"
+echo "${FPPUSER} ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+
+if $isimage; then
+    #######################################
+    # Setup mail
+    echo "FPP - Updating exim4 config file"
+    cat <<-EOF > /etc/exim4/update-exim4.conf.conf
 # /etc/exim4/update-exim4.conf.conf
 #
 # Edit this file and /etc/mailname by hand and execute update-exim4.conf
@@ -903,20 +938,15 @@ dc_mailname_in_oh='true'
 dc_localdelivery='mail_spool'
 EOF
 
-# remove exim4 panic log so exim4 doesn't throw an alert about a non-zero log
-# file due to some odd error thrown during inital setup
-rm /var/log/exim4/paniclog
-#update config and restart exim
-update-exim4.conf
+    # remove exim4 panic log so exim4 doesn't throw an alert about a non-zero log
+    # file due to some odd error thrown during inital setup
+    rm /var/log/exim4/paniclog
+    #update config and restart exim
+    update-exim4.conf
 
-#######################################
-# Fix sudoers to not require password
-echo "FPP - Giving ${FPPUSER} user sudo"
-echo "${FPPUSER} ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
-
-#######################################
-# Print notice during login regarding console access
-cat <<-EOF >> /etc/motd
+    #######################################
+    # Print notice during login regarding console access
+    cat <<-EOF >> /etc/motd
 [0;31m
                    _______  ___
                   / __/ _ \\/ _ \\
@@ -927,37 +957,33 @@ This FPP console is for advanced users, debugging, and developers.  If
 you aren't one of those, you're probably looking for the web-based GUI.
 
 You can access the UI by typing "http://fpp.local/" into a web browser.[0m
-	EOF
+EOF
 
-#######################################
-# Config fstab to mount some filesystems as tmpfs
-echo "FPP - Configuring tmpfs filesystems"
-echo "#####################################" >> /etc/fstab
-#echo "tmpfs         /var/log    tmpfs   nodev,nosuid,size=10M 0 0" >> /etc/fstab
-echo "tmpfs         /tmp        tmpfs   nodev,nosuid,size=10M 0 0" >> /etc/fstab
-echo "tmpfs         /var/tmp    tmpfs   nodev,nosuid,size=50M 0 0" >> /etc/fstab
-echo "#####################################" >> /etc/fstab
+    #######################################
+    # Config fstab to mount some filesystems as tmpfs
+    echo "FPP - Configuring tmpfs filesystems"
+    echo "#####################################" >> /etc/fstab
+    echo "tmpfs         /tmp        tmpfs   nodev,nosuid,size=50M 0 0" >> /etc/fstab
+    echo "tmpfs         /var/tmp    tmpfs   nodev,nosuid,size=50M 0 0" >> /etc/fstab
+    echo "#####################################" >> /etc/fstab
 
-COMMENTED=""
-SDA1=$(lsblk -l | grep sda1 | awk '{print $7}')
-if [ -n ${SDA1} ]
-then
-	COMMENTED="#"
+    COMMENTED=""
+    SDA1=$(lsblk -l | grep sda1 | awk '{print $7}')
+    if [ -n ${SDA1} ]
+    then
+        COMMENTED="#"
+    fi
+    echo "${COMMENTED}/dev/sda1     ${FPPHOME}/media  auto    defaults,nonempty,noatime,nodiratime,exec,nofail,flush,uid=500,gid=500  0  0" >> /etc/fstab
+    echo "#####################################" >> /etc/fstab
+
+    #######################################
+    #  Prefer IPv4
+    echo "FPP - Prefer IPv4"
+    echo "precedence ::ffff:0:0/96  100" >>  /etc/gai.conf
+
+    # need to keep extra memory to process network packets
+    echo "vm.min_free_kbytes=16384" >> /etc/sysctl.conf
 fi
-echo "${COMMENTED}/dev/sda1     ${FPPHOME}/media  auto    defaults,nonempty,noatime,nodiratime,exec,nofail,flush,uid=500,gid=500  0  0" >> /etc/fstab
-echo "#####################################" >> /etc/fstab
-
-#######################################
-# Disable IPv6
-echo "FPP - Disabling IPv6"
-cat <<-EOF >> /etc/sysctl.conf
-
-	# FPP - Disable IPv6
-	net.ipv6.conf.all.disable_ipv6 = 1
-	net.ipv6.conf.default.disable_ipv6 = 1
-	net.ipv6.conf.lo.disable_ipv6 = 1
-	net.ipv6.conf.eth0.disable_ipv6 = 1
-	EOF
 
 #######################################
 echo "FPP - Configuring Apache webserver"
@@ -966,63 +992,110 @@ echo "FPP - Configuring Apache webserver"
 sed -i -e "s/APACHE_RUN_USER=.*/APACHE_RUN_USER=${FPPUSER}/" /etc/apache2/envvars
 sed -i -e "s/APACHE_RUN_GROUP=.*/APACHE_RUN_GROUP=${FPPUSER}/" /etc/apache2/envvars
 sed -i -e "s#APACHE_LOG_DIR=.*#APACHE_LOG_DIR=${FPPHOME}/media/logs#" /etc/apache2/envvars
+sed -i -e "s/Listen 8080.*/Listen 80/" /etc/apache2/ports.conf
 
 sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" < ${FPPDIR}/etc/apache2.site > /etc/apache2/sites-enabled/000-default.conf
 
-sed -i \
-	-e "s/short_open_tag =.*/short_open_tag = On/" \
-	-e "s/max_execution_time =.*/max_execution_time = 300/" \
-	-e "s/max_input_time =.*/max_input_time = 300/" \
-	-e "s/max_input_vars =.*/max_input_vars = 5000/" \
-	-e "s/default_socket_timeout =.*/default_socket_timeout = 300/" \
-	-e "s/post_max_size =.*/post_max_size = 4G/" \
-	-e "s/upload_max_filesize =.*/upload_max_filesize = 4G/" \
-	-e "s#;upload_tmp_dir =.*#upload_tmp_dir = ${FPPHOME}/media/upload#" \
-	${PHPDIR}/apache2/php.ini
+# Enable Apache modules
+a2enmod cgi
+a2enmod rewrite
+a2enmod proxy
+a2enmod proxy_http
+a2enmod proxy_html
+a2enmod headers
+
 
 # Fix name of Apache default error log so it gets rotated by our logrotate config
 sed -i -e "s/error\.log/apache2-base-error.log/" /etc/apache2/apache2.conf
-
-# Disable private /tmp directory
-sed -i -e "s/PrivateTmp=true/PrivateTmp=false/" /lib/systemd/system/apache2.service
 
 # Disable default access logs
 rm /etc/apache2/conf-enabled/other-vhosts-access-log.conf
 
 case "${OSVER}" in
-	debian_9)
+	debian_9 |  debian_10 | ununtu_20.04)
 		systemctl enable apache2.service
 		;;
 esac
-#######################################
-echo "FPP - Configuring (but disabling) nginx webserver"
 
-# Disable default site
-rm /etc/nginx/sites-enabled/default
-# Set user to ${FPPUSER}
-sed -i -e "s/^\s*\#\?\s*user\(\s*\)[^;]*/user\1${FPPUSER}/" /etc/nginx/nginx.conf
-# Install the fpp site
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" < ${FPPDIR}/etc/nginx.conf > /etc/nginx/sites-enabled/fpp_nginx.conf
 
-case "${OSVER}" in
-	debian_9)
-		systemctl disable php7.0-fpm.service
-		systemctl disable nginx.service
-		;;
-esac
+if [ "x${FPPPLATFORM}" = "xBeagleBone Black" ]; then
+    #######################################
+    echo "FPP - Updating HotSpot"
+    sed -i -e "s/USE_PERSONAL_SSID=.*/USE_PERSONAL_SSID=FPP/" /etc/default/bb-wl18xx
+    sed -i -e "s/USE_PERSONAL_PASSWORD=.*/USE_PERSONAL_PASSWORD=Christmas/" /etc/default/bb-wl18xx
+    
+    systemctl disable dev-hugepages.mount
+
+    echo "FPP - update BBB boot scripts for faster boot, don't force getty"
+    cd /opt/scripts
+    git reset --hard
+    git pull
+    sed -i 's/systemctl restart serial-getty/systemctl is-enabled serial-getty/g' boot/am335x_evm.sh
+    git commit -a -m "delay getty start" --author='fpp<fpp>'
+    
+    if [ ! -f "/opt/source/bb.org-overlays/Makefile" ]; then
+        mkdir -p /opt/source
+        cd /opt/source
+        git clone https://github.com/beagleboard/bb.org-overlays
+    fi
+    
+    cd /opt/fpp/capes/drivers/bbb
+    make
+    make install
+    make clean
+    
+    # install the newer pru code generator
+    apt-get install ti-pru-cgt-installer
+    
+    #set the preferred tech
+    sed -i -e "s/PreferredTechnologies\(.*\)/PreferredTechnologies=wifi,ethernet/" /etc/connman/main.conf
+
+    #Set colored prompt
+    sed -i -e "s/#force_color_prompt=yes/force_color_prompt=yes/" /home/fpp/.bashrc
+    
+    #adjust a bunch of settings in /boot/uEnv.txt
+    sed -i -e "s+^#disable_uboot_overlay_video=\(.*\)+disable_uboot_overlay_video=1+g"  /boot/uEnv.txt
+    sed -i -e "s+#uboot_overlay_addr0=\(.*\)+uboot_overlay_addr0=/lib/firmware/bbb-fpp-reserve-memory.dtbo+g"  /boot/uEnv.txt
+    sed -i -e "s+#uboot_overlay_addr4=\(.*\)+uboot_overlay_addr4=/lib/firmware/AM335X-I2C2-400-00A0.dtbo+g"  /boot/uEnv.txt
+    sed -i -e "s+#uboot_overlay_addr5=\(.*\)+uboot_overlay_addr5=/lib/firmware/AM335X-I2C1-400-00A0.dtbo+g"  /boot/uEnv.txt
+    sed -i -e "s+ quiet+ quiet rootwait+g"  /boot/uEnv.txt
+    sed -i -e "s+^uboot_overlay_pru=+#uboot_overlay_pru=+g"  /boot/uEnv.txt
+    sed -i -e "s+#uboot_overlay_pru=/lib/firmware/AM335X-PRU-RPROC-4-19-TI-00A0.dtbo+uboot_overlay_pru=/lib/firmware/AM335X-PRU-RPROC-4-19-TI-00A0.dtbo+g" /boot/uEnv.txt
+    echo "bootdelay=0" >> /boot/uEnv.txt
+    echo "#cmdline=init=/opt/fpp/SD/BBB-AutoFlash.sh" >> /boot/uEnv.txt
+fi
+
+if $isimage; then
+    rm -rf /usr/share/doc/*
+    apt-get clean
+fi
+
 
 #######################################
 echo "FPP - Configuring FPP startup"
-cp /opt/fpp/etc/systemd/fppinit.service /lib/systemd/system/
-systemctl enable fppinit.service
-cp /opt/fpp/etc/systemd/fppd.service /lib/systemd/system/
-systemctl enable fppd.service
+cp /opt/fpp/etc/systemd/*.service /lib/systemd/system/
+if [ "$FPPPLATFORM" == "BeagleBone Black" ]; then
+    # Beagles don't have hdmi/video out so no need to wait for getty before starting up
+    sed -i -e "s/getty.target//g" /lib/systemd/system/fppd.service
+fi
 
+systemctl disable mosquitto
+systemctl daemon-reload
+systemctl enable fppinit.service
+systemctl enable fppcapedetect.service
+systemctl enable fpprtc.service
+systemctl enable fppoled.service
+systemctl enable fppd.service
+systemctl enable fpp_postnetwork.service
 systemctl enable rsync
 
-echo "FPP - Disabling services not needed/used"
-systemctl disable olad
-systemctl disable connman-wait-online
+if $isimage; then
+    cp /opt/fpp/etc/update-RTC /etc/cron.daily
+    
+    echo "FPP - Disabling services not needed/used"
+    systemctl disable connman-wait-online
+fi
+
 
 echo "FPP - Compiling binaries"
 cd /opt/fpp/src/
@@ -1030,10 +1103,39 @@ make clean ; make optimized
 
 
 ######################################
-if [ "x${FPPPLATFORM}" = "xRaspberry Pi" ]; then
+if [ "$FPPPLATFORM" == "Raspberry Pi" -o "$FPPPLATFORM" == "BeagleBone Black" ]; then
     echo "FPP - Compiling WIFI drivers"
     cd /opt/fpp/SD
-    ./FPP-Wifi-Drivers.sh
+    bash ./FPP-Wifi-Drivers.sh
+    rm -f /etc/modprobe.d/rtl8723bu-blacklist.conf
+    
+    sed -i 's/ExecStart.*/ExecStart=\/usr\/sbin\/connmand -n --nodnsproxy/g' /lib/systemd/system/connman.service
+
+    # replace entry already there
+    sed -i 's/^DAEMON_CONF.*/DAEMON_CONF="\/etc\/hostapd\/hostapd.conf"/g' /etc/default/hostapd
+    if ! grep -q etc/hostapd/hostapd.conf "/etc/default/hostapd"; then
+        # not there, append after the commented out default line
+        sed -i 's/^#DAEMON_CONF\(.*\)/#DAEMON_CONF\1\nDAEMON_CONF="\/etc\/hostapd\/hostapd.conf"/g' /etc/default/hostapd
+    fi
+    if ! grep -q etc/hostapd/hostapd.conf "/etc/default/hostapd"; then
+        # default line not there, just append to end of file
+        echo "DAEMON_CONF=\"/etc/hostapd/hostapd.conf\"" >> /etc/default/hostapd
+    fi
+
+    sed -i 's/^NetworkInterfaceBlacklist.*/NetworkInterfaceBlacklist=SoftAp0,usb0,usb1/g' /etc/connman/main.conf
+    if ! grep -q "^NetworkInterfaceBlacklist" "/etc/connman/main.conf"; then
+        echo "NetworkInterfaceBlacklist=SoftAp0,usb0,usb1" >> /etc/connman/main.conf
+    fi
+    
+    if $isimage; then
+
+        systemctl enable dnsmasq
+        systemctl unmask hostapd
+    
+        cd /etc
+        rm resolv.conf
+        ln -s /var/run/connman/resolv.conf .
+    fi
 fi
 
 ENDTIME=$(date)
@@ -1046,19 +1148,19 @@ echo "========================================================="
 echo "You can reboot the system by changing to the '${FPPUSER} user with the"
 echo "password 'falcon' and running the shutdown command."
 echo ""
-echo "su - ${FPPUSER}
+echo "su - ${FPPUSER}"
 echo "sudo shutdown -r now"
 echo ""
 echo "NOTE: If you are prepping this as an image for release,"
 echo "remove the SSH keys before shutting down so they will be"
 echo "rebuilt during the next boot."
 echo ""
-echo "su - ${FPPUSER}
+echo "su - ${FPPUSER}"
 echo "sudo rm -rf /etc/ssh/ssh_host*key*"
 echo "sudo shutdown -r now"
 echo "========================================================="
 echo ""
 
-cp /home/pi/FPP_Install.* ${FPPHOME}/
+cp /root/FPP_Install.* ${FPPHOME}/
 chown fpp.fpp ${FPPHOME}/FPP_Install.*
 

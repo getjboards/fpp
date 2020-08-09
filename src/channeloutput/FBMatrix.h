@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   FrameBuffer Virtual matrix handler for Falcon Player (FPP)
  *
@@ -23,26 +24,25 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _FBMATRIX_H
-#define _FBMATRIX_H
-
 #include <linux/fb.h>
 #include <string>
 
-#include "ThreadedChannelOutputBase.h"
+#include "ChannelOutputBase.h"
 
-class FBMatrixOutput : public ThreadedChannelOutputBase {
+class FBMatrixOutput : public ChannelOutputBase {
   public:
 	FBMatrixOutput(unsigned int startChannel, unsigned int channelCount);
-	~FBMatrixOutput();
+	virtual ~FBMatrixOutput();
 
-	int Init(char *configStr);
-	int Close(void);
+    virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+    virtual int SendData(unsigned char *channelData) override;
+    virtual void PrepData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
-	virtual void GetRequiredChannelRange(int &min, int & max);
+	virtual void DumpConfig(void) override;
+
+    virtual void  GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	int     m_fbFd;
@@ -55,16 +55,18 @@ class FBMatrixOutput : public ThreadedChannelOutputBase {
 	int          m_inverted;
 	int          m_bpp;
 	std::string  m_device;
+    
+    bool         m_isDoubleBuffered;
+    bool         m_topFrame;
 
 	char   *m_fbp;
+    char   *m_frame;
 	int     m_screenSize;
+    int     m_lineLength;
 
-	unsigned char *m_lastFrame;
 	uint16_t ***m_rgb565map;
 
 	struct fb_var_screeninfo m_vInfo;
 	struct fb_var_screeninfo m_vInfoOrig;
 	struct fb_fix_screeninfo m_fInfo;
 };
-
-#endif /* _FBMATRIX_H */

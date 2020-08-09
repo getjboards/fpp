@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Remap Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYREMAP_H
-#define _PLAYLISTENTRYREMAP_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -35,15 +33,15 @@ class RemapOutputProcessor;
 class PlaylistEntryRemap : public PlaylistEntryBase {
   public:
 	PlaylistEntryRemap(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryRemap();
+	virtual ~PlaylistEntryRemap();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
+	virtual int  StartPlaying(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
 
   private:
 	std::string m_action;
@@ -53,7 +51,4 @@ class PlaylistEntryRemap : public PlaylistEntryBase {
 	int m_channelCount;
 	int m_loops;
 	int m_reverse;
-    RemapOutputProcessor *m_processor;
 };
-
-#endif

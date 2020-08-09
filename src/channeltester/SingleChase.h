@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Channel Test Pattern Single Chase class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _SINGLECHASE_H
-#define _SINGLECHASE_H
-
 #include <string>
 #include <vector>
 
@@ -36,18 +34,16 @@
 class TestPatternSingleChase : public TestPatternBase {
   public:
     TestPatternSingleChase();
-	~TestPatternSingleChase();
+	virtual ~TestPatternSingleChase();
 
-	int  Init(Json::Value config);
+	virtual int Init(Json::Value config) override;
 
-	int  SetupTest(void);
-	void DumpConfig(void);
+	virtual int SetupTest(void) override;
+	virtual void DumpConfig(void) override;
 
   private:
-	void CycleData(void);
+	void CycleData(void) override;
 
 	int  m_chaseSize;
 	char m_chaseValue;
 };
-
-#endif /* _SINGLECHASE_H */

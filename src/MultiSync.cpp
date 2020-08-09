@@ -23,52 +23,112 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
 #include <sys/types.h>
-#include <unistd.h>
 #include <linux/version.h>
-
+#include <math.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <ifaddrs.h>
 
+#include <curl/curl.h>
 
+#include "MultiSync.h"
 
-#include <string>
-#include <vector>
-#include <set>
-
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/predicate.hpp>
-#include <boost/algorithm/string/replace.hpp>
-#include <boost/tokenizer.hpp>
-#include <jsoncpp/json/json.h>
-
-#include "channeloutputthread.h"
 #include "command.h"
-#include "common.h"
 #include "events.h"
 #include "falcon.h"
 #include "fppversion.h"
-#include "log.h"
-#include "mediaoutput.h"
-#include "MultiSync.h"
 #include "Plugins.h"
-#include "Sequence.h"
-#include "settings.h"
+
+#include "mediaoutput/mediaoutput.h"
 #include "channeloutput/channeloutput.h"
+#include "channeloutput/channeloutputthread.h"
+#include "playlist/Playlist.h"
+#include "commands/Commands.h"
+#include "NetworkController.h"
+#include "NetworkMonitor.h"
 
 
-MultiSync *multiSync;
+MultiSync MultiSync::INSTANCE;
+MultiSync *multiSync = &MultiSync::INSTANCE;
 
 static const char * MULTISYNC_MULTICAST_ADDRESS = "239.70.80.80"; // 239.F.P.P
+static uint32_t MULTISYNC_MULTICAST_ADD = inet_addr(MULTISYNC_MULTICAST_ADDRESS);
+
+NetInterfaceInfo::NetInterfaceInfo() : address(0), broadcastAddress(0), multicastSocket(-1) {
+}
+NetInterfaceInfo::~NetInterfaceInfo() {
+    if (multicastSocket != -1) {
+        LogDebug(VB_SYNC, "Closing multicast socket for %s\n", interfaceName.c_str());
+        close(multicastSocket);
+    }
+}
+
+
+void MultiSyncSystem::update(MultiSyncSystemType type,
+                             unsigned int majorVersion, unsigned int minorVersion,
+                             FPPMode fppMode,
+                             const std::string &address,
+                             const std::string &hostname,
+                             const std::string &version,
+                             const std::string &model,
+                             const std::string &ranges,
+                             const bool multiSync) {
+    // If this record is from info learned via the MultiSync protocol,
+    // don't allow it to be overwritten by data discovered elsewhere
+    if (this->multiSync && !multiSync)
+        return;
+
+    this->type         = type;
+    this->majorVersion = majorVersion;
+    this->minorVersion = minorVersion;
+    this->address      = address;
+    this->hostname     = hostname;
+    this->fppMode      = fppMode;
+    this->version      = version;
+    this->model        = model;
+    this->ranges       = ranges;
+    std::vector<std::string> parts = split(address, '.');
+    this->ipa = atoi(parts[0].c_str());
+    this->ipb = atoi(parts[1].c_str());
+    this->ipc = atoi(parts[2].c_str());
+    this->ipd = atoi(parts[3].c_str());
+
+    if (!this->multiSync && multiSync)
+        this->multiSync = true;
+}
+
+Json::Value MultiSyncSystem::toJSON(bool local, bool timestamps) {
+    Json::Value system;
+
+    system["type"] = MultiSync::GetTypeString(type, local);
+    system["typeId"] = (int)type;
+    if (timestamps) {
+        system["lastSeen"]     = (Json::UInt64)lastSeen;
+        system["lastSeenStr"]  = lastSeenStr;
+    }
+    system["majorVersion"] = majorVersion;
+    system["minorVersion"] = minorVersion;
+    system["fppMode"]      = fppMode;
+    
+    char *s = modeToString(fppMode);
+    system["fppModeString"] = s;
+    free(s);
+    
+    system["address"]      = address;
+    system["hostname"]     = hostname;
+    system["version"]      = version;
+    system["model"]        = model;
+    system["channelRanges"] = ranges;
+
+    system["multiSyncCapable"] = multiSync ? 1 : 0;
+
+    return system;
+}
+
 
 /*
  *
@@ -76,16 +136,17 @@ static const char * MULTISYNC_MULTICAST_ADDRESS = "239.70.80.80"; // 239.F.P.P
 MultiSync::MultiSync()
   : m_broadcastSock(-1),
 	m_controlSock(-1),
-	m_controlCSVSock(-1),
 	m_receiveSock(-1),
     m_lastMediaHalfSecond(0),
 	m_remoteOffset(0.0),
-    m_numLocalSystems(0),
     m_lastPingTime(0),
-    m_lastCheckTime(0)
+    m_lastCheckTime(0),
+    m_lastFrame(0),
+    m_sendMulticast(false),
+    m_sendBroadcast(false)
 {
-	pthread_mutex_init(&m_systemsLock, NULL);
-	pthread_mutex_init(&m_socketLock, NULL);
+    memset(rcvBuffers, 0, sizeof(rcvBuffers));
+    memset(rcvCmbuf, 0, sizeof(rcvCmbuf));
 }
 
 /*
@@ -94,9 +155,6 @@ MultiSync::MultiSync()
 MultiSync::~MultiSync()
 {
 	ShutdownSync();
-
-	pthread_mutex_destroy(&m_systemsLock);
-	pthread_mutex_destroy(&m_socketLock);
 }
 
 /*
@@ -104,6 +162,7 @@ MultiSync::~MultiSync()
  */
 int MultiSync::Init(void)
 {
+    FillInInterfaces();
 	FillLocalSystemInfo();
 
 	if (!OpenReceiveSocket())
@@ -115,11 +174,23 @@ int MultiSync::Init(void)
 	if (getFPPmode() == MASTER_MODE) {
 		if (!OpenControlSockets())
 			return 0;
-
-		if (!OpenCSVControlSockets())
-			return 0;
 	}
 
+    std::function<void(NetworkMonitor::NetEventType i, int up, const std::string &)> f = [this] (NetworkMonitor::NetEventType i, int up, const std::string &name) {
+        LogDebug(VB_SYNC, "MultiSync::NetworkChanged - Interface: %s   Up: %d   Msg: %d\n", name.c_str(), up, i);
+        if (i == NetworkMonitor::NetEventType::DEL_ADDR && !up) {
+            RemoveInterface(name);
+        } else if (i == NetworkMonitor::NetEventType::NEW_ADDR && up) {
+            bool changed = FillInInterfaces();
+            if (changed) {
+                FillLocalSystemInfo();
+                Ping(0, false);
+            }
+            setupMulticastReceive();
+        }
+    };
+    NetworkMonitor::INSTANCE.registerCallback(f);
+    
 	return 1;
 }
 
@@ -133,53 +204,53 @@ void MultiSync::UpdateSystem(MultiSyncSystemType type,
                              const std::string &hostname,
                              const std::string &version,
                              const std::string &model,
-                             const std::string &ranges
+                             const std::string &ranges,
+                             const bool multiSync
                              )
 {
-	pthread_mutex_lock(&m_systemsLock);
-	int found = -1;
-	for (int i = 0; i < m_systems.size(); i++) {
-		if ((address == m_systems[i].address) &&
-			(hostname == m_systems[i].hostname)) {
-			found = i;
-		}
-	}
+    LogDebug(VB_SYNC, "UpdateSystem(%d, %u, %u, %d, '%s', '%s', '%s', '%s', '%s', %s)\n",
+        (int)type, majorVersion, minorVersion, (int)fppMode,
+        address.c_str(), hostname.c_str(), version.c_str(), model.c_str(),
+        ranges.c_str(), multiSync ? "true" : "false");
 
-	if (found < 0) {
-		MultiSyncSystem newSystem;
-
-		m_systems.push_back(newSystem);
-
-		found = m_systems.size() - 1;
-	}
-
-	char timeStr[32];
-	time_t t = time(NULL);
-	struct tm tm;
-
-	m_systems[found].lastSeen     = (unsigned long)t;
-	m_systems[found].type         = type;
-	m_systems[found].majorVersion = majorVersion;
-	m_systems[found].minorVersion = minorVersion;
-	m_systems[found].address      = address;
-	m_systems[found].hostname     = hostname;
-	m_systems[found].fppMode      = fppMode;
-	m_systems[found].version      = version;
-	m_systems[found].model        = model;
-    m_systems[found].ranges       = ranges;
-	std::vector<std::string> parts = split(address, '.');
-	m_systems[found].ipa = atoi(parts[0].c_str());
-	m_systems[found].ipb = atoi(parts[1].c_str());
-	m_systems[found].ipc = atoi(parts[2].c_str());
-	m_systems[found].ipd = atoi(parts[3].c_str());
-
-	localtime_r(&t, &tm);
-	sprintf(timeStr,"%4d-%.2d-%.2d %.2d:%.2d:%.2d",
-		1900+tm.tm_year, tm.tm_mon+1, tm.tm_mday,
-		tm.tm_hour, tm.tm_min, tm.tm_sec);
-	m_systems[found].lastSeenStr = timeStr;
-
-	pthread_mutex_unlock(&m_systemsLock);
+    char timeStr[32];
+    memset(timeStr, 0, sizeof(timeStr));
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    sprintf(timeStr,"%4d-%.2d-%.2d %.2d:%.2d:%.2d",
+        1900+tm.tm_year, tm.tm_mon+1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec);
+    
+    std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+    bool found = false;
+    for (auto & sys : m_remoteSystems) {
+        if ((address == sys.address) &&
+            ((hostname == sys.hostname) ||
+             (address == sys.hostname) ||
+             (hostname == sys.address))) {
+            found = true;
+            sys.update(type, majorVersion, minorVersion, fppMode, address, hostname, version, model, ranges, multiSync);
+            sys.lastSeenStr = timeStr;
+            sys.lastSeen = t;
+        }
+    }
+    for (auto & sys : m_localSystems) {
+        if ((address == sys.address) &&
+            (hostname == sys.hostname)) {
+            found = true;
+            sys.update(type, majorVersion, minorVersion, fppMode, address, hostname, version, model, ranges, multiSync);
+            sys.lastSeen = t;
+            sys.lastSeenStr = timeStr;
+        }
+    }
+    if (!found) {
+        MultiSyncSystem sys;
+        sys.update(type, majorVersion, minorVersion, fppMode, address, hostname, version, model, ranges, multiSync);
+        sys.lastSeenStr = timeStr;
+        sys.lastSeen = t;
+        m_remoteSystems.push_back(sys);
+    }
 }
 
 /*
@@ -187,42 +258,46 @@ void MultiSync::UpdateSystem(MultiSyncSystemType type,
  */
 MultiSyncSystemType MultiSync::ModelStringToType(std::string model)
 {
-	if (boost::starts_with(model, "Raspberry Pi Model A Rev"))
+	if (startsWith(model, "Raspberry Pi Model A Rev"))
 		return kSysTypeFPPRaspberryPiA;
-	if (boost::starts_with(model, "Raspberry Pi Model B Rev"))
+	if (startsWith(model, "Raspberry Pi Model B Rev"))
 		return kSysTypeFPPRaspberryPiB;
-	if (boost::starts_with(model, "Raspberry Pi Model A Plus"))
+	if (startsWith(model, "Raspberry Pi Model A Plus"))
 		return kSysTypeFPPRaspberryPiAPlus;
-	if (boost::starts_with(model, "Raspberry Pi Model B Plus"))
+	if (startsWith(model, "Raspberry Pi Model B Plus"))
 		return kSysTypeFPPRaspberryPiBPlus;
-	if ((boost::starts_with(model, "Raspberry Pi 2 Model B 1.1")) ||
-		(boost::starts_with(model, "Raspberry Pi 2 Model B 1.0")))
+	if ((startsWith(model, "Raspberry Pi 2 Model B 1.1")) ||
+		(startsWith(model, "Raspberry Pi 2 Model B 1.0")))
 		return kSysTypeFPPRaspberryPi2B;
-	if (boost::starts_with(model, "Raspberry Pi 2 Model B"))
+	if (startsWith(model, "Raspberry Pi 2 Model B"))
 		return kSysTypeFPPRaspberryPi2BNew;
-	if (boost::starts_with(model, "Raspberry Pi 3 Model B Rev"))
+	if (startsWith(model, "Raspberry Pi 3 Model B Rev"))
 		return kSysTypeFPPRaspberryPi3B;
-	if (boost::starts_with(model, "Raspberry Pi 3 Model B Plus"))
+	if (startsWith(model, "Raspberry Pi 3 Model B Plus"))
 		return kSysTypeFPPRaspberryPi3BPlus;
-	if (boost::starts_with(model, "Raspberry Pi Zero Rev"))
+	if (startsWith(model, "Raspberry Pi Zero Rev"))
 		return kSysTypeFPPRaspberryPiZero;
-	if (boost::starts_with(model, "Raspberry Pi Zero W"))
+	if (startsWith(model, "Raspberry Pi Zero W"))
 		return kSysTypeFPPRaspberryPiZeroW;
-    if (boost::starts_with(model, "SanCloud BeagleBone Enhanced"))
+    if (startsWith(model, "Raspberry Pi 3 Model A Plus"))
+        return kSysTypeFPPRaspberryPi3APlus;
+    if (startsWith(model, "Raspberry Pi 4"))
+        return kSysTypeFPPRaspberryPi4;
+    if (startsWith(model, "SanCloud BeagleBone Enhanced"))
         return kSysTypeFPPSanCloudBeagleBoneEnhanced;
-    if (boost::algorithm::contains(model, "BeagleBone Black")) {
-        if (boost::algorithm::contains(model, "Wireless")) {
+    if (contains(model, "BeagleBone Black")) {
+        if (contains(model, "Wireless")) {
             return kSysTypeFPPBeagleBoneBlackWireless;
         }
         return kSysTypeFPPBeagleBoneBlack;
     }
-    if (boost::algorithm::contains(model, "BeagleBone Green")) {
-        if (boost::algorithm::contains(model, "Wireless")) {
+    if (contains(model, "BeagleBone Green")) {
+        if (contains(model, "Wireless")) {
             return kSysTypeFPPBeagleBoneGreenWireless;
         }
         return kSysTypeFPPBeagleBoneGreen;
     }
-	if (boost::algorithm::contains(model, "PocketBeagle"))
+	if (contains(model, "PocketBeagle"))
 		return kSysTypeFPPPocketBeagle;
 	// FIXME, fill in the rest of the types
 
@@ -232,10 +307,8 @@ MultiSyncSystemType MultiSync::ModelStringToType(std::string model)
 /*
  *
  */
-void MultiSync::FillLocalSystemInfo(void)
+bool MultiSync::FillLocalSystemInfo(void)
 {
-	pthread_mutex_lock(&m_systemsLock);
-
 	MultiSyncSystem newSystem;
 
 	std::string model = GetHardwareModel();
@@ -253,8 +326,9 @@ void MultiSync::FillLocalSystemInfo(void)
             if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET) {
                 if (strncmp("usb", tmp->ifa_name, 3) != 0) {
                     //skip the usb* interfaces as we won't support multisync on those
+                    memset(addressBuf, 0, sizeof(addressBuf));
                     GetInterfaceAddress(tmp->ifa_name, addressBuf, NULL, NULL);
-                    if (strcmp(addressBuf, "127.0.0.1")) {
+                    if (isSupportedForMultisync(addressBuf, tmp->ifa_name)) {
                         addresses.push_back(addressBuf);
                     }
                 }
@@ -265,14 +339,18 @@ void MultiSync::FillLocalSystemInfo(void)
         }
         freeifaddrs(interfaces);
     } else {
+        memset(addressBuf, 0, sizeof(addressBuf));
         GetInterfaceAddress(multiSyncInterface.c_str(), addressBuf, NULL, NULL);
         addresses.push_back(addressBuf);
     }
 
-	m_hostname = getSetting("HostName");
+    if (m_hostname == "") {
+        m_hostname = getSetting("HostName");
+    }
 
-	if (m_hostname == "")
+    if (m_hostname == "") {
 		m_hostname = "FPP";
+    }
 
 	newSystem.lastSeen     = (unsigned long)time(NULL);
 	newSystem.type         = type;
@@ -282,24 +360,38 @@ void MultiSync::FillLocalSystemInfo(void)
 	newSystem.fppMode      = getFPPmode();
 	newSystem.version      = getFPPVersion();
 	newSystem.model        = model;
-
+    newSystem.ipa          = 0;
+    newSystem.ipb          = 0;
+    newSystem.ipc          = 0;
+    newSystem.ipd          = 0;
+    
+    LogDebug(VB_SYNC, "Host name: %s\n", newSystem.hostname.c_str());
+    LogDebug(VB_SYNC, "Version: %s\n", newSystem.version.c_str());
+    LogDebug(VB_SYNC, "Model: %s\n", newSystem.model.c_str());
+    
+    bool changed = false;
+    std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+    
     for (auto address : addresses) {
-        if (m_localAddress == "") {
-            m_localAddress = address;
+        bool found = false;
+        for (auto &sys : m_localSystems) {
+            if (sys.address == address) {
+                found = true;
+            }
         }
-        newSystem.address = address;
-        std::vector<std::string> parts = split(newSystem.address, '.');
-        newSystem.ipa = atoi(parts[0].c_str());
-        newSystem.ipb = atoi(parts[1].c_str());
-        newSystem.ipc = atoi(parts[2].c_str());
-        newSystem.ipd = atoi(parts[3].c_str());
-
-        m_systems.push_back(newSystem);
-        m_numLocalSystems++;
+        if (!found) {
+            LogDebug(VB_SYNC, "Adding Local System Address: %s\n", address.c_str());
+            changed = true;
+            newSystem.address = address;
+            std::vector<std::string> parts = split(newSystem.address, '.');
+            newSystem.ipa = atoi(parts[0].c_str());
+            newSystem.ipb = atoi(parts[1].c_str());
+            newSystem.ipc = atoi(parts[2].c_str());
+            newSystem.ipd = atoi(parts[3].c_str());
+            m_localSystems.push_back(newSystem);
+        }
     }
-    LogDebug(VB_SYNC, "m_localAddress = %s\n", m_localAddress.c_str());
-
-	pthread_mutex_unlock(&m_systemsLock);
+    return changed;
 }
 
 /*
@@ -331,8 +423,11 @@ std::string MultiSync::GetHardwareModel(void)
 		result = "Unknown Hardware Platform";
 	}
 
-	if (boost::ends_with(result, "\n"))
-		boost::replace_first(result, "\n", "");
+    if (endsWith(result, "\n")) {
+        replaceAll(result, "\n", "");
+    }
+
+    TrimWhiteSpace(result);
 
 	return result;
 }
@@ -340,8 +435,36 @@ std::string MultiSync::GetHardwareModel(void)
 /*
  *
  */
-std::string MultiSync::GetTypeString(MultiSyncSystemType type)
+std::string MultiSync::GetTypeString(MultiSyncSystemType type, bool local)
 {
+    if (local && type == kSysTypeFPP) {
+        //unknown hardware, but we can figure out the OS version
+        if (FileExists("/etc/os-release")) {
+            std::string file = GetFileContents("/etc/os-release");
+            std::vector<std::string> lines = split(file, '\n');
+            std::map<std::string, std::string> values;
+            for (auto &str : lines) {
+                size_t pos = str.find("=");
+                if (pos != std::string::npos) {
+                    std::string key = str.substr(0, pos);
+                    std::string val = str.substr(pos + 1);
+                    if (val[0] == '"') {
+                        val = val.substr(1, val.length() - 2);
+                    }
+                    TrimWhiteSpace(key);
+                    TrimWhiteSpace(val);
+                    values[key] = val;
+                }
+            }
+            if (values["NAME"] != "") {
+                return "FPP (" + values["NAME"] + ")";
+            }
+            if (values["PRETTY_NAME"] != "") {
+                return "FPP (" + values["PRETTY_NAME"] + ")";
+            }
+        }
+        return "FPP (unknown hardware)";
+    }
 	switch (type) {
 		case kSysTypeUnknown:                 return "Unknown System Type";
 		case kSysTypeFPP:                     return "FPP (unknown hardware)";
@@ -355,10 +478,16 @@ std::string MultiSync::GetTypeString(MultiSyncSystemType type)
 		case kSysTypeFPPRaspberryPi3BPlus:    return "Raspberry Pi 3 B+";
 		case kSysTypeFPPRaspberryPiZero:      return "Raspberry Pi Zero";
 		case kSysTypeFPPRaspberryPiZeroW:     return "Raspberry Pi Zero W";
+        case kSysTypeFPPRaspberryPi3APlus:    return "Raspberry Pi 3 A+";
+        case kSysTypeFPPRaspberryPi4:         return "Raspberry Pi 4";
 		case kSysTypeFalconController:        return "Falcon Controller";
         case kSysTypeFalconF16v2:             return "Falcon F16v2";
+        case kSysTypeFalconF4v2_64Mb:         return "Falcon F4v2_64Mb";
+        case kSysTypeFalconF16v2R:            return "Falcon F16v2R";
+        case kSysTypeFalconF4v2:              return "Falcon F4v2";
+        case kSysTypeFalconF4v3:              return "Falcon F4v3";
         case kSysTypeFalconF16v3:             return "Falcon F16v3";
-        case kSysTypeFalconF48v1:             return "Falcon F48v1";
+        case kSysTypeFalconF48:               return "Falcon F48";
 		case kSysTypeOtherSystem:             return "Other Unknown System";
         case kSysTypeFPPBeagleBoneBlack:      return "BeagleBone Black";
         case kSysTypeFPPBeagleBoneBlackWireless: return "BeagleBone Black Wireless";
@@ -369,77 +498,279 @@ std::string MultiSync::GetTypeString(MultiSyncSystemType type)
             
         case kSysTypexSchedule:               return "xSchedule";
         case kSysTypeESPixelStick:            return "ESPixelStick";
+        case kSysTypeSanDevices:              return "SanDevices";
 		default:                              return "Unknown System Type";
 	}
 }
 
-/*
- *
- */
-Json::Value MultiSync::GetSystems(bool localOnly, bool timestamps)
-{
-	Json::Value result;
-	Json::Value systems(Json::arrayValue);
 
-	pthread_mutex_lock(&m_systemsLock);
-
-    int max = localOnly ? m_numLocalSystems : m_systems.size();
-    
-    const std::vector<std::pair<uint32_t, uint32_t>> &ranges = GetOutputRanges();
+static std::string createRanges(std::vector<std::pair<uint32_t, uint32_t>> ranges, int limit) {
     bool first = true;
-    std::string range;
+    std::string range("");
+    char buf[64];
+    memset(buf, 0, sizeof(buf));
     for (auto &a : ranges) {
         if (!first) {
             range += ",";
         }
-        char buf[64];
         sprintf(buf, "%d-%d", a.first, (a.first + a.second - 1));
         range += buf;
         first = false;
     }
+    while (range.size() > limit) {
+        //range won't fit within the space in the Ping packet, we need to shrink the range
+        // we'll find the smallest gap and combine into a larger range
+        int minGap = 9999999;
+        int minIdx = -1;
+        int last = ranges[0].first + ranges[1].second - 1;
+        for (int x = 1; x < ranges.size(); x++) {
+            int gap = ranges[x].first - last;
+            if (gap < minGap) {
+                minIdx = x;
+                minGap = gap;
+            }
+            last = ranges[x].first + ranges[x].second - 1;
+        }
+        if (minIdx) {
+            int newLast = ranges[minIdx].first + ranges[minIdx].second;
+            ranges[minIdx - 1].second = newLast - ranges[minIdx - 1].first;
+            ranges.erase(ranges.begin() + minIdx);
+        }
+        range = createRanges(ranges, 999999);
+    }
+    return range;
+}
 
+Json::Value MultiSync::GetSystems(bool localOnly, bool timestamps)
+{
+	Json::Value result;
+	Json::Value systems(Json::arrayValue);
     
-	for (int i = 0; i < max; i++) {
-		Json::Value system;
+    
+    const std::vector<std::pair<uint32_t, uint32_t>> &ranges = GetOutputRanges();
+    std::string range = createRanges(ranges, 999999);
 
-		system["type"]         = GetTypeString(m_systems[i].type);
-        if (timestamps) {
-            system["lastSeen"]     = (Json::UInt64)m_systems[i].lastSeen;
-            system["lastSeenStr"]  = m_systems[i].lastSeenStr;
+    std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+    for (auto &sys : m_localSystems) {
+        sys.ranges = range;
+        systems.append(sys.toJSON(true, timestamps));
+    }
+    if (!localOnly) {
+        for (auto &sys : m_remoteSystems) {
+            systems.append(sys.toJSON(false, timestamps));
         }
-		system["majorVersion"] = m_systems[i].majorVersion;
-		system["minorVersion"] = m_systems[i].minorVersion;
-		system["fppMode"]      = m_systems[i].fppMode;
-        
-        char *s = modeToString(m_systems[i].fppMode);
-        system["fppModeString"] = s;
-        free(s);
-        
-		system["address"]      = m_systems[i].address;
-		system["hostname"]     = m_systems[i].hostname;
-		system["version"]      = m_systems[i].version;
-		system["model"]        = m_systems[i].model;
-        if (i < m_numLocalSystems) {
-            m_systems[i].ranges = range;
-        }
-        system["channelRanges"] = m_systems[i].ranges;
-
-		systems.append(system);
-	}
-
-	pthread_mutex_unlock(&m_systemsLock);
-
+    }
 	result["systems"] = systems;
-
 	return result;
+}
+
+void MultiSync::Discover()
+{
+    Ping(1);
+
+    PerformHTTPDiscovery();
+}
+
+void MultiSync::PerformHTTPDiscovery()
+{
+    std::string subnetsStr = getSetting("MultiSyncHTTPSubnets");
+
+    Json::Value outputs = LoadJsonFromFile("/home/fpp/media/config/co-universes.json");
+    if (outputs.isMember("channelOutputs")) {
+        for (int co = 0; co < outputs["channelOutputs"].size(); co++) {
+            if (outputs["channelOutputs"][co].isMember("universes")) {
+                for (int i = 0; i < outputs["channelOutputs"][co]["universes"].size(); i++) {
+                    if (outputs["channelOutputs"][co]["universes"][i].isMember("address")) {
+                        std::string ip = outputs["channelOutputs"][co]["universes"][i]["address"].asString();
+                        if (subnetsStr != "") {
+                            subnetsStr += ",";
+                        }
+                        subnetsStr += ip;
+                    }
+                }
+            }
+        }
+    }
+
+    if (subnetsStr != "") {
+        std::vector<std::string> tokens = split(subnetsStr, ',');
+        std::set<std::string> subnets;
+        for (auto &token : tokens) {
+            TrimWhiteSpace(token);
+            if (token != "") {
+                DiscoverSubnetViaHTTP(token);
+            }
+        }
+    }
+}
+
+static size_t curl_write_data(void *ptr, size_t size, size_t nmemb, void *ourpointer)
+{
+    LogExcess(VB_SYNC, "write_data(%p, %d, %d, %p)\n", ptr, size, nmemb, ourpointer);
+    multiSync->StoreHTTPResponse((std::string*)ourpointer, (uint8_t*)ptr, size * nmemb);
+
+    return size * nmemb;
+}
+
+void MultiSync::StoreHTTPResponse(std::string *ipp, uint8_t *data, int sz)
+{
+    std::string ip = *ipp;
+    std::unique_lock<std::mutex> lock(m_httpResponsesLock);
+
+    int pos = m_httpResponses[ip].size();
+    m_httpResponses[ip].resize(m_httpResponses[ip].size() + sz);
+    memcpy(&m_httpResponses[ip][pos], data, sz);
+}
+
+void MultiSync::DiscoverIPViaHTTP(const std::string &ip, bool allowUnknown)
+{
+    LogDebug(VB_SYNC, "Checking HTTP response from %s\n", ip.c_str());
+
+    std::unique_lock<std::mutex> lock(m_httpResponsesLock);
+    auto search = m_httpResponses.find(ip);
+    if (search == m_httpResponses.end()) {
+        LogErr(VB_SYNC, "Error, no value in m_httpResponses for %s IP\n", ip.c_str());
+        return;
+    }
+    /*
+    // if you need to debug thing, uncomment this.  Any \r in the string
+    // will likely make a printf("%s") not work as each "line" will overwrite itself
+    for (int x = 0; x < search->second.size(); x++) {
+        if (search->second[x] == '\n' || search->second[x] == '\r') {
+            search->second[x] = ' ';
+        }
+    }
+    */
+    std::string data((char *)&search->second[0], search->second.size());
+
+    lock.unlock();
+
+    NetworkController *nc = NetworkController::DetectControllerViaHTML(ip, data);
+
+    if (nc) {
+        UpdateSystem(nc->typeId, nc->majorVersion, nc->minorVersion,
+            nc->systemMode, nc->ip, nc->hostname, nc->version,
+            nc->typeStr, nc->ranges, false);
+        delete nc;
+    } else if (allowUnknown) {
+        UpdateSystem(kSysTypeUnknown, 0, 0, UNKNOWN_MODE, ip, ip, "Unknown", "Unknown", "0-0", false);
+    }
+
+}
+
+void MultiSync::DiscoverSubnetViaHTTP(std::string subnet)
+{
+    LogDebug(VB_SYNC, "Discovering %s subnet via HTTP Discovery\n", subnet.c_str());
+
+    std::vector<std::string> parts = split(subnet, '/');
+    int prefix = 32;
+
+    if (parts.size() == 2)
+        prefix = atoi(parts[1].c_str());
+
+    int ips = (int)(powl(2, 32 - prefix));
+    unsigned long firstIP = htonl(inet_addr(parts[0].c_str()));
+
+    // If prefix is a /31 or /32, we scan all IPs, otherwise skip network
+    // and broadcast
+    if (prefix <= 30) {
+        ips -= 2;
+        firstIP++;
+    }
+
+    std::vector<std::string> ipList;
+    CURL *handles[ips];
+    CURLM *multi_handle;
+    CURLMsg *msg;
+    int still_running = 0;
+    int msgs_left;
+
+    std::string userAgent = "FPP/";
+    userAgent += getFPPVersionTriplet();
+
+    LogExcess(VB_SYNC, "Scanning IPs:\n");
+    struct in_addr ia;
+    char ip[16];
+    char url[24];
+    
+    ipList.resize(ips);
+    for (int i = 0; i < ips; i++) {
+        ia.s_addr = ntohl(firstIP + i);
+        strcpy(ip, inet_ntoa(ia));
+        LogExcess(VB_SYNC, "  %s\n", ip);
+
+        handles[i] = curl_easy_init();
+
+        ipList[i] = ip;
+        m_httpResponses.erase(ipList[i]);
+
+        sprintf(url, "http://%s/", ip);
+        curl_easy_setopt(handles[i], CURLOPT_URL, url);
+        curl_easy_setopt(handles[i], CURLOPT_TIMEOUT, 1L);
+        curl_easy_setopt(handles[i], CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(handles[i], CURLOPT_USERAGENT, userAgent.c_str());
+        curl_easy_setopt(handles[i], CURLOPT_PRIVATE, &ipList[i]);
+        curl_easy_setopt(handles[i], CURLOPT_WRITEFUNCTION, curl_write_data);
+        curl_easy_setopt(handles[i], CURLOPT_WRITEDATA, &ipList[i]);
+        curl_easy_setopt(handles[i], CURLOPT_ACCEPT_ENCODING, "");
+    }
+
+    multi_handle = curl_multi_init();
+
+    for (int i = 0; i < ips; i++) {
+        curl_multi_add_handle(multi_handle, handles[i]);
+    }
+
+    curl_multi_perform(multi_handle, &still_running);
+
+    do {
+        int numfds=0;
+        int res = curl_multi_wait(multi_handle, NULL, 0, 200, &numfds);
+        if(res != CURLM_OK) {
+            LogErr(VB_SYNC, "error: curl_multi_wait() returned %d\n", res);
+            return;
+        }
+        curl_multi_perform(multi_handle, &still_running);
+
+    } while(still_running);
+
+    int respCode = 0;
+    std::string *respIP;
+
+    while((msg = curl_multi_info_read(multi_handle, &msgs_left))) {
+        if(msg->msg == CURLMSG_DONE) {
+            int idx;
+
+            for(idx = 0; idx < ips; idx++) {
+                int found = (msg->easy_handle == handles[idx]);
+                if(found)
+                    break;
+            }
+
+            curl_easy_getinfo(handles[idx], CURLINFO_RESPONSE_CODE, &respCode);
+
+            if (respCode == 200 || (msg->data.result == 0 && respCode == 0)) {
+                curl_easy_getinfo(handles[idx], CURLINFO_PRIVATE, &respIP);
+
+                LogExcess(VB_SYNC, "IP index %d (%s) completed with %d status, code: %d, IP: %s\n", idx, ipList[idx].c_str(), msg->data.result, respCode, respIP->c_str());
+
+                DiscoverIPViaHTTP(*respIP, prefix == 32);
+            }
+        }
+    }
+
+    curl_multi_cleanup(multi_handle);
+
+    for(int i = 0; i < ips; i++)
+        curl_easy_cleanup(handles[i]);
 }
 
 /*
  *
  */
-void MultiSync::Ping(int discover)
+void MultiSync::Ping(int discover, bool broadcast)
 {
-	LogDebug(VB_SYNC, "MultiSync::Ping(%d)\n", discover);
+	LogDebug(VB_SYNC, "MultiSync::Ping(%d, %d)\n", discover, broadcast);
     time_t t = time(NULL);
     m_lastPingTime = (unsigned long)t;
 
@@ -450,27 +781,35 @@ void MultiSync::Ping(int discover)
     
     //update the range for local systems so it's accurate
     const std::vector<std::pair<uint32_t, uint32_t>> &ranges = GetOutputRanges();
-    bool first = true;
-    std::string range;
-    for (auto &a : ranges) {
-        if (!first) {
-            range += ",";
+    std::string range = createRanges(ranges, 120);
+    char outBuf[768];
+    
+    std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+    for (auto & sys : m_localSystems) {
+        memset(outBuf, 0, sizeof(outBuf));
+        sys.ranges = range;
+        int len = CreatePingPacket(sys, outBuf, discover);
+        lock.unlock();
+        if (broadcast) {
+            SendBroadcastPacket(outBuf, len);
+        } else {
+            SendMulticastPacket(outBuf, len);
         }
-        char buf[64];
-        sprintf(buf, "%d-%d", a.first, (a.first + a.second - 1));
-        range += buf;
-        first = false;
+        lock.lock();
     }
-    for (int x = 0; x < m_numLocalSystems; x++) {
-        pthread_mutex_lock(&m_systemsLock);
-        m_systems[x].ranges = range;
-        MultiSyncSystem sysInfo = m_systems[x];
-        pthread_mutex_unlock(&m_systemsLock);
-        
-        char           outBuf[512];
-        bzero(outBuf, sizeof(outBuf));
-        int len = CreatePingPacket(sysInfo, outBuf, discover);
-        SendBroadcastPacket(outBuf, len);
+
+    if (discover) {
+        std::string extraRemotes = getSetting("MultiSyncExtraRemotes");
+        if (extraRemotes != "") {
+            std::vector<std::string> tokens = split(extraRemotes, ',');
+            std::set<std::string> remotes;
+            for (auto &token : tokens) {
+                TrimWhiteSpace(token);
+                if (token != "") {
+                    PingSingleRemote(token.c_str(), 1);
+                }
+            }
+        }
     }
 }
 void MultiSync::PeriodicPing() {
@@ -482,14 +821,14 @@ void MultiSync::PeriodicPing() {
     if (lpt < (unsigned long)t) {
         //once an hour, we'll send a ping letting everyone know we're still here
         //mark ourselves as seen
-        pthread_mutex_lock(&m_systemsLock);
-        for (int x = 0; x < m_numLocalSystems; x++) {
-            m_systems[x].lastSeen = (unsigned long)t;
+        std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+        for (auto &sys : m_localSystems) {
+            sys.lastSeen = (unsigned long)t;
         }
-        pthread_mutex_unlock(&m_systemsLock);
+        lock.unlock();
         Ping();
     }
-    //every 10 minutes we'll loop through real quick and check for instances
+    //every 10 minutes we'll loop through real quick and check for remote instances
     //we haven't heard from in a while
     lpt = m_lastCheckTime + 60*10;
     if (lpt < (unsigned long)t) {
@@ -500,46 +839,94 @@ void MultiSync::PeriodicPing() {
         //have caused at least 4 pings to have been sent.  If it has responded
         //to any of those 4, it's got to be down/gone.   Remove it.
         unsigned long timeoutRemove = (unsigned long)t - 60*120;
-        pthread_mutex_lock(&m_systemsLock);
-        for (auto it = m_systems.begin(); it != m_systems.end(); ) {
+        std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+        for (auto it = m_remoteSystems.begin(); it != m_remoteSystems.end(); ) {
             if (it->lastSeen < timeoutRemove) {
                 LogInfo(VB_SYNC, "Have not seen %s in over 2 hours, removing\n", it->address.c_str());
-                m_systems.erase(it);
+                m_remoteSystems.erase(it);
             } else if (it->lastSeen < timeoutRePing) {
-                //do a ping
-                PingSingleRemote(it - m_systems.begin());
+                if (it->multiSync) {
+                    PingSingleRemote(*it, 1);
+                } else {
+                    PingSingleRemoteViaHTTP(it->address);
+                }
+
                 ++it;
             } else {
                 ++it;
             }
         }
-        pthread_mutex_unlock(&m_systemsLock);
     }
 }
-void MultiSync::PingSingleRemote(int sysIdx) {
+
+void MultiSync::PingSingleRemoteViaHTTP(const std::string &address) {
+    std::string url("http://");
+    std::string resp;
+
+    url += address;
+
+    if (urlHelper("GET", url, resp, 1)) {
+        if (resp != "") {
+            NetworkController *nc = NetworkController::DetectControllerViaHTML(address.c_str(), resp);
+
+            if (nc) {
+                UpdateSystem(nc->typeId, nc->majorVersion, nc->minorVersion,
+                    nc->systemMode, nc->ip, nc->hostname, nc->version,
+                    nc->typeStr, nc->ranges, false);
+                delete nc;
+            } else {
+                UpdateSystem(kSysTypeUnknown, 0, 0, UNKNOWN_MODE, address,
+                    address, "Unknown", "Unknown", "0-0", false);
+            }
+        }
+    }
+}
+
+void MultiSync::PingSingleRemote(const char *address, int discover) {
+    MultiSyncSystem sys;
+
+    sys.address = address;
+
+    PingSingleRemote(sys, discover);
+}
+
+void MultiSync::PingSingleRemote(MultiSyncSystem &sys, int discover) {
+    if (m_localSystems.empty()) {
+        return;
+    }
     char           outBuf[512];
     memset(outBuf, 0, sizeof(outBuf));
-    int len = CreatePingPacket(m_systems[0], outBuf, 1);
+    int len = CreatePingPacket(m_localSystems[0], outBuf, discover);
     struct sockaddr_in dest_addr;
     memset(&dest_addr, 0, sizeof(dest_addr));
     dest_addr.sin_family = AF_INET;
-    dest_addr.sin_addr.s_addr = inet_addr(m_systems[sysIdx].address.c_str());
+    dest_addr.sin_addr.s_addr = inet_addr(sys.address.c_str());
     dest_addr.sin_port   = htons(FPP_CTRL_PORT);
-    pthread_mutex_lock(&m_socketLock);
-    sendto(m_controlSock, outBuf, len, MSG_DONTWAIT, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-    pthread_mutex_unlock(&m_socketLock);
+    std::unique_lock<std::mutex> lock(m_socketLock);
+    if (m_controlSock >= 0) {
+        sendto(m_controlSock, outBuf, len, MSG_DONTWAIT, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+    } else {
+        int pingSock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (pingSock < 0) {
+            LogErr(VB_SYNC, "Error opening Ping socket\n");
+            return;
+        }
+
+        sendto(pingSock, outBuf, len, MSG_DONTWAIT, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+        close(pingSock);
+    }
 }
 int MultiSync::CreatePingPacket(MultiSyncSystem &sysInfo, char* outBuf, int discover) {
     ControlPkt    *cpkt = (ControlPkt*)outBuf;
     InitControlPacket(cpkt);
     
     cpkt->pktType        = CTRL_PKT_PING;
-    cpkt->extraDataLen   = 214; // v2 ping length
+    cpkt->extraDataLen   = 294; // v3 ping length
     
     unsigned char *ed = (unsigned char*)(outBuf + 7);
     memset(ed, 0, cpkt->extraDataLen - 7);
     
-    ed[0]  = 2;                    // ping version 1
+    ed[0]  = 3;                    // ping version 3
     ed[1]  = discover > 0 ? 1 : 0; // 0 = ping, 1 = discover
     ed[2]  = sysInfo.type;
     ed[3]  = (sysInfo.majorVersion & 0xFF00) >> 8;
@@ -555,26 +942,66 @@ int MultiSync::CreatePingPacket(MultiSyncSystem &sysInfo, char* outBuf, int disc
     strncpy((char *)(ed + 12), sysInfo.hostname.c_str(), 65);
     strncpy((char *)(ed + 77), sysInfo.version.c_str(), 41);
     strncpy((char *)(ed + 118), sysInfo.model.c_str(), 41);
-    strncpy((char *)(ed + 159), sysInfo.ranges.c_str(), 41);
-    SendBroadcastPacket(outBuf, sizeof(ControlPkt) + cpkt->extraDataLen);
+    strncpy((char *)(ed + 159), sysInfo.ranges.c_str(), 121);
     return sizeof(ControlPkt) + cpkt->extraDataLen;
 }
 
-/*
- *
- */
-void MultiSync::SendSeqSyncStartPacket(const char *filename)
+void MultiSync::SendSeqOpenPacket(const std::string &filename)
 {
-	LogDebug(VB_SYNC, "SendSeqSyncStartPacket('%s')\n", filename);
+    if (filename.empty()) {
+        return;
+    }
+    
+    if (m_controlSock < 0) {
+        LogErr(VB_SYNC, "ERROR: Tried to send start packet but sync socket is not open.\n");
+        return;
+    }
+    
+    LogDebug(VB_SYNC, "SendSeqOpenPacket('%s')\n", filename.c_str());
+    for (auto a : m_plugins) {
+        a->SendSeqOpenPacket(filename);
+    }
+    m_lastFrame = -1;
+    m_lastFrameSent = -1;
 
-	if (!filename || !filename[0])
-		return;
+    char           outBuf[2048];
+    bzero(outBuf, sizeof(outBuf));
+    
+    ControlPkt    *cpkt = (ControlPkt*)outBuf;
+    SyncPkt *spkt = (SyncPkt*)(outBuf + sizeof(ControlPkt));
+    
+    InitControlPacket(cpkt);
+    
+    cpkt->pktType        = CTRL_PKT_SYNC;
+    cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
+    
+    spkt->pktType  = SYNC_PKT_OPEN;
+    spkt->fileType = SYNC_FILE_SEQ;
+    spkt->frameNumber = 0;
+    spkt->secondsElapsed = 0;
+    strcpy(spkt->filename, filename.c_str());
+    
+    SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
+}
+
+void MultiSync::SendSeqSyncStartPacket(const std::string &filename)
+{
+    if (filename.empty()) {
+        return;
+    }
 
 	if (m_controlSock < 0) {
 		LogErr(VB_SYNC, "ERROR: Tried to send start packet but sync socket is not open.\n");
 		return;
 	}
 
+    LogDebug(VB_SYNC, "SendSeqSyncStartPacket('%s')\n", filename.c_str());
+    for (auto a : m_plugins) {
+        a->SendSeqSyncStartPacket(filename);
+    }
+    m_lastFrame = -1;
+    m_lastFrameSent = -1;
+    
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
 
@@ -584,39 +1011,35 @@ void MultiSync::SendSeqSyncStartPacket(const char *filename)
 	InitControlPacket(cpkt);
 
 	cpkt->pktType        = CTRL_PKT_SYNC;
-	cpkt->extraDataLen   = sizeof(SyncPkt) + strlen(filename);
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
 	
 	spkt->pktType  = SYNC_PKT_START;
 	spkt->fileType = SYNC_FILE_SEQ;
 	spkt->frameNumber = 0;
 	spkt->secondsElapsed = 0;
-	strcpy(spkt->filename, filename);
+	strcpy(spkt->filename, filename.c_str());
 
-	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + strlen(filename));
-
-	if (m_destAddrCSV.size() > 0) {
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d,%d,%d,%s\n",
-			CTRL_PKT_SYNC, SYNC_FILE_SEQ, SYNC_PKT_START, filename);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
 }
 
 /*
  *
  */
-void MultiSync::SendSeqSyncStopPacket(const char *filename)
+void MultiSync::SendSeqSyncStopPacket(const std::string &filename)
 {
-	LogDebug(VB_SYNC, "SendSeqSyncStopPacket(%s)\n", filename);
-
-	if (!filename || !filename[0])
-		return;
-
+    if (filename.empty()) {
+        return;
+    }
 	if (m_controlSock < 0) {
 		LogErr(VB_SYNC, "ERROR: Tried to send stop packet but sync socket is not open.\n");
 		return;
 	}
+    LogDebug(VB_SYNC, "SendSeqSyncStopPacket(%s)\n", filename.c_str());
 
+    for (auto a : m_plugins) {
+        a->SendSeqSyncStopPacket(filename);
+    }
+    
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
 
@@ -626,40 +1049,51 @@ void MultiSync::SendSeqSyncStopPacket(const char *filename)
 	InitControlPacket(cpkt);
 
 	cpkt->pktType        = CTRL_PKT_SYNC;
-	cpkt->extraDataLen   = sizeof(SyncPkt) + strlen(filename);
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
 	
 	spkt->pktType  = SYNC_PKT_STOP;
 	spkt->fileType = SYNC_FILE_SEQ;
 	spkt->frameNumber = 0;
 	spkt->secondsElapsed = 0;
-	strcpy(spkt->filename, filename);
+	strcpy(spkt->filename, filename.c_str());
 
-	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + strlen(filename));
-
-    if (m_destAddrCSV.size() > 0) {
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d,%d,%d,%s\n",
-			CTRL_PKT_SYNC, SYNC_FILE_SEQ, SYNC_PKT_STOP, filename);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
+    
+    m_lastFrame = -1;
+    m_lastFrameSent = -1;
 }
 
 /*
  *
  */
-void MultiSync::SendSeqSyncPacket(const char *filename, int frames, float seconds)
+void MultiSync::SendSeqSyncPacket(const std::string &filename, int frames, float seconds)
 {
-	LogDebug(VB_SYNC, "SendSeqSyncPacket( '%s', %d, %.2f)\n",
-		filename, frames, seconds);
-
-	if (!filename || !filename[0])
-		return;
-
+    if (filename.empty()) {
+        return;
+    }
 	if (m_controlSock < 0) {
 		LogErr(VB_SYNC, "ERROR: Tried to send sync packet but sync socket is not open.\n");
 		return;
 	}
-
+    for (auto a : m_plugins) {
+        a->SendSeqSyncPacket(filename, frames, seconds);
+    }
+    m_lastFrame = frames;
+    int diff = frames - m_lastFrameSent;
+    if (frames > 32) {
+        //after 32 frames, we send every 10
+        // that's either twice a second (50ms sequences) or 4 times (25ms)
+        if (diff < 10) {
+            return;
+        }
+    } else if (frames && diff < 4) {
+        //under 32 frames, we send every 4
+        return;
+    }
+    m_lastFrameSent = frames;
+    
+    LogDebug(VB_SYNC, "SendSeqSyncPacket( '%s', %d, %.2f)\n",
+             filename.c_str(), frames, seconds);
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
 
@@ -669,39 +1103,34 @@ void MultiSync::SendSeqSyncPacket(const char *filename, int frames, float second
 	InitControlPacket(cpkt);
 
 	cpkt->pktType        = CTRL_PKT_SYNC;
-	cpkt->extraDataLen   = sizeof(SyncPkt) + strlen(filename);
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
 	
 	spkt->pktType  = SYNC_PKT_SYNC;
 	spkt->fileType = SYNC_FILE_SEQ;
 	spkt->frameNumber = frames;
 	spkt->secondsElapsed = seconds;
-	strcpy(spkt->filename, filename);
+	strcpy(spkt->filename, filename.c_str());
 
-	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + strlen(filename));
-
-    if (m_destAddrCSV.size() > 0) {
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d,%d,%d,%s,%d,%d\n",
-			CTRL_PKT_SYNC, SYNC_FILE_SEQ, SYNC_PKT_SYNC, filename,
-			(int)seconds, (int)(seconds * 1000) % 1000);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
 }
 
-/*
- *
- */
-void MultiSync::SendMediaSyncStartPacket(const char *filename)
+void MultiSync::SendMediaOpenPacket(const std::string &filename)
 {
-	LogDebug(VB_SYNC, "SendMediaSyncStartPacket('%s')\n", filename);
-    m_lastMediaHalfSecond = 0;
-	if (!filename || !filename[0])
-		return;
+    if (filename.empty()) {
+        return;
+    }
 
 	if (m_controlSock < 0) {
 		LogErr(VB_SYNC, "ERROR: Tried to send start packet but sync socket is not open.\n");
 		return;
 	}
+    LogDebug(VB_SYNC, "SendMediaOpenPacket('%s')\n", filename.c_str());
+    
+    for (auto a : m_plugins) {
+        a->SendMediaOpenPacket(filename);
+    }
+    
+    m_lastMediaHalfSecond = 0;
 
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
@@ -712,41 +1141,71 @@ void MultiSync::SendMediaSyncStartPacket(const char *filename)
 	InitControlPacket(cpkt);
 
 	cpkt->pktType        = CTRL_PKT_SYNC;
-	cpkt->extraDataLen   = sizeof(SyncPkt) + strlen(filename);
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
+
+	spkt->pktType  = SYNC_PKT_OPEN;
+	spkt->fileType = SYNC_FILE_MEDIA;
+	spkt->frameNumber = 0;
+	spkt->secondsElapsed = 0;
+	strcpy(spkt->filename, filename.c_str());
+
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
+}
+void MultiSync::SendMediaSyncStartPacket(const std::string &filename)
+{
+    if (filename.empty()) {
+        return;
+    }
+
+	if (m_controlSock < 0) {
+		LogErr(VB_SYNC, "ERROR: Tried to send start packet but sync socket is not open.\n");
+		return;
+	}
+    LogDebug(VB_SYNC, "SendMediaSyncStartPacket('%s')\n", filename.c_str());
+    
+    for (auto a : m_plugins) {
+        a->SendMediaSyncStartPacket(filename);
+    }
+    
+    m_lastMediaHalfSecond = 0;
+
+	char           outBuf[2048];
+	bzero(outBuf, sizeof(outBuf));
+
+	ControlPkt    *cpkt = (ControlPkt*)outBuf;
+	SyncPkt *spkt = (SyncPkt*)(outBuf + sizeof(ControlPkt));
+
+	InitControlPacket(cpkt);
+
+	cpkt->pktType        = CTRL_PKT_SYNC;
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
 
 	spkt->pktType  = SYNC_PKT_START;
 	spkt->fileType = SYNC_FILE_MEDIA;
 	spkt->frameNumber = 0;
 	spkt->secondsElapsed = 0;
-	strcpy(spkt->filename, filename);
+	strcpy(spkt->filename, filename.c_str());
 
-	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + strlen(filename));
-
-#if 0
-	if (m_destAddrCSV.size() > 0)
-	{
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d,%d,%d,%s\n",
-			CTRL_PKT_SYNC, SYNC_FILE_MEDIA, SYNC_PKT_START, filename);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
-#endif
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
 }
 
 /*
  *
  */
-void MultiSync::SendMediaSyncStopPacket(const char *filename)
+void MultiSync::SendMediaSyncStopPacket(const std::string &filename)
 {
-	LogDebug(VB_SYNC, "SendMediaSyncStopPacket(%s)\n", filename);
-
-	if (!filename || !filename[0])
-		return;
+    if (filename.empty()) {
+        return;
+    }
 
 	if (m_controlSock < 0) {
 		LogErr(VB_SYNC, "ERROR: Tried to send stop packet but sync socket is not open.\n");
 		return;
 	}
+    LogDebug(VB_SYNC, "SendMediaSyncStopPacket(%s)\n", filename.c_str());
+    for (auto a : m_plugins) {
+        a->SendMediaSyncStopPacket(filename);
+    }
 
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
@@ -757,50 +1216,44 @@ void MultiSync::SendMediaSyncStopPacket(const char *filename)
 	InitControlPacket(cpkt);
 
 	cpkt->pktType        = CTRL_PKT_SYNC;
-	cpkt->extraDataLen   = sizeof(SyncPkt) + strlen(filename);
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
 
 	spkt->pktType  = SYNC_PKT_STOP;
 	spkt->fileType = SYNC_FILE_MEDIA;
 	spkt->frameNumber = 0;
 	spkt->secondsElapsed = 0;
-	strcpy(spkt->filename, filename);
+	strcpy(spkt->filename, filename.c_str());
 
-	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + strlen(filename));
-
-#if 0
-	if (m_destAddrCSV.size() > 0)
-	{
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d,%d,%d,%s\n",
-			CTRL_PKT_SYNC, SYNC_FILE_MEDIA, SYNC_PKT_STOP, filename);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
-#endif
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
 }
 
 /*
  *
  */
-void MultiSync::SendMediaSyncPacket(const char *filename, int frames, float seconds)
+void MultiSync::SendMediaSyncPacket(const std::string &filename, float seconds)
 {
+    if (filename.empty()) {
+        return;
+    }
+
+    if (m_controlSock < 0) {
+        LogErr(VB_SYNC, "ERROR: Tried to send sync packet but sync socket is not open.\n");
+        return;
+    }
+
+    for (auto a : m_plugins) {
+        a->SendMediaSyncPacket(filename, seconds);
+    }
+    
     int curTS = (seconds * 2.0f);
     if (m_lastMediaHalfSecond == curTS) {
         //not time to send
         return;
     }
     m_lastMediaHalfSecond = curTS;
-    
-    
-	LogExcess(VB_SYNC, "SendMediaSyncPacket( '%s', %d, %.2f)\n",
-		filename, frames, seconds);
 
-	if (!filename || !filename[0])
-		return;
-
-	if (m_controlSock < 0) {
-		LogErr(VB_SYNC, "ERROR: Tried to send sync packet but sync socket is not open.\n");
-		return;
-	}
+    LogExcess(VB_SYNC, "SendMediaSyncPacket( '%s', %.2f)\n",
+              filename.c_str(), seconds);
 
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
@@ -811,37 +1264,30 @@ void MultiSync::SendMediaSyncPacket(const char *filename, int frames, float seco
 	InitControlPacket(cpkt);
 
 	cpkt->pktType        = CTRL_PKT_SYNC;
-	cpkt->extraDataLen   = sizeof(SyncPkt) + strlen(filename);
+	cpkt->extraDataLen   = sizeof(SyncPkt) + filename.length();
 
 	spkt->pktType  = SYNC_PKT_SYNC;
 	spkt->fileType = SYNC_FILE_MEDIA;
-	spkt->frameNumber = frames;
+	spkt->frameNumber = 0;
 	spkt->secondsElapsed = seconds;
-	strcpy(spkt->filename, filename);
+	strcpy(spkt->filename, filename.c_str());
 
-	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + strlen(filename));
-
-#if 0
-	if (m_destAddrCSV.size() > 0)
-	{
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d,%d,%d,%s,%d,%d\n",
-			CTRL_PKT_SYNC, SYNC_FILE_MEDIA, SYNC_PKT_SYNC, filename,
-			(int)seconds, (int)(seconds * 1000) % 1000);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
-#endif
+	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
 }
 
 /*
  *
  */
-void MultiSync::SendEventPacket(const char *eventID)
+void MultiSync::SendEventPacket(const std::string &eventID)
 {
-	LogDebug(VB_SYNC, "SendEventPacket('%s')\n", eventID);
+    if (eventID.empty()) {
+        return;
+    }
+    for (auto a : m_plugins) {
+        a->SendEventPacket(eventID);
+    }
 
-	if (!eventID || !eventID[0])
-		return;
+	LogDebug(VB_SYNC, "SendEventPacket('%s')\n", eventID.c_str());
 
 	if (m_controlSock < 0) {
 		LogErr(VB_SYNC, "ERROR: Tried to send event packet but control socket is not open.\n");
@@ -859,9 +1305,39 @@ void MultiSync::SendEventPacket(const char *eventID)
 	cpkt->pktType        = CTRL_PKT_EVENT;
 	cpkt->extraDataLen   = sizeof(EventPkt);
 
-	strcpy(epkt->eventID, eventID);
+	strcpy(epkt->eventID, eventID.c_str());
 
 	SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(EventPkt));
+}
+void MultiSync::SendPluginData(const std::string &name, const uint8_t *data, int len) {
+    if (name.empty()) {
+        return;
+    }
+    for (auto a : m_plugins) {
+        a->SendPluginData(name, data, len);
+    }
+    
+    LogDebug(VB_SYNC, "SendPluginData('%s')\n", name.c_str());
+    if (m_controlSock < 0) {
+        LogErr(VB_SYNC, "ERROR: Tried to send event packet but control socket is not open.\n");
+        return;
+    }
+    
+    char           outBuf[2048];
+    bzero(outBuf, sizeof(outBuf));
+    
+    ControlPkt    *cpkt = (ControlPkt*)outBuf;
+    CommandPkt *epkt = (CommandPkt*)(outBuf + sizeof(ControlPkt));
+    
+    InitControlPacket(cpkt);
+    int nlen = strlen(name.c_str()) + 1;  //add the null
+    cpkt->pktType        = CTRL_PKT_PLUGIN;
+    cpkt->extraDataLen   = len + nlen;
+    
+    strcpy(epkt->command, name.c_str());
+    memcpy(&epkt->command[nlen], data, len);
+    
+    SendControlPacket(outBuf, sizeof(ControlPkt) + len + nlen);
 }
 
 /*
@@ -875,7 +1351,9 @@ void MultiSync::SendBlankingDataPacket(void)
 		LogErr(VB_SYNC, "ERROR: Tried to send blanking data packet but control socket is not open.\n");
 		return;
 	}
-
+    for (auto a : m_plugins) {
+        a->SendBlankingDataPacket();
+    }
 	char           outBuf[2048];
 	bzero(outBuf, sizeof(outBuf));
 
@@ -887,12 +1365,6 @@ void MultiSync::SendBlankingDataPacket(void)
 	cpkt->extraDataLen   = 0;
 
 	SendControlPacket(outBuf, sizeof(ControlPkt));
-
-	if (m_controlCSVSock >= 0) {
-		// Now send the Broadcast CSV version
-		sprintf(outBuf, "FPP,%d\n", CTRL_PKT_BLANK);
-		SendCSVControlPacket(outBuf, strlen(outBuf));
-	}
 }
 
 /*
@@ -902,8 +1374,11 @@ void MultiSync::ShutdownSync(void)
 {
 	LogDebug(VB_SYNC, "ShutdownSync()\n");
 
-	pthread_mutex_lock(&m_socketLock);
+    for (auto a : m_plugins) {
+        a->ShutdownSync();
+    }
 
+    std::unique_lock<std::mutex> lock(m_socketLock);
 	if (m_broadcastSock >= 0) {
 		close(m_broadcastSock);
 		m_broadcastSock = -1;
@@ -914,17 +1389,10 @@ void MultiSync::ShutdownSync(void)
 		m_controlSock = -1;
 	}
 
-	if (m_controlCSVSock >= 0) {
-		close(m_controlCSVSock);
-		m_controlCSVSock = -1;
-	}
-
 	if (m_receiveSock >= 0) {
 		close(m_receiveSock);
 		m_receiveSock = -1;
 	}
-
-	pthread_mutex_unlock(&m_socketLock);
 }
 
 /*
@@ -954,39 +1422,19 @@ int MultiSync::OpenBroadcastSocket(void)
 		return 0;
 	}
 
-	memset((void *)&m_broadcastDestAddr, 0, sizeof(struct sockaddr_in));
-
-	m_broadcastDestAddr.sin_family      = AF_INET;
-	m_broadcastDestAddr.sin_port        = htons(FPP_CTRL_PORT);
-	m_broadcastDestAddr.sin_addr.s_addr = inet_addr("255.255.255.255");
-
 	return 1;
 }
 
-/*
- *
- */
-void MultiSync::SendBroadcastPacket(void *outBuf, int len)
-{
-	if ((logLevel == LOG_EXCESSIVE) &&
-		(logMask & VB_SYNC)) {
-		HexDump("Sending Broadcast packet with contents:", outBuf, len);
-	}
-
-	pthread_mutex_lock(&m_socketLock);
-
-	if (sendto(m_broadcastSock, outBuf, len, 0, (struct sockaddr*)&m_broadcastDestAddr, sizeof(struct sockaddr_in)) < 0)
-		LogErr(VB_SYNC, "Error: Unable to send packet: %s\n", strerror(errno));
-
-	pthread_mutex_unlock(&m_socketLock);
-}
 
 /*
  *
  */
-int MultiSync::OpenControlSockets(void)
+int MultiSync::OpenControlSockets()
 {
 	LogDebug(VB_SYNC, "OpenControlSockets()\n");
+    if (m_controlSock >= 0) {
+        return 1;
+    }
 
 	m_controlSock = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -1003,28 +1451,37 @@ int MultiSync::OpenControlSockets(void)
 	}
 
     std::string remotesString = getSetting("MultiSyncRemotes");
-    boost::char_separator<char> sep(", ");
-    boost::tokenizer< boost::char_separator<char> > tokens(remotesString, sep);
-    std::set<std::string> remotes;
-    for (auto &token : tokens) {
-        remotes.insert(token);
+    if (remotesString == "" || getFPPmode() != MASTER_MODE) {
+        remotesString += ",";
+        remotesString += MULTISYNC_MULTICAST_ADDRESS;
     }
 
-    bool needBroadcast = false;
-    if (remotes.find("255.255.255.255") != remotes.end()) {
-        needBroadcast = true;
+    std::vector<std::string> tokens = split(remotesString, ',');
+    std::set<std::string> remotes;
+    for (auto &token : tokens) {
+        TrimWhiteSpace(token);
+        if (token != "") {
+            remotes.insert(token);
+        }
     }
-    if (remotes.find(MULTISYNC_MULTICAST_ADDRESS) != remotes.end()) {
-        needBroadcast = true;
-    }
-	if (needBroadcast) {
-		int broadcast = 1;
-		if (setsockopt(m_controlSock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
-			LogErr(VB_SYNC, "Error setting SO_BROADCAST: \n", strerror(errno));
-			return 0;
-		}
-	}
+
+    if (getSettingInt("MultiSyncBroadcast", 0))
+        m_sendBroadcast = true;
+
+    if (getSettingInt("MultiSyncMulticast", 1))
+        m_sendMulticast = true;
+
     for (auto &s : remotes) {
+        // FIXME, need to remove this code sometime after v4.0.  It is only
+        // left in for now so that old configs still work.
+        if (s == "255.255.255.255") {
+            m_sendBroadcast = true;
+            continue;
+        } else if (s == MULTISYNC_MULTICAST_ADDRESS) {
+            m_sendMulticast = true;
+            continue;
+        }
+        
 		LogDebug(VB_SYNC, "Setting up Remote Sync for %s\n", s.c_str());
 		struct sockaddr_in newRemote;
 
@@ -1064,13 +1521,10 @@ int MultiSync::OpenControlSockets(void)
 
 	LogDebug(VB_SYNC, "%d Remote Sync systems configured\n",
 		m_destAddr.size());
-
+    FillInInterfaces();
 	return 1;
 }
 
-/*
- *
- */
 void MultiSync::SendControlPacket(void *outBuf, int len)
 {
 	if ((logLevel == LOG_EXCESSIVE) &&
@@ -1079,132 +1533,135 @@ void MultiSync::SendControlPacket(void *outBuf, int len)
 		HexDump("Sending Control packet with contents:", outBuf, len);
 	}
 
-    m_destIovec.iov_base = outBuf;
-    m_destIovec.iov_len = len;
 
     int msgCount = m_destMsgs.size();
-    if (msgCount == 0) {
-        return;
-    }
-    
-    pthread_mutex_lock(&m_socketLock);
-    int oc = sendmmsg(m_controlSock, &m_destMsgs[0], msgCount, 0);
-    int outputCount = oc;
-    while (oc > 0 && outputCount != msgCount) {
-        int oc = sendmmsg(m_controlSock, &m_destMsgs[outputCount], msgCount - outputCount, 0);
-        if (oc >= 0) {
-            outputCount += oc;
-        }
-    }
-    if (outputCount != msgCount) {
-        LogErr(VB_SYNC, "Error: Unable to send multisync packet: %s\n", strerror(errno));
-    }
-
-	pthread_mutex_unlock(&m_socketLock);
-}
-
-/*
- *
- */
-int MultiSync::OpenCSVControlSockets(void)
-{
-	LogDebug(VB_SYNC, "OpenCSVControlSockets()\n");
-
-	m_controlCSVSock = socket(AF_INET, SOCK_DGRAM, 0);
-
-	if (m_controlCSVSock < 0) {
-		LogErr(VB_SYNC, "Error opening Master/Remote CSV Sync socket; %s\n",
-			strerror(errno));
-		return 0;
-	}
-
-	char loopch = 0;
-	if(setsockopt(m_controlCSVSock, IPPROTO_IP, IP_MULTICAST_LOOP, (char *)&loopch, sizeof(loopch)) < 0) {
-		LogErr(VB_SYNC, "Error setting IP_MULTICAST_LOOP: \n",
-			strerror(errno));
-		return 0;
-	}
-
-	char *tmpRemotes = strdup(getSetting("MultiSyncCSVRemotes"));
-
-	if (!strcmp(tmpRemotes, "255.255.255.255")) {
-		int broadcast = 1;
-		if(setsockopt(m_controlCSVSock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
-			LogErr(VB_SYNC, "Error setting SO_BROADCAST: \n", strerror(errno));
-			return 0;
-		}
-	}
-
-	char *s = strtok(tmpRemotes, ",");
-
-	while (s) {
-		LogDebug(VB_SYNC, "Setting up CSV Remote Sync for %s\n", s);
-		struct sockaddr_in newRemote;
-
-		newRemote.sin_family      = AF_INET;
-		newRemote.sin_port        = htons(FPP_CTRL_CSV_PORT);
-		newRemote.sin_addr.s_addr = inet_addr(s);
-
-		m_destAddrCSV.push_back(newRemote);
-
-		s = strtok(NULL, ",");
-	}
-    for (int x = 0; x < m_destAddrCSV.size(); x++) {
-        struct mmsghdr msg;
-        memset(&msg, 0, sizeof(msg));
+    if (msgCount != 0) {
+        m_destIovec.iov_base = outBuf;
+        m_destIovec.iov_len = len;
         
-        msg.msg_hdr.msg_name = &m_destAddrCSV[x];
-        msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
-        msg.msg_hdr.msg_iov = &m_destIovecCSV;
-        msg.msg_hdr.msg_iovlen = 1;
-        msg.msg_len = 0;
-        m_destMsgsCSV.push_back(msg);
-    }
-
-
-	LogDebug(VB_SYNC, "%d CSV Remote Sync systems configured\n",
-		m_destAddrCSV.size());
-
-	free(tmpRemotes);
-
-	return 1;
-}
-
-/*
- *
- */
-void MultiSync::SendCSVControlPacket(void *outBuf, int len)
-{
-	LogExcess(VB_SYNC, "SendCSVControlPacket: '%s'\n", (char *)outBuf);
-
-	if (m_controlCSVSock < 0) {
-		LogErr(VB_SYNC, "ERROR: Tried to send CSV Sync packet but CSV sync socket is not open.\n");
-		return;
-	}
-
-
-    m_destIovecCSV.iov_base = outBuf;
-    m_destIovecCSV.iov_len = len;
-    int msgCount = m_destMsgsCSV.size();
-    if (msgCount == 0) {
-        return;
-    }
-    
-    pthread_mutex_lock(&m_socketLock);
-
-    int oc = sendmmsg(m_controlCSVSock, &m_destMsgsCSV[0], msgCount, 0);
-    int outputCount = oc;
-    while (oc > 0 && outputCount != msgCount) {
-        int oc = sendmmsg(m_controlCSVSock, &m_destMsgsCSV[outputCount], msgCount - outputCount, 0);
-        if (oc >= 0) {
-            outputCount += oc;
+        std::unique_lock<std::mutex> lock(m_socketLock);
+        int oc = sendmmsg(m_controlSock, &m_destMsgs[0], msgCount, 0);
+        int outputCount = oc;
+        while (oc > 0 && outputCount != msgCount) {
+            int oc = sendmmsg(m_controlSock, &m_destMsgs[outputCount], msgCount - outputCount, 0);
+            if (oc >= 0) {
+                outputCount += oc;
+            }
+        }
+        if (outputCount != msgCount) {
+            LogErr(VB_SYNC, "Error: Unable to send multisync packet: %s\n", strerror(errno));
         }
     }
-    if (outputCount != msgCount) {
-        LogErr(VB_SYNC, "Error: Unable to send CSV multisync packet: %s\n", strerror(errno));
+    if (m_sendMulticast) {
+        SendMulticastPacket(outBuf, len);
+    }
+    if (m_sendBroadcast) {
+        SendBroadcastPacket(outBuf, len);
+    }
+}
+void MultiSync::SendBroadcastPacket(void *outBuf, int len)
+{
+    if ((logLevel == LOG_EXCESSIVE) &&
+        (logMask & VB_SYNC)) {
+        HexDump("Sending Broadcast packet with contents:", outBuf, len);
     }
 
-	pthread_mutex_unlock(&m_socketLock);
+    std::unique_lock<std::mutex> lock(m_socketLock);
+    for (auto &a : m_interfaces) {
+        struct sockaddr_in  bda;
+        memset((void *)&bda, 0, sizeof(struct sockaddr_in));
+        bda.sin_family      = AF_INET;
+        bda.sin_port        = htons(FPP_CTRL_PORT);
+        bda.sin_addr.s_addr = a.second.broadcastAddress;
+
+        if (sendto(m_broadcastSock, outBuf, len, 0, (struct sockaddr*)&bda, sizeof(struct sockaddr_in)) < 0)
+            LogErr(VB_SYNC, "Error: Unable to send packet: %s\n", strerror(errno));
+    }
+}
+void MultiSync::SendMulticastPacket(void *outBuf, int len)
+{
+    std::unique_lock<std::mutex> lock(m_socketLock);
+    for (auto &a : m_interfaces) {
+        struct sockaddr_in  bda;
+        memset((void *)&bda, 0, sizeof(struct sockaddr_in));
+        bda.sin_family      = AF_INET;
+        bda.sin_port        = htons(FPP_CTRL_PORT);
+        bda.sin_addr.s_addr = MULTISYNC_MULTICAST_ADD;
+        
+        if (a.second.multicastSocket == -1) {
+            //create the socket
+            a.second.multicastSocket = socket(AF_INET, SOCK_DGRAM, 0);
+
+            if (a.second.multicastSocket < 0) {
+                LogErr(VB_SYNC, "Error opening Multicast socket for %s\n", a.second.interfaceName.c_str());
+            } else {
+                char loopch = 0;
+                if (setsockopt(a.second.multicastSocket, IPPROTO_IP, IP_MULTICAST_LOOP, (char *)&loopch, sizeof(loopch)) < 0) {
+                    LogErr(VB_SYNC, "Error setting IP_MULTICAST_LOOP for %s: %s\n", a.second.interfaceName.c_str(), strerror(errno));
+                }
+                
+                if (setsockopt(a.second.multicastSocket, SOL_SOCKET, SO_BINDTODEVICE, a.second.interfaceName.c_str(), a.second.interfaceName.size()) < 0) {
+                    LogErr(VB_SYNC, "Error setting IP_MULTICAST Device for %s: %s\n", a.second.interfaceName.c_str(), strerror(errno));
+                }
+            }
+        }
+
+        if (a.second.multicastSocket >= 0) {
+            if (sendto(a.second.multicastSocket, outBuf, len, 0, (struct sockaddr*)&bda, sizeof(struct sockaddr_in)) < 0)
+                LogErr(VB_SYNC, "Error: Unable to send packet: %s\n", strerror(errno));
+        }
+    }
+}
+bool MultiSync::FillInInterfaces() {
+    struct ifaddrs *interfaces,*tmp;
+    getifaddrs(&interfaces);
+    tmp = interfaces;
+    
+    bool change = false;
+
+    std::unique_lock<std::mutex> lock(m_socketLock);
+    while (tmp) {
+        if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET) {
+            
+            if (isSupportedForMultisync("", tmp->ifa_name)) {
+                //skip the usb* interfaces as we won't support multisync on those
+                struct sockaddr_in *ba = (struct sockaddr_in*)(tmp->ifa_ifu.ifu_broadaddr);
+                struct sockaddr_in *sa = (struct sockaddr_in*)(tmp->ifa_addr);
+
+                NetInterfaceInfo &info = m_interfaces[tmp->ifa_name];
+                change |= info.interfaceName == "";
+                change |= info.interfaceAddress == "";
+                info.interfaceName = tmp->ifa_name;
+                info.interfaceAddress = inet_ntoa(sa->sin_addr);
+                info.address = sa->sin_addr.s_addr;
+                info.broadcastAddress = ba->sin_addr.s_addr;
+            }
+        } else if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET6) {
+            //FIXME for ipv6 multisync
+        }
+        tmp = tmp->ifa_next;
+    }
+    freeifaddrs(interfaces);
+    return change;
+}
+bool MultiSync::RemoveInterface(const std::string &interface) {
+    std::unique_lock<std::mutex> lock(m_socketLock);
+    auto it = m_interfaces.find(interface);
+    if (it != m_interfaces.end()) {
+        LogDebug(VB_SYNC, "Removing interface %s - %s\n", it->second.interfaceName.c_str(), it->second.interfaceAddress.c_str());
+
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr.s_addr = inet_addr(MULTISYNC_MULTICAST_ADDRESS);
+        mreq.imr_interface.s_addr = it->second.address;
+        int rc = 0;
+        if ((rc = setsockopt(m_receiveSock, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
+            LogDebug(VB_SYNC, "   Did not drop Multicast membership for interface %s - %s\n", it->second.interfaceName.c_str(), it->second.interfaceAddress.c_str());
+        }
+        m_interfaces.erase(it);
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -1234,11 +1691,12 @@ int MultiSync::OpenReceiveSocket(void)
 	char           strMulticastGroup[16];
 
 	/* set up socket */
-	m_receiveSock = socket(AF_INET, SOCK_DGRAM, 0);
+	m_receiveSock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
 	if (m_receiveSock < 0) {
 		LogErr(VB_SYNC, "Error opening Receive socket; %s\n", strerror(errno));
 		return 0;
 	}
+    LogDebug(VB_SYNC, "Receive socket: %d\n", m_receiveSock);
 
 	bzero((char *)&m_receiveSrcAddr, sizeof(m_receiveSrcAddr));
 	m_receiveSrcAddr.sin_family = AF_INET;
@@ -1262,42 +1720,15 @@ int MultiSync::OpenReceiveSocket(void)
 		return 0;
 	}
 
-    struct ip_mreq mreq;
-    struct ifaddrs *interfaces,*tmp;
-    getifaddrs(&interfaces);
-    memset(&mreq, 0, sizeof(mreq));
-    mreq.imr_multiaddr.s_addr = inet_addr(MULTISYNC_MULTICAST_ADDRESS);
-    int multicastJoined = 0;
-    tmp = interfaces;
-    //loop through all the interfaces and subscribe to the group
-    while (tmp) {
-        //struct sockaddr_in *sin = (struct sockaddr_in *)tmp->ifa_addr;
-        //strcpy(address, inet_ntoa(sin->sin_addr));
-        if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET) {
-            char address[16];
-            address[0] = 0;
-            GetInterfaceAddress(tmp->ifa_name, address, NULL, NULL);
-            if (strcmp(address, "127.0.0.1")) {
-                LogDebug(VB_SYNC, "   Adding interface %s - %s\n", tmp->ifa_name, address);
-                mreq.imr_interface.s_addr = inet_addr(address);
-                if (setsockopt(m_receiveSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-                    LogWarn(VB_SYNC, "   Could not setup Multicast Group for interface %s\n", tmp->ifa_name);
-                }
-                multicastJoined = 1;
-            }
-        } else if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET6) {
-            //FIXME for ipv6 multicast
-            //LogDebug(VB_SYNC, "   Inet6 interface %s\n", tmp->ifa_name);
-        }
-        tmp = tmp->ifa_next;
-    }
-    freeifaddrs(interfaces);
+	if (getFPPmode() == REMOTE_MODE) {
+		int remoteOffsetInt = getSettingInt("remoteOffset");
+		if (remoteOffsetInt)
+			m_remoteOffset = (float)remoteOffsetInt * -0.001;
+		else
+			m_remoteOffset = 0.0;
 
-	int remoteOffsetInt = getSettingInt("remoteOffset");
-	if (remoteOffsetInt)
-		m_remoteOffset = (float)remoteOffsetInt * -0.001;
-	else
-		m_remoteOffset = 0.0;
+		LogDebug(VB_SYNC, "Using remoteOffset of %.3f\n", m_remoteOffset);
+	}
     
     memset(rcvMsgs, 0, sizeof(rcvMsgs));
     for (int i = 0; i < MAX_MS_RCV_MSG; i++) {
@@ -1311,7 +1742,57 @@ int MultiSync::OpenReceiveSocket(void)
         rcvMsgs[i].msg_hdr.msg_controllen = 0x100;
     }
 
+    setupMulticastReceive();
 	return 1;
+}
+bool MultiSync::isSupportedForMultisync(const char *address, const char *intface) {
+    if (!strcmp(address, "127.0.0.1")) {
+        return false;
+    }
+    if (!strncmp(intface, "usb", 3) || !strcmp(intface, "lo") || !strncmp(intface, "tether", 6) || !strncmp(intface, "SoftAp", 6)) {
+        return false;
+    }
+    return true;
+}
+
+void MultiSync::setupMulticastReceive() {
+    LogDebug(VB_SYNC, "setupMulticastReceive()\n");
+    //loop through all the interfaces and subscribe to the group
+    std::unique_lock<std::mutex> lock(m_socketLock);
+    for (auto &a : m_interfaces) {
+        LogDebug(VB_SYNC, "   Adding interface %s - %s\n", a.second.interfaceName.c_str(), a.second.interfaceAddress.c_str());
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr.s_addr = inet_addr(MULTISYNC_MULTICAST_ADDRESS);
+        mreq.imr_interface.s_addr = a.second.address;
+        int rc = 0;
+        if ((rc = setsockopt(m_receiveSock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) < 0) {
+            if (m_broadcastSock < 0) {
+                // first time through, log as warning, otherise error is likely due t already being subscribed
+                LogWarn(VB_SYNC, "   Could not setup Multicast Group for interface %s    rc: %d\n",  a.second.interfaceName.c_str(), rc);
+            } else {
+                LogDebug(VB_SYNC, "   Could not setup Multicast Group for interface %s    rc: %d\n",  a.second.interfaceName.c_str(), rc);
+            }
+        }
+    }
+}
+
+
+static bool shouldSkipPacket(int i, int num, std::vector<unsigned char *> &rcvBuffers) {
+    ControlPkt *pkt = (ControlPkt*)(rcvBuffers[i]);
+    for (int x = i + 1; x < num; x++) {
+        ControlPkt *npkt = (ControlPkt*)(rcvBuffers[x]);
+        if (pkt->pktType == npkt->pktType && pkt->pktType == CTRL_PKT_SYNC) {
+            SyncPkt *spkt = (SyncPkt*)(((char*)pkt) + sizeof(ControlPkt));
+            SyncPkt *snpkt = (SyncPkt*)(((char*)npkt) + sizeof(ControlPkt));
+            if (spkt->fileType == snpkt->fileType
+                && spkt->pktType == snpkt->pktType) {
+                return true;
+            }
+
+        }
+    }
+    return false;
 }
 
 /*
@@ -1324,162 +1805,238 @@ void MultiSync::ProcessControlPacket(void)
 	ControlPkt *pkt;
     
     int msgcnt = recvmmsg(m_receiveSock, rcvMsgs, MAX_MS_RCV_MSG, MSG_DONTWAIT, nullptr);
-    LogExcess(VB_SYNC, "ProcessControlPacket msgcnt: %d\n", msgcnt);
-    for (int msg = 0; msg < msgcnt; msg++) {
-        int len = rcvMsgs[msg].msg_len;
-        if (len <= 0) {
-            LogErr(VB_SYNC, "Error: recvmsg failed: %s\n", strerror(errno));
-            continue;
+    while (msgcnt > 0) {
+        std::vector<unsigned char *>v;
+        for (int msg = 0; msg < msgcnt; msg++) {
+            int len = rcvMsgs[msg].msg_len;
+            if (len <= 0) {
+                LogErr(VB_SYNC, "Error: recvmsg failed: %s\n", strerror(errno));
+                continue;
+            }
+            unsigned char *inBuf = rcvBuffers[msg];
+            inBuf[len] = 0;
+            v.push_back(inBuf);
         }
-        unsigned char *inBuf = rcvBuffers[msg];
+        LogExcess(VB_SYNC, "ProcessControlPacket msgcnt: %d\n", msgcnt);
+        for (int msg = 0; msg < msgcnt; msg++) {
+            int len = rcvMsgs[msg].msg_len;
+            if (len <= 0) {
+                LogErr(VB_SYNC, "Error: recvmsg failed: %s\n", strerror(errno));
+                continue;
+            }
+            unsigned char *inBuf = rcvBuffers[msg];
 
-        if (inBuf[0] == 0x55 || inBuf[0] == 0xCC) {
-            struct in_addr  recvAddr;
-            struct cmsghdr *cmsg;
+            if (inBuf[0] == 0x55 || inBuf[0] == 0xCC) {
+                struct in_addr  recvAddr;
+                struct cmsghdr *cmsg;
 
-            for (cmsg = CMSG_FIRSTHDR(&rcvMsgs[msg].msg_hdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&rcvMsgs[msg].msg_hdr, cmsg)) {
-                if (cmsg->cmsg_level != IPPROTO_IP || cmsg->cmsg_type != IP_PKTINFO) {
-                    continue;
+                for (cmsg = CMSG_FIRSTHDR(&rcvMsgs[msg].msg_hdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&rcvMsgs[msg].msg_hdr, cmsg)) {
+                    if (cmsg->cmsg_level != IPPROTO_IP || cmsg->cmsg_type != IP_PKTINFO) {
+                        continue;
+                    }
+
+                    struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
+                    recvAddr = pi->ipi_addr;
+                    recvAddr = pi->ipi_spec_dst;
                 }
 
-                struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
-                recvAddr = pi->ipi_addr;
-                recvAddr = pi->ipi_spec_dst;
+                ProcessFalconPacket(m_receiveSock, (struct sockaddr_in *)&rcvSrcAddr[msg], recvAddr, inBuf);
+                continue;
             }
 
-            ProcessFalconPacket(m_receiveSock, (struct sockaddr_in *)&rcvSrcAddr[msg], recvAddr, inBuf);
-            continue;
-        }
+            if (len < sizeof(ControlPkt)) {
+                LogErr(VB_SYNC, "Error: Received control packet too short\n");
+                HexDump("Received data:", (void*)inBuf, len);
+                continue;
+            }
+            if (shouldSkipPacket(msg, msgcnt, v)) {
+                LogExcess(VB_SYNC, "Skipping sync packet %d/%d\n", msg, msgcnt);
+                continue;
+            }
 
-        if (len < sizeof(ControlPkt)) {
-            LogErr(VB_SYNC, "Error: Received control packet too short\n");
-            HexDump("Received data:", (void*)inBuf, len);
-            continue;
-        }
+            pkt = (ControlPkt*)inBuf;
 
-        pkt = (ControlPkt*)inBuf;
+            if ((pkt->fppd[0] != 'F') ||
+                (pkt->fppd[1] != 'P') ||
+                (pkt->fppd[2] != 'P') ||
+                (pkt->fppd[3] != 'D')) {
+                LogErr(VB_SYNC, "Error: Invalid Received Control Packet, missing 'FPPD' header\n");
+                HexDump("Received data:", (void*)inBuf, len);
+                continue;
+            }
 
-        if ((pkt->fppd[0] != 'F') ||
-            (pkt->fppd[1] != 'P') ||
-            (pkt->fppd[2] != 'P') ||
-            (pkt->fppd[3] != 'D')) {
-            LogErr(VB_SYNC, "Error: Invalid Received Control Packet, missing 'FPPD' header\n");
-            HexDump("Received data:", (void*)inBuf, len);
-            continue;
-        }
+            if (len != (sizeof(ControlPkt) + pkt->extraDataLen)) {
+                LogErr(VB_SYNC, "Error: Expected %d data bytes, received %d\n",
+                    pkt->extraDataLen, len - sizeof(ControlPkt));
+                HexDump("Received data:", (void*)inBuf, len);
+                continue;
+            }
 
-        if (len != (sizeof(ControlPkt) + pkt->extraDataLen)) {
-            LogErr(VB_SYNC, "Error: Expected %d data bytes, received %d\n",
-                pkt->extraDataLen, len - sizeof(ControlPkt));
-            HexDump("Received data:", (void*)inBuf, len);
-            continue;
-        }
+            if ((logLevel == LOG_EXCESSIVE) &&
+                (logMask & VB_SYNC)) {
+                HexDump("Received MultiSync packet with contents:", (void*)inBuf, len);
+            }
 
-        if ((logLevel == LOG_EXCESSIVE) &&
-            (logMask & VB_SYNC)) {
-            HexDump("Received MultiSync packet with contents:", (void*)inBuf, len);
+            switch (pkt->pktType) {
+                case CTRL_PKT_CMD:
+                    ProcessCommandPacket(pkt, len);
+                    break;
+                case CTRL_PKT_SYNC:
+                    if (getFPPmode() == REMOTE_MODE)
+                        ProcessSyncPacket(pkt, len);
+                    break;
+                case CTRL_PKT_EVENT:
+                    if (getFPPmode() == REMOTE_MODE)
+                        ProcessEventPacket(pkt, len);
+                    break;
+                case CTRL_PKT_BLANK:
+                    if (getFPPmode() == REMOTE_MODE)
+                        sequence->SendBlankingData();
+                    break;
+                case CTRL_PKT_PING:
+                    ProcessPingPacket(pkt, len);
+                    break;
+                case CTRL_PKT_PLUGIN:
+                    ProcessPluginPacket(pkt, len);
+                    break;
+                case CTRL_PKT_FPPCOMMAND:
+                    ProcessFPPCommandPacket(pkt, len);
+                    break;
+            }
         }
-
-        switch (pkt->pktType) {
-            case CTRL_PKT_CMD:	ProcessCommandPacket(pkt, len);
-                                break;
-            case CTRL_PKT_SYNC: if (getFPPmode() == REMOTE_MODE)
-                                    ProcessSyncPacket(pkt, len);
-                                break;
-            case CTRL_PKT_EVENT:
-                                if (getFPPmode() == REMOTE_MODE)
-                                    ProcessEventPacket(pkt, len);
-                                break;
-            case CTRL_PKT_BLANK:
-                                if (getFPPmode() == REMOTE_MODE)
-                                    sequence->SendBlankingData();
-                                break;
-            case CTRL_PKT_PING:
-                                ProcessPingPacket(pkt, len);
-                                break;
-        }
+        msgcnt = recvmmsg(m_receiveSock, rcvMsgs, MAX_MS_RCV_MSG, MSG_DONTWAIT, nullptr);
     }
 }
 
-/*
- *
- */
-void MultiSync::StartSyncedSequence(char *filename)
+
+void MultiSync::OpenSyncedSequence(const char *filename)
 {
-	LogDebug(VB_SYNC, "StartSyncedSequence(%s)\n", filename);
+    LogDebug(VB_SYNC, "OpenSyncedSequence(%s)\n", filename);
 
     ResetMasterPosition();
     sequence->OpenSequenceFile(filename);
 }
 
-/*
- *
- */
-void MultiSync::StopSyncedSequence(char *filename)
+void MultiSync::StartSyncedSequence(const char *filename)
+{
+	LogDebug(VB_SYNC, "StartSyncedSequence(%s)\n", filename);
+    
+    ResetMasterPosition();
+    if (!sequence->IsSequenceRunning(filename)) {
+        sequence->StartSequence(filename, 0);
+    }
+}
+
+void MultiSync::StopSyncedSequence(const char *filename)
 {
 	LogDebug(VB_SYNC, "StopSyncedSequence(%s)\n", filename);
 
 	sequence->CloseIfOpen(filename);
 }
 
+void MultiSync::SyncPlaylistToMS(uint64_t ms, const std::string &pl, bool sendSyncPackets) {
+    if (playlist->GetPlaylistName() != pl) {
+        if (pl == "") {
+            return;
+        }
+        playlist->Load(pl.c_str());
+    }
+    float seconds = ms;
+    seconds /= 1000;
+
+    int desiredpos = playlist->FindPosForMS(ms);
+    if (desiredpos) {
+        if (m_controlSock < 0 && sendSyncPackets) {
+            OpenControlSockets();
+        }
+        
+        std::string seq, med;
+        playlist->GetFilenamesForPos(desiredpos, seq, med);
+        if (seq != "") {
+            if (!sequence->IsSequenceRunning(seq)) {
+                if (sequence->IsSequenceRunning()) {
+                    if (sendSyncPackets) SendSeqSyncStopPacket(sequence->m_seqFilename);
+                    sequence->CloseSequenceFile();
+                }
+                ResetMasterPosition();
+                sequence->OpenSequenceFile(seq.c_str());
+                if (sendSyncPackets) SendSeqOpenPacket(seq);
+                int frame = ms / sequence->GetSeqStepTime();
+                sequence->StartSequence(seq.c_str(), frame);
+                if (sendSyncPackets) SendSeqSyncStartPacket(seq);
+            } else {
+                int frame = ms / sequence->GetSeqStepTime();
+                SyncSyncedSequence(seq.c_str(), frame, seconds);
+                if (sendSyncPackets) SendSeqSyncPacket(seq, frame, seconds);
+            }
+        }
+        if (med != "") {
+            if (mediaOutput && !MatchesRunningMediaFilename(med.c_str())) {
+                StopSyncedMedia(med.c_str());
+                if (sendSyncPackets) SendMediaSyncStopPacket(med);
+            }
+            if (!mediaOutput) {
+                OpenSyncedMedia(med.c_str());
+                if (sendSyncPackets) SendMediaOpenPacket(med);
+                StartSyncedMedia(med.c_str());
+                if (sendSyncPackets) SendMediaSyncStartPacket(med);
+            }
+            UpdateMasterMediaPosition(med.c_str(), seconds);
+            if (sendSyncPackets) SendMediaSyncPacket(med, seconds);
+        }
+    }
+}
+
+
 /*
  *
  */
-void MultiSync::SyncSyncedSequence(char *filename, int frameNumber, float secondsElapsed)
+void MultiSync::SyncSyncedSequence(const char *filename, int frameNumber, float secondsElapsed)
 {
 	LogExcess(VB_SYNC, "SyncSyncedSequence('%s', %d, %.2f)\n",
 		filename, frameNumber, secondsElapsed);
 
-	if (!sequence->IsSequenceRunning(filename)) {
-        sequence->OpenSequenceFile(filename, frameNumber);
+    if (!sequence->IsSequenceRunning(filename)) {
+        sequence->StartSequence(filename, frameNumber);
 	}
     if (sequence->IsSequenceRunning(filename)) {
 		UpdateMasterPosition(frameNumber);
     }
 }
 
-/*
- *
- */
-void MultiSync::StartSyncedMedia(char *filename)
+void MultiSync::OpenSyncedMedia(const char *filename)
+{
+    LogDebug(VB_SYNC, "OpenSyncedMedia(%s)\n", filename);
+    
+    if (mediaOutput) {
+        LogDebug(VB_SYNC, "Start media %s received while playing media %s\n",
+                 filename, mediaOutput->m_mediaFilename.c_str());
+        
+        CloseMediaOutput();
+    }
+    
+    OpenMediaOutput(filename);
+}
+
+void MultiSync::StartSyncedMedia(const char *filename)
 {
 	LogDebug(VB_SYNC, "StartSyncedMedia(%s)\n", filename);
 
-	if (mediaOutput) {
-		LogDebug(VB_SYNC, "Start media %s received while playing media %s\n",
-			filename, mediaOutput->m_mediaFilename.c_str());
-
-		CloseMediaOutput();
-	}
-
-	OpenMediaOutput(filename);
+	StartMediaOutput(filename);
 }
 
 /*
  *
  */
-void MultiSync::StopSyncedMedia(char *filename)
+void MultiSync::StopSyncedMedia(const char *filename)
 {
 	LogDebug(VB_SYNC, "StopSyncedMedia(%s)\n", filename);
 
-	if (!mediaOutput)
+    if (!mediaOutput) {
 		return;
+    }
 
-	int stopSyncedMedia = 0;
-
-	if (!strcmp(mediaOutput->m_mediaFilename.c_str(), filename)) {
-		stopSyncedMedia = 1;
-	} else {
-		char tmpFile[1024];
-		strcpy(tmpFile, filename);
-        if (HasVideoForMedia(tmpFile)) {
-            if (!strcmp(mediaOutput->m_mediaFilename.c_str(), tmpFile)) {
-                stopSyncedMedia = 1;
-            }
-        }
-	}
-
-	if (stopSyncedMedia) {
+	if (MatchesRunningMediaFilename(filename)) {
 		LogDebug(VB_SYNC, "Stopping synced media: %s\n", mediaOutput->m_mediaFilename.c_str());
 		CloseMediaOutput();
 	}
@@ -1488,28 +2045,12 @@ void MultiSync::StopSyncedMedia(char *filename)
 /*
  *
  */
-void MultiSync::SyncSyncedMedia(char *filename, int frameNumber, float secondsElapsed)
+void MultiSync::SyncSyncedMedia(const char *filename, int frameNumber, float secondsElapsed)
 {
 	LogExcess(VB_SYNC, "SyncSyncedMedia('%s', %d, %.2f)\n",
 		filename, frameNumber, secondsElapsed);
 
-	if (!mediaOutput) {
-		LogExcess(VB_SYNC, "Received sync for media %s but no media playing\n",
-			filename);
-		return;
-	}
-
-	if (!strcmp(mediaOutput->m_mediaFilename.c_str(), filename)) {
-		UpdateMasterMediaPosition(secondsElapsed);
-    } else {
-        char tmpFile[1024];
-        strcpy(tmpFile, filename);
-        if (HasVideoForMedia(tmpFile)) {
-            if (!strcmp(mediaOutput->m_mediaFilename.c_str(), tmpFile)) {
-                UpdateMasterMediaPosition(secondsElapsed);
-            }
-        }
-	}
+    UpdateMasterMediaPosition(filename, secondsElapsed);
 }
 
 /*
@@ -1525,13 +2066,15 @@ void MultiSync::ProcessSyncPacket(ControlPkt *pkt, int len)
 
 	SyncPkt *spkt = (SyncPkt*)(((char*)pkt) + sizeof(ControlPkt));
 
-    LogDebug(VB_SYNC, "ProcessSyncPacket()   filename: %s    type: %d   filetype: %d   frameNumber: %d\n",
-             spkt->filename, spkt->pktType, spkt->fileType, spkt->frameNumber);
+    LogDebug(VB_SYNC, "ProcessSyncPacket()   filename: %s    type: %d   filetype: %d   frameNumber: %d   secondsElapsed: %0.2f\n",
+             spkt->filename, spkt->pktType, spkt->fileType, spkt->frameNumber, spkt->secondsElapsed);
 
 	float secondsElapsed = 0.0;
 
 	if (spkt->fileType == SYNC_FILE_SEQ) {
 		switch (spkt->pktType) {
+			case SYNC_PKT_OPEN:  OpenSyncedSequence(spkt->filename);
+								 break;
 			case SYNC_PKT_START: StartSyncedSequence(spkt->filename);
 								 break;
 			case SYNC_PKT_STOP:  StopSyncedSequence(spkt->filename);
@@ -1546,6 +2089,8 @@ void MultiSync::ProcessSyncPacket(ControlPkt *pkt, int len)
 		}
 	} else if (spkt->fileType == SYNC_FILE_MEDIA) {
 		switch (spkt->pktType) {
+            case SYNC_PKT_OPEN:  OpenSyncedMedia(spkt->filename);
+                                 break;
 			case SYNC_PKT_START: StartSyncedMedia(spkt->filename);
 								 break;
 			case SYNC_PKT_STOP:  StopSyncedMedia(spkt->filename);
@@ -1598,7 +2143,7 @@ void MultiSync::ProcessEventPacket(ControlPkt *pkt, int len)
 
 	EventPkt *epkt = (EventPkt*)(((char*)pkt) + sizeof(ControlPkt));
 
-	pluginCallbackManager.eventCallback(epkt->eventID, "remote");
+    PluginManager::INSTANCE.eventCallback(epkt->eventID, "remote");
 	TriggerEventByID(epkt->eventID);
 }
 
@@ -1639,6 +2184,7 @@ void MultiSync::ProcessPingPacket(ControlPkt *pkt, int len)
 	FPPMode systemMode = (FPPMode)extraData[7];
 
 	char addrStr[16];
+    memset(addrStr, 0, sizeof(addrStr));
     bool isInstance = true;
     if (extraData[8] == 0
         && extraData[9] == 0
@@ -1657,6 +2203,7 @@ void MultiSync::ProcessPingPacket(ControlPkt *pkt, int len)
 	std::string address = addrStr;
 
 	char tmpStr[128];
+    memset(tmpStr, 0, sizeof(tmpStr));
 	strcpy(tmpStr, (char*)(extraData + 12));
 	std::string hostname(tmpStr);
 
@@ -1675,13 +2222,107 @@ void MultiSync::ProcessPingPacket(ControlPkt *pkt, int len)
 
     if (isInstance) {
         multiSync->UpdateSystem(type, majorVersion, minorVersion,
-                                systemMode, address, hostname, version, typeStr, ranges);
+                                systemMode, address, hostname, version,
+                                typeStr, ranges, true);
     }
-
-	if ((discover) &&
-		(hostname != m_hostname) &&
-		(address != m_localAddress))
-		multiSync->Ping();
+    if (discover) {
+        bool isLocal = false;
+        std::unique_lock<std::mutex> lock(m_socketLock);
+        for (auto &a : m_interfaces) {
+            if (address == a.second.interfaceAddress) {
+                isLocal = true;
+            }
+        }
+        lock.unlock();
+        if ((hostname != m_hostname) && !isLocal) {
+            multiSync->PingSingleRemote(addrStr, 0);
+            multiSync->Ping();
+        }
+    }
 }
+
+
+void MultiSync::ProcessPluginPacket(ControlPkt *pkt, int plen) {
+    LogDebug(VB_SYNC, "ProcessPluginPacket()\n");
+    CommandPkt *cpkt = (CommandPkt*)(((char*)pkt) + sizeof(ControlPkt));
+    int len = pkt->extraDataLen;
+    char *pn = &cpkt->command[0];
+    int nlen = strlen(pn) + 1;
+    len -= nlen;
+    uint8_t *data = (uint8_t*)&cpkt->command[nlen];
+    PluginManager::INSTANCE.multiSyncData(pn, data, len);
+}
+
+static bool MyHostMatches(const std::string &host, const std::string &hostName, std::vector<MultiSyncSystem> &localSystems) {
+    std::vector<std::string> names = split(host, ',');
+    if (std::find(names.begin(), names.end(), hostName) != names.end()) {
+        return true;
+    }
+    for (auto &ls : localSystems) {
+        if (host == ls.address || host == ls.hostname) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void MultiSync::ProcessFPPCommandPacket(ControlPkt *pkt, int len) {
+    char *b = (char *)pkt;
+    int pos = sizeof(ControlPkt);
+    int numArgs = b[pos++];
+    std::string host = &b[pos];
+    pos += host.length() + 1;
+    std::string cmd = &b[pos];
+    pos += cmd.length() + 1;
+    std::vector<std::string> args;
+    for (int x = 0; x < numArgs; x++) {
+        std::string arg = &b[pos];
+        pos += arg.length() + 1;
+        args.push_back(arg);
+    }
+    if (host == "" || MyHostMatches(host, m_hostname, m_localSystems)) {
+        CommandManager::INSTANCE.run(cmd, args);
+    }
+}
+
+void MultiSync::SendFPPCommandPacket(const std::string &host, const std::string &cmd, const std::vector<std::string> &args) {
+    if (m_controlSock < 0) {
+        OpenControlSockets();
+    }
+    if (m_controlSock < 0) {
+        OpenControlSockets();
+        LogErr(VB_SYNC, "ERROR: Tried to send FPP Command packet but sync socket is not open.\n");
+        return;
+    }
+    LogDebug(VB_SYNC, "SendFPPCommandPacket\n");
+    for (auto a : m_plugins) {
+        a->SendFPPCommandPacket(host, cmd, args);
+    }
+    char           outBuf[2048];
+    bzero(outBuf, sizeof(outBuf));
+
+    ControlPkt    *cpkt = (ControlPkt*)outBuf;
+    InitControlPacket(cpkt);
+    cpkt->pktType        = CTRL_PKT_FPPCOMMAND;
+    
+    int pos = sizeof(ControlPkt);
+    outBuf[pos++] = args.size();
+    strcpy(&outBuf[pos], host.c_str());
+    pos += host.length() + 1;
+    strcpy(&outBuf[pos], cmd.c_str());
+    pos += cmd.length() + 1;
+    for (auto &a : args) {
+        strcpy(&outBuf[pos], a.c_str());
+        pos += a.length() + 1;
+    }
+    cpkt->extraDataLen   = pos - sizeof(ControlPkt);
+    SendControlPacket(outBuf, pos);
+    // the packet won't loop back so if it's supposed to run on this host as well,
+    // we need to force it
+    if (host == "" || MyHostMatches(host, m_hostname, m_localSystems)) {
+        CommandManager::INSTANCE.run(cmd, args);
+    }
+}
+
 
 

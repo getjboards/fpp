@@ -22,27 +22,19 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <errno.h>
 #include <fcntl.h>
 #include <linux/kd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/predicate.hpp>
+#include <Magick++.h>
+#include <magick/type.h>
 
-#include "common.h"
-#include "log.h"
 #include "VirtualDisplay.h"
-#include "Sequence.h"
-#include "settings.h"
 
 /////////////////////////////////////////////////////////////////////////////
 // To disable interpolated scaling on the GPU, add this to /boot/config.txt:
@@ -53,7 +45,7 @@
  */
 VirtualDisplayOutput::VirtualDisplayOutput(unsigned int startChannel,
 	unsigned int channelCount)
-  : ThreadedChannelOutputBase(startChannel, channelCount),
+  : ChannelOutputBase(startChannel, channelCount),
 	m_backgroundFilename("virtualdisplaybackground.jpg"),
 	m_backgroundBrightness(0.5),
 	m_width(1280),
@@ -70,9 +62,6 @@ VirtualDisplayOutput::VirtualDisplayOutput(unsigned int startChannel,
 {
 	LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::VirtualDisplayOutput(%u, %u)\n",
 		startChannel, channelCount);
-
-	m_maxChannels = FPPD_MAX_CHANNELS;
-	m_useDoubleBuffer = 1;
 }
 
 /*
@@ -96,6 +85,10 @@ VirtualDisplayOutput::~VirtualDisplayOutput()
 
 		delete[] m_rgb565map;
 	}
+    
+    if (m_virtualDisplay) {
+        free(m_virtualDisplay);
+    }
 }
 
 /*
@@ -126,7 +119,7 @@ int VirtualDisplayOutput::Init(Json::Value config)
 	if (config.isMember("backgroundBrightness"))
 		m_backgroundBrightness = 1.0 * config["backgroundBrightness"].asInt() / 100;
 
-	return ThreadedChannelOutputBase::Init(config);
+	return ChannelOutputBase::Init(config);
 }
 
 /*
@@ -176,6 +169,8 @@ int VirtualDisplayOutput::InitializePixelMap(void)
 	unsigned char customG;
 	unsigned char customB;
 	VirtualPixelColor vpc = kVPC_RGB;
+	std::string colorPart;
+	int BPP = 3;
 
 	while ((read = getline(&line, &len, file)) != -1)
 	{
@@ -225,7 +220,7 @@ int VirtualDisplayOutput::InitializePixelMap(void)
 					// image width should equal virtual display width
 					m_scale = 1.0 * m_width / m_previewWidth;
 					colOffset = 0;
-					rowOffset = (m_height - (m_previewHeight * m_scale));
+					rowOffset = ((m_height - (m_previewHeight * m_scale)) / 2);
 				}
 			}
 
@@ -233,16 +228,31 @@ int VirtualDisplayOutput::InitializePixelMap(void)
 			continue;
 		}
 
-		if (parts.size() >= 4)
+		if (parts.size() >= 5)
 		{
 			x  = atoi(parts[0].c_str());
 			y  = atoi(parts[1].c_str());
-			z  = atoi(parts[2].c_str());
-			ch = atoi(parts[3].c_str());
+
+			if (parts.size() == 5)
+			{
+				z = 0;
+				ch = atoi(parts[2].c_str());
+				BPP = atoi(parts[3].c_str());
+				colorPart = parts[4];
+			}
+			else if (parts.size() == 6)
+			{
+				z  = atoi(parts[2].c_str());
+				ch = atoi(parts[3].c_str());
+				BPP = atoi(parts[4].c_str());
+				colorPart = parts[5];
+			}
+			else
+				continue;
 
 			customR = customG = customB = 0;
 
-			s = ((m_height - (int)(y * m_scale) - 1) * m_width
+			s = ((m_height - (int)(y * m_scale + rowOffset) - 1) * m_width
 					+ (int)(x * m_scale + colOffset)) * m_bytesPerPixel;
 
 			if (m_colorOrder == "RGB")
@@ -282,42 +292,42 @@ int VirtualDisplayOutput::InitializePixelMap(void)
 				b = s + 0;
 			}
 
-			if (parts[5] == "RGB")
+			if (colorPart == "RGB")
 				vpc = kVPC_RGB;
-			else if (parts[5] == "RBG")
+			else if (colorPart == "RBG")
 				vpc = kVPC_RBG;
-			else if (parts[5] == "GRB")
+			else if (colorPart == "GRB")
 				vpc = kVPC_GRB;
-			else if (parts[5] == "GBR")
+			else if (colorPart == "GBR")
 				vpc = kVPC_GBR;
-			else if (parts[5] == "BRG")
+			else if (colorPart == "BRG")
 				vpc = kVPC_BRG;
-			else if (parts[5] == "BGR")
+			else if (colorPart == "BGR")
 				vpc = kVPC_BGR;
-			else if (parts[5] == "RGBW")
+			else if (colorPart == "RGBW")
 				vpc = kVPC_RGBW;
-			else if (parts[5] == "Red")
+			else if (colorPart == "Red")
 				vpc = kVPC_Red;
-			else if (parts[5] == "Green")
+			else if (colorPart == "Green")
 				vpc = kVPC_Green;
-			else if (parts[5] == "Blue")
+			else if (colorPart == "Blue")
 				vpc = kVPC_Blue;
-			else if (parts[5] == "White")
+			else if (colorPart == "White")
 				vpc = kVPC_White;
-			else if (boost::starts_with(parts[5], "#"))
+			else if (startsWith(colorPart, "#"))
 			{
-				std::string colorPart;
+				std::string tmpColor;
 
 				vpc = kVPC_Custom;
 
-				colorPart = parts[5].substr(1,2);
-				customR = std::stoi(colorPart, NULL, 16);
+				tmpColor = colorPart.substr(1,2);
+				customR = std::stoi(tmpColor, NULL, 16);
 
-				colorPart = parts[5].substr(3,2);
-				customG = std::stoi(colorPart, NULL, 16);
+				tmpColor = colorPart.substr(3,2);
+				customG = std::stoi(tmpColor, NULL, 16);
 
-				colorPart = parts[5].substr(5,2);
-				customB = std::stoi(colorPart, NULL, 16);
+				tmpColor = colorPart.substr(5,2);
+				customB = std::stoi(tmpColor, NULL, 16);
 			}
 
 			found = 0;
@@ -328,7 +338,7 @@ int VirtualDisplayOutput::InitializePixelMap(void)
 			}
 
 			if (!found)
-				m_pixels.push_back({ x, y, z, ch, r, g, b, atoi(parts[4].c_str()), customR, customG, customB, vpc });
+				m_pixels.push_back({ x, y, z, ch, r, g, b, BPP, customR, customG, customB, vpc });
 		}
 	}
 
@@ -340,151 +350,91 @@ int VirtualDisplayOutput::InitializePixelMap(void)
 /*
  *
  */
-int VirtualDisplayOutput::ScaleBackgroundImage(std::string &bgFile, std::string &rgbFile)
-{
-	std::string command;
-
-	command = "convert -scale " + std::to_string(m_width) + "x"
-		+ std::to_string(m_height) + " " + bgFile + " " + rgbFile;
-
-	LogDebug(VB_CHANNELOUT, "Generating scaled RGB background image: %s\n", command.c_str());
-	system(command.c_str());
-
-	return 1;
-}
-
-/*
- *
- */
 void VirtualDisplayOutput::LoadBackgroundImage(void)
 {
-	std::string bgFile = "/home/fpp/media/upload/";
+	std::string bgFile = "/home/fpp/media/images/";
 	bgFile += m_backgroundFilename;
-
-	std::string rgbFile = bgFile + ".rgb";
 
 	if (!FileExists(bgFile))
 	{
-		LogErr(VB_CHANNELOUT, "Background image does not exist: %s\n",
+		LogWarn(VB_CHANNELOUT, "Background image does not exist: %s\n",
 			bgFile.c_str());
 		return;
 	}
 
-	if ((!FileExists(rgbFile)) && (!ScaleBackgroundImage(bgFile, rgbFile)))
-		return;
+	Magick::Image image;
+	Magick::Blob blob;
 
-	struct stat ostat;
-	struct stat sstat;
-
-	stat(bgFile.c_str(), &ostat);
-	stat(rgbFile.c_str(), &sstat);
-
-	// Check if original is newer than scaled version
-	if ((ostat.st_mtim.tv_sec > sstat.st_mtim.tv_sec) && (!ScaleBackgroundImage(bgFile, rgbFile)))
-		return;
-
-	FILE *fd = fopen(rgbFile.c_str(), "rb");
-	if (fd)
+	try {
+		image.quiet(true);
+		image.read(bgFile.c_str());
+		image.modifyImage();
+		image.scale(Magick::Geometry(m_width, m_height));
+		image.type(Magick::TrueColorType);
+		image.magick("RGBA");
+		image.write(&blob);
+	}
+	catch (Magick::Exception &error_)
 	{
-		unsigned char buf[3072];
-		int bytesRead = -1;
-		int offset = 0;
-		unsigned long RGBx;
-		int imgWidth = 0;
-		int imgHeight = 0;
+		LogErr(VB_CHANNELOUT, "GraphicsMagick exception reading %s: %s\n",
+			bgFile.c_str(), error_.what());
+	}
 
-		if ((1.0 * m_width / m_previewWidth) < (1.0 * m_height / m_previewHeight))
+	unsigned char *imgData = (unsigned char *)blob.data();
+	unsigned int imgWidth = image.columns();
+	unsigned int imgHeight = image.rows();
+	unsigned int imgBytes = imgWidth * imgHeight * 4; // RGBA
+	unsigned long RGBx = 0;
+	bool letterboxed = false;
+	int offset = 0;
+	int colOffset = (m_width - imgWidth) / 2;
+	int r = 0;
+	int c = 0;
+
+	if ((1.0 * m_width / m_previewWidth) > (1.0 * m_height / m_previewHeight))
+		letterboxed = true;
+
+	offset = (m_height - imgHeight) / 2 * m_width * m_bytesPerPixel;
+
+	for (int i = 0; i < imgBytes;)
+	{
+		if ((letterboxed) && (c == 0))
 		{
-			// Virtual Display is taller than the preview aspect, so background
-			// image width should equal virtual display width
-			imgWidth = m_width;
-			imgHeight = sstat.st_size / m_width / 3;
-			offset = (m_height - imgHeight) * m_width * m_bytesPerPixel;
-
-			while (bytesRead != 0)
-			{
-				bytesRead = fread(buf, 1, 3072, fd);
-
-				for (int i = 0; i < bytesRead;)
-				{
-					if ((m_bpp == 24) || (m_bpp == 32))
-					{
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-
-						if (m_bpp == 32)
-							offset++;
-					}
-					else // 16bpp RGB565
-					{
-						RGBx = *(unsigned long *)(buf + i);
-						*(uint16_t*)(m_virtualDisplay + offset) =
-							(((int)((RGBx & 0x000000FF) * m_backgroundBrightness) <<  8) & 0b1111100000000000) |
-							(((int)((RGBx & 0x0000FF00) * m_backgroundBrightness) >>  5) & 0b0000011111100000) |
-							(((int)((RGBx & 0x00FF0000) * m_backgroundBrightness) >> 19)); // & 0b0000000000011111);
-
-						i += 3;
-						offset += 2;
-					}
-				}
-			}
-		}
-		else
-		{
-			// Virtual Display is wider than the preview aspect, so background
-			// image height should equal virtual display height
-			imgHeight = m_height;
-			imgWidth = sstat.st_size / m_height / 3;
-
-			int colOffset = (m_width - imgWidth) / 2;
-			int r = 0;
-			int c = 0;
-
-			while (bytesRead != 0)
-			{
-				bytesRead = fread(buf, 1, 3072, fd);
-
-				for (int i = 0; i < bytesRead;)
-				{
-					if (c == 0)
-					{
-						offset = ((r * m_width) + colOffset) * m_bytesPerPixel;
-					}
-
-					if ((m_bpp == 24) || (m_bpp == 32))
-					{
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-
-						if (m_bpp == 32)
-							offset++;
-					}
-					else
-					{
-						RGBx = *(unsigned long *)(buf + i);
-						*(uint16_t*)(m_virtualDisplay + offset) =
-							(((int)((RGBx & 0x000000FF) * m_backgroundBrightness) <<  8) & 0b1111100000000000) |
-							(((int)((RGBx & 0x0000FF00) * m_backgroundBrightness) >>  5) & 0b0000011111100000) |
-							(((int)((RGBx & 0x00FF0000) * m_backgroundBrightness) >> 19)); // & 0b0000000000011111);
-
-						i += 3;
-						offset += 2;
-					}
-
-					c++;
-
-					if (c >= imgWidth)
-					{
-						c = 0;
-						r++;
-					}
-				}
-			}
+			offset = ((r * m_width) + colOffset) * m_bytesPerPixel;
 		}
 
-		fclose(fd);
+		if ((m_bpp == 24) || (m_bpp == 32))
+		{
+			m_virtualDisplay[offset++] = imgData[i++] * m_backgroundBrightness;
+			m_virtualDisplay[offset++] = imgData[i++] * m_backgroundBrightness;
+			m_virtualDisplay[offset++] = imgData[i++] * m_backgroundBrightness;
+			i++;
+
+			if (m_bpp == 32)
+				offset++;
+		}
+		else // 16bpp RGB565
+		{
+			RGBx = *(unsigned long *)(imgData + i);
+			*(uint16_t*)(m_virtualDisplay + offset) =
+				(((int)((RGBx & 0x000000FF) * m_backgroundBrightness) <<  8) & 0b1111100000000000) |
+				(((int)((RGBx & 0x0000FF00) * m_backgroundBrightness) >>  5) & 0b0000011111100000) |
+				(((int)((RGBx & 0x00FF0000) * m_backgroundBrightness) >> 19)); // & 0b0000000000011111);
+
+			i += 4;
+			offset += 2;
+		}
+
+		if (letterboxed)
+		{
+			c++;
+
+			if (c >= imgWidth)
+			{
+				c = 0;
+				r++;
+			}
+		}
 	}
 }
 
@@ -530,13 +480,14 @@ void VirtualDisplayOutput::DrawPixel(int rOffset, int gOffset, int bOffset,
 	}
 }
 
-void VirtualDisplayOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
+void VirtualDisplayOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    int min = FPPD_MAX_CHANNELS;
+    int max = 0;
     for (auto &pixel : m_pixels) {
         min = std::min(min, pixel.ch);
         max = std::max(max, pixel.ch + (pixel.cpp == 4 ? 3 : 2));
     }
+    addRange(min, max);
 }
 
 
@@ -557,34 +508,37 @@ void VirtualDisplayOutput::DrawPixels(unsigned char *channelData)
 
 		GetPixelRGB(pixel, channelData, r, g, b);
 
+		DrawPixel(pixel.r, pixel.g, pixel.b, r, g, b);
+
 		if (m_pixelSize == 2)
 		{
-			DrawPixel(pixel.r, pixel.g, pixel.b, r, g, b);
-
 			r /= 2;
 			g /= 2;
 			b /= 2;
 
-			DrawPixel(pixel.r + m_bytesPerPixel,
-					  pixel.g + m_bytesPerPixel,
-					  pixel.b + m_bytesPerPixel,
-					  r, g, b);
-			DrawPixel(pixel.r - m_bytesPerPixel,
-					  pixel.g - m_bytesPerPixel,
-					  pixel.b - m_bytesPerPixel,
-					  r, g, b);
-			DrawPixel(pixel.r + stride,
-					  pixel.g + stride,
-					  pixel.b + stride,
-					  r, g, b);
-			DrawPixel(pixel.r - stride,
-					  pixel.g - stride,
-					  pixel.b - stride,
-					  r, g, b);
-		}
-		else
-		{
-			DrawPixel(pixel.r, pixel.g, pixel.b, r, g, b);
+			if (pixel.y < (m_width - 1))
+				DrawPixel(pixel.r + m_bytesPerPixel,
+						  pixel.g + m_bytesPerPixel,
+						  pixel.b + m_bytesPerPixel,
+						  r, g, b);
+
+			if (pixel.y > 0)
+				DrawPixel(pixel.r - m_bytesPerPixel,
+						  pixel.g - m_bytesPerPixel,
+						  pixel.b - m_bytesPerPixel,
+						  r, g, b);
+
+			if (pixel.x > 0)
+				DrawPixel(pixel.r + stride,
+						  pixel.g + stride,
+						  pixel.b + stride,
+						  r, g, b);
+
+			if (pixel.x < (m_height - 1))
+				DrawPixel(pixel.r - stride,
+						  pixel.g - stride,
+						  pixel.b - stride,
+						  r, g, b);
 		}
 	}
 }
@@ -604,6 +558,6 @@ void VirtualDisplayOutput::DumpConfig(void)
 	LogDebug(VB_CHANNELOUT, "    color Order   : %s\n", m_colorOrder.c_str());
 	LogDebug(VB_CHANNELOUT, "    pixel count   : %d\n", m_pixels.size());
 	LogDebug(VB_CHANNELOUT, "    pixel size    : %d\n", m_pixelSize);
-    ThreadedChannelOutputBase::DumpConfig();
+    ChannelOutputBase::DumpConfig();
 }
 

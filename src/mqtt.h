@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Mosquitto Client for Falcon Player (FPP)
  *
@@ -23,13 +24,17 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _MQTT_H
-#define _MQTT_H
 
 #include <pthread.h>
 #include <string>
+#include <map>
+#include <functional>
+
+#include <jsoncpp/json/json.h>
 
 #include "mosquitto.h"
+
+void * RunMqttPublishThread(void *data);
 
 class MosquittoClient {
   public:
@@ -38,14 +43,26 @@ class MosquittoClient {
 
 	int  Init(const std::string &username, const std::string &password, const std::string &ca_file);
 
-	int  PublishRaw(const std::string &topic, const std::string &msg);
-	int  Publish(const std::string &subTopic, const std::string &msg);
-	int  Publish(const std::string &subTopic, const int value);
+	int  PublishRaw(const std::string &topic, const std::string &msg, const int qos = 1, const bool retain = true);
+	int  Publish(const std::string &subTopic, const std::string &msg, const int qos = 1, const bool retain = true);
+	int  Publish(const std::string &subTopic, const int value, const int qos = 1, const bool retain = true);
 
 	void LogCallback(void *userdata, int level, const char *str);
 	void MessageCallback(void *obj, const struct mosquitto_message *message);
+    
+	void AddCallback(const std::string &topic, std::function<void(const std::string &topic, const std::string &payload)> &callback);
+	void HandleDisconnect();
+	void HandleConnect();
+	bool IsConnected();
+
+	void PublishStatus();
+	void SetReady();
+
+	std::string GetBaseTopic() { return m_baseTopic; }
 
   private:
+	bool        m_canProcessMessages;
+	bool        m_isConnected;
 	std::string m_host;
 	int         m_port;
 	int         m_keepalive;
@@ -55,13 +72,9 @@ class MosquittoClient {
 
 	struct mosquitto *m_mosq;
 	pthread_mutex_t   m_mosqLock;
-
-	// Topics we want to take action on
-	std::string m_topicPlaylist;
-	std::string m_topicPlaylistOld;
-
+	pthread_t         m_mqtt_publish_t;
+    
+    std::map<std::string, std::function<void(const std::string &topic, const std::string &payload)>> callbacks;
 };
 
 extern MosquittoClient *mqtt;
-
-#endif

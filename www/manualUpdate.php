@@ -1,14 +1,21 @@
-<!DOCTYPE html>
-<html>
-<?php
+<?
+header( "Access-Control-Allow-Origin: *");
+
+$wrapped = 0;
+
+if (isset($_GET['wrapped']))
+    $wrapped = 1;
+
+if (!$wrapped)
+    echo "<html>\n";
 
 $skipJSsettings = 1;
 require_once("common.php");
 
 DisableOutputBuffering();
 
+if (!$wrapped) {
 ?>
-
 <head>
 <title>
 FPP Manual Update
@@ -17,9 +24,18 @@ FPP Manual Update
 <body>
 <h2>FPP Manual Update</h2>
 <pre>
+<?
+}
+?>
 Stopping fppd...
 <?php
-system($SUDO . " $fppDir/scripts/fppd_stop");
+if (file_exists("/.dockerenv")) {
+    system($SUDO . " $fppDir/scripts/fppd_stop");
+} else {
+    exec($SUDO . " systemctl stop fppd");
+}
+
+touch("$mediaDirectory/tmp/fppd_restarted");
 ?>
 ==========================================================================
 Pulling in updates...
@@ -29,13 +45,23 @@ system("$fppDir/scripts/git_pull");
 ==========================================================================
 Restarting fppd...
 <?
-system($SUDO . " $fppDir/scripts/fppd_start");
+if (file_exists("/.dockerenv")) {
+    system($SUDO . " $fppDir/scripts/fppd_start");
+} else {
+    exec($SUDO . " systemctl restart fppd");
+}
+exec($SUDO . " rm -f /tmp/cache_*.cache");
 ?>
 ==========================================================================
 Update Complete.
-</pre>
-<a href='/'>Go to FPP Main Status Page</a><br>
+<?
+if (!$wrapped) {
+?>
+<a href='index.php'>Go to FPP Main Status Page</a><br>
 <a href='about.php'>Go back to FPP About page</a><br>
 
 </body>
 </html>
+<?
+}
+?>

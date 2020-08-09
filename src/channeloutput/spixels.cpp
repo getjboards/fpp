@@ -22,22 +22,23 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 
 
-#include "common.h"
-#include "log.h"
 #include "spixels.h"
-#include "Sequence.h" // for FPPD_MAX_CHANNELS
-#include "settings.h"
+
+
+
+extern "C" {
+    SpixelsOutput *createOutputspixels(unsigned int startChannel,
+                                       unsigned int channelCount) {
+        return new SpixelsOutput(startChannel, channelCount);
+    }
+}
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -51,8 +52,6 @@ SpixelsOutput::SpixelsOutput(unsigned int startChannel, unsigned int channelCoun
 {
 	LogDebug(VB_CHANNELOUT, "SpixelsOutput::SpixelsOutput(%u, %u)\n",
 		startChannel, channelCount);
-
-	m_maxChannels = FPPD_MAX_CHANNELS;
 }
 
 /*
@@ -184,20 +183,22 @@ int SpixelsOutput::Close(void)
 	return ThreadedChannelOutputBase::Close();
 }
 
-void SpixelsOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
-    
+void SpixelsOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
     PixelString *ps = NULL;
     for (int s = 0; s < m_strings.size(); s++) {
         ps = m_strings[s];
+        int min = FPPD_MAX_CHANNELS;
+        int max = 0;
         int inCh = 0;
         for (int p = 0; p < ps->m_outputChannels; p++) {
             int ch = ps->m_outputMap[inCh++];
-            if (ch < (FPPD_MAX_CHANNELS - 3)) {
+            if (ch < FPPD_MAX_CHANNELS) {
                 min = std::min(min, ch);
                 max = std::max(max, ch);
             }
+        }
+        if (min < max) {
+            addRange(min, max);
         }
     }
 }

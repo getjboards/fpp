@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry MQTT Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYMQTT_H
-#define _PLAYLISTENTRYMQTT_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -33,19 +31,17 @@
 class PlaylistEntryMQTT : public PlaylistEntryBase {
   public:
 	PlaylistEntryMQTT(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryMQTT();
+	virtual ~PlaylistEntryMQTT();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
+	virtual int  StartPlaying(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
 
   private:
 	std::string m_topic;
 	std::string m_message;
 };
-
-#endif

@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   BeagleBone Black PRU Serial DMX/Pixelnet handler for Falcon Player (FPP)
  *
@@ -23,15 +24,12 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _BBBSERIAL_H
-#define _BBBSERIAL_H
-
 #include <string>
 #include <vector>
 
 using namespace::std;
 
-#include "BBBUtils.h"
+#include "util/BBBPruUtils.h"
 #include "ThreadedChannelOutputBase.h"
 
 // structure of the data at the start of the PRU ram
@@ -48,16 +46,16 @@ typedef struct {
 class BBBSerialOutput : public ThreadedChannelOutputBase {
   public:
     BBBSerialOutput(unsigned int startChannel, unsigned int channelCount);
-    ~BBBSerialOutput();
+    virtual ~BBBSerialOutput();
 
-    int Init(Json::Value config);
-    int Close(void);
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-    int RawSendData(unsigned char *channelData);
+    virtual int RawSendData(unsigned char *channelData) override;
 
-    void DumpConfig(void);
+    virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
   private:
     int                m_outputs;
     int                m_pixelnet;
@@ -70,5 +68,3 @@ class BBBSerialOutput : public ThreadedChannelOutputBase {
     BBBPru             *m_pru;
     BBBSerialData      *m_serialData;
 };
-
-#endif /* _BBBSERIAL_H */

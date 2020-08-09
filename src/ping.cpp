@@ -1,3 +1,5 @@
+#include "fpp-pch.h"
+
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/param.h>
@@ -10,13 +12,8 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <netdb.h>
-#include <unistd.h>
-#include <stdio.h>
 #include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <iostream>
 #include "ping.h"
 
 using namespace std;
@@ -59,7 +56,7 @@ inline uint16_t in_cksum(uint16_t *addr, unsigned len)
 }
 
 
-int ping(string target)
+int ping(string target, int timeoutMs)
 {
     
     int i, cc, packlen, datalen = DEFDATALEN;
@@ -70,6 +67,7 @@ int ping(string target)
     u_char packet[DEFDATALEN + MAXIPLEN + MAXICMPLEN];
     u_char outpack[MAXPACKET];
     char hnamebuf[MAXHOSTNAMELEN];
+    
     string hostname;
     struct icmp *icp;
     int ret, fromlen, hlen;
@@ -80,6 +78,12 @@ int ping(string target)
     int /*start_t, */end_t;
     bool cont = true;
     
+    memset(outpack, 0, sizeof(outpack));
+    memset(packet, 0, sizeof(packet));
+    memset(hnamebuf, 0, sizeof(hnamebuf));
+    memset(&to, 0, sizeof(to));
+    memset(&from, 0, sizeof(to));
+
     to.sin_family = AF_INET;
     
     // try to convert as dotted decimal address, else if that fails assume it's a hostname
@@ -143,9 +147,8 @@ int ping(string target)
     // Watch stdin (fd 0) to see when it has input.
     FD_ZERO(&rfds);
     FD_SET(pingSocket, &rfds);
-    // Wait up to one seconds.
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
+    tv.tv_sec = 0;
+    tv.tv_usec = timeoutMs * 1000;
     
     while(cont)
     {
@@ -207,7 +210,7 @@ int ping(string target)
         }
         else
         {
-            //cout << "No data within one seconds.\n";
+            //cout << "No data within 1/4 second.\n";
             return 0;
         }
     }

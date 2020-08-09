@@ -5,32 +5,30 @@
 #include <unistd.h>
 #include <signal.h>
 
-#include "I2C.h"
-#include "SSD1306_OLED.h"
+#include "OLEDPages.h"
 #include "FPPOLEDUtils.h"
 #include "settings.h"
 #include "common.h"
 
+#include "util/BBBUtils.h"
+
+
+static FPPOLEDUtils *oled = nullptr;
 void sigInteruptHandler(int sig) {
-    clearDisplay();
-    Display();
+    oled->cleanup();
+    OLEDPage::displayOff();
     exit(1);
 }
 
 void sigTermHandler(int sig) {
-    clearDisplay();
-    Display();
+    oled->cleanup();
+    OLEDPage::displayOff();
     exit(0);
 }
 
-#ifdef PLATFORM_BBB
-#define I2C_DEV_PATH I2C_DEV2_PATH
-#else
-#define I2C_DEV_PATH I2C_DEV1_PATH
-#endif
-
 
 int main (int argc, char *argv[]) {
+    PinCapabilities::InitGPIO("FPPOLED");
     printf("FPP OLED Status Display Driver\n");
     initSettings(argc, argv);
     if (DirectoryExists("/home/fpp")) {
@@ -40,27 +38,11 @@ int main (int argc, char *argv[]) {
     int ledType = getSettingInt("LEDDisplayType");
     printf("    Led Type: %d\n", ledType);
     fflush(stdout);
-    LED_DISPLAY_WIDTH = 128;
-    if (ledType == 3 || ledType == 4) {
-        LED_DISPLAY_HEIGHT = 32;
-    } else {
-        LED_DISPLAY_HEIGHT = 64;
-    }
-
-    if (ledType == 5 || ledType == 6) {
-        LED_DISPLAY_TYPE = LED_DISPLAY_TYPE_SH1106;
-    }
     
-    if (init_i2c_dev2(I2C_DEV_PATH, SSD1306_OLED_ADDR) != 0) {
-        printf("(Main)i2c: OOPS! Something Went Wrong\n");
-        exit(1);
-    }
-    
-    if (ledType && display_Init_seq() )  {
-        printf("Could not initialize display\n");
+    if (!OLEDPage::InitializeDisplay(ledType)) {
         ledType = 0;
     }
-    
+
     struct sigaction sigIntAction;
     sigIntAction.sa_handler = sigInteruptHandler;
     sigemptyset(&sigIntAction.sa_mask);
@@ -74,6 +56,6 @@ int main (int argc, char *argv[]) {
     sigaction(SIGTERM, &sigTermAction, NULL);
     
     int count = 0;
-    FPPOLEDUtils oled(ledType);
-    oled.run();
+    oled = new FPPOLEDUtils(ledType);
+    oled->run();
 }

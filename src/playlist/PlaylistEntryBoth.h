@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Both Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYBOTH_H
-#define _PLAYLISTENTRYBOTH_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -35,21 +33,30 @@
 class PlaylistEntryBoth : public PlaylistEntryBase {
   public:
 	PlaylistEntryBoth(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryBoth();
+	virtual ~PlaylistEntryBoth();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
+	virtual Json::Value GetMqttStatus(void) override;
 
 	std::string GetSequenceName(void) { return m_sequenceName; }
 	std::string GetMediaName(void)    { return m_mediaName; }
 
+    virtual uint64_t GetLengthInMS() override;
+    virtual uint64_t GetElapsedMS() override;
+
+    
+    virtual void Pause() override;
+    virtual bool IsPaused() override;
+    virtual void Resume() override;
+    
   private:
 	int                  m_duration;
 
@@ -58,6 +65,6 @@ class PlaylistEntryBoth : public PlaylistEntryBase {
 
 	PlaylistEntryMedia     *m_mediaEntry;
 	PlaylistEntrySequence  *m_sequenceEntry;
+    
+    std::recursive_mutex   m_mutex;
 };
-
-#endif

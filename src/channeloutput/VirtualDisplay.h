@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   VirtualDisplay Channel Output for Falcon Player (FPP)
  *
@@ -23,14 +24,11 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _VIRTUALDISPLAY_H
-#define _VIRTUALDISPLAY_H
-
 #include <linux/fb.h>
 #include <string>
 #include <vector>
 
-#include "ThreadedChannelOutputBase.h"
+#include "ChannelOutputBase.h"
 
 typedef enum virtualPixelColor {
 	kVPC_RGB,
@@ -63,12 +61,12 @@ typedef struct virtualDisplayPixel {
 	VirtualPixelColor vpc;
 } VirtualDisplayPixel;
 
-class VirtualDisplayOutput : public ThreadedChannelOutputBase {
+class VirtualDisplayOutput : public ChannelOutputBase {
   public:
 	VirtualDisplayOutput(unsigned int startChannel, unsigned int channelCount);
-	~VirtualDisplayOutput();
+	virtual ~VirtualDisplayOutput();
 
-	virtual int  Init(Json::Value config);
+	virtual int  Init(Json::Value config) override;
 
 	int  InitializePixelMap(void);
 	int  ScaleBackgroundImage(std::string &bgFile, std::string &rgbFile);
@@ -80,9 +78,9 @@ class VirtualDisplayOutput : public ThreadedChannelOutputBase {
 		unsigned char r, unsigned char g, unsigned char b);
 	void DrawPixels(unsigned char *channelData);
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
 	std::string  m_backgroundFilename;
 	float        m_backgroundBrightness;
@@ -186,5 +184,3 @@ inline void VirtualDisplayOutput::GetPixelRGB(VirtualDisplayPixel &pixel,
 		}
 	}
 }
-
-#endif /* _VIRTUALDISPLAY_H */

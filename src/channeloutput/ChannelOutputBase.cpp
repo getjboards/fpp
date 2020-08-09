@@ -23,21 +23,16 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <vector>
+#include "fpp-pch.h"
 
 #include <errno.h>
-#include <string.h>
 #include <sys/time.h>
-#include <unistd.h>
 
 #include "ChannelOutputBase.h"
-#include "common.h"
-#include "log.h"
 
 ChannelOutputBase::ChannelOutputBase(unsigned int startChannel,
 	 unsigned int channelCount)
   : m_outputType(""),
-	m_maxChannels(0),
 	m_startChannel(startChannel),
 	m_channelCount(channelCount)
 {
@@ -48,39 +43,15 @@ ChannelOutputBase::~ChannelOutputBase()
 	LogDebug(VB_CHANNELOUT, "ChannelOutputBase::~ChannelOutputBase()\n");
 }
 
-int ChannelOutputBase::Init(void)
-{
-	LogDebug(VB_CHANNELOUT, "ChannelOutputBase::Init()\n");
-
-	if (m_channelCount == -1)
-		m_channelCount = m_maxChannels;
-
-	DumpConfig();
-	return 1;
-}
-
 int ChannelOutputBase::Init(Json::Value config)
 {
 	LogDebug(VB_CHANNELOUT, "ChannelOutputBase::Init(JSON)\n");
 	m_outputType = config["type"].asString();
-	return Init();
-}
+    if (m_channelCount == -1)
+        m_channelCount = 0;
 
-int ChannelOutputBase::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "ChannelOutputBase::Init('%s')\n", configStr);
-
-	std::vector<std::string> configElems = split(configStr, ';');
-
-	for (int i = 0; i < configElems.size(); i++) {
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
-
-		if (elem[0] == "type")
-			m_outputType = elem[1];
-	}
-	return Init();
+    DumpConfig();
+    return 1;
 }
 
 int ChannelOutputBase::Close(void)
@@ -94,7 +65,60 @@ void ChannelOutputBase::DumpConfig(void)
 	LogDebug(VB_CHANNELOUT, "ChannelOutputBase::DumpConfig()\n");
 
 	LogDebug(VB_CHANNELOUT, "    Output Type      : %s\n", m_outputType.c_str());
-	LogDebug(VB_CHANNELOUT, "    Max Channels     : %u\n", m_maxChannels);
 	LogDebug(VB_CHANNELOUT, "    Start Channel    : %u\n", m_startChannel + 1);
 	LogDebug(VB_CHANNELOUT, "    Channel Count    : %u\n", m_channelCount);
+}
+
+
+void ChannelOutputBase::ConvertToCSV(Json::Value config, char *configStr) {
+    Json::Value::Members memberNames = config.getMemberNames();
+    
+    configStr[0] = '\0';
+    
+    if (!config.isMember("type"))
+    {
+        strcpy(configStr, "");
+        return;
+    }
+    
+    if (config.isMember("enabled"))
+        strcat(configStr, config["enabled"].asString().c_str());
+    else
+        strcat(configStr, "0");
+    
+    strcat(configStr, ",");
+    
+    strcat(configStr, config["type"].asString().c_str());
+    strcat(configStr, ",");
+    
+    if (config.isMember("startChannel"))
+        strcat(configStr, config["startChannel"].asString().c_str());
+    else
+        strcat(configStr, "1");
+    
+    strcat(configStr, ",");
+    
+    if (config.isMember("channelCount"))
+        strcat(configStr, config["channelCount"].asString().c_str());
+    else
+        strcat(configStr, "1");
+    
+    std::string key;
+    int first = 1;
+    for (int i = 0; i < memberNames.size(); i++)
+    {
+        key = memberNames[i];
+        
+        if (first)
+        {
+            strcat(configStr, ",");
+            first = 0;
+        }
+        else
+            strcat(configStr, ";");
+        
+        strcat(configStr, key.c_str());
+        strcat(configStr, "=");
+        strcat(configStr, config[key].asString().c_str());
+    }
 }

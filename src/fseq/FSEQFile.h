@@ -1,5 +1,4 @@
-#ifndef __FSEQFILE_H_
-#define __FSEQFILE_H_
+#pragma once
 
 #include <stdio.h>
 #include <string>
@@ -26,7 +25,7 @@ public:
         FrameData(uint32_t f) : frame(f) {};
         virtual ~FrameData() {};
         
-        virtual void readFrame(uint8_t *data) = 0;
+        virtual bool readFrame(uint8_t *data, uint32_t maxChannels) = 0;
         
         uint32_t frame;
     };
@@ -52,7 +51,7 @@ public:
     static FSEQFile* createFSEQFile(const std::string &fn,
                                     int version,
                                     CompressionType ct = CompressionType::zstd,
-                                    int level = 10);
+                                    int level = -99);
     //utility methods
     static std::string getMediaFilename(const std::string &fn);
     std::string getMediaFilename() const;
@@ -64,7 +63,7 @@ public:
     //prepare to start reading. The ranges will be the list of channel ranges that
     //are acutally needed for each frame.   The reader can optimize to only
     //read those frames.
-    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) {}
+    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges, uint32_t startFrame = 0) {}
     
     //For reading data from the fseq file, returns an object can
     //provide the necessary data in a timely fassion for the given frame
@@ -136,7 +135,7 @@ public:
 
     virtual ~V1FSEQFile();
   
-    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) override;
+    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges, uint32_t startFrame = 0) override;
     virtual FrameData *getFrame(uint32_t frame) override;
 
     virtual void writeHeader() override;
@@ -163,7 +162,7 @@ public:
 
     virtual ~V2FSEQFile();
     
-    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges) override;
+    virtual void prepareRead(const std::vector<std::pair<uint32_t, uint32_t>> &ranges, uint32_t startFrame = 0) override;
     virtual FrameData *getFrame(uint32_t frame) override;
     
     virtual void writeHeader() override;
@@ -189,6 +188,3 @@ private:
     V2Handler *m_handler;
     friend class V2Handler;
 };
-
-
-#endif

@@ -23,10 +23,9 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
+#include "fpp-pch.h"
 
 #include "events.h"
-#include "log.h"
 #include "PlaylistEntryEvent.h"
 
 /*
@@ -41,6 +40,7 @@ PlaylistEntryEvent::PlaylistEntryEvent(PlaylistEntryBase *parent)
 	LogDebug(VB_PLAYLIST, "PlaylistEntryEvent::PlaylistEntryEvent()\n");
 
 	m_type = "event";
+	m_deprecated = 1;
 }
 
 /*

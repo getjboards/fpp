@@ -23,6 +23,8 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "fpp-pch.h"
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -30,11 +32,15 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
+#ifndef PLATFORM_OSX
 #include <linux/if_link.h>
+#endif
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,20 +53,32 @@
 #include <ctype.h>
 #include <unistd.h>
 
+
 #include <sstream>
+#include <fstream>
+#include <algorithm>
+
+#include <curl/curl.h>
 
 #include "common.h"
+#include "fppversion.h"
 #include "log.h"
 
 /*
  * Get the current time down to the microsecond
  */
-long long GetTime(void)
-{
+long long GetTime(void) {
 	struct timeval now_tv;
 	gettimeofday(&now_tv, NULL);
 	return now_tv.tv_sec * 1000000LL + now_tv.tv_usec;
 }
+
+long long GetTimeMS(void) {
+    struct timeval now_tv;
+    gettimeofday(&now_tv, NULL);
+    return now_tv.tv_sec * 1000LL + now_tv.tv_usec / 1000;
+}
+
 
 /*
  * Check to see if the specified directory exists
@@ -85,7 +103,7 @@ int DirectoryExists(const char * Directory)
 int FileExists(const char * File)
 {
 	struct stat sts;
-	if (stat(File, &sts) == -1 && errno == ENOENT) {
+	if (stat(File, &sts) == -1) {
 		return 0;
 	} else {
 		return 1;
@@ -94,6 +112,17 @@ int FileExists(const char * File)
 int FileExists(const std::string &f) {
     return FileExists(f.c_str());
 }
+
+int Touch(const std::string &File) {
+    int fd = open(File.c_str(), O_WRONLY|O_CREAT|O_NOCTTY|O_NONBLOCK, 0666);
+    if (fd < 0)
+        return 0;
+
+    close(fd);
+
+    return 1;
+}
+
 
 /*
  * Dump memory block in hex and human-readable formats
@@ -403,11 +432,21 @@ int CurrentDateInRange(int startDate, int endDate)
 {
 	int currentDate = GetCurrentDateInt();
 
+	LogExcess(VB_GENERAL, "CurrentDateInRange, checking if %d (s) <= %d (c) <= %d (e)\n", startDate, currentDate, endDate);
+
 	if ((startDate < 10000) || (endDate < 10000))
 	{
 		startDate = startDate % 10000;
 		endDate = endDate % 10000;
 		currentDate = currentDate % 10000;
+
+		if (endDate < startDate)
+		{
+			if (currentDate <= endDate)
+				currentDate += 10000;
+
+			endDate += 10000; // next year
+		}
 	}
 
 	if ((startDate < 100) || (endDate < 100))
@@ -415,7 +454,17 @@ int CurrentDateInRange(int startDate, int endDate)
 		startDate = startDate % 100;
 		endDate = endDate % 100;
 		currentDate = currentDate % 100;
+
+		if (endDate < startDate)
+		{
+			if (currentDate <= endDate)
+				currentDate += 100;
+
+			endDate += 100; // next month
+		}
 	}
+
+	LogExcess(VB_GENERAL, "Actual compare is: %d (s) <= %d (c) <= %d (e)\n", startDate, currentDate, endDate);
 
 	if ((startDate == 0) && (endDate == 0))
 		return 1;
@@ -458,7 +507,82 @@ std::vector<std::string> split(const std::string &s, char delim) {
     return elems;
 }
 
+inline std::string dequote(const std::string &s) {
+    if ((s[0] == '\'' || s[0] == '"')
+        && s[0] == s[s.length() - 1]
+        && s.length() > 2) {
+        return s.substr(1, s.length() - 2);
+    }
+    return s;
+}
 
+std::vector<std::string> splitWithQuotes(const std::string &s, char delim) {
+    std::vector<std::string> ret;
+    const char *mystart = s.c_str();
+    bool instring = false;
+    for (const char* p = mystart; *p; p++) {
+        if (*p == '"' || *p == '\'') {
+            instring = !instring;
+        } else if (*p == delim && !instring) {
+            ret.push_back(dequote(std::string(mystart, p - mystart)));
+            mystart = p + 1;
+        }
+    }
+    ret.push_back(dequote(std::string(mystart)));
+    return ret;
+}
+
+
+std::string GetFileContents(const std::string &filename)
+{
+    std::ifstream in(filename, std::ios::in | std::ios::binary);
+    if (in) {
+        std::string contents;
+        in.seekg(0, std::ios::end);
+        contents.resize(in.tellg());
+        in.seekg(0, std::ios::beg);
+        in.read(&contents[0], contents.size());
+        in.close();
+        return(contents);
+    }
+    return "";
+}
+
+bool PutFileContents(const std::string &filename, const std::string &str) {
+    std::ofstream out(filename, std::ofstream::out);
+    if (out) {
+        out << str;
+        out.close();
+
+        SetFilePerms(filename);
+
+        return true;
+    }
+
+    LogErr(VB_GENERAL, "ERROR: Unable to open %s for writing.\n", filename.c_str());
+
+    return false;
+}
+
+bool SetFilePerms(const std::string &filename)
+{
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH;
+    chmod(filename.c_str(), mode);
+
+    struct passwd *pwd = getpwnam("fpp");
+    chown(filename.c_str(), pwd->pw_uid, pwd->pw_gid);
+
+    return true;
+}
+
+bool SetFilePerms(const char *file)
+{
+    const std::string filename = file;
+    return SetFilePerms(filename);
+}
+
+/////////////////////////////////////////////////////////////////////////////
+#ifndef PLATFORM_OSX
 /*
  * Merge the contens of Json::Value b into Json::Value a
  */
@@ -488,14 +612,351 @@ void MergeJsonValues(Json::Value &a, Json::Value &b)
 /*
  *
  */
-Json::Value JSONStringToObject(const std::string &str)
+Json::Value LoadJsonFromFile(const std::string &filename)
 {
-	Json::Value result;
-	Json::Reader reader;
+    Json::Value root;
 
-	bool success = reader.parse(str.c_str(), result);
-	if (!success)
-		LogErr(VB_GENERAL, "Error parsing JSON string in JSONStringToObject()\n");
+    LoadJsonFromFile(filename, root);
 
-	return result;
+    return root;
 }
+
+/*
+ *
+ */
+Json::Value LoadJsonFromString(const std::string &str) {
+    Json::Value root;
+    bool result = LoadJsonFromString(str, root);
+
+    return root;
+}
+
+/*
+ *
+ */
+bool LoadJsonFromString(const std::string &str, Json::Value &root)
+{
+    Json::CharReaderBuilder builder;
+    Json::CharReader *reader = builder.newCharReader();
+    std::string errors;
+
+    builder["collectComments"] = false;
+
+    bool success = reader->parse(str.c_str(), str.c_str() + str.size(), &root, &errors);
+    delete reader;
+
+    if (!success) {
+        LogErr(VB_GENERAL, "Error parsing JSON string in LoadJsonFromString(): '%s'\n", str.c_str());
+        Json::Value empty;
+        root = empty;
+        return false;
+    }
+
+    LogDebug(VB_GENERAL, "LoadJsonFromString() loaded: '%s'\n", str.c_str());
+
+    return true;
+}
+
+bool LoadJsonFromFile(const std::string &filename, Json::Value &root)
+{
+    if (!FileExists(filename)) {
+        LogErr(VB_GENERAL, "JSON File %s does not exist\n", filename.c_str());
+        return false;
+    }
+
+    std::string jsonStr = GetFileContents(filename);
+
+    return LoadJsonFromString(jsonStr, root);
+}
+
+bool LoadJsonFromFile(const char *filename, Json::Value &root)
+{
+    std::string filenameStr = filename;
+
+    return LoadJsonFromFile(filenameStr, root);
+}
+
+std::string SaveJsonToString(const Json::Value &root, const std::string &indentation) {
+    Json::StreamWriterBuilder wbuilder;
+    wbuilder["indentation"] = indentation;
+
+    std::string result = Json::writeString(wbuilder, root);
+
+    return result;
+}
+
+bool SaveJsonToString(const Json::Value &root, std::string &str, const std::string &indentation) {
+    str = SaveJsonToString(root, indentation);
+
+    if (str.empty())
+        return false;
+
+    return true;
+}
+
+bool SaveJsonToFile(const Json::Value &root, const std::string &filename, const std::string &indentation) {
+    std::string str;
+
+    bool result = SaveJsonToString(root, str, indentation);
+
+    if (!result) {
+        LogErr(VB_GENERAL, "Error converting Json::Value to std::string()\n");
+        return false;
+    }
+
+    result = PutFileContents(filename, str);
+    if (!result) {
+        return false;
+    }
+
+    return true;
+}
+
+bool SaveJsonToFile(const Json::Value &root, const char *filename, const char *indentation) {
+    std::string filenameStr = filename;
+    std::string indentationStr = indentation;
+
+    return SaveJsonToFile(root, filenameStr, indentationStr);
+}
+#endif
+
+
+/////////////////////////////////////////////////////////////////////////////
+// trim from start (in place)
+static inline void ltrim(std::string &s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
+        return !std::isspace(ch);
+    }));
+}
+// trim from end (in place)
+static inline void rtrim(std::string &s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
+        return !std::isspace(ch);
+    }).base(), s.end());
+}
+// trim from both ends (in place)
+void TrimWhiteSpace(std::string &s) {
+    ltrim(s);
+    rtrim(s);
+}
+
+bool startsWith(const std::string &str, const std::string &prefix) {
+    return ((prefix.size() <= str.size()) && std::equal(prefix.begin(), prefix.end(), str.begin()));
+}
+bool endsWith(const std::string& str, const std::string& suffix) {
+    return str.size() >= suffix.size() && 0 == str.compare(str.size()-suffix.size(), suffix.size(), suffix);
+}
+bool contains(const std::string &str, const std::string &v) {
+    return str.find(v) != std::string::npos;
+}
+void replaceAll(std::string& str, const std::string& from, const std::string& to) {
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); // ...
+    }
+}
+
+bool replaceStart(std::string& str, const std::string& from, const std::string& to) {
+    if (!startsWith(str, from))
+        return false;
+
+    str.replace(0, from.size(), to);
+    return true;
+}
+
+bool replaceEnd(std::string& str, const std::string& from, const std::string& to) {
+    if (!endsWith(str, from))
+        return false;
+
+    str.replace(str.size()-from.size(), from.size(), to);
+    return true;
+}
+
+void toUpper(std::string& str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+}
+void toLower(std::string& str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+}
+std::string toUpperCopy(const std::string& str) {
+    std::string cp = str;
+    toUpper(cp);
+    return cp;
+}
+std::string toLowerCopy(const std::string& str) {
+    std::string cp = str;
+    toLower(cp);
+    return cp;
+}
+
+std::string getSimpleHTMLTTag(const std::string &html, const std::string &searchStr, const std::string &skipStr, const std::string &endStr)
+{
+    std::string value;
+    std::string tStr;
+    std::size_t fStart = html.find(searchStr);
+    std::size_t fEnd;
+
+    if (fStart != std::string::npos) {
+        tStr = html.substr(fStart + searchStr.size());
+        fStart = tStr.find(skipStr);
+        if (fStart != std::string::npos) {
+            fStart += skipStr.size();
+            fEnd = tStr.substr(fStart).find(endStr);
+            fEnd += fStart;
+            if (fEnd > fStart) {
+                value = tStr.substr(fStart, fEnd - fStart);
+                TrimWhiteSpace(value);
+                replaceAll(value, std::string("  "), std::string(" "));
+            }
+        }
+    }
+
+    return value;
+}
+
+std::string getSimpleXMLTag(const std::string &xml, const std::string &tag)
+{
+    std::string value;
+    std::string sSearch = "<";
+    sSearch += tag + ">";
+
+    std::string eSearch = "</";
+    eSearch += tag + ">";
+
+    std::size_t fStart = xml.find(sSearch);
+    std::size_t fEnd = xml.find(eSearch);
+
+    if ((fStart != std::string::npos) &&
+        (fEnd != std::string::npos) &&
+        (fEnd > fStart)) {
+        value = xml.substr(fStart + sSearch.length(), fEnd - fStart - sSearch.length());
+        TrimWhiteSpace(value);
+    }
+
+    return value;
+}
+
+// URL Helpers
+size_t urlWriteData(void *buffer, size_t size, size_t nmemb, void *userp)
+{
+	std::string *str = (std::string *)userp;
+
+	str->append(static_cast<const char*>(buffer), size * nmemb);
+
+	return size * nmemb;
+}
+
+bool urlHelper(const std::string method, const std::string &url, const std::string &data, std::string &resp, const unsigned int timeout)
+{
+	CURL *curl = curl_easy_init();
+	struct curl_slist *headers = NULL;
+    std::string userAgent = "FPP/";
+    userAgent += getFPPVersionTriplet();
+
+	resp = "";
+
+	if (!curl)
+	{
+		LogDebug(VB_GENERAL, "Unable to create curl instance in urlHelper()\n");
+		return false;
+	}
+
+	CURLcode status;
+	status = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, urlWriteData);
+	if (status != CURLE_OK)
+	{
+		LogErr(VB_GENERAL, "curl_easy_setopt() Error setting write callback function: %s\n", curl_easy_strerror(status));
+		return false;
+	}
+
+	status = curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+	if (status != CURLE_OK)
+	{
+		LogErr(VB_GENERAL, "curl_easy_setopt() Error setting class pointer: %s\n", curl_easy_strerror(status));
+		return false;
+	}
+
+	status = curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	if (status != CURLE_OK)
+	{
+		LogErr(VB_GENERAL, "curl_easy_setopt() Error setting URL: %s\n", curl_easy_strerror(status));
+		return false;
+	}
+
+	if (startsWith(data,"{") && endsWith(data,"}"))
+	{
+		headers = curl_slist_append(headers, "Accept: application/json");
+		headers = curl_slist_append(headers, "Content-Type: application/json");
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	}
+
+	if (data != "")
+	{
+		status = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+		if (status != CURLE_OK)
+		{
+			LogErr(VB_GENERAL, "curl_easy_setopt() Error setting postfields data: %s\n", curl_easy_strerror(status));
+			return false;
+		}
+	}
+
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout);
+
+	if (method == "POST")
+		curl_easy_setopt(curl, CURLOPT_POST, 1);
+	else if (method == "PUT")
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+	else if (method == "DELETE")
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, userAgent.c_str());
+
+	status = curl_easy_perform(curl);
+	if (status != CURLE_OK)
+	{
+		LogErr(VB_GENERAL, "curl_easy_perform() failed: %s\n", curl_easy_strerror(status));
+		return false;
+	}
+
+	LogDebug(VB_GENERAL, "resp: %s\n", resp.c_str());
+
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+
+	return true;
+}
+
+bool urlHelper(const std::string method, const std::string &url, std::string &resp, const unsigned int timeout)
+{
+	std::string data;
+	return urlHelper(method, url, data, resp, timeout);
+}
+
+bool urlGet(const std::string url, std::string &resp)
+{
+	std::string data;
+	return urlHelper("GET", url, resp);
+}
+
+bool urlPost(const std::string url, const std::string data, std::string &resp)
+{
+	return urlHelper("POST", url, data, resp);
+}
+
+bool urlPut(const std::string url, const std::string data, std::string &resp)
+{
+	return urlHelper("PUT", url, data, resp);
+}
+
+bool urlDelete(const std::string url, const std::string data, std::string &resp)
+{
+	return urlHelper("DELETE", url, data, resp);
+}
+
+bool urlDelete(const std::string url, std::string &resp)
+{
+	std::string data;
+	return urlHelper("DELETE", url, data, resp);
+}
+

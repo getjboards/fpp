@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   E131 Defines for Falcon Player (FPP)
  *
@@ -23,15 +24,11 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _E131_DEFS_H
-#define _E131_DEFS_H
 
-#define MAX_UNIVERSE_COUNT    512
 #define E131_HEADER_LENGTH    126
 #define MAX_STEPS_OUT_OF_SYNC 2
 
 #define E131_DEST_PORT        5568
-#define E131_SOURCE_PORT      58301
 
 #define E131_UNIVERSE_INDEX   113
 #define E131_SEQUENCE_INDEX   111
@@ -49,4 +46,3 @@
 #define VECTOR_ROOT_E131_DATA       0x4
 #define VECTOR_ROOT_E131_EXTENDED   0x8
 
-#endif

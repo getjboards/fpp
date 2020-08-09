@@ -23,20 +23,21 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "fpp-pch.h"
+
 #include <fcntl.h>
 #include <linux/kd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <unistd.h>
 
-#include "common.h"
-#include "log.h"
 #include "FBVirtualDisplay.h"
-#include "Sequence.h"
-#include "settings.h"
+
+extern "C" {
+    FBVirtualDisplayOutput *createOutputFBVirtualDisplay(unsigned int startChannel,
+                                                         unsigned int channelCount) {
+        return new FBVirtualDisplayOutput(startChannel, channelCount);
+    }
+}
 
 /////////////////////////////////////////////////////////////////////////////
 // To disable interpolated scaling on the GPU, add this to /boot/config.txt:
@@ -55,7 +56,6 @@ FBVirtualDisplayOutput::FBVirtualDisplayOutput(unsigned int startChannel,
 	LogDebug(VB_CHANNELOUT, "FBVirtualDisplayOutput::FBVirtualDisplayOutput(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = FPPD_MAX_CHANNELS;
 	m_bytesPerPixel = 3;
 	m_bpp = 24;
 }
@@ -79,6 +79,10 @@ int FBVirtualDisplayOutput::Init(Json::Value config)
 
 	if (!VirtualDisplayOutput::Init(config))
 		return 0;
+    if (m_virtualDisplay) {
+        free(m_virtualDisplay);
+        m_virtualDisplay = nullptr;
+    }
 
 	m_device = "/dev/";
 	if (config.isMember("device"))
@@ -195,6 +199,7 @@ int FBVirtualDisplayOutput::Init(Json::Value config)
 		close(m_fbFd);
 		return 0;
 	}
+    memset(m_virtualDisplay, 0, m_screenSize);
 
 	if (m_bpp == 16)
 	{
@@ -246,8 +251,6 @@ int FBVirtualDisplayOutput::Init(Json::Value config)
 		}
 	}
 
-	bzero(m_virtualDisplay, m_screenSize);
-
 	return InitializePixelMap();
 }
 
@@ -258,7 +261,10 @@ int FBVirtualDisplayOutput::Close(void)
 {
 	LogDebug(VB_CHANNELOUT, "FBVirtualDisplayOutput::Close()\n");
 
-	munmap(m_virtualDisplay, m_screenSize);
+    if (m_virtualDisplay) {
+        munmap(m_virtualDisplay, m_screenSize);
+        m_virtualDisplay = nullptr;
+    }
 
 	if (m_device == "/dev/fb0")
 	{
@@ -267,8 +273,6 @@ int FBVirtualDisplayOutput::Close(void)
 	}
 
 	close(m_fbFd);
-
-	delete [] m_virtualDisplay;
 
 	if (m_device == "/dev/fb0")
 	{
@@ -283,9 +287,9 @@ int FBVirtualDisplayOutput::Close(void)
 /*
  *
  */
-int FBVirtualDisplayOutput::RawSendData(unsigned char *channelData)
+int FBVirtualDisplayOutput::SendData(unsigned char *channelData)
 {
-	LogExcess(VB_CHANNELOUT, "FBVirtualDisplayOutput::RawSendData(%p)\n",
+	LogExcess(VB_CHANNELOUT, "FBVirtualDisplayOutput::SendData(%p)\n",
 		channelData);
 	DrawPixels(channelData);
 

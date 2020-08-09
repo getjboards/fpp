@@ -23,13 +23,9 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <string.h>
-#include <strings.h>
-#include <stdlib.h>
+#include "fpp-pch.h"
 
 #include "TestPatternBase.h"
-#include "common.h"
-#include "log.h"
 
 /*
  *
@@ -46,8 +42,8 @@ TestPatternBase::TestPatternBase()
 {
 	LogExcess(VB_CHANNELOUT, "TestPatternBase::TestPatternBase()\n");
 
-	// Give room for an extra RGB Triplet to make coding test patterns easier
-	m_testData = new char[FPPD_MAX_CHANNELS + 3];
+	// Give room for an extra RGBW Pixel to make coding test patterns easier
+	m_testData = new char[FPPD_MAX_CHANNELS + 4];
 }
 
 /*
@@ -66,10 +62,7 @@ TestPatternBase::~TestPatternBase()
 int TestPatternBase::Init(std::string configStr)
 {
 	Json::Value config;
-	Json::Reader reader;
-
-	bool success = reader.parse(configStr, config);
-	if (!success)
+	if (!LoadJsonFromString(configStr, config))
 	{
 		LogErr(VB_CHANNELOUT,
 			"Error parsing Test Pattern config string: '%s'\n",

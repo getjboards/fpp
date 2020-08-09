@@ -23,10 +23,17 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "common.h"
+#include "fpp-pch.h"
 #include "DebugOutput.h"
-#include "log.h"
-#include "Sequence.h"
+
+
+
+extern "C" {
+    DebugOutput *createOutputDebug(unsigned int startChannel,
+                                   unsigned int channelCount) {
+        return new DebugOutput(startChannel, channelCount);
+    }
+}
 
 /*
  *
@@ -36,9 +43,6 @@ DebugOutput::DebugOutput(unsigned int startChannel, unsigned int channelCount)
 {
 	LogDebug(VB_CHANNELOUT, "DebugOutput::DebugOutput(%u, %u)\n",
 		startChannel, channelCount);
-
-	// Set any max channels limit if necessary
-	m_maxChannels = FPPD_MAX_CHANNELS;
 }
 
 /*
@@ -52,12 +56,12 @@ DebugOutput::~DebugOutput()
 /*
  *
  */
-int DebugOutput::Init(char *configStr)
+int DebugOutput::Init(Json::Value v)
 {
-	LogDebug(VB_CHANNELOUT, "DebugOutput::Init('%s')\n", configStr);
+	LogDebug(VB_CHANNELOUT, "DebugOutput::Init()\n");
 
 	// Call the base class' Init() method, do not remove this line.
-	return ChannelOutputBase::Init(configStr);
+	return ChannelOutputBase::Init(v);
 }
 
 /*

@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   HTTPVirtualDisplay Channel Output for Falcon Player (FPP)
  *
@@ -23,11 +24,9 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _HTTPVIRTUALDISPLAY_H
-#define _HTTPVIRTUALDISPLAY_H
-
 #include <thread>
 #include <vector>
+#include <mutex>
 
 #include "VirtualDisplay.h"
 
@@ -36,12 +35,13 @@
 class HTTPVirtualDisplayOutput : protected VirtualDisplayOutput {
   public:
 	HTTPVirtualDisplayOutput(unsigned int startChannel, unsigned int channelCount);
-	~HTTPVirtualDisplayOutput();
+	virtual ~HTTPVirtualDisplayOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual void PrepData(unsigned char *channelData) override;
+	virtual int  SendData(unsigned char *channelData) override;
 
 	void ConnectionThread(void);
 	void SelectThread(void);
@@ -54,6 +54,8 @@ class HTTPVirtualDisplayOutput : protected VirtualDisplayOutput {
 
 	int m_socket;
 
+	std::string m_sseData;
+
 	volatile bool m_running;
 	volatile bool m_connListChanged;
 	std::thread *m_connThread;
@@ -62,5 +64,3 @@ class HTTPVirtualDisplayOutput : protected VirtualDisplayOutput {
 	std::mutex m_connListLock;
 	std::vector<int> m_connList;
 };
-
-#endif /* _HTTPVIRTUALDISPLAY_H */

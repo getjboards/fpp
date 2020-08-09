@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Media handler for Falcon Player (FPP)
  *
@@ -23,12 +24,7 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _MEDIAOUTPUT_H
-#define _MEDIAOUTPUT_H
-
-#include <unistd.h>
 #include <pthread.h>
-#include <sys/wait.h>
 
 #include "MediaOutputBase.h"
 #include "MediaOutputStatus.h"
@@ -39,15 +35,21 @@ extern MediaOutputStatus  mediaOutputStatus;
 
 void InitMediaOutput(void);
 void CleanupMediaOutput(void);
-int  OpenMediaOutput(char *filename);
-void CloseMediaOutput(void);
-void UpdateMasterMediaPosition(float seconds);
+
+bool MatchesRunningMediaFilename(const char *filename);
+int  OpenMediaOutput(const char *filename);
+int  StartMediaOutput(const char *filename);
+void UpdateMasterMediaPosition(const char *filename, float seconds);
+void CloseMediaOutput();
+
+MediaOutputBase *CreateMediaOutput(const std::string &mediaFilename, const std::string &videoOut);
 
 /* If try, filename will be updated with the media filename */
-bool HasVideoForMedia(char *filename);
+bool HasVideoForMedia(std::string &filename);
+
+bool IsExtensionVideo(const std::string &ext);
+bool IsExtensionAudio(const std::string &ext);
 
 //volume control
 void setVolume(int volume);
 int  getVolume(void);
-#endif /* _MEDIAOUTPUT_H */
-

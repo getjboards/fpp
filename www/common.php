@@ -15,6 +15,20 @@ function check($var, $var_name = "", $function_name = "")
 		error_log("WARNING: Variable '$var_name' in function '$function_name' was empty");
 }
 
+function getFileList($dir, $ext)
+{
+  $i = array();
+  if ($handle = opendir($dir)) {
+      while (($file = readdir($handle)) !== false) {
+          if (!in_array($file, array('.', '..')) && !is_dir($dir . $file) && strtolower(substr($file, strrpos($file, '.') + 1)) == $ext) {
+              array_push($i, $file);
+          }
+      }
+  }
+  return $i;
+}
+
+
 function ScrubFile($filename, $taboo = Array("emailgpass"))
 {
 	if ( !file_exists($filename) )
@@ -100,24 +114,263 @@ function WriteSettingToFile($settingName, $setting, $plugin = "")
 	}
 	file_put_contents($filename, $settingsStr);
 }
+    
+function DeleteSettingFromFile($settingName, $plugin = "")
+{
+	global $settingsFile;
+	global $settings;
+	$filename = $settingsFile;
 
-function IfSettingEqualPrint($setting, $value, $print, $pluginName = "")
+	if ($plugin != "") {
+		$filename = $settings['configDirectory'] . "/plugin." . $plugin;
+	}
+
+	$settingsStr = "";
+	$tmpSettings = parse_ini_file($filename);
+    unset($tmpSettings[$settingName]);
+	foreach ($tmpSettings as $key => $value) {
+		$settingsStr .= $key . " = \"" . $value . "\"\n";
+	}
+	file_put_contents($filename, $settingsStr);
+}
+
+function IfSettingEqualPrint($setting, $value, $print, $pluginName = "", $defaultValue = "")
 {
 	global $settings;
 	global $pluginSettings;
 
 	if ($pluginName != "") {
+		if (($defaultValue != "") && !isset($pluginSettings[$setting]))
+			$pluginSettings[$setting] = $defaultValue;
+
 		if ((isset($pluginSettings[$setting])) &&
 			($pluginSettings[$setting] == $value ))
 			echo $print;
 	} else {
+		if (($defaultValue != "") && !isset($settings[$setting]))
+			$settings[$setting] = $defaultValue;
+
 		if ((isset($settings[$setting])) &&
 			($settings[$setting] == $value ))
 			echo $print;
 	}
 }
 
-function PrintSettingCheckbox($title, $setting, $restart = 1, $reboot = 0, $checkedValue, $uncheckedValue, $pluginName = "", $callbackName = "")
+$settingGroups = Array();
+$settingInfos = Array();
+function LoadSettingInfos() {
+    global $settings;
+    global $settingInfos;
+    global $settingGroups;
+
+    if (empty($settingInfos) || empty($settingGroups)) {
+        $data = json_decode(file_get_contents($settings['fppDir'] . '/www/settings.json'), true);
+        $settingInfos = $data['settings'];
+        $settingGroups = $data['settingGroups'];
+    }
+}
+
+function PrintSetting($setting, $callback = '', $options = Array()) {
+    global $settings;
+    global $settingInfos;
+
+    LoadSettingInfos();
+
+    if (!isset($settingInfos[$setting])) {
+        echo "<tr><td colspan='2'><b>Invalid Setting: $setting</b></td></tr>\n";
+        return;
+    }
+
+    $s = $settingInfos[$setting];
+    $level = isset($s['level']) ? $s['level'] : 0;
+    $reloadUI = isset($s['reloadUI']) ? $s['reloadUI'] : 0;
+    $textOnRight = isset($s['textOnRight']) ? $s['textOnRight'] : 0;
+
+    if (($callback == '') && ($reloadUI == 1))
+        $callback = 'reloadSettingsPage';
+
+    $checkFileOK = 0;
+    if (isset($s['checkFile'])) {
+        foreach ($s['checkFile'] as $f) {
+            if (file_exists($f)) {
+                $checkFileOK = 1;
+            }
+        }
+    } else {
+        $checkFileOK = 1;
+    }
+
+    if (($settings['uiLevel'] >= $level) &&
+        ($checkFileOK) &&
+        ((!isset($s['fppModes'])) ||
+         (in_array('ALL', $s['fppModes'])) ||
+         (in_array($settings['fppMode'], $s['fppModes']))) &&
+        ((!isset($s['platforms'])) ||
+         (in_array('ALL', $s['platforms'])) ||
+         (in_array($settings['Platform'], $s['platforms'])))) {
+        $restart = isset($s['restart']) ? $s['restart'] : 0;
+        $reboot = isset($s['reboot']) ? $s['reboot'] : 0;
+        $suffix = isset($s['suffix']) ? $s['suffix'] : '';
+
+        if ($textOnRight)
+            echo "<tr id='" . $setting . "Row'><td>";
+        else
+            echo "<tr id='" . $setting . "Row'><th>" . $s['description'] . ":</th><td>";
+
+        switch ($s['type']) {
+            case 'select':
+                if (empty($options)) {
+                    if (isset($s['optionsURL'])) {
+                        $json = "";
+                        $url = $s['optionsURL'];
+                        if (!preg_match('/^\//', $s['optionsURL'])) {
+                            $url = "http://127.0.0.1/" . $s['optionsURL'];
+                        }
+                        $json = file_get_contents($url);
+                        $options = json_decode($json, true);
+                        if (!(array_keys($options) !== range(0, count($options) - 1))) {
+                            $tmp = $options;
+                            $options = Array();
+                            foreach ($tmp as $item) {
+                                $options[$item] = $item;
+                            }
+                        }
+                    } else if (isset($s['options'])) {
+                        $options = $s['options'];
+                    }
+                }
+
+                $default = isset($s['default']) ? $s['default'] : "";
+
+                PrintSettingSelect($s['description'], $setting, $restart, $reboot, $default, $options, '', $callback, '', $s);
+
+                break;
+            case 'checkbox':
+                $checkedValue = isset($s['checkedValue']) ? $s['checkedValue'] : "1";
+                $uncheckedValue = isset($s['uncheckedValue']) ? $s['uncheckedValue'] : "0";
+                $default = isset($s['default']) ? $s['default'] : "0";
+
+                PrintSettingCheckbox($s['description'], $setting, $restart, $reboot, $checkedValue, $uncheckedValue, '', $callback, $default, '', $s);
+                break;
+            case 'time':
+                $size = 8;
+                $maxlength = 8;
+                $default = isset($s['default']) ? $s['default'] : '';
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, '', $default, $callback, '', 'text', $s);
+                break;
+            case 'date':
+                $size = 10;
+                $maxlength = 10;
+                $default = isset($s['default']) ? $s['default'] : '';
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, '', $default, $callback, '', 'text', $s);
+                break;
+            case 'text':
+                $size = isset($s['size']) ? $s['size'] : 32;
+                $maxlength = isset($s['maxlength']) ? $s['maxlength'] : 32;
+                $default = isset($s['default']) ? $s['default'] : "";
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, '', $default, $callback, '', 'text', $s);
+                break;
+            case 'password':
+                $size = isset($s['size']) ? $s['size'] : 32;
+                $maxlength = isset($s['maxlength']) ? $s['maxlength'] : 32;
+                $default = isset($s['default']) ? $s['default'] : "";
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, '', $default, $callback, '', "password", $s);
+                break;
+            case 'number':
+                $min = isset($s['min']) ? $s['min'] : 0;
+                $max = isset($s['max']) ? $s['max'] : 99;
+                $step = isset($s['step']) ? $s['step'] : 1;
+                $default = isset($s['default']) ? $s['default'] : "0";
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $max, $min, '', $default, $callback, '', 'number', $s);
+                break;
+            default:
+                printf( "FIXME, handle %s setting type for %s\n", $s['type'], $setting);
+                break;
+        }
+
+        if ($suffix != '')
+            echo $suffix . ' ';
+
+        if ($textOnRight)
+            echo "</td><th>" . $s['description'] . " ";
+
+        PrintToolTip($setting);
+
+        if ($level == 1)
+            echo " <b>*</b>";
+        else if ($level == 2)
+            echo " <b>**</b>";
+        else if ($level == 3)
+            echo " <b>***</b>";
+
+        if ($textOnRight)
+            echo "</th></tr>\n";
+        else
+            echo "</td></tr>\n";
+    }
+}
+
+function PrintSettingGroup($group, $appendData = "", $prependData = "", $indent = 1) {
+    global $settings;
+    global $settingGroups;
+
+    LoadSettingInfos();
+
+    if (!isset($settingGroups[$group])) {
+        echo "<b>ERROR: Invalid Setting Group: $group</b><br>\n";
+        return;
+    }
+
+    $g = $settingGroups[$group];
+    $level = isset($g['level']) ? $g['level'] : 0;
+
+    if (($settings['uiLevel'] >= $level) &&
+        ((!isset($g['fppModes'])) ||
+         (in_array('ALL', $g['fppModes'])) ||
+         (in_array($settings['fppMode'], $g['fppModes']))) &&
+        ((!isset($g['platforms'])) ||
+         (in_array('ALL', $g['platforms'])) ||
+         (in_array($settings['Platform'], $g['platforms'])))) {
+        echo "<b>" . $g['description'] . "</b>\n";
+        echo "<table class='settingsTable ";
+
+        if ($indent)
+            echo "settingsGroupTable'>\n";
+        else
+            echo "'>\n";
+
+        if ($prependData != "") {
+            if (preg_match("/<tr>/", $prependData))
+                echo $prependData;
+            else
+                echo "<tr><th colspan=2>$prependData</td></tr>\n";
+        }
+
+        foreach ($g['settings'] as $setting) {
+            PrintSetting($setting);
+        }
+
+        if ($appendData != "") {
+            if (preg_match("/<tr>/", $appendData))
+                echo $appendData;
+            else
+                echo "<tr><th colspan=2>$appendData</td></tr>\n";
+        }
+
+        echo "</table><br>\n";
+    }
+}
+
+function PrintSettingGroupTable($group, $appendData = "", $prependData = "", $indent = 1) {
+    echo "<table class='settingsTable'>\n";
+    PrintSettingGroup($group, $appendData, $prependData, $indent);
+    echo "</table>\n";
+}
+
+function PrintSettingCheckbox($title, $setting, $restart = 1, $reboot = 0, $checkedValue, $uncheckedValue, $pluginName = "", $callbackName = "", $defaultValue = 0, $desc = "", $sData = Array())
 {
 	global $settings;
 	global $pluginSettings;
@@ -125,20 +378,60 @@ function PrintSettingCheckbox($title, $setting, $restart = 1, $reboot = 0, $chec
 	$plugin = "";
 	$settingsName = "settings";
 
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
+
 	if ($pluginName != "") {
 		$plugin = "Plugin";
 		$settingsName = "pluginSettings";
 	}
 
 	if ($callbackName != "")
-		$callbackName = $callbackName . "();";
+		$callbackName = $callbackName . "('$setting');";
+
+    $changedFunction = preg_replace('/\./', '', $setting . "Changed");
+
+    echo "<script>\n";
+    if (isset($sData['children'])) {
+        echo "function Update$setting" . "Children(mode) {
+	var checked = 0;
+	if ($('#$escSetting').is(':checked')) {
+		checked = 1;
+    }
+
+    if (checked)
+        $('.$escSetting' + 'Child').show();
+    else
+        $('.$escSetting' + 'Child').hide();
+
+";
+        foreach ( $sData['children'] as $k => $v) {
+            if ($k == "1") {
+                echo "if (checked) {\n";
+                echo "    if (mode != 2) {\n";
+                foreach ($v as $name) {
+                    echo "    if ((mode == 0) || (hiddenChildren.$name != 1))\n";
+                    echo "        $('#" . $name . "Row').show();\n";
+                }
+                echo "    }\n";
+                echo "} else {\n";
+                echo "    if (mode != 1) {\n";
+                foreach ($v as $name) {
+                    echo "$('#" . $name . "Row').hide();\n";
+                    echo "hiddenChildren.$name = 1\n";
+                }
+                echo "    }\n";
+                echo "}\n";
+            }
+        }
+
+        echo "}\n\n";
+    }
 
 	echo "
-<script>
-function " . $setting . "Changed() {
+function " . $changedFunction . "() {
 	var value = '$uncheckedValue';
 	var checked = 0;
-	if ($('#$setting').is(':checked')) {
+	if ($('#$escSetting').is(':checked')) {
 		checked = 1;
 		value = '$checkedValue';
 	}
@@ -153,20 +446,30 @@ function " . $setting . "Changed() {
 ";
 
 if ($restart)
-	echo "SetRestartFlag();\n";
+	echo "SetRestartFlag($restart);\n";
 if ($reboot)
 	echo "SetRebootFlag();\n";
 
+if (isset($sData['children'])) {
+    echo "Update$setting" . "Children(0);\n";
+}
+
 echo "
 			$callbackName
+
+            if (checked)
+                $('.$escSetting' + 'Child').show();
+            else
+                $('.$escSetting' + 'Child').hide();
+
 			CheckRestartRebootFlags();
 		}).fail(function() {
 			if (checked) {
 				DialogError('$title', 'Failed to Enable $title');
-				$('#$setting').prop('checked', false);
+				$('#$escSetting').prop('checked', false);
 			} else {
 				DialogError('$title', 'Failed to Disable $title');
-				$('#$setting').prop('checked', true);
+				$('#$escSetting').prop('checked', true);
 			}
 		});
 }
@@ -174,18 +477,32 @@ echo "
 
 <input type='checkbox' id='$setting' ";
 
-	IfSettingEqualPrint($setting, $checkedValue, "checked", $pluginName);
+    if (isset($sData['children'])) {
+        echo "class='parentSetting' ";
+    }
 
-	echo " onChange='" . $setting . "Changed();'>\n";
+	IfSettingEqualPrint($setting, $checkedValue, "checked", $pluginName, $defaultValue);
+
+    if (isset($sData['onChange']))
+	    echo " onChange='" . $sData['onChange'] . "();'";
+    else
+	    echo " onChange='" . $changedFunction . "();'";
+
+    if ($desc != "")
+        echo '>' . $desc . "</input>\n";
+    else
+        echo " />\n";
 }
 
-function PrintSettingSelect($title, $setting, $restart = 1, $reboot = 0, $defaultValue, $values, $pluginName = "", $callbackName = "", $changedFunction = "")
+function PrintSettingSelect($title, $setting, $restart = 1, $reboot = 0, $defaultValue, $values, $pluginName = "", $callbackName = "", $changedFunction = "", $sData = Array())
 {
 	global $settings;
 	global $pluginSettings;
 
 	$plugin = "";
 	$settingsName = "settings";
+
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
 
 	if ($pluginName != "") {
 		$plugin = "Plugin";
@@ -196,12 +513,48 @@ function PrintSettingSelect($title, $setting, $restart = 1, $reboot = 0, $defaul
 		$callbackName = $callbackName . "();";
 
     if ($changedFunction == "")
-        $changedFunction = $setting . "Changed";
+        $changedFunction = preg_replace('/\./', '', $setting . "Changed");
+
+    echo "<script>\n";
+
+    if (isset($sData['children'])) {
+        echo "function Update$setting" . "Children(mode) {
+    var val = $('#$escSetting').val();
+";
+        foreach ( $sData['children'] as $k => $v) {
+            echo "if (val == '$k') {\n";
+            echo "    if (mode != 2) {\n";
+            foreach ($v as $name) {
+                echo "    if ((mode == 0) || (hiddenChildren.$name != 1))\n";
+                echo "        $('#" . $name . "Row').show();\n";
+            }
+            echo "    }\n";
+            echo "} else {\n";
+            echo "    if (mode != 1) {\n";
+            foreach ($v as $name) {
+                echo "$('#" . $name . "Row').hide();\n";
+                echo "hiddenChildren.$name = 1\n";
+            }
+            echo "    }\n";
+            echo "}\n";
+        }
+
+        echo "}\n\n";
+    }
+
+    if (isset($sData['reloadOther'])) {
+        echo "function ReloadOther$setting" . "() {
+";
+        foreach ( $sData['reloadOther'] as $sname) {
+            echo "    ReloadSettingOptions('$sname');\n";
+        }
+
+        echo "}\n\n";
+    }
 
 	echo "
-<script>
-function " . $setting . "Changed() {
-	var value = $('#$setting').val();
+function " . $changedFunction . "() {
+	var value = $('#$escSetting').val();
 
 	$.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
 		.done(function() {
@@ -211,9 +564,17 @@ function " . $setting . "Changed() {
 ";
 
 if ($restart)
-	echo "SetRestartFlag();\n";
+	echo "SetRestartFlag($restart);\n";
 if ($reboot)
 	echo "SetRebootFlag();\n";
+
+if (isset($sData['children'])) {
+    echo "Update$setting" . "Children(0);\n";
+}
+
+if (isset($sData['reloadOther'])) {
+    echo "ReloadOther$setting" . "();\n";
+}
 
 echo "
 		}).fail(function() {
@@ -221,8 +582,19 @@ echo "
 		});
 }
 </script>
+";
 
-<select id='$setting' onChange='" . $changedFunction . "();'>\n";
+    if (isset($sData['onChange']))
+        echo "<select id='$setting' onChange='" . $sData['onChange'] . "();' ";
+    else
+        echo "<select id='$setting' onChange='" . $changedFunction . "();' ";
+
+    if (isset($sData['children'])) {
+        echo "class='parentSetting' ";
+    }
+
+    echo ">\n";
+
 
 	foreach ( $values as $key => $value )
 	{
@@ -264,13 +636,16 @@ function PrintSettingText($setting, $restart = 1, $reboot = 0, $maxlength = 32, 
 
 	echo "\">\n";
 }
-function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "", $callbackName = "", $changedFunction = "", $inputType = "text")
+
+function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "", $callbackName = "", $changedFunction = "", $inputType = "text", $sData = Array())
 { 
 	global $settings;
 	global $pluginSettings;
 
 	$plugin = "";
 	$settingsName = "settings";
+
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
 
 	if ($pluginName != "") {
 		$plugin = "Plugin";
@@ -281,12 +656,56 @@ function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength =
     if ($callbackName != "")
         $callbackName = $callbackName . "();";
     if ($changedFunction == "")
-        $changedFunction = $setting . "Changed";
+        $changedFunction = preg_replace('/\./', '', $setting . "Changed");
+
+    $maxTag = 'maxlength';
+    $sizeTag = 'size';
+    if ($inputType == 'number') {
+        $maxTag = 'max';
+        $sizeTag = 'min';
+    }
+
+    echo "<script>\n";
+    if (isset($sData['children'])) {
+        echo "function Update$setting" . "Children(mode) {
+    var val = $('#$escSetting').val();
+";
+        foreach ( $sData['children'] as $k => $v) {
+            echo "if (val != '') {\n";
+            echo "    if (mode != 2) {\n";
+            foreach ($v as $name) {
+                echo "    if ((mode == 0) || (hiddenChildren.$name != 1))\n";
+                echo "        $('#" . $name . "Row').show();\n";
+            }
+            echo "    }\n";
+            echo "} else {\n";
+            echo "    if (mode != 1) {\n";
+            foreach ($v as $name) {
+                echo "$('#" . $name . "Row').hide();\n";
+                echo "hiddenChildren.$name = 1\n";
+            }
+            echo "    }\n";
+            echo "}\n";
+        }
+
+        echo "}\n\n";
+    }
 
     echo "
-    <script>
-    function " . $setting . "Changed() {
-        var value = $('#$setting').val();
+    function " . $changedFunction . "() {
+        var value = $('#$escSetting').val();
+";
+
+    if (isset($sData['regex']) && isset($sData['regexDesc'])) {
+        echo "
+        if (!RegexCheckData('" . $sData['regex'] . "', value, '" . $sData['regexDesc'] . ", '$inputType' == 'password')) {
+            $('#" . $escSetting . "').focus();
+            return;
+        }
+";
+    }
+
+    echo "
         $.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
         .done(function() {
               $.jGrowl('$setting Saved');
@@ -294,10 +713,14 @@ function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength =
               ";
               
               if ($restart)
-                echo "SetRestartFlag();\n";
+                echo "SetRestartFlag($restart);\n";
               if ($reboot)
                 echo "SetRebootFlag();\n";
               
+              if (isset($sData['children'])) {
+                echo "Update$setting" . "Children(0);\n";
+              }
+
               echo "
               $callbackName
               CheckRestartRebootFlags();
@@ -306,22 +729,44 @@ function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength =
               });
     }
     </script>
+";
 
-    
-    <input type='$inputType' id='$setting' maxlength='$maxlength' size='$size' onChange='" . $changedFunction . "();' value=\"";
+    if (isset($sData['onChange']))
+        echo "<input type='$inputType' id='$setting' $maxTag='$maxlength' $sizeTag='$size' onChange='" . $sData['onChange'] . "();' value=\"";
+    else
+        echo "<input type='$inputType' id='$setting' $maxTag='$maxlength' $sizeTag='$size' onChange='" . $changedFunction . "();' value=\"";
 
-	if (isset($settings[$setting]))
-		echo $settings[$setting];
-	elseif (isset($pluginSettings[$setting]))
-		echo $pluginSettings[$setting];
-	else
-		echo $defaultValue;
+    if ((isset($sData['alwaysReset'])) && ($sData['alwaysReset'] == 1)) {
+        echo $defaultValue;
+    } else {
+        if (isset($settings[$setting]))
+            echo $settings[$setting];
+        elseif (isset($pluginSettings[$setting]))
+            echo $pluginSettings[$setting];
+        else
+            echo $defaultValue;
+    }
 
-	echo "\">\n";
+	echo "\" \n";
+
+    if (isset($sData['children'])) {
+        echo "class='parentSetting' ";
+    }
+    if (isset($sData['type'])) {
+        if ($sData['type'] == 'time') {
+            echo "class='time' autocomplete='off' ";
+        }
+        if ($sData['type'] == 'date') {
+            echo "class='date' autocomplete='off' ";
+        }
+    }
+
+	echo ">\n";
 }
 function PrintSettingPasswordSaved($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "", $callbackName = "", $changedFunction = "")
 {
-	PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $pluginName, $defaultValue, $callbackName, $changedFunction, "password");
+    $sData = Array();
+	PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $pluginName, $defaultValue, $callbackName, $changedFunction, "password", $sData);
 }
 
 
@@ -333,6 +778,8 @@ function PrintSettingSave($title, $setting, $restart = 1, $reboot = 0, $pluginNa
 	$plugin = "";
 	$settingsName = "settings";
 
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
+
 	if ($pluginName != "") {
 		$plugin = "Plugin";
 		$settingsName = "pluginSettings";
@@ -341,10 +788,12 @@ function PrintSettingSave($title, $setting, $restart = 1, $reboot = 0, $pluginNa
 	if ($callbackName != "")
 		$callbackName = $callbackName . "();";
 
+    $saveFunction = preg_replace('/\./', '', $setting . "Changed");
+
 	echo "
 <script>
-function save" . $setting . "() {
-	var value = $('#$setting').val();
+function " . $saveFunction . "() {
+	var value = $('#$escSetting').val();
 
 	$.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
 		.done(function() {
@@ -354,19 +803,19 @@ function save" . $setting . "() {
 ";
 
 if ($restart)
-	echo "SetRestartFlag();\n";
+	echo "SetRestartFlag($restart);\n";
 if ($reboot)
 	echo "SetRebootFlag();\n";
 
 echo "
 		}).fail(function() {
 			DialogError('$title', 'Failed to save $title');
-			$('#$setting').prop('checked', false);
+			$('#$escSetting').prop('checked', false);
 		});
 }
 </script>
 
-<input type='button' class='buttons' id='save$setting' onClick='save" . $setting . "();' value='Save'>\n";
+<input type='button' class='buttons' id='save$setting' onClick='" . $saveFunction . "();' value='Save'>\n";
 }
 
 /**
@@ -711,13 +1160,68 @@ function get_kernel_version(){
 	return $kernel_version;
 }
 
+    
+function get_cpu_stats() {
+    $stats = @file_get_contents("/proc/stat");
+    if ($stats !== false) {
+        // Remove double spaces to make it easier to extract values with explode()
+        $stats = preg_replace("/[[:blank:]]+/", " ", $stats);
+
+        // Separate lines
+        $stats = str_replace(array("\r\n", "\n\r", "\r"), "\n", $stats);
+        $stats = explode("\n", $stats);
+        foreach ($stats as $statLine) {
+            $statLineData = explode(" ", trim($statLine));
+            // Found!
+            if ((count($statLineData) >= 5)
+                && ($statLineData[0] == "cpu")) {
+                return array(
+                    $statLineData[1],
+                    $statLineData[2],
+                    $statLineData[3],
+                    $statLineData[4],
+                    $statLineData[5],
+                    $statLineData[6],
+                    $statLineData[7],
+                );
+            }
+        }
+    }
+    return array(0, 0, 0 ,0);
+}
+    
 /**
  * Returns average CPU usage
  * @return mixed
  */
 function get_server_cpu_usage(){
-	$load = sys_getloadavg();
-	return $load[0];
+    if (!file_exists("/tmp/cpustats.txt")) {
+        $ostats = get_cpu_stats();
+        $vs = sprintf("%d %d %d %d %d %d %d", $ostats[0],$ostats[1], $ostats[2], $ostats[3], $ostats[4], $ostats[5], $ostats[6]);
+        @file_put_contents("/tmp/cpustats.txt", $vs);
+        usleep(10000);
+    } else {
+        $statLine = @file_get_contents("/tmp/cpustats.txt");
+        $ostats = explode(" ", trim($statLine));
+    }
+    $stats = get_cpu_stats();
+    $vs = sprintf("%d %d %d %d %d %d %d", $stats[0], $stats[1], $stats[2], $stats[3], $stats[4], $stats[5], $stats[6]);
+    @file_put_contents("/tmp/cpustats.txt", $vs);
+    
+    $user = $stats[0] - $ostats[0];
+    $nice = $stats[1] - $ostats[1];
+    $system = $stats[2] - $ostats[2];
+    $idle = $stats[3] - $ostats[3];
+    $iowait = $stats[4] - $ostats[4];
+    $irq = $stats[5] - $ostats[5];
+    $softirq = $stats[6] - $ostats[6];
+
+    $total = $user + $nice + $system + $idle + $iowait + $irq + $softirq;
+    $val = $idle * 100.0;
+    // 100 - the percent idle
+    $val = 100.0 - ($val / $total);
+    
+	return $val;
 }
 
 /**
@@ -752,7 +1256,7 @@ function get_fpp_head_version(){
 
 	$cached_data = file_cache($cachefile_name, NULL, $cache_age);
 	if ($cached_data == NULL) {
-		$fpp_head_version = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ describe --tags", $output, $return_val);
+		$fpp_head_version = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ describe", $output, $return_val);
 		if ($return_val != 0)
 			$fpp_head_version = "Unknown";
 		unset($output);
@@ -796,7 +1300,7 @@ function get_git_branch(){
 function get_local_git_version(){
 	$git_version = "Unknown";
 	$cachefile_name = "local_git_version";
-	$cache_age = 90;
+	$cache_age = 20;
 
 	$cached_data = file_cache($cachefile_name,NULL,$cache_age);
 	if ($cached_data == NULL) {
@@ -818,8 +1322,13 @@ function get_local_git_version(){
  * @return string
  */
 function get_remote_git_version($git_branch){
+    global $settings;
+
 	$git_remote_version = "Unknown";
 
+    $origin = "github.com";
+    if (isset($settings['UpgradeSource']))
+        $origin = $settings['UpgradeSource'];
 
 	if (!empty($git_branch) || strtolower($git_branch) != "unknown") {
 		$cachefile_name = "git_" . $git_branch;
@@ -831,15 +1340,28 @@ function get_remote_git_version($git_branch){
 		if ($cached_data == NULL) {
 			//if for some reason name resolution fails ping will take roughly 10 seconds to return (Default DNS Timeout 5 seconds x 2 retries)
 			//to try work around this ping the google public DNS @ 8.8.8.8 (to skip DNS) waiting for a reply for max 1 second, if that's ok we have a route to the internet, then it's highly likely DNS will also work
-			$google_dns_ping = exec("ping -q -c 1 -W 1 8.8.8.8 > /dev/null", $output, $return_val);
-			unset($output);
+            $return_val = 0;
+            if ($origin == 'github.com') {
+                $google_dns_ping = exec("ping -q -c 1 -W 1 8.8.8.8 > /dev/null", $output, $return_val);
+                unset($output);
+            }
 			if ($return_val == 0){
 				//Google DNS Ping success
 				// this can take a couple seconds to complete so we'll cache it
-				$git_remote_version = exec("ping -q -c 1 github.com > /dev/null && (git --git-dir=/opt/fpp/.git/ ls-remote -q -h origin $git_branch | awk '$1 > 0 { print substr($1,1,7)}')", $output, $return_val);
+				$git_remote_version = exec("ping -q -c 1 $origin > /dev/null && (git --git-dir=/opt/fpp/.git/ ls-remote -q -h origin $git_branch | awk '$1 > 0 { print substr($1,1,7)}')", $output, $return_val);
 				if ($return_val != 0)
 					$git_remote_version = "Unknown";
 				unset($output);
+
+				// If we get back a blank version, this clone may be setup to
+				// use ssh to access github, so fallback and check for a
+				// 'github' origin which can be setup to use https://
+				if ($git_remote_version == "") {
+					$git_remote_version = exec("ping -q -c 1 github.com > /dev/null && (git --git-dir=/opt/fpp/.git/ ls-remote -q -h github $git_branch | awk '$1 > 0 { print substr($1,1,7)}')", $output, $return_val);
+					if ($return_val != 0)
+						$git_remote_version = "Unknown";
+					unset($output);
+				}
 			}else{
 				//Google DNS Ping fail - return unknown
 				$git_remote_version = "Unknown";
@@ -851,21 +1373,6 @@ function get_remote_git_version($git_branch){
 			//return the cached version
 			$git_remote_version = $cached_data;
 		}
-
-//        if( ! file_exists( $file )  ||  ( time() - filemtime( $file ) > $time)) {
-//            // this can take a couple seconds to complete so we'll cache it
-//            $ver = exec("ping -q -c 1 github.com > /dev/null && (git --git-dir=/opt/fpp/.git/ ls-remote -q -h origin $git_branch | awk '$1 > 0 { print substr($1,1,7)}')", $output, $return_val);
-//            if ( $return_val != 0 )
-//                $ver = "Unknown";
-//            unset($output);
-//
-//            exec("echo \"$ver\" | sudo tee $file", $output, $return_val);
-//            unset($output);
-//        } else {
-//            $handle = fopen($file, 'r');
-//            $ver = trim(fread($handle,filesize($file)));
-//            fclose($handle);
-//        }
 	}
 
 	return $git_remote_version;
@@ -899,64 +1406,6 @@ function ReplaceIllegalCharacters($input_string)
 	}
 
 	return $input_string;
-}
-
-/**
- * Restarts the ntp server service
- */
-function NtpServiceRestart(){
-	global $SUDO;
-
-	exec($SUDO . " service ntp restart", $output, $return_val);
-	unset($output);
-	//TODO: check return
-}
-
-/**
- * Sets the NTP server source to the supplied NTP server, if nothing is supplied default to the debian pool
- * @param $ntp_server String DNS or IP address of a NTP server
- */
-function SetNtpServer($ntp_server){
-	global $SUDO;
-
-	WriteSettingToFile("ntpServer",$ntp_server);
-	$settings['ntpServer'] = $ntp_server;
-	if ($ntp_server != "")
-	{
-		exec($SUDO . " sed -i '/^server.*/d' /etc/ntp.conf ; " . $SUDO . " sed -i '\$s/\$/\\nserver " . $ntp_server . " iburst/' /etc/ntp.conf");
-	}
-	else
-	{
-		exec($SUDO . " sed -i '/^server.*/d' /etc/ntp.conf ; " . $SUDO . " sed -i '\$s/\$/\\nserver 0.debian.pool.ntp.org iburst\\nserver 1.debian.pool.ntp.org iburst\\nserver 2.debian.pool.ntp.org iburst\\nserver 3.debian.pool.ntp.org iburst\\n/' /etc/ntp.conf");
-	}
-}
-
-/**
- * Toggles NTP service state
- * @param $state int 1 to Enable, 0 to Disable
- */
-function SetNtpState($state){
-	global $SUDO;
-
-    WriteSettingToFile("NTP",$state);
-
-    if($state == true){
-        error_log("Enabling NTP because it's disabled and we were told to enable it.");
-        exec($SUDO . " update-rc.d ntp defaults", $output, $return_val);
-        unset($output);
-        //TODO: check return
-        exec($SUDO . " service ntp start", $output, $return_val);
-        unset($output);
-        //TODO: check return
-    }else if ($state == false){
-        error_log("Disabling NTP because it's enabled and we were told to disable it.");
-        exec($SUDO . " service ntp stop", $output, $return_val);
-        unset($output);
-        //TODO: check return
-        exec($SUDO . " update-rc.d ntp remove", $output, $return_val);
-        unset($output);
-        //TODO: check return
-    }
 }
 
 /**
@@ -1080,6 +1529,26 @@ function DisableOutputBuffering() {
 
 	ob_implicit_flush(true);
 	flush();
+}
+
+function PrintToolTip($setting) {
+    global $settingInfos;
+    if (empty($settingInfos)) {
+        LoadSettingInfos();
+    }
+
+    if ((isset($settingInfos[$setting])) &&
+        (isset($settingInfos[$setting]['tip']))) {
+        echo "<img id='$setting" . "_img' title='$setting' src='images/questionmark.png'><span id='$setting" . "_tip' class='tooltip' style='display: none'>" . $settingInfos[$setting]['tip'] . "</span>\n";
+    }
+}
+
+function PrintAwesomeFree($code, $isLink = 0) {
+    echo "<span class='AwesomeFree";
+    if ($isLink)
+        echo " AwesomeFreeLink";
+
+    echo "'>&#x$code;</span>";
 }
 
 ?>

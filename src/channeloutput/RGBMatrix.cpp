@@ -22,15 +22,16 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <stdlib.h>
-#include <string.h>
-#include <cmath>
-
-#include "common.h"
-#include "log.h"
 #include "RGBMatrix.h"
-#include "settings.h"
+
+extern "C" {
+    RGBMatrixOutput *createOutputRGBMatrix(unsigned int startChannel,
+                                          unsigned int channelCount) {
+        return new RGBMatrixOutput(startChannel, channelCount);
+    }
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -175,8 +176,8 @@ int RGBMatrixOutput::Init(Json::Value config)
     if (config.isMember("panelColorDepth")) {
         colorDepth = config["panelColorDepth"].asInt();
     }
-    if (colorDepth > 8 || colorDepth < 6) {
-        colorDepth = 8;
+    if (colorDepth > 11 || colorDepth < 6) {
+        colorDepth = 11;
     }
     options.pwm_bits = colorDepth;
 
@@ -184,8 +185,24 @@ int RGBMatrixOutput::Init(Json::Value config)
              options.chain_length, options.parallel, options.rows, options.cols,
              options.brightness, options.pwm_bits);
 
-    
-    
+    if (config.isMember("cpuPWM")) {
+        options.disable_hardware_pulsing = config["cpuPWM"].asBool();
+        if (options.disable_hardware_pulsing) {
+            LogDebug(VB_CHANNELOUT, "Disabling use of Hardware PWM for OE pin\n");
+        }
+    }
+    if (config.isMember("panelInterleave")) {
+        options.multiplexing = std::atoi(config["panelInterleave"].asString().c_str());
+        
+        int panelScan = config["panelScan"].asInt();
+        if (panelScan == 0) {
+            // 1/8 scan by default
+            panelScan = m_panelHeight / 2;
+        }
+        if (panelScan == (m_panelHeight / 2)) {
+            options.multiplexing = 0;
+        }
+    }
 	m_rgbmatrix = new RGBMatrix(m_gpio, options);
 	if (!m_rgbmatrix)
 	{
@@ -240,9 +257,8 @@ int RGBMatrixOutput::Init(Json::Value config)
 
 	return ChannelOutputBase::Init(config);
 }
-void RGBMatrixOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = m_startChannel + m_channelCount - 1;
+void RGBMatrixOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    addRange(m_startChannel, m_startChannel + m_channelCount - 1);
 }
 
 /*
@@ -286,7 +302,7 @@ void RGBMatrixOutput::PrepData(unsigned char *channelData)
         {
             int panel = m_panelMatrix->m_outputPanels[output][i];
             
-            int chain = (panelsOnOutput - 1) - m_panelMatrix->m_panels[panel].chain;
+            int chain = (m_longestChain - 1) - m_panelMatrix->m_panels[panel].chain;
             for (int y = 0; y < m_panelHeight; y++)
             {
                 int px = chain * m_panelWidth;

@@ -1,68 +1,31 @@
 #!/bin/bash
 
-#############################################################################
-# Setup default /etc/network/interfaces and wpa_supplicant.conf files
-SetupDefaultNetworkConfig () {
-	if [ ! -f "/etc/network/interfaces.default" ]
-	then
-		cat <<-EOF > /etc/network/interfaces.default
-		auto lo
-		iface lo inet loopback
+AttemptCreateSoftAP() {
+    TetherInterface=$(getSetting TetherInterface)
+    if [ "x${TetherInterface}" == "x" ]; then
+        TetherInterface="wlan0";
+    fi
+    if [ -e "/sys/class/net/$TetherInterface" ]; then
+        /sbin/iwconfig $TetherInterface power off || true
+    fi
+    TetherInterfaceNum=$(echo $TetherInterface | colrm 1 4)
+    if [ ! -e "/sys/class/net/SoftAp0" ]; then
+        if [ -e "/sys/class/net/$TetherInterface" ]; then
+            COMBINATIONS=$(iw "phy${TetherInterfaceNum}" info | grep "interface combinations are not supported")
+            if [ "x${COMBINATIONS}" == "x" ]; then
+                iw phy "phy${TetherInterfaceNum}" interface add "SoftAp0" type __ap
+            fi
+        fi
+    fi
 
-		allow-hotplug eth0
-
-		iface eth0 inet dhcp
-
-		iface wlan0 inet dhcp
-		  wpa-roam /etc/wpa_supplicant/wpa_supplicant.conf
-
-		iface eth0:0 inet static
-		  address 192.168.0.10
-		  netmask 255.255.255.0
-		  network 192.168.0.0
-		EOF
-	fi
-
-	cp /etc/network/interfaces.default /etc/network/interfaces
-
-	if [ ! -f "/etc/wpa_supplicant/wpa_supplicant.conf.default" ]
-	then
-		cat <<-EOF > /etc/wpa_supplicant/wpa_supplicant.conf.default
-		ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-		update_config=1
-		EOF
-	fi
-
-	cp /etc/wpa_supplicant/wpa_supplicant.conf.default /etc/wpa_supplicant/wpa_supplicant.conf
-
-	persistent_net_rules="/etc/udev/rules.d/70-persistent-net.rules"
-	[ $persistent_net_rules ] && sed -i '/ NAME="wlan/d' $persistent_net_rules
-
-	if [ ! -f "/etc/resolv.conf.default" ]
-	then
-		touch /etc/resolv.conf.default
-	fi
-
-	cp /etc/resolv.conf.default /etc/resolv.conf
+    if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
+        modprobe g_ether iManufacturer="FPP-Tether" iProduct="FPP-Tether"
+        ls /sys/class/net/
+        if [ -e "/sys/class/net/usb0" ]; then
+            ifconfig usb0 192.168.7.2 netmask 255.255.255.0
+        fi
+    fi
 }
-
-#############################################################################
-# netcalc function found online on linuxquestions.org
-# http://www.linuxquestions.org/questions/programming-9/bash-cidr-calculator-646701/
-netcalc(){
-	local IFS='.' ip i
-	local -a oct msk
-
-	read -ra oct <<<"$1"
-	read -ra msk <<<"$2"
-
-	for i in ${!oct[@]}; do
-		ip+=( "$(( oct[i] & msk[i] ))" )
-	done
-
-	echo "${ip[*]}"
-}
-
 
 SetupFPPNetworkConfigViaConnMann() {
 
@@ -85,6 +48,12 @@ SetupFPPNetworkConfigViaConnMann() {
         DNS="$DNS1,$DNS2"
     fi
 
+    WifiRegulatoryDomain=$(getSetting WifiRegulatoryDomain)
+    if [ "$WifiRegulatoryDomain" == "" ]; then
+        WifiRegulatoryDomain="US"
+    fi
+    iw reg set "$WifiRegulatoryDomain"
+
     TMPFILE="/var/tmp/fpp.config"
     rm -f ${TMPFILE}
 
@@ -101,6 +70,11 @@ SetupFPPNetworkConfigViaConnMann() {
     unset DOWAIT
         . ${f}
 
+        # Handle the PSK differently since variable substitution is
+        # performed when sourcing the config file which prevents using a PSK
+        # with a dollar sign in it.  Rather than trying to escape/unescape
+        # things in the settings UI code, handle it here.
+        PSK=$(grep "^PSK=" ${f} | sed -e "s/^PSK=\"//" -e "s/\"$//")
 
         DOWAIT=0
         echo "[service_$INTERFACE]" >> ${TMPFILE}
@@ -168,355 +142,55 @@ SetupFPPNetworkConfigViaConnMann() {
         cp $TMPFILE /var/lib/connman/fpp.config
     fi
     TetherEnabled=$(getSetting EnableTethering)
-    if [ "$TetherEnabled" != "1" ]; then
-        # make sure tethering is off
-        sed -i -e 's/Tethering=true/Tethering=false/g' /var/lib/connman/settings
-        if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+    TetherTechnology=$(getSetting TetherTechnology)
+    sed -i -e 's/Tethering=true/Tethering=false/g' /var/lib/connman/settings
+    if [ -f "/etc/default/bb-wl18xx" ]; then
+        sed -i -e "s/TETHER_ENABLED=.*/TETHER_ENABLED=no/g" /etc/default/bb-wl18xx
+    fi
+    if [ "$TetherTechnology" == "1" ]; then
+        if [ "$TetherEnabled" != "1" ]; then
+            if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+                check_dnsmasq=$(systemctl is-enabled dnsmasq.service || true)
+                if [ "x${check_dnsmasq}" = "xdisabled" ] ; then
+                    systemctl enable dnsmasq &
+                fi
+            fi
+        elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
             check_dnsmasq=$(systemctl is-enabled dnsmasq.service || true)
-            if [ "x${check_dnsmasq}" = "xdisabled" ] ; then
-                systemctl enable dnsmasq &
+            if [ "x${check_dnsmasq}" = "xenabled" ] ; then
+                systemctl disable dnsmasq &
             fi
         fi
-    elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-        check_dnsmasq=$(systemctl is-enabled dnsmasq.service || true)
-        if [ "x${check_dnsmasq}" = "xenabled" ] ; then
-            systemctl disable dnsmasq &
+    else
+        AttemptCreateSoftAP
+    fi
+    if [ "$TetherEnabled" != "1" ]; then
+        # make sure tethering is off
+        rm -f /etc/dnsmasq.d/fpp-tether
+        ISENABLED=$(systemctl is-enabled hostapd)
+        if [ "$ISENABLED" == "enabled" ]; then
+            systemctl disable hostapd
         fi
     fi
-
-    #ifconfig -a > /var/tmp/conm.txt
-    #ls -l /sys/class/net/ >>  /var/tmp/conm.txt
-    # connmanctl services > /var/tmp/services.txt
-}
-
-
-#############################################################################
-# Create our version of /etc/network/interfaces and wpa_supplicant.conf files
-SetupFPPNetworkConfigViaInterfaces () {
-
-	if [ ! -f "${FPPHOME}/media/config/interface.eth0" -a ! -f "${FPPHOME}/media/config/interface.wlan0" ]
-	then
-		echo "FPP - Using default network config"
-		return
-	fi
-
-	echo "FPP - Configuring Network"
-
-	TMPFILE="/etc/network/interfaces.FPP"
-	INITETH0="no"
-	UPWLAN0="no"
-
-	cat <<-EOF > ${TMPFILE}
-	auto lo
-	iface lo inet loopback
-
-	EOF
-
-	PROTO="dhcp"
-	if [ -f "${FPPHOME}/media/config/interface.eth0" ]
-	then
-		. ${FPPHOME}/media/config/interface.eth0
-	fi
-
-	kill -9 $(ps auxw | grep ifplugd | grep -v grep | grep eth0 | awk '{print $2}') > /dev/null 2>&1
-
-	if [ "x${PROTO}" = "xdhcp" ]
-	then
-		cat <<-EOF >> ${TMPFILE}
-		auto eth0
-		iface eth0 inet dhcp
-		EOF
-	else
-		# Re-initialize eth0 since it is not using DHCP
-		INITETH0="yes"
-
-		kill -9 $(ps auxw | grep dhclient | grep -v grep | grep eth0 | awk '{print $2}') > /dev/null 2>&1
-
-		NETWORK=$(netcalc ${ADDRESS} ${NETMASK})
-
-		cat <<-EOF >> ${TMPFILE}
-		auto eth0
-		iface eth0 inet static
-		  address ${ADDRESS}
-		  netmask ${NETMASK}
-		  network ${NETWORK}
-		EOF
-
-		if [ "x${GATEWAY}" != "x" ]
-		then
-			echo "  gateway ${GATEWAY}" >> ${TMPFILE}
-		fi
-	fi
-
-	echo >> ${TMPFILE}
-
-	if [ -f "${FPPHOME}/media/config/interface.wlan0" ]
-	then
-		UPWLAN0="yes"
-
-		. ${FPPHOME}/media/config/interface.wlan0
-
-		kill -9 $(ps auxw | grep ifplugd | grep -v grep | grep wlan0 | awk '{print $2}') > /dev/null 2>&1
-
-		if [ "x${PROTO}" = "xdhcp" ]
-		then
-			cat <<-EOF >> ${TMPFILE}
-			allow-hotplug wlan0
-			iface wlan0 inet manual
-			  wpa-roam /etc/wpa_supplicant/wpa_supplicant.conf
-			wireless-power off
-
-			iface FPP-wlan0 inet dhcp
-
-			EOF
-		else
-			NETWORK=$(netcalc ${ADDRESS} ${NETMASK})
-
-			kill -9 $(ps auxw | grep dhclient | grep -v grep | grep wlan0 | awk '{print $2}') > /dev/null 2>&1
-
-			cat <<-EOF >> ${TMPFILE}
-			allow-hotplug wlan0
-			iface wlan0 inet manual
-			  wpa-roam /etc/wpa_supplicant/wpa_supplicant.conf
-			wireless-power off
-
-			iface FPP-wlan0 inet static
-			  address ${ADDRESS}
-			  netmask ${NETMASK}
-			  network ${NETWORK}
-			EOF
-
-			if [ "x${GATEWAY}" != "x" ]
-			then
-				echo "  gateway ${GATEWAY}" >> ${TMPFILE}
-			fi
-
-			echo >> ${TMPFILE}
-			echo "iface default inet dhcp" >> ${TMPFILE}
-		fi
-		echo >> ${TMPFILE}
-
-		cat <<-EOF > /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-		update_config=1
-
-		network={
-		  ssid="${SSID}"
-		EOF
-
-		if [ "x${PSK}" != "x" ]
-		then
-			echo "  psk=\"${PSK}\"" >> /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		else
-			echo "  key_mgmt=NONE" >> /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		fi
-
-		cat <<-EOF >> /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		  scan_ssid=1
-		  id_str="FPP-wlan0"
-		}
-
-		EOF
-
-		cp /etc/wpa_supplicant/wpa_supplicant.conf.FPP /etc/wpa_supplicant/wpa_supplicant.conf
-	fi
-
-	cat <<-EOF >> ${TMPFILE}
-	iface eth0:0 inet static
-	  address 192.168.0.10
-	  netmask 255.255.255.0
-	  network 192.168.0.0
-	EOF
-
-	echo >> ${TMPFILE}
-
-	cp ${TMPFILE} /etc/network/interfaces
-
-	if [ "x${INITETH0}" = "xyes" ]
-	then
-		echo "FPP - Taking eth0 down"
-		ifdown eth0 > /dev/null 2>&1
-
-		echo "FPP - Bringing eth0 back up"
-		ifup eth0
-	fi
-
-	if [ "x${UPWLAN0}" = "xyes" ]
-	then
-		echo "FPP - Taking wlan0 down"
-		ifdown wlan0 > /dev/null 2>&1
-
-		#wpa_cli reconfigure > /dev/null 2>&1
-
-		echo "FPP - Bringing wlan0 up"
-		ifup wlan0 > /dev/null 2>&1
-
-		# Shouldn't need this since we have "wireless-power off" but leave it
-		# in here just in case for now.
-		#echo "FPP - Disabling power management on wlan0"
-		#iwconfig wlan0 power off > /dev/null 2>&1
-	else
-		if [ "x${SSID}" = "x" ]
-		then
-			echo "FPP - Empty SSID, taking wlan0 down"
-			ifdown wlan0 > /dev/null 2>&1
-		fi
-	fi
 }
 SetupFPPNetworkConfig () {
-    if [ -f "/usr/bin/connmanctl" -o -f "/usr/sbin/connmanctl" ]
-    then
-        SetupFPPNetworkConfigViaConnMann
-    else
-        SetupFPPNetworkConfigViaInterfaces
-    fi
-
+    SetupFPPNetworkConfigViaConnMann
     ENABLEROUTING=$(getSetting EnableRouting)
-	if [ "x${ENABLEROUTING}" = "x1" ]
-	then
-		sysctl -w net.ipv4.ip_forward=1
-	else
+    if [ "x${ENABLEROUTING}" = "x1" ]
+    then
+        sysctl -w net.ipv4.ip_forward=1
+    else
         sysctl -w net.ipv4.ip_forward=0
-	fi
+    fi
 }
-
-#############################################################################
-# Configure fallback IP address if necessary
-ConfigureFallbackIP() {
-	if [ -f "${CFGDIR}/interface.eth0" ]
-	then
-		. ${CFGDIR}/interface.eth0
-		if [ "x${PROTO}" = "xstatic" ]
-		then
-			return
-		fi
-	fi
-
-	#####################################################################
-	# Don't configure fallback IP if no link is detected
-	ethtool eth0 | grep -q "Link detected: yes"
-	if [ $? -eq 1 ]
-	then
-		return
-	fi
-
-
-	ETH0GATEWAY=$(netstat -rn | grep "^0\.0\.0\.0.*eth0$" | awk '{print $2}')
-	WLAN0GATEWAY=$(netstat -rn | grep "^0\.0\.0\.0.*wlan0$" | awk '{print $2}')
-	WLAN0NETWORK=$(ifconfig wlan0 2> /dev/null | grep "inet addr:" | awk '{print $2}' | cut -f2 -d: | cut -f1-3 -d\.)
-	NEEDFALLBACKIP=1
-	NEEDFALLBACKGW=1
-
-	if [ ! -z "${ETH0GATEWAY}" ]
-	then
-		ping -c 1 ${ETH0GATEWAY} > /dev/null 2>&1
-		if [ $? -eq 0 ]
-		then
-			# Have a default gateway on eth0 and it is pingable
-			NEEDFALLBACKIP=0
-			NEEDFALLBACKGW=0
-		fi
-	fi
-
-	if [ ! -z "${WLAN0GATEWAY}" ]
-	then
-		ping -c 1 ${WLAN0GATEWAY} > /dev/null 2>&1
-		if [ $? -eq 0 ]
-		then
-			# Have a default gateway on wlan0 and it is pingable
-			NEEDFALLBACKGW=0
-		fi
-	fi
-
-	if [ ${NEEDFALLBACKIP} -eq 1 ]
-	then
-		OTHERNET=1
-		IP=192.168.0.10
-		NETMASK=255.255.255.0
-		BROADCAST=192.168.0.255
-		GATEWAY=192.168.0.1
-
-		arping -q -c 1 -w 1000000 -I eth0 192.168.1.1 2> /dev/null
-		if [ $? -eq 0 ]
-		then
-			# we're on the 192.168.1.0/24 network
-			OTHERNET=0
-			IP=192.168.1.10
-			NETMASK=255.255.255.0
-			BROADCAST=192.168.1.255
-			GATEWAY=192.168.1.1
-		fi
-
-		FBNETWORK=$(echo ${IP} | cut -f1-3 -d\.)
-		if [ "x${WLAN0NETWORK}" = "x${FBNETWORK}" ]
-		then
-			IP=192.168.${OTHERNET}.10
-			NETMASK=255.255.255.0
-			BROADCAST=192.168.${OTHERNET}.255
-			GATEWAY=192.168.${OTHERNET}.1
-		fi
-		ifconfig eth0:0 ${IP} netmask ${NETMASK} broadcast ${BROADCAST} up
-
-		if [ ${NEEDFALLBACKGW} -eq 1 ]
-		then
-			route add default gw ${GATEWAY} eth0:0
-		fi
-	fi
-}
-
-#############################################################################
-# Get a list of all interfaces using dhclient to get an IP and
-# waits for them to all recieve IPs.  If any interface does not
-# have an IP, then the function will sleep for a little while
-# and then jump back to the top of the loop to check again.
-WaitForDHCPIPs() {
-	DHCP_INTERFACES="$(ps auxw | grep "dhclient\.\([a-z0-9]*\)\.pid" | grep -v grep | sed -e 's/.*client\.\([a-z0-9]*\)\.pid.*/\1/' | sort | uniq)"
-	SLEEPTIME=2
-
-	if [ -z "${DHCP_INTERFACES}" ]
-	then
-		return 0
-	fi
-
-	echo "Waiting for DHCP to receive IP addresses: '${DHCP_INTERFACES}'"
-
-	# Loop up to 5 times, so max wait time is 5 * ${SLEEPTIME}
-	for i in {1..5}
-	do
-		IP=""
-		for INTERFACE in ${DHCP_INTERFACES}
-		do
-			LINKUP="N/A"
-			if [ "x${INTERFACE}" = "xeth0" ]
-			then
-				LINKUP=$(ethtool eth0 | grep "Link detected: yes")
-			fi
-
-			IP=$(ifconfig ${INTERFACE} | grep "inet " | sed -e "s/addr://" | awk '{print $2}')
-			if [ -n "${LINKUP}" -a -z "${IP}" ]
-			then
-				echo "${INTERFACE} does not have an IP, waiting for ${SLEEPTIME} seconds"
-				sleep ${SLEEPTIME}
-				continue
-			fi
-		done
-		if [ -z "${IP}" ]
-		then
-			continue
-		fi
-
-		break
-	done
-}
-
 
 WaitForInterfacesUp() {
     IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
     if [ -z "$IPS" ]; then
-        # Loop up to 4 times, so max wait time is 4 * 2
-        for i in {1..4}
+        # Loop up to 12 times, so max wait time is 12
+        for i in {1..12}
         do
-            sleep 2
+            sleep 1
             IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
             #echo "y:  $IPS" >> /tmp/ips.txt
             if [ -z "$IPS" ]
@@ -526,26 +200,27 @@ WaitForInterfacesUp() {
 
             break
         done
-	    if [ -z "$IPS" ]; then
+	if [ -z "$IPS" ]; then
             #on some adapters, we need to down/up in order for connman to be able
             #to detect the link on it and attach to wifi
             ifconfig wlan0 down
+            sleep 1
             ifconfig wlan0 up
-            connmanctl scan wifi
+            #connmanctl scan wifi
             # Loop up to 8 times, so max wait time is 8 * 2
             for i in {1..8}
             do
                sleep 2
                IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
-                   if [ -z "$IPS" ]; then
-               continue
+               if [ -z "$IPS" ]; then
+                   continue
                fi
                break
             done
         fi
     fi
 
-    connmanctl services >> /tmp/services.txt
+    # connmanctl services >> /tmp/services.txt
 
     CONFIGS=`ls ${FPPHOME}/media/config/interface.w* 2> /dev/null; ls ${FPPHOME}/media/config/interface.e* 2> /dev/null`
     for f in $CONFIGS; do
@@ -556,12 +231,12 @@ WaitForInterfacesUp() {
     done
     if [ "x$DEFGW" == "x" ]; then
         # no gateway defined
-	    CURDIR=$(pwd)
+	CURDIR=$(pwd)
         ETHS=`ls -d ether* 2> /dev/null`
         WIFIS=`ls -d wifi* 2> /dev/null`
         if [ "x$WIFIS" != "x" ]; then
             for f in $ETHS; do
-	            connmanctl move-before $WIFIS $f
+	        connmanctl move-before $WIFIS $f
             done
         fi
         cd "${CURDIR}"
@@ -575,21 +250,12 @@ MaybeEnableTethering() {
     TetherEnabled=$(getSetting EnableTethering)
 
     if [ "x${TetherEnabled}" == "x" ]; then
-        if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-            # many USB wifi adapters on the BBB don't support AP mode
-            # it also disables the reliable USB connection
-            # thus, on the BBB, make the default to not have Tether mode
-            # and make the user specifically have to enable it
-            setSetting EnableTethering 2
-            TetherEnabled=2
-        else
-            TetherEnabled=0
-        fi
+        TetherEnabled=0
     fi
 
     if [ "$TetherEnabled" == "0" ]; then
         IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
-        HASLINK="$(ethtool eth0 | grep \"Link detected: yes\")"
+        HASLINK=$(ethtool eth0 | grep "Link detected: yes")
         if [ "x${HASLINK}" = "x" ]; then
             # no link on eth0
             if [ -z "$IPS" ]; then
@@ -598,18 +264,95 @@ MaybeEnableTethering() {
             fi
         fi
     fi
-    if [ ! -e /sys/class/net/wlan0 ]; then
+    TetherInterface=$(getSetting TetherInterface)
+    if [ "x${TetherInterface}" == "x" ]; then
+        TetherInterface="wlan0";
+    fi
+    if [ ! -e "/sys/class/net/${TetherInterface}" ]; then
+        # no wifi adapter, try wlan0
+        TetherInterface="wlan0";
+    fi
+    if [ "$TetherEnabled" == "1" ]; then
+        for i in {1..30}
+        do
+            if [ ! -e "/sys/class/net/${TetherInterface}" ]; then
+                echo "${TetherInterface} is not available, waiting..."
+                sleep 1
+            fi
+        done
+    fi
+    if [ ! -e "/sys/class/net/${TetherInterface}" ]; then
         # no wifi adapter, no point enabling tethering
         TetherEnabled=2
-    fi 
+    fi
     if [ "$TetherEnabled" == "1" ]; then
         TetherSSID=$(getSetting TetherSSID)
         TetherPSK=$(getSetting TetherPSK)
-        if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-            systemctl disable dnsmasq
-            systemctl stop dnsmasq
+        if [ "${TetherSSID}x" == "x" ]; then
+            TetherSSID="FPP"
         fi
-        connmanctl tether wifi on "${TetherSSID:=FPP}" "${TetherPSK:=Christmas}"
+        if [ "${TetherPSK}x" == "x" ]; then
+            TetherPSK="Christmas"
+        fi
+
+        TetherTechnology=$(getSetting TetherTechnology)
+        if [ "$TetherTechnology" == "1" ]; then
+            if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+                systemctl disable dnsmasq
+                systemctl stop dnsmasq
+            fi
+            connmanctl tether wifi on "${TetherSSID}" "${TetherPSK}"
+        else
+            AttemptCreateSoftAP
+            if [ -e "/sys/class/net/SoftAp0" ]; then
+                TetherInterface="SoftAp0"
+            fi
+
+            systemctl stop dnsmasq
+
+cat > /etc/dnsmasq.d/fpp-tether <<-EOF
+interface=${TetherInterface}
+dhcp-range=${TetherInterface},192.168.8.2,192.168.8.20,255.255.255.0,24h
+listen-address=192.168.8.1
+dhcp-option=${TetherInterface},3
+dhcp-option=${TetherInterface},6
+EOF
+
+cat > /etc/hostapd/hostapd.conf <<-EOF
+interface=${TetherInterface}
+driver=nl80211
+wpa_passphrase=${TetherPSK}
+ssid=${TetherSSID}
+country_code=US
+hw_mode=g
+channel=11
+macaddr_acl=0
+auth_algs=3
+wpa=2
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
+rsn_pairwise=CCMP
+wmm_enabled=0
+ignore_broadcast_ssid=0
+reassociation_deadline=3000
+pmk_r1_push=1
+ft_over_ds=0
+bss_transition=1
+wpa_group_rekey=3600
+wpa_gmk_rekey=86400
+EOF
+
+            /sbin/ifconfig ${TetherInterface} 192.168.8.1 netmask 255.255.255.0
+
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+            iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+            iptables -A FORWARD -i eth0 -o  ${TetherInterface} -m state --state RELATED,ESTABLISHED -j ACCEPT
+            iptables -A FORWARD -i  ${TetherInterface} -o eth0 -j ACCEPT
+
+            systemctl unmask hostapd
+            systemctl start dnsmasq
+            systemctl start hostapd
+        fi
     fi
 }
 
@@ -617,44 +360,84 @@ MaybeEnableTethering() {
 # Functions for compiling and cleaning up compiled binaries
 BINARIES="fppd fpp fppmm"
 cleanCompiledBinaries() {
+    echo "in Clean stage"
+
 	if [ "x${FPPDIR}" = "x/opt/fpp" ]
 	then
 		cd ${FPPDIR}/src && ${SUDO} make clean
 	else
 		cd ${FPPDIR}/src && sudo -u ${FPPUSER} make clean
 	fi
+
+    for p in ${MEDIADIR}/plugins/*; do
+        if [ -d "$p" ]; then
+            if [ -f "${p}/Makefile" ]; then
+                echo "Cleaning plugin $p"
+                make -C "${p}" -f "${p}/Makefile" clean
+            fi
+        fi
+    done
+}
+populateCCACHE() {
+    FPPBASEVERSION=$(</etc/fpp/rfs_version)
+    MAJVER=${FPPBASEVERSION:1:1}
+    MINVER=${FPPBASEVERSION:3:2}
+    if [[ $MINVER == *"-" ]]; then
+        MINVER=${FPPBASEVERSION:3:1}
+    fi
+    if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
+        PLAT=Pi
+    elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+        PLAT=BBB
+    else
+        return 0
+    fi
+    if [[ ${MAJVER} -gt 3 || ${MAJVER} -eq 3 && ${MINVER} -ge 3 ]]; then
+        #at least v3.3
+        BRANCH=$(git branch --list | grep \* | colrm 1 2)
+        
+        FILETOGET="ccache-${PLAT}-${MAJVER}.x-${BRANCH}.tar.gz"
+        echo $FILETOGET
+
+        curl  -f --fail-early "https://falconchristmas.github.io/ccache/${FILETOGET}" --output "/tmp/$FILETOGET"
+        
+        if [ -f "/tmp/$FILETOGET" ]; then
+            sudo tar -x -z -C /root -f "/tmp/$FILETOGET"
+            rm -f "/tmp/$FILETOGET"
+        fi
+    fi
+    
+    # set the CCache sizes/flags that we need to be able to successfully compile
+    sudo ccache -M 250M
+    sudo ccache --set-config=temporary_dir=/tmp
+    sudo ccache --set-config=sloppiness=pch_defines,time_macros,locale
+    sudo ccache --set-config=pch_external_checksum=true
+    sudo ccache --set-config=hard_link=true
 }
 
 compileBinaries() {
 	cleanCompiledBinaries
+    populateCCACHE
 
+	# export CCACHE_LOGFILE=/tmp/cache.debug
+	export LANG=en_US.UTF-8
+	export TERM=linux
+	CPUS=$(grep "^processor" /proc/cpuinfo | wc -l)
 	if [ "x${FPPDIR}" = "x/opt/fpp" ]
 	then
-		cd ${FPPDIR}/src && ${SUDO} make clean && ${SUDO} make optimized
+		cd ${FPPDIR}/src && ${SUDO} make clean && ${SUDO} -E make -j ${CPUS} optimized
 	else
-		cd ${FPPDIR}/src && ${SUDO} -u ${FPPUSER} make clean && sudo -u ${FPPUSER} make optimized
+		cd ${FPPDIR}/src && ${SUDO} -u ${FPPUSER} make clean && sudo -u ${FPPUSER} make -j ${CPUS} optimized
 	fi
 
-	if [ "x${FPPBINDIR}" != "x${FPPDIR}/src" ]
-	then
-		# Clean up any installed binaries that are identical to the one in git
-		for FILE in ${BINARIES}
-		do
-			if [ "x${FPPDIR}" = "x/opt/fpp" ]
-			then
-				${SUDO} strip ${FPPDIR}/src/${FILE}
-			else
-				${SUDO} -u ${FPPUSER} strip ${FPPDIR}/src/${FILE}
-			fi
-
-			BINMD5=$(md5sum ${FPPBINDIR}/${FILE} | awk '{print $1}')
-			SRCMD5=$(md5sum ${FPPDIR}/src/${FILE} | awk '{print $1}')
-			if [ "${BINMD5}" = "${SRCMD5}" ]
-			then
-				${SUDO} rm -f ${FPPDIR}/src/${FILE}
-			fi
-		done
-	fi
+    for p in ${MEDIADIR}/plugins/*; do
+        if [ -d "$p" ]; then
+            if [ -f "${p}/Makefile" ]; then
+                echo "Building plugin $p"
+                make -C "${p}" -f "${p}/Makefile" -j ${CPUS}
+            fi
+        fi
+    done
 }
 
 #############################################################################
@@ -722,64 +505,6 @@ runPostStopScripts() {
 }
 
 #############################################################################
-# Update the Avahi daemon service config file for fpp
-updateAvahiConfig() {
-	TMPFILE="/var/tmp/fpp.service"
-	AVAHICFGFILE="/etc/avahi/services/fpp.service"
-
-	fppMode=$(getSetting fppMode)
-	platform=$(cat /etc/fpp/platform)
-
-	cat > ${TMPFILE} <<-EOF
-		<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
-		<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-
-		<service-group>
-		  <name replace-wildcards="yes">%h</name>
-		  <service>
-		    <type>_fpp-httpd._tcp</type>
-		    <port>80</port>
-		  </service>
-		  <service>
-		    <type>_fpp-fppd._udp</type>
-		    <port>32320</port>
-		    <txt-record>fppMode=${fppMode},platform=${platform}</txt-record>
-		  </service>
-		</service-group>
-		EOF
-
-	cp ${TMPFILE} ${AVAHICFGFILE}
-}
-
-#############################################################################
-# Start/Stop OLA Daemon
-startOLADaemonIfNecessary() {
-	# Start OLA daemon if necessary
-	cat ${FPPHOME}/media/config/channeloutputs.json 2> /dev/null | tr -d "\r\n" | egrep -q 'OLA",[ 	a-zA-Z0-9:",]*"enabled": 1'
-	if [ $? -eq 0 ]
-	then
-		OLAPID=$(pgrep olad)
-		if [ -z "${OLAPID}" ]
-		then
-			sudo -u ${FPPUSER} olad -f -c ${FPPHOME}/media/config/ola
-		fi
-	fi
-}
-
-stopOLADaemonIfUnused() {
-	# Start OLA daemon if necessary
-	cat ${FPPHOME}/media/config/channeloutputs.json 2> /dev/null | tr -d "\r\n" | egrep -q 'OLA",[ 	a-zA-Z0-9:",]*"enabled": 1'
-	if [ $? -ne 0 ]
-	then
-		OLAPID=$(pgrep olad)
-		if [ -n "${OLAPID}" ]
-		then
-			killall -9 olad
-		fi
-	fi
-}
-
-#############################################################################
 # Configure Channel Outputs
 setupChannelOutputs() {
 
@@ -801,6 +526,9 @@ setupChannelOutputs() {
 				echo "blacklist snd_bcm2835" | sudo tee /etc/modprobe.d/blacklist-bcm2835.conf > /dev/null
 				shutdown -r now
 			fi
+            # load the dummy sound driver so things that expect a sound device to be there will still work
+            modprobe snd-dummy
+            modprobe snd-seq-dummy
 		else
 			# Re-enable onboard sound if it is disabled
 			if [ -f /etc/modprobe.d/blacklist-bcm2835.conf ]
@@ -811,49 +539,16 @@ setupChannelOutputs() {
 			fi
 		fi
 	fi
-
-	startOLADaemonIfNecessary
-}
-
-#############################################################################
-# Start/Stop the Web Socket Server
-startWebSocketServer() {
-	/usr/bin/nohup ${SCRIPTDIR}/fppwss > ${LOGDIR}/fppwss.log 2>&1 &
-}
-
-stopWebSocketServer() {
-	killall -9 fppwss 2> /dev/null
-}
-
-#############################################################################
-# Detect PiFace
-detectPiFace() {
-	/usr/local/bin/gpio -p write 207 1
-	PIFACEFOUND=$(/usr/local/bin/gpio -p read 215)
-	/usr/local/bin/gpio -p write 207 0
-
-	grep -q PiFaceDetected ${CFGFILE}
-	if [ $? -eq 0 ]
-	then
-		sed -i "s/^PiFaceDetected =.*/PiFaceDetected = ${PIFACEFOUND}/" ${CFGFILE}
-	else
-		echo "PiFaceDetected = ${PIFACEFOUND}" >> ${CFGFILE}
-	fi
 }
 
 #############################################################################
 # Detect Falcon hardware on SPI port
 detectFalconHardware() {
-	${FPPD} -H > /dev/null 2>&1
+	${FPPD} -H
 	FHWFOUND=$?
 
-	grep -q FalconHardwareDetected ${CFGFILE}
-	if [ $? -eq 0 ]
-	then
-		sed -i "s/^FalconHardwareDetected =.*/FalconHardwareDetected = ${FHWFOUND}/" ${CFGFILE}
-	else
-		echo "FalconHardwareDetected = ${FHWFOUND}" >> ${CFGFILE}
-	fi
+	echo "Result: ${FHWFOUND}"
+    setSetting FalconHardwareDetected ${FHWFOUND}
 }
 
 #############################################################################
@@ -929,119 +624,52 @@ checkTimeAgainstUSNO() {
 }
 
 #############################################################################
-# Setup RTC on the Pi.
-setupRTC () {
-
-    if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
-        # RTC Setup
-        # to get the RPi board version:
-        REV=$(cat /proc/cpuinfo|grep Revision)
-        # Extract revision
-        REV=${REV##*: }
-        # Make it readable as hex
-        REV=0x$REV
-        # Convert hex to dec
-        REV=$((REV))
-
-        if [ $REV -lt 4 ]; then
-            I2CBUS="i2c-0"
-        else
-            I2CBUS="i2c-1"
-        fi
-    elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-        I2CBUS="i2c-2"
+# Configure BBB Leds
+configureBBBLeds() {
+    BBBLedPWR=$(getSetting BBBLedPWR)
+    if [ "x$BBBLedPWR" == "x0" ]; then
+        i2cset -f -y 0 0x24 0x0b 0x6e
+        i2cset -f -y 0 0x24 0x13 0x00
+        i2cset -f -y 0 0x24 0x0b 0x6e
+        i2cset -f -y 0 0x24 0x13 0x00
     else
-        return
+        i2cset -f -y 0 0x24 0x0b 0x6e
+        i2cset -f -y 0 0x24 0x13 0x38
+        i2cset -f -y 0 0x24 0x0b 0x6e
+        i2cset -f -y 0 0x24 0x13 0x38
     fi
-
-	# Read Clock Setting From Settings File
-	piRTC=$(awk -f ${FPPDIR}/scripts/readSetting.awk ${SETTINGSFILE} setting=piRTC)
-
-	case "$piRTC" in
-	1)
-	  # rasClock chip
-      echo "FPP - Configuring RTC, Setting to rasClock/${I2CBUS}"
-      echo "pcf2127 0x51" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	2)
-	  # DS1307 chip
-      echo "FPP - Configuring RTC, Setting to DS1307/${I2CBUS}"
-      echo "ds1307 0x68" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	3)
-	  # PiFace Chip
-      echo "FPP - Configuring RTC, Settting to mcp7941x/${I2CBUS}"
-	  echo "mcp7941x 0x6f" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	4)
-	  # AdaFruit
-      echo "FPP - Configuring RTC, Settting to pcf8523/${I2CBUS}"
-	  echo "pcf8523 0x68" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	*)
-	  # None
-      echo "FPP - Configuring RTC, None Selected"
-	  ;;
-	esac
+    BBBLeds0=$(getSetting BBBLeds0)
+    if [ "x$BBBLeds0" != "x" ]; then
+        echo "$BBBLeds0" > /sys/class/leds/beaglebone\:green\:usr0/trigger
+    fi
+    BBBLeds1=$(getSetting BBBLeds1)
+    if [ "x$BBBLeds1" != "x" ]; then
+        echo "$BBBLeds1" > /sys/class/leds/beaglebone\:green\:usr1/trigger
+    fi
+    BBBLeds2=$(getSetting BBBLeds2)
+    if [ "x$BBBLeds2" != "x" ]; then
+        echo "$BBBLeds2" > /sys/class/leds/beaglebone\:green\:usr2/trigger
+    fi
+    BBBLeds3=$(getSetting BBBLeds3)
+    if [ "x$BBBLeds3" != "x" ]; then
+        echo "$BBBLeds3" > /sys/class/leds/beaglebone\:green\:usr3/trigger
+    fi
 }
 
 #############################################################################
-# Functions to remount root read-write if read-only and switch back if necessary
-remountRootReadWrite() {
-	if [ "x${MOUNTSTATE}" = "x" ]
-	then
-		export MOUNTSTATE=$(mount | grep "on / type" | cut -f2 -d\( | cut -f1 -d,)
-	fi
-
-	if [ "x${MOUNTSTATE}" = "xro" ]
-	then
-		echo "Remounting root filesystem Read-Write"
-		sudo mount -o remount,rw /
-	fi
-}
-
-remountRootReadOnlyIfNeeded() {
-	if [ "x${MOUNTSTATE}" = "xro" ]
-	then
-		echo "Remounting root filesystem Read-Only"
-		sudo mount -o remount,ro /
-	fi
-}
-
-#############################################################################
-# Some fixups related to running the v1.x SD image read-only.  These are pure
-# hacks for now until we get a new SD image that is designed to be read-only
-# from the start.
-applyReadOnlySDFixups() {
-	if [ "x${MOUNTSTATE}" = "x" ]
-	then
-		export MOUNTSTATE=$(mount | grep "on / type" | cut -f2 -d\( | cut -f1 -d,)
-	fi
-
-	SDVER=$(cat /etc/fpp/rfs_version | cut -f1 -d\.)
-
-	if [ "x${SDVER}" = "xv1" -a "x${MOUNTSTATE}" = "xro" ]
-	then
-		echo "FPP: Root is mounted read-only on a v1.x SD image, applying read-only fixups."
-
-		# Samba's smbd won't start if it can't write to /var/lib/samba
-		cp -rp /var/lib/samba /tmp/
-		mkdir /var/log/samba
-		mount -o bind /tmp/samba /var/lib/samba
-		/etc/init.d/samba restart
-
-		remountRootReadWrite
-
-		# Our startup script can't copy php.ini into place if root is read-only
-		cp /opt/fpp/etc/php.ini /etc/
-		/etc/init.d/apache2 restart
-
-		remountRootReadOnlyIfNeeded
-	fi
+applyScreenBlankSetting() {
+echo 0 > /sys/class/graphics/fbcon/cursor_blink
+SCREENSAVER=$(getSetting screensaver)
+if [ "x${SCREENSAVER}" = "x1" ]
+then
+        echo "FPP - Turning ON screen blanking"
+        TERM=linux setterm --clear all --blank 1  >> /dev/tty0
+        sleep 5
+        dd if=/dev/zero of=/dev/fb0 > /dev/null 2>&1
+else
+        echo "FPP - Turning OFF screen blanking"
+        TERM=linux setterm --blank 0  >> /dev/tty0
+fi
 }
 
 #############################################################################

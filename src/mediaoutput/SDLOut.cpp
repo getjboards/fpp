@@ -23,21 +23,13 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdlib.h>
-#include <stdio.h>
+#include "fpp-pch.h"
+
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include <sys/types.h>
 #include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
-#include <atomic>
 #include <cmath>
-#include <set>
-#include <thread>
-#include <list>
-#include <mutex>
 
 extern "C"
 {
@@ -50,23 +42,14 @@ extern "C"
 }
 
 
-#include "channeloutputthread.h"
-#include "common.h"
-#include "log.h"
 #include "MultiSync.h"
 #include "SDLOut.h"
-#include "Sequence.h"
-#include "settings.h"
-#include "PixelOverlay.h"
-
-#define DEFAULT_RATE 44100
+#include "overlays/PixelOverlay.h"
+#include "overlays/PixelOverlayModel.h"
+#include "channeloutput/channeloutputthread.h"
 
 //Only keep 30 frames in buffer
 #define VIDEO_FRAME_MAX     30
-
-// 2 seconds of audio in the queue
-#define ALSA_MIN_QUEUED_SIZE DEFAULT_RATE*2*2*2
-#define ALSA_MAX_QUEUED_SIZE ALSA_MIN_QUEUED_SIZE*2
 
 #if defined(PLATFORM_PI)
 //on the old single core Pi's, we need to increase the buffer size
@@ -110,7 +93,7 @@ static int DTStoMS(int64_t dts , int dtspersec)
 
 class SDLInternalData {
 public:
-    SDLInternalData() : curPos(0) {
+    SDLInternalData(int rate, int bps, bool flt) : curPos(0) {
         formatContext = nullptr;
         audioCodecContext = nullptr;
         videoCodecContext = nullptr;
@@ -127,8 +110,14 @@ public:
         curVideoFrame = nullptr;
         videoFrameCount = 0;
         audioDev = 0;
-        outBuffer = new uint8_t[ALSA_MAX_QUEUED_SIZE];
         outBufferPos = 0;
+        currentRate = rate;
+        bytesPerSample = bps;
+        isSamplesFloat = flt;
+        
+        minQueueSize = rate*bps*2*2;  // 2 seconds of 2 channel audio
+        maxQueueSize = minQueueSize * 2;
+        outBuffer = new uint8_t[maxQueueSize];
     }
     ~SDLInternalData() {
         if (frame != nullptr) {
@@ -177,6 +166,11 @@ public:
     SDL_AudioDeviceID audioDev;
     int outBufferPos = 0;
     uint8_t *outBuffer;
+    int currentRate;
+    int bytesPerSample;
+    bool isSamplesFloat;
+    int minQueueSize;
+    int maxQueueSize;
 
     // stuff for the video stream
     AVCodecContext *videoCodecContext;
@@ -211,7 +205,7 @@ public:
         }
         ++videoFrameCount;
     }
-
+    
     int buffersFull(bool flushaudio) {
         int retVal = -1;
         if (video_stream_idx != -1) {
@@ -238,7 +232,7 @@ public:
         }
         unsigned int queue = SDL_GetQueuedAudioSize(audioDev);
         //if we have data and are either below the queue threshold or we've finished reading
-        if (outBufferPos && ((queue < ALSA_MIN_QUEUED_SIZE) || doneRead)) {
+        if (outBufferPos && ((queue < minQueueSize) || doneRead)) {
             curPosLock.lock();
             SDL_QueueAudio(audioDev, outBuffer, outBufferPos);
             curPos += outBufferPos;
@@ -254,9 +248,9 @@ public:
             return 2;
         }
         queue += outBufferPos;
-        if (queue < ALSA_MIN_QUEUED_SIZE) {
+        if (queue < minQueueSize) {
             return 0;
-        } else if (queue < ALSA_MAX_QUEUED_SIZE) {
+        } else if (queue < maxQueueSize) {
             return 1;
         }
         return 2;
@@ -281,21 +275,20 @@ public:
                     int lastPacketRecvCount = packetRecvCount;
                     while (!avcodec_receive_frame(audioCodecContext, frame)) {
                         packetRecvCount++;
-                        int sz = frame->nb_samples * 2 * 2;
-
+                        
                         uint8_t* out_buffer = &outBuffer[outBufferPos];
-                        int max = ALSA_MAX_QUEUED_SIZE - outBufferPos;
+                        int max = maxQueueSize - outBufferPos;
                         int outSamples = swr_convert(au_convert_ctx,
                                                      &out_buffer,
                                                      max / 4,
                                                      (const uint8_t **)frame->extended_data,
                                                      frame->nb_samples);
 
-                        outBufferPos += (outSamples * 2 * 2);
-                        if (outBufferPos > ALSA_MAX_QUEUED_SIZE) {
+                        outBufferPos += (outSamples * bytesPerSample * 2);
+                        if (outBufferPos > maxQueueSize) {
                             AudioHasStalled = true;
                         }
-                        decodedDataLen += (outSamples * 2 * 2);
+                        decodedDataLen += (outSamples * bytesPerSample * 2);
                         av_frame_unref(frame);
                     }
                     if (packetSendCount > 1000 && lastPacketRecvCount == packetRecvCount) {
@@ -340,7 +333,7 @@ public:
             
             if (packetOk) {
                 if (first) {
-                    if ((outBufferPos > ALSA_MIN_QUEUED_SIZE || videoFrameCount > VIDEO_FRAME_MAX))  {
+                    if ((outBufferPos > minQueueSize || videoFrameCount > VIDEO_FRAME_MAX))  {
                         return outBufferPos - orig;
                     }
                 } else if (video_stream_idx != -1 && !vidPacket) {
@@ -420,6 +413,8 @@ class SDL
     volatile SDLSTATE _state;
     SDL_AudioSpec _wanted_spec;
     int _initialisedRate;
+    int _bytesPerSample;
+    bool _isSampleFloat;
     SDL_AudioDeviceID audioDev;
     std::atomic_bool decoding;
     
@@ -427,16 +422,58 @@ public:
     SDL() : data(nullptr), _state(SDLSTATE::SDLUNINITIALISED), decodeThread(nullptr) {}
     virtual ~SDL();
     
+    int getRate() { return _initialisedRate; }
+    int getBytesPerSample() { return _bytesPerSample; }
+    bool isSamplesFloat() { return _isSampleFloat; }
+
     static void decodeThreadEntry(SDL *sdl) {
         sdl->runDecode();
     }
-    bool Start(SDLInternalData *d) {
+    bool Start(SDLInternalData *d, int msTime) {
         if (!initSDL()) {
             return false;
         }
         if (!openAudio()) {
             return false;
         }
+        d->curPos = 0;
+        if (msTime > 0) {
+            float f = msTime * 2 * d->bytesPerSample;
+            f /= 1000;
+            f *= d->currentRate;
+            int samplesRequired = f;
+
+            while (d->curPos < samplesRequired) {
+                int c = samplesRequired - d->curPos;
+                if (c < d->outBufferPos) {
+                    d->curPos += c;
+                    memcpy(d->outBuffer, &d->outBuffer[c], d->outBufferPos-c);
+                    d->outBufferPos -= c;
+                    d->maybeFillBuffer(false);
+                    
+                    while (d->firstVideoFrame && d->firstVideoFrame->timestamp < msTime) {
+                        VideoFrame *t = d->firstVideoFrame;
+                        d->firstVideoFrame = t->next;
+                        delete t;
+                    }
+                    d->curVideoFrame = d->firstVideoFrame;
+                    d->maybeFillBuffer(false);
+                } else {
+                    //need to skip the entire chunk, just wipe it out
+                    d->curPos += d->outBufferPos;
+                    d->outBufferPos = 0;
+                    while (d->firstVideoFrame) {
+                        VideoFrame *t = d->firstVideoFrame;
+                        d->firstVideoFrame = t->next;
+                        delete t;
+                    }
+                    d->curVideoFrame = nullptr;
+                    d->maybeFillBuffer(false);
+                }
+            }
+        }
+        
+        
         if (!decodeThread) {
             decodeThread = new std::thread(decodeThreadEntry, this);
         }
@@ -446,7 +483,7 @@ public:
                 data->curPosLock.lock();
                 SDL_ClearQueuedAudio(audioDev);
                 SDL_QueueAudio(audioDev, data->outBuffer, data->outBufferPos);
-                data->curPos = data->outBufferPos;
+                data->curPos += data->outBufferPos;
                 data->outBufferPos = 0;
                 data->curPosLock.unlock();
                 SDL_PauseAudioDevice(audioDev, 0);
@@ -532,14 +569,14 @@ void SDL::runDecode() {
             int countRead = 0;
             while (bufFull != 2 && count < 5) {
                 count++;
-                if (data->outBufferPos > ALSA_MIN_QUEUED_SIZE > 2) {
+                if (data->outBufferPos > data->minQueueSize) {
                     //single packet
                     countRead += data->maybeFillBuffer(false);
                     bufFull = 2;
                 } else {
                     //read a little more than single
                     countRead += data->maybeFillBuffer(false);
-                    if (countRead > (DEFAULT_RATE*2*2/10)) {
+                    if (countRead > (data->currentRate * data->bytesPerSample * 2/10)) {
                         // read a 1/10 of a second, move on
                         bufFull = 2;
                     } else {
@@ -564,13 +601,62 @@ void SDL::runDecode() {
 }
 
 static bool noDeviceWarning = false;
+static std::string noDeviceError;
 bool SDL::openAudio() {
     if (_state == SDLSTATE::SDLINITIALISED) {
-        _initialisedRate = DEFAULT_RATE;
+        int tp = getSettingInt("AudioFormat");
         
         SDL_memset(&_wanted_spec, 0, sizeof(_wanted_spec));
-        _wanted_spec.freq = _initialisedRate;
-        _wanted_spec.format = AUDIO_S16SYS;
+        switch (tp) {
+            case 0:
+#if defined(PLATFORM_BBB) || defined(PLATFORM_PI)
+                _wanted_spec.freq = 48000;
+#else
+                _wanted_spec.freq = 44100;
+#endif
+                _wanted_spec.format = AUDIO_S16;
+                break;
+            
+            case 1:
+                _wanted_spec.freq = 44100;
+                _wanted_spec.format = AUDIO_S16;
+            break;
+            case 2:
+                _wanted_spec.freq = 44100;
+                _wanted_spec.format = AUDIO_S32;
+            break;
+            case 3:
+                _wanted_spec.freq = 44100;
+                _wanted_spec.format = AUDIO_F32;
+            break;
+            
+            case 4:
+                _wanted_spec.freq = 48000;
+                _wanted_spec.format = AUDIO_S16;
+            break;
+            case 5:
+                _wanted_spec.freq = 48000;
+                _wanted_spec.format = AUDIO_S32;
+            break;
+            case 6:
+                _wanted_spec.freq = 48000;
+                _wanted_spec.format = AUDIO_F32;
+            break;
+            
+            case 7:
+                _wanted_spec.freq = 96000;
+                _wanted_spec.format = AUDIO_S16;
+            break;
+            case 8:
+                _wanted_spec.freq = 96000;
+                _wanted_spec.format = AUDIO_S32;
+            break;
+            case 9:
+                _wanted_spec.freq = 96000;
+                _wanted_spec.format = AUDIO_F32;
+            break;
+        }
+        
         _wanted_spec.channels = 2;
         _wanted_spec.silence = 0;
         _wanted_spec.samples = DEFAULT_NUM_SAMPLES;
@@ -578,11 +664,31 @@ bool SDL::openAudio() {
         _wanted_spec.userdata = nullptr;
         
         SDL_AudioSpec have;
-        audioDev = SDL_OpenAudioDevice(NULL, 0, &_wanted_spec, &have, 0);
+        audioDev = SDL_OpenAudioDevice(NULL, 0, &_wanted_spec, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_FORMAT_CHANGE);
         if (audioDev == 0 && !noDeviceWarning) {
-            LogErr(VB_MEDIAOUT, "Could not open audio device - %s\n", SDL_GetError());
+            noDeviceError = "Could not open audio device - ";
+            noDeviceError += SDL_GetError();
+            LogErr(VB_MEDIAOUT, "%s\n", noDeviceError.c_str());
             noDeviceWarning = true;
+        } else {
+            LogDebug(VB_MEDIAOUT, "Opened Audio Device -  Rates:  %d -> %d     AudioFormat:  %X -> %X \n", _wanted_spec.freq, have.freq, _wanted_spec.format, have.format);
+            if (have.format != AUDIO_S32 && have.format != AUDIO_S16 && have.format != AUDIO_F32) {
+                //we'll only support these
+                LogDebug(VB_MEDIAOUT, "    Format not supported, will reopen\n");
+                SDL_CloseAudioDevice(audioDev);
+                audioDev = SDL_OpenAudioDevice(NULL, 0, &_wanted_spec, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+                if (audioDev == 0 && !noDeviceWarning) {
+                    noDeviceError = "Could not open audio device - ";
+                    noDeviceError += SDL_GetError();
+                    LogErr(VB_MEDIAOUT, "%s\n", noDeviceError.c_str());
+                    noDeviceWarning = true;
+                }
+                LogDebug(VB_MEDIAOUT, "Repened Audio Device -  Rates:  %d -> %d     AudioFormat:  %X -> %X \n", _wanted_spec.freq, have.freq, _wanted_spec.format, have.format);
+            }
         }
+        _initialisedRate = have.freq;
+        _bytesPerSample = (have.format == AUDIO_S16) ? 2 : 4;
+        _isSampleFloat = (have.format == AUDIO_F32);
         
         _state = SDLSTATE::SDLOPENED;
     }
@@ -630,6 +736,7 @@ bool SDLOutput::ProcessVideoOverlay(unsigned int msTimestamp) {
             data->videoOverlayModel->setData(vf->data);
         }
     }
+    return false;
 }
 
 static std::string currentMediaFilename;
@@ -688,17 +795,17 @@ SDLOutput::SDLOutput(const std::string &mediaFilename,
         return;
     }
     std::string fullAudioPath = mediaFilename;
-    if (!FileExists(mediaFilename.c_str())) {
+    if (!FileExists(mediaFilename)) {
         fullAudioPath = getMusicDirectory();
         fullAudioPath += "/";
         fullAudioPath += mediaFilename;
     }
-    if (!FileExists(fullAudioPath.c_str())) {
+    if (!FileExists(fullAudioPath)) {
         fullAudioPath = getVideoDirectory();
         fullAudioPath += "/";
         fullAudioPath += mediaFilename;
     }
-    if (!FileExists(fullAudioPath.c_str())) {
+    if (!FileExists(fullAudioPath)) {
         LogErr(VB_MEDIAOUT, "%s does not exist!\n", fullAudioPath.c_str());
         currentMediaFilename = "";
         return;
@@ -714,10 +821,16 @@ SDLOutput::SDLOutput(const std::string &mediaFilename,
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
     av_log_set_callback(LogCallback);
     
-    data = new SDLInternalData();
     
+    sdlManager.initSDL();
+    sdlManager.openAudio();
+    
+    data = new SDLInternalData(sdlManager.getRate(), sdlManager.getBytesPerSample(), sdlManager.isSamplesFloat());
+
     // Initialize FFmpeg codecs
+#if LIBAVFORMAT_VERSION_MAJOR < 58
     av_register_all();
+#endif
     int res = avformat_open_input(&data->formatContext, fullAudioPath.c_str(), nullptr, nullptr);
     if (avformat_find_stream_info(data->formatContext, nullptr) < 0) {
         LogErr(VB_MEDIAOUT, "Could not find suitable input stream!\n");
@@ -734,7 +847,7 @@ SDLOutput::SDLOutput(const std::string &mediaFilename,
         data->audio_stream_idx = -1;
     }
     int videoOverlayWidth, videoOverlayHeight;
-    if (videoOutput != "--Disabled--" && videoOutput != "" && videoOutput != "--HDMI--") {
+    if (videoOutput != "--Disabled--" && videoOutput != "" && (videoOutput != "--HDMI--" && videoOutput != "HDMI")) {
         data->videoOverlayModel = PixelOverlayManager::INSTANCE.getModel(videoOutput);
         
         if (data->videoOverlayModel &&
@@ -767,12 +880,13 @@ SDLOutput::SDLOutput(const std::string &mediaFilename,
         int64_t in_channel_layout = av_get_default_channel_layout(data->audioCodecContext->channels);
 
         uint64_t out_channel_layout = AV_CH_LAYOUT_STEREO;
-        AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_S16;
-        int out_sample_rate = DEFAULT_RATE;
+        AVSampleFormat out_sample_fmt = (data->bytesPerSample == 2) ? AV_SAMPLE_FMT_S16 : (data->isSamplesFloat ? AV_SAMPLE_FMT_FLT :AV_SAMPLE_FMT_S32 );
+        int out_sample_rate = data->currentRate;
         
         data->au_convert_ctx = swr_alloc_set_opts(nullptr,
                                             out_channel_layout, out_sample_fmt, out_sample_rate,
-                                            in_channel_layout, data->audioCodecContext->sample_fmt, data->audioCodecContext->sample_rate, 0, nullptr);
+                                            in_channel_layout, data->audioCodecContext->sample_fmt,
+                                            data->audioCodecContext->sample_rate, 0, nullptr);
         swr_init(data->au_convert_ctx);
         
         //get an estimate of the total length
@@ -782,7 +896,7 @@ SDLOutput::SDLOutput(const std::string &mediaFilename,
         usf /= 100.0f;
         d += usf;
         data->totalLen = d;
-        data->totalDataLen = d * DEFAULT_RATE * 2 * 2;
+        data->totalDataLen = d * data->currentRate * data->bytesPerSample * 2;
     }
     if (data->video_stream_idx != -1) {
         data->video_frames = (long)data->videoStream->nb_frames;
@@ -819,7 +933,6 @@ SDLOutput::SDLOutput(const std::string &mediaFilename,
 
     data->stopped = 0;
     data->maybeFillBuffer(true);
-
 }
 
 /*
@@ -831,18 +944,22 @@ SDLOutput::~SDLOutput()
     Close();
     if (data) {
         delete data;
+        data = nullptr;
     }
 }
 
 /*
  *
  */
-int SDLOutput::Start(void)
+int SDLOutput::Start(int msTime)
 {
 	LogDebug(VB_MEDIAOUT, "SDLOutput::Start() %X\n", data);
     if (data) {
         SetChannelOutputFrameNumber(0);
-        if (!sdlManager.Start(data)) {
+        if (!sdlManager.Start(data, msTime)) {
+            if (noDeviceWarning) {
+                WarningHolder::AddWarning(noDeviceError);
+            }
             m_mediaOutputStatus->status = MEDIAOUTPUTSTATUS_IDLE;
             Stop();
             return 0;
@@ -850,6 +967,9 @@ int SDLOutput::Start(void)
         if (data->audioDev == 0 && data->video_stream_idx == -1) {
             //no audio device so audio data is useless and no video stream so not useful either,
             //bail
+            if (noDeviceWarning) {
+                WarningHolder::AddWarning(noDeviceError);
+            }
             m_mediaOutputStatus->status = MEDIAOUTPUTSTATUS_IDLE;
             Stop();
             return 0;
@@ -898,8 +1018,8 @@ int SDLOutput::Process(void)
         }
         lastCurTime = curtime;
         
-        curtime /= DEFAULT_RATE; //samples per sec
-        curtime /= 4; //4 bytes per sample
+        curtime /= data->currentRate; //samples per sec
+        curtime /= 2 * data->bytesPerSample; //bytes per sample * 2 channels
         
         m_mediaOutputStatus->mediaSeconds = curtime;
 
@@ -946,7 +1066,7 @@ int SDLOutput::Process(void)
         }
     }
     if (getFPPmode() == MASTER_MODE) {
-        multiSync->SendMediaSyncPacket(m_mediaFilename.c_str(), 0,
+        multiSync->SendMediaSyncPacket(m_mediaFilename,
                             m_mediaOutputStatus->mediaSeconds);
     }
     
@@ -987,7 +1107,8 @@ int SDLOutput::Stop(void)
         if (data->video_stream_idx >= 0) {
             data->video_stream_idx = -1;
             if (data->videoOverlayModel) {
-                data->videoOverlayModel->clear();
+                data->videoOverlayModel->clearOverlayBuffer();
+                data->videoOverlayModel->flushOverlayBuffer();
                 data->videoOverlayModel->setState(PixelOverlayState::Disabled);
             }
         }

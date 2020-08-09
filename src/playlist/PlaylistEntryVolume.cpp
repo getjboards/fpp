@@ -23,9 +23,8 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "log.h"
+#include "fpp-pch.h"
 #include "PlaylistEntryVolume.h"
-#include "settings.h"
 #include "mediaoutput/mediaoutput.h"
 
 /*
@@ -38,6 +37,7 @@ PlaylistEntryVolume::PlaylistEntryVolume(PlaylistEntryBase *parent)
 	LogDebug(VB_PLAYLIST, "PlaylistEntryVolume::PlaylistEntryVolume()\n");
 
 	m_type = "volume";
+	m_deprecated = 1;
 }
 
 /*
@@ -56,7 +56,7 @@ int PlaylistEntryVolume::Init(Json::Value &config)
 
     std::string vol = config["volume"].asString();
     m_volAdjust = ((vol[0] == '-') || (vol[0] == '+'));
-    m_volume = std::stoi(vol);
+    m_volume = std::atoi(vol.c_str());
 
 
 	return PlaylistEntryBase::Init(config);

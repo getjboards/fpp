@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   E131 / ArtNet Universe structure definition for Falcon Player (FPP)
  *
@@ -23,8 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _UNIVERSE_H
-#define _UNIVERSE_H
 
 #define E131_TYPE_MULTICAST   0
 #define E131_TYPE_UNICAST     1
@@ -32,17 +31,15 @@
 #define ARTNET_TYPE_UNICAST   3
 
 typedef struct {
-	int           active;
-	int           universe;
-	int           size;
-	int           startAddress;
-	int           type;
-	char          unicastAddress[16];
-	unsigned long bytesReceived;
-	unsigned long packetsReceived;
-    unsigned long errorPackets;
-    int           lastSequenceNumber;
-	int           priority;
+	uint32_t           active;
+	uint32_t           universe;
+	uint32_t           size;
+	uint32_t           startAddress;
+	uint32_t           type;
+	char               unicastAddress[16];
+	uint32_t           bytesReceived;
+	uint32_t           packetsReceived;
+    uint32_t           errorPackets;
+    uint32_t           lastSequenceNumber;
+	uint32_t           priority;
 } UniverseEntry;
-
-#endif /* _UNIVERSE_H */

@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   WS2801 SPI handler for Falcon Player (FPP)
  *
@@ -23,31 +24,28 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _SPIWS2801_H
-#define _SPIWS2801_H
-
 #include "ThreadedChannelOutputBase.h"
+#include "util/SPIUtils.h"
 
 class SPIws2801Output : public ThreadedChannelOutputBase {
   public:
 	SPIws2801Output(unsigned int startChannel, unsigned int channelCount);
-	~SPIws2801Output();
+	virtual ~SPIws2801Output();
 
-	int Init(char *configStr);
+    virtual int Init(Json::Value config) override;
 
-	int Close(void);
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual int RawSendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
+    SPIUtils       *m_spi;
 	int            m_port;
 	int            m_pi36;
 	unsigned char *m_pi36Data;
 	int            m_pi36DataSize;
 };
-
-#endif

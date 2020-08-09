@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   ScheduleEntry class for the Falcon Player (FPP) 
  *
@@ -23,65 +24,48 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _SCHEDULEENTRY_H
-#define _SCHEDULEENTRY_H
-
 #include <string>
-
+#include <utility>
 #include <time.h>
 
-#include "Playlist.h"
-
-#define DAYS_PER_WEEK       7
 
 class ScheduleEntry {
   public:
 	ScheduleEntry();
 	~ScheduleEntry();
 
+	void        CalculateEaster(int year, int &month, int &day);
+	std::string DateFromLocaleHoliday(Json::Value &holiday);
+	std::string CheckHoliday(std::string date);
+
 	int  LoadFromString(std::string entryStr);
-	void CalculateTimes(void);
+	int  LoadFromJson(Json::Value &entry);
 
-	typedef enum {
-		SS_IDLE = 0,
-		SS_PLAYING,
-		SS_STOPPING
-	} ScheduleState;
+    void pushStartEndTimes(int start, int end);
+    
+	Json::Value GetJson(void);
 
-	int          m_enabled;
-	std::string  m_playlistName;
-	OldPlaylist    *m_playlist;
-	int          m_priority;
-	int          m_repeating;
-	int          m_dayIndex;
-	int          m_weeklySecondCount;
-	int          m_weeklyStartSeconds[DAYS_PER_WEEK];
-	int          m_weeklyEndSeconds[DAYS_PER_WEEK];
-	int          m_startTime; // HHMMSS format as an integer
-	int          m_endTime;   // HHMMSS format as an integer
-	int          m_startHour;
-	int          m_startMinute;
-	int          m_startSecond;
-	int          m_endHour;
-	int          m_endMinute;
-	int          m_endSecond;
-	int          m_startDate; // YYYYMMDD format as an integer
-	int          m_endDate;   // YYYYMMDD format as an integer
+	bool         enabled;
+	std::string  playlist;
+    
+    int          dayIndex;
+    int          startHour;
+    int          startMinute;
+    int          startSecond;
+    int          endHour;
+    int          endMinute;
+    int          endSecond;
+	bool         repeat;
+    int          repeatInterval;
+    
+    std::vector<std::pair<int, int>> startEndSeconds;
+    
+	int          startDate; // YYYYMMDD format as an integer
+	int          endDate;   // YYYYMMDD format as an integer
+	int          stopType;
 
-	ScheduleState m_state;
-
-	// The last start/stop block
-	time_t m_lastStartTime;
-	time_t m_lastEndTime;
-
-	// The current start/stop block. if not playing then == next
-	time_t m_thisStartTime;
-	time_t m_thisEndTime;
-
-	// The next scheduled start/stop block
-	time_t m_nextStartTime;
-	time_t m_nextEndTime;
-
+    int          startTimeOffset;
+    int          endTimeOffset;
+	std::string  startDateStr;
+	std::string  endDateStr;
 };
-
-#endif /* _SCHEDULEENTRY_H */

@@ -22,23 +22,24 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <unistd.h>
+#include <fcntl.h>
 
-#include <map>
-#include <sstream>
+#include <iomanip>
+#include <ctime>
 
-#include "common.h"
-#include "log.h"
 #include "HTTPVirtualDisplay.h"
-#include "Sequence.h"
-#include "settings.h"
 
+
+extern "C" {
+    HTTPVirtualDisplayOutput *createOutputHTTPVirtualDisplay(unsigned int startChannel,
+                                                             unsigned int channelCount) {
+        return new HTTPVirtualDisplayOutput(startChannel, channelCount);
+    }
+}
 /////////////////////////////////////////////////////////////////////////////
 
 /*
@@ -58,7 +59,6 @@ HTTPVirtualDisplayOutput::HTTPVirtualDisplayOutput(unsigned int startChannel,
 	LogDebug(VB_CHANNELOUT, "HTTPVirtualDisplayOutput::HTTPVirtualDisplayOutput(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = FPPD_MAX_CHANNELS;
 	m_bytesPerPixel = 3;
 	m_bpp = 24;
 }
@@ -148,6 +148,8 @@ int HTTPVirtualDisplayOutput::Init(Json::Value config)
 		return 0;
 	}
 
+	fcntl(m_socket, F_SETFL, O_NONBLOCK);
+
 	struct sockaddr_in addr;
 
 	memset(&addr, 0, sizeof(addr));
@@ -187,9 +189,6 @@ int HTTPVirtualDisplayOutput::Close(void)
 {
 	LogDebug(VB_CHANNELOUT, "HTTPVirtualDisplayOutput::Close()\n");
 
-	if (m_virtualDisplay)
-		free(m_virtualDisplay);
-
 	return VirtualDisplayOutput::Close();
 }
 
@@ -199,17 +198,6 @@ int HTTPVirtualDisplayOutput::Close(void)
 void HTTPVirtualDisplayOutput::ConnectionThread(void)
 {
 	int client;
-	const char sseResp[] = "HTTP/1.1 200 OK\r\n"
-		"Content-Type: text/event-stream;charset=UTF-8\r\n"
-		"Transfer-Encoding: chunked\r\n"
-		"Connection: close\r\n"
-		"Date: Mon, 01 Jan 1970 00:00:00 GMT\r\n"
-		"Server: fppd\r\n"
-		"X-Powered-By: FPP/7.2.14\r\n"
-		"Cache-Control: no-cache, private\r\n"
-		"Access-Control-Allow-Origin: *\r\n"
-		"Access-Control-Allow-Credentials: true\r\n"
-		"\r\n";
 
 	while (m_running)
 	{
@@ -217,13 +205,42 @@ void HTTPVirtualDisplayOutput::ConnectionThread(void)
 
 		if (client >= 0)
 		{
+			auto t = std::time(nullptr);
+			auto tm = *std::localtime(&t);
+			std::stringstream sstr;
+			sstr << std::put_time(&tm, "%a %b %d %H:%M:%S %Z %Y");
+
+			std::string sseResp;
+			sseResp =
+				"HTTP/1.1 200 OK\r\n"
+				"Content-Type: text/event-stream;charset=UTF-8\r\n"
+				"Transfer-Encoding: chunked\r\n"
+				"Connection: close\r\n"
+				"Date: ";
+			sseResp += sstr.str();
+			sseResp +=
+				"\r\n"
+				"Server: fppd\r\n"
+                "X-Powered-By: FPP/";
+            sseResp += getFPPVersion();
+            sseResp += "\r\n"
+				"Cache-Control: no-cache, private\r\n"
+				"Access-Control-Allow-Origin: *\r\n"
+				"Access-Control-Allow-Credentials: true\r\n"
+				"\r\n";
+
+			// Reset our display cache so we draw everything needed
+			bzero(m_virtualDisplay, m_screenSize);
+
 			std::unique_lock<std::mutex> lock(m_connListLock);
 			m_connList.push_back(client);
 
-			write(client, sseResp, strlen(sseResp));
+			write(client, sseResp.c_str(), sseResp.length());
 
 			m_connListChanged = true;
 		}
+
+		usleep(100000);
 	}
 }
 
@@ -234,7 +251,7 @@ void HTTPVirtualDisplayOutput::SelectThread(void)
 {
 	fd_set active_fd_set;
 	fd_set read_fd_set;
-    int    selectResult;
+	int    selectResult;
 	struct timeval timeout;
 	char   buf[1024];
 	int    bytesRead;
@@ -332,18 +349,18 @@ int HTTPVirtualDisplayOutput::WriteSSEPacket(int fd, std::string data)
 /*
  *
  */
-int HTTPVirtualDisplayOutput::RawSendData(unsigned char *channelData)
+void HTTPVirtualDisplayOutput::PrepData(unsigned char *channelData)
 {
 	static int id = 0;
 
-	LogExcess(VB_CHANNELOUT, "HTTPVirtualDisplayOutput::RawSendData(%p)\n",
+	LogExcess(VB_CHANNELOUT, "HTTPVirtualDisplayOutput::PrepData(%p)\n",
 		channelData);
 
 	{
 		// Short circuit if no current connections
 		std::unique_lock<std::mutex> lock(m_connListLock);
 		if (!m_connList.size())
-			return m_channelCount;
+			return;
 	}
 
 	std::string data;
@@ -414,10 +431,10 @@ int HTTPVirtualDisplayOutput::RawSendData(unsigned char *channelData)
 
 	if (colors.size())
 	{
-		data = "id: ";
-		data += std::to_string(id) + "\r\n";
-		data += "event: message\r\n";
-		data += "data: ";
+		m_sseData = "id: ";
+		m_sseData += std::to_string(id) + "\r\n";
+		m_sseData += "event: message\r\n";
+		m_sseData += "data: ";
 
 		std::string data2;
 		for (const auto &pair : colors)
@@ -427,17 +444,28 @@ int HTTPVirtualDisplayOutput::RawSendData(unsigned char *channelData)
 
 			data2 += pair.second;
 		}
-		data += data2 + "\r\n\r\n";
+		m_sseData += data2 + "\r\n\r\n";
 
-		LogExcess(VB_CHANNELOUT, "PixelsChanged: %d, Colors: %d, Data: %d\n",
-			pixelsChanged, colors.size(), data.size());
-
-		std::unique_lock<std::mutex> lock(m_connListLock);
-		for (int i = 0; i < m_connList.size(); i++)
-			WriteSSEPacket(m_connList[i], data);
+		LogExcess(VB_CHANNELOUT, "PixelsChanged: %d, Colors: %d, Data Size: %d\n",
+			pixelsChanged, colors.size(), m_sseData.size());
 	}
+	else
+		m_sseData = "";
 
 	id++;
+}
+
+/*
+ *
+ */
+int HTTPVirtualDisplayOutput::SendData(unsigned char *channelData)
+{
+	if (m_sseData != "")
+	{
+		std::unique_lock<std::mutex> lock(m_connListLock);
+		for (int i = 0; i < m_connList.size(); i++)
+			WriteSSEPacket(m_connList[i], m_sseData);
+	}
 
 	return m_channelCount;
 }

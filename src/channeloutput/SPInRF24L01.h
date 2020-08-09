@@ -1,12 +1,8 @@
+#pragma once
 /*
- *   WS2801 SPI handler for Falcon Player (FPP)
+ *   nRF24 SPI handler for Falcon Player (FPP)
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
+ *   Copyright (C) 2013-2019 the Falcon Player Developers
  *      For additional credits and developers, see credits.php.
  *
  *   The Falcon Player (FPP) is free software; you can redistribute it
@@ -23,12 +19,26 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _SPINRF24L01_H
-#define _SPINRF24L01_H
+#include "ChannelOutputBase.h"
 
-#include "channeloutput.h"
+class SPInRF24L01PrivData;
 
-/* Expose our interface */
-extern FPPChannelOutput SPInRF24L01Output;
+class SPInRF24L01Output : public ChannelOutputBase {
+public:
+    SPInRF24L01Output(unsigned int startChannel, unsigned int channelCount);
+    virtual ~SPInRF24L01Output();
+    
+    virtual int Init(Json::Value config) override;
+    
+    virtual int Close(void) override;
+    
+    virtual int SendData(unsigned char *channelData) override;
+    
+    virtual void DumpConfig(void) override;
+    
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
-#endif
+private:
+    SPInRF24L01PrivData *data;
+};
+

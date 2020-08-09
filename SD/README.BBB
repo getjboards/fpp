@@ -1,8 +1,8 @@
 # FPP BBB Images creation notes (work in progress)
 #
 # FPP images are currently based on the following Debian BeagleBone images:
-# bone-debian-9.4-console-armhf-2018-06-17-1gb.img
-# from https://rcn-ee.com/rootfs/bb.org/testing/2018-06-17/stretch-console/
+# bone-debian-10.4-console-armhf-2020-06-01-1gb.img
+# from  https://rcn-ee.com/rootfs/bb.org/testing/2020-06-01/buster-console/
 #
 # The below steps (much can be run via copy/paste into a terminal) will
 # prepare the "clean image" from above to have the appropriate 
@@ -30,94 +30,50 @@ chmod +x BBB-FlashMMC.sh
 #having to reset known_hosts while building image
 mount -t ext4 /dev/mmcblk1p1 /tmp/rootfs
 cp -a /etc/ssh/* /tmp/rootfs/etc/ssh
-reboot
+shutdown -h now
 
 
-#That will flash the stretch-console image to the internal eMMC and then shutdown
+#That will flash the buster-console image to the internal eMMC and then shutdown
 #Remove the SD card and restart the BBB, re-login with default debian:temppwd
 #then "sudo bash" to become root
-
 
 apt-get update
 apt-get -y upgrade
 
 #need to install/generate the UTF-8 locales
-apt-get install -y locales
+apt-get install -y locales git curl
 echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 localectl set-locale LANG="en_US.utf8"
 
-
-apt-get install -y git
 cd /opt/scripts
 git pull
 cd /opt/scripts/tools
 
 #check
-# ./update_kernel.sh --lts-4_14 --bone-kernel
-# and see what is the latest kernel version and put it here
+cd /root
+wget https://github.com/FalconChristmas/fpp-linux-kernel/raw/master/debs/linux-image-4.19.94fpp_4.19.94fpp-3_armhf.deb
+wget https://github.com/FalconChristmas/fpp-linux-kernel/raw/master/debs/linux-headers-4.19.94fpp_4.19.94fpp-3_armhf.deb
+dpkg -i *.deb
+rm -f *.deb
 
-export KERNEL_VERSION=4.14.71-bone17
-./update_kernel.sh --lts-4_14 --bone-kernel  $KERNEL_VERSION
-apt-get install -y linux-headers-$KERNEL_VERSION
-
-apt-get remove -y --purge --autoremove linux-image-$(uname -r) linux-headers-$(uname -r) ti-temperature-modules-$(uname -r) ti-debugss-modules-$(uname -r)
-
+apt-get remove -y --purge --autoremove linux-image-$(uname -r) linux-headers-$(uname -r)
 
 # delete old kernels and modules in /boot and /lib/modules
 # and in /boot/dtbs and any initrd's
 rm -rf /lib/modules/$(uname -r)
+rm -rf /boot/dtbs/$(uname -r)
 rm -rf /boot/initrd.img*
 
 
 cd /opt/scripts/tools/developers/
 sudo ./update_bootloader.sh
 
-
 cd /opt/backup/uboot
-export BOOTLOADERVER=v2018.09-r7
-wget https://rcn-ee.com/repos/bootloader/am335x_evm/MLO-am335x_evm-${BOOTLOADERVER}
-wget https://rcn-ee.com/repos/bootloader/am335x_evm/u-boot-am335x_evm-${BOOTLOADERVER}.img
-mv -f MLO-am335x_evm-${BOOTLOADERVER} MLO
-mv -f u-boot-am335x_evm-${BOOTLOADERVER}.img u-boot.img
-
-
-# need to keep extra memory to process network packets
-echo "vm.min_free_kbytes=16384" >> /etc/sysctl.conf
-
-#prefer ipv4
-echo "precedence ::ffff:0:0/96  100" >>  /etc/gai.conf
-
-nano /boot/uEnv.txt
-#     enable_uboot_overlays=1
-#     disable_uboot_overlay_video=1
-#     disable_uboot_overlay_audio=1
-#     disable_uboot_overlay_adc=1
-#     uboot_overlay_pru=/lib/firmware/AM335X-PRU-UIO-00A0.dtbo
-#  add "rootwait" to cmdline
-
-nano /opt/scripts/boot/am335x_evm.sh
-# comment out all lines related to restart serial-getty@ttyGS0.service
-
-
-## need the latest version for the PocketBeagle pins
-cd /opt/source
-git clone https://github.com/beagleboard/bb.org-overlays
-cd /opt/source/bb.org-overlays
-git pull
-cp tools/beaglebone-universal-io/config-pin /usr/bin/config-pin
-
-apt-get -y --purge autoremove
-
-#remove a bunch of packages that aren't neeeded, free's up space
-apt-get remove -y --purge --autoremove roboticscape nodejs c9-core-installer \
-    doc-beaglebone-getting-started doc-beaglebonegreen-getting-started doc-seeed-bbgw-getting-started \
-    bonescript bone101 bb-node-red-installer \
-    ardupilot-copter-bbbmini ardupilot-copter-blue ardupilot-plane-bbbmini ardupilot-plane-blue ardupilot-rover-bbbmini ardupilot-rover-blue
-
-apt-get -y clean
-apt-get -y --purge autoremove
-apt-get -y clean
+export BOOTLOADERVER=v2019.04-r13
+curl --output MLO  https://rcn-ee.com/repos/bootloader/am335x_evm/MLO-am335x_evm-${BOOTLOADERVER}
+curl --output u-boot.img https://rcn-ee.com/repos/bootloader/am335x_evm/u-boot-am335x_evm-${BOOTLOADERVER}.img
+echo "$BOOTLOADERVER" > version.txt
 
 
 # remove a bunch of source that is not needed, free's up space
@@ -135,7 +91,9 @@ rm -rf /opt/source/dtb*
 rm -rf /opt/source/BB*
 rm -rf /opt/source/adafruit*
 rm -rf /opt/source/Userspace*
-rm /usr/local/bin/node-red*
+rm -rf /opt/source/py-uio
+rm -rf /opt/source/librobotcontrol
+rm -rf /usr/local/bin/node-red*
 rm -rf /var/cache/doc-beaglebone-getting-started
 rm -rf /usr/share/beagle-tester
 rm -rf /usr/sbin/beagle-tester*
@@ -143,126 +101,51 @@ rm -rf /lib/systemd/system/beagle-tester.service
 rm -rf /etc/udev/rules.d/beagle-tester.rules
 rm -rf /opt/cloud9
 rm -rf /etc/avahi/services/cloud9.service
-
+rm -f /var/local/bb_usb_mass_storage.img
 
 # need to reboot so that the new kernel is picked up and used
 reboot
 #re-login in and make sure "df -k" reports 2.5G+ of space for /
 
-apt-get install -y \
-    alsa-utils arping avahi-daemon avahi-discover avahi-utils \
-    apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php7.0 \
-    bc build-essential ca-certificates ccache connman bzip2 samba rsync \
-    curl dh-autoreconf ethtool fbi fbset file vsftpd shellinabox vorbis-tools \
-    bash-completion exfat-fuse btrfs-tools ntp ethtool sysstat tcpdump  \
-    php php-cli php-common php-curl php-mcrypt php-pear \
-    python-daemon python-smbus hdparm i2c-tools ifplugd \
-    libmicrohttpd-dev libmosquitto-dev liblo-dev imagemagick \
-    ola ola-python libola-dev libola1 libboost-dev libjsoncpp-dev libtag1-dev \
-    libconvert-binary-c-perl libjson-perl perlmagick \
-    libavcodec-dev libavformat-dev libswresample-dev libsdl2-dev libswscale-dev libavdevice-dev libavfilter-dev \
-    sqlite3 php-sqlite3 php-zip zip unzip dos2unix \
-    mailutils librtmidi-dev libcurl4-openssl-dev \
-    gcc g++ firmware-realtek firmware-atheros firmware-ralink firmware-brcm80211 firmware-iwlwifi firmware-libertas firmware-zd1211\
-    firmware-ti-connectivity resolvconf wireless-tools \
-    mailutils mp3info linux-cpupower cpufrequtils \
-    usbutils usb-modeswitch locales lzma lshw lsof libiio-utils device-tree-compiler at haveged bluetooth bluez \
-    libzstd-dev zstd
-
-
-curl -L https://cpanmin.us | perl - --sudo App::cpanminus
-echo "yes" | cpanm -fin Test::Tester File::Map Net::WebSocket::Server Net::PJLink
-
-apt-get -y clean
-apt-get -y --purge autoremove
-apt-get -y clean
-
-
-echo "blacklist spidev" > /etc/modprobe.d/blacklist-spidev.conf
-echo "# allocate 768K instead of the default 256K" > /etc/modprobe.d/uio_pruss.conf
-echo "options uio_pruss extram_pool_sz=786432" >> /etc/modprobe.d/uio_pruss.conf
-
-
-# need to blacklist the gyroscope and barometer on the SanCloud enhanced or it consumes some pins
-echo "blacklist st_pressure_i2c" > /etc/modprobe.d/blacklist-gyro.conf
-echo "blacklist st_pressure" >> /etc/modprobe.d/blacklist-gyro.conf
-echo "blacklist inv_mpu6050_i2c" >> /etc/modprobe.d/blacklist-gyro.conf
-echo "blacklist st_sensors_i2c" >> /etc/modprobe.d/blacklist-gyro.conf
-echo "blacklist inv_mpu6050" >> /etc/modprobe.d/blacklist-gyro.conf
-echo "blacklist st_sensors" >> /etc/modprobe.d/blacklist-gyro.conf
-
-
-cd /opt/
-git clone https://github.com/etr/libhttpserver
-cd libhttpserver
-git checkout bd08772
-./bootstrap
-mkdir build
-cd build
-CXXFLAGS=-std=c++98 ../configure --prefix=/usr
-make
-make install
-cd /opt
-rm -rf libhttpserver
-
-cd /opt
-git clone https://github.com/beagleboard/am335x_pru_package
-cd am335x_pru_package
-make
-make install
-make clean
-
-
-ldconfig
-
-# need to edit some files... sed/awk/perl can do this automatically?
-#nano /lib/systemd/system/apache2.service
-#    PrivateTmp=false
-#nano /etc/default/shellinabox
-#    add -t to args
-#nano /etc/connman/main.conf
-#    PreferredTechnologies=wifi,ethernet
-
-
-#install new Wifi drivers
-cd /tmp
-wget -O ./FPP-Wifi-Drivers.sh  http://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP-Wifi-Drivers.sh
-chmod +x FPP-Wifi-Drivers.sh
-./FPP-Wifi-Drivers.sh
-
-rm /etc/modprobe.d/rtl8723bu-blacklist.conf
-
 
 cd /root
-wget -O ./FPP_Install_BBB.sh  http://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install_BBB.sh
-chmod 700 ./FPP_Install_BBB.sh
-./FPP_Install_BBB.sh
+wget -O ./FPP_Install.sh  http://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
+chmod 700 ./FPP_Install.sh
+./FPP_Install.sh --img
 
+# once FPP_Install is done, the wifi drivers and such are installed so the linux-headers
+# are no longer needed, remove them to save 150MB of space
+apt-get remove -y --purge --autoremove linux-headers-$(uname -r)
+apt-get clean
 
-touch /home/fpp/media/.auto_update_disabled
-chmod 644 /home/fpp/media/.auto_update_disabled
-nano /home/fpp/.bashrc
-# uncomment force_color_prompt=yes
-
+# edit /etc/fstab and make sure it looks OK for tmpfs
+reboot
 
 
 #place 4G SD card in sd slot
 # zero out everything unused so compressing the image will work better
-dd if=/dev/zero of=/dev/mmcblk0 bs=1M status=progress count=3500
-/opt/fpp/SD/BBB-FlashMMC.sh -s 2800M -noreboot ext4 /dev/mmcblk0
+dd if=/dev/zero of=/dev/mmcblk0 bs=1M status=progress count=3600
+/opt/fpp/SD/BBB-FlashMMC.sh -s 3500M -noreboot ext4 /dev/mmcblk0
 rmdir /tmp/rootfs
-
-#place second in slot
-dd if=/dev/zero of=/dev/mmcblk0 bs=1M status=progress count=3000
-/opt/fpp/SD/BBB-FlashMMC.sh -s 1750M -noreboot btrfs /dev/mmcblk0
-
 
 #On a MAC, the resulting SD cards can be used to create an image via:
 # use diskutil list to get the disk name (/dev/rdisk3)
-# For ext4:
-sudo dd if=/dev/rdisk3 of=FPP-v2.0-Beta-BBB-ext4.img bs=1m count=3072
+sudo dd if=/dev/rdisk3 of=FPP-v4.0-BBB.img bs=1m count=3572
+
+
 # For btrfs:
-sudo dd if=/dev/rdisk3 of=FPP-v2.0-Beta-BBB-btrfs.img bs=1m count=2000
+
+dd if=/dev/zero of=/dev/mmcblk0 bs=1M status=progress count=2000
+/opt/fpp/SD/BBB-FlashMMC.sh -s 1750M -noreboot btrfs /dev/mmcblk0
+
+sudo dd if=/dev/rdisk3 of=FPP-v3.1-BBB-btrfs.img bs=1m count=2000
 
 
 
+# To create the squashfs image needed for OS updates
+# On a separate Linux box:  (this will take a LOOOONG time)
+# mksquashfs is multithreaded so its recommended to use a multicore
+# box for this and not an actual BBB
+apt-get install squashfs-tools
+mount /dev/sda1 /mnt
+mksquashfs /mnt /home/fpp/media/bbb-4.0.sqfs -comp xz

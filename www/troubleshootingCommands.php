@@ -7,9 +7,13 @@ putenv("PATH=/bin:/usr/bin:/sbin:/usr/sbin");
 $rtcDevice = "/dev/rtc0";
 $i2cDevice = "1";
 
-if ($settings['Platform'] == "BeagleBone Black")
-{
-	$rtcDevice = "/dev/rtc1";
+if ($settings['Platform'] == "BeagleBone Black") {
+    if (file_exists("/sys/class/rtc/rtc0/name")) {
+        $rtcname = file_get_contents("/sys/class/rtc/rtc0/name");
+        if (strpos($rtcname, "omap_rtc") !== false) {
+            $rtcDevice = "/dev/rtc1";
+        }
+    }
 	$i2cDevice = "2";
 }
 
@@ -47,18 +51,23 @@ $commands = array(
 	'Sound Cards'        => $SUDO . ' aplay -l',
 	'Mixer Devices'      => '(/bin/ls -1d /proc/asound/card[0-9] | sed -e "s/.*\/card//" | while read ID; do echo "CardID: ${ID}"; ' . $SUDO . ' amixer -c ${ID} ; echo ; done)',
 
-	// GPIO
-	'GPIO'               => $SUDO . ' gpio readall',
-
 	// Kernel
 	'Kernel Version'     => 'uname -a',
 	'Kernel Modules'     => 'lsmod',
 
 	// i2c
-	'i2cdetect'          => $SUDO . ' i2cdetect -y ' . $i2cDevice,
+	'i2cdetect'          => $SUDO . ' i2cdetect -y -r ' . $i2cDevice,
 
 	// Processes
 	'Processes'          => 'ps -edaf --forest',  // Keep this last since it is so long
+
+    // Boot
+    'FPP Cape Detect Log'   => $SUDO . ' journalctl -u fppcapedetect ',
+    'FPP RTC Log'          => $SUDO . ' journalctl -u fpprtc ',
+    'FPP Init Log'          => $SUDO . ' journalctl -u fppinit ',
+    'FPP Post Network Logs' => $SUDO . ' journalctl -u fpp_postnetwork ',
+    'FPP OLED Logs' => $SUDO . ' journalctl -u fppoled ',
+    'FPP FPPD Logs' => $SUDO . ' journalctl -u fppd '
 	);
 
 $results = array();

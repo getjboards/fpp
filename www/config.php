@@ -9,6 +9,12 @@ $settingsFile = $fppHome . "/media/settings";
 
 if (file_exists("/etc/fpp/rfs_version"))
 	$fppRfsVersion = trim(file_get_contents("/etc/fpp/rfs_version"));
+    
+if (file_exists("/opt/fpp/www/fppversion.php")) {
+    include_once "/opt/fpp/www/fppversion.php";
+} else {
+    include_once "/opt/fpp/www/fppunknown_versions.php";
+}
 
 // Allow overrides that we'll ignore from the git repository to make it
 // easier to develop on machines configured differently than our current
@@ -23,22 +29,54 @@ $pluginSettings = array();
 $settings['fppMode'] = "player";
 
 // Helper function for accessing the global settings array
-function GetSettingValue($setting) {
-	global $settings;
+function GetSettingValue($setting, $default = '', $prefix = '', $suffix = '') {
+    global $settings;
 
-	if (isset($settings[$setting]))
-		return $settings[$setting];
-
-	return;  // FIXME, should we do this or return something else
-}
-function ApprovedVendor($v) {
-    if (isSet($v["name"]) && ($v["name"] == "Daniel Kulp")) {
-        return true;
+    if (isset($settings[$setting])) {
+        if ($settings[$setting] != '')
+            return $prefix . $settings[$setting] . $suffix;
+        else
+            return $default;
     }
-    return false;
+
+    return $default;
 }
-function ApprovedDesigner($v) {
-    if (isSet($v["designer"]) && ($v["designer"] == "Daniel Kulp")) {
+
+function LoadLocale()
+{
+    global $settings;
+    $locale = Array();
+
+    if (!isset($settings['Locale']))
+        $settings['Locale'] = 'Global';
+
+    $localeFile = $settings['fppDir'] . '/etc/locale/global.json';
+    if (file_exists($localeFile)) {
+        $localeStr = file_get_contents($localeFile);
+        $locale = json_decode($localeStr, true);
+    }
+
+    if ($settings['Locale'] != 'Global')
+    {
+        $localeFile = $settings['fppDir'] . '/etc/locale/' . $settings['Locale'] . '.json';
+        if (file_exists($localeFile)) {
+            $localeStr = file_get_contents($localeFile);
+            $tmpLocale = json_decode($localeStr, true);
+            $locale = array_merge($locale, $tmpLocale);
+        }
+    }
+
+    $settings['locale'] = $locale;
+}
+
+function ApprovedCape($v) {
+    if (isSet($v["vendor"])) {
+        if (isSet($v["vendor"]["name"]) && ($v["vendor"]["name"] == "Upgrade")
+            && isSet($v["designer"]) && ($v["designer"] == "Unknown")) {
+            return true;
+        }
+    }
+    if (isSet($v["verifiedKeyId"]) && file_exists("/opt/fpp/scripts/keys/" . $v["verifiedKeyId"] . "_pub.pem")) {
         return true;
     }
     return false;
@@ -116,181 +154,136 @@ if (file_exists("/etc/fpp/platform"))
 if (file_exists($mediaDirectory . "/tmp/cape-info.json")) {
     $cape_info = json_decode(file_get_contents($mediaDirectory . "/tmp/cape-info.json"), true);
     if (isSet($cape_info["vendor"])) {
-        if (!ApprovedVendor($cape_info["vendor"])
-            && !ApprovedDesigner($cape_info)) {
+        if (!ApprovedCape($cape_info)) {
             unset($cape_info["vendor"]);
         }
     }
     $settings['cape-info'] = $cape_info;
 }
 
-if ($settings['Platform'] == FALSE)
-{
+$settings['Variant'] = $settings['Platform'];
+$settings['SubPlatform'] = "";
+$settings['OSImagePrefix'] = "";
+
+if ($settings['Platform'] == FALSE) {
 	$settings['Platform'] = exec("uname -s");
+	$settings['Variant'] = $settings['Platform'];
 }
 
-if ($settings['Platform'] == "Raspberry Pi")
-{
+if ($settings['Platform'] == "Raspberry Pi") {
+    $settings['OSImagePrefix'] = "Pi";
 	$settings['LogoLink'] = "http://raspberrypi.org/";
 	$settings['SubPlatform'] = trim(file_get_contents("/sys/firmware/devicetree/base/model"));
 
-	if (preg_match('/Pi Model A Rev/', $settings['SubPlatform']))
-	{
+	if (preg_match('/Pi Model A Rev/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "Model A";
 		$settings['Logo'] = "Raspberry_Pi_A.png";
-	}
-	else if (preg_match('/Pi Model B Rev/', $settings['SubPlatform']))
-	{
+	} else if (preg_match('/Pi Model B Rev/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "Model B";
 		$settings['Logo'] = "Raspberry_Pi_B.png";
-	}
-	else if (preg_match('/Pi Model A Plus/', $settings['SubPlatform']))
-	{
+	} else if (preg_match('/Pi Model A Plus/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "Model A+";
 		$settings['Logo'] = "Raspberry_Pi_A+.png";
-	}
-	else if (preg_match('/Pi Model B Plus/', $settings['SubPlatform']))
-	{
+	} else if (preg_match('/Pi Model B Plus/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "Model B+";
 		$settings['Logo'] = "Raspberry_Pi_B+.png";
-	}
-	else if (preg_match('/Pi 2 Model B/', $settings['SubPlatform']))
-	{
+    } else if (preg_match('/Pi 2 Model B/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "Pi 2 Model B";
 		$settings['Logo'] = "Raspberry_Pi_2.png";
-	}
-        else if (preg_match('/Pi 3 Model B Plus/', $settings['SubPlatform']))
-        {
-                $settings['Variant'] = "Pi 3 Model B+";
-                $settings['Logo'] = "Raspberry_Pi_3B+.png";
-        }
-	else if (preg_match('/Pi 3 Model B/', $settings['SubPlatform']))
-	{
+    } else if (preg_match('/Pi 3 Model B Plus/', $settings['SubPlatform'])) {
+        $settings['Variant'] = "Pi 3 Model B+";
+        $settings['Logo'] = "Raspberry_Pi_3B+.png";
+    } else if (preg_match('/Pi 3 Model A Plus/', $settings['SubPlatform'])) {
+        $settings['Variant'] = "Pi 3 Model A+";
+        $settings['Logo'] = "Raspberry_Pi_3A+.png";
+    } else if (preg_match('/Pi 3 Model B/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "Pi 3 Model B";
 		$settings['Logo'] = "Raspberry_Pi_3.png";
-	}
-        else if (preg_match('/Pi Zero W/', $settings['SubPlatform']))
-        {
-                $settings['Variant'] = "PiZero W";
-                $settings['Logo'] = "Raspberry_Pi_ZeroW.png";
-        }
-	else if (preg_match('/Pi Zero/', $settings['SubPlatform']))
-	{
+    } else if (preg_match('/Pi 4/', $settings['SubPlatform'])) {
+        $settings['Variant'] = "Pi 4";
+        $settings['Logo'] = "Raspberry_Pi_4.png";
+	} else if (preg_match('/Pi Zero W/', $settings['SubPlatform'])) {
+        $settings['Variant'] = "PiZero W";
+        $settings['Logo'] = "Raspberry_Pi_ZeroW.png";
+    } else if (preg_match('/Pi Zero/', $settings['SubPlatform'])) {
 		$settings['Variant'] = "PiZero";
 		$settings['Logo'] = "Raspberry_Pi_Zero.png";
-	}
-	else if ($settings['SubPlatform'] == "V2P-CA15")
-	{
+	} else if ($settings['SubPlatform'] == "V2P-CA15") {
 		$settings['Variant'] = "qemu";
 		$settings['Logo'] = "QEMU_Logo.png";
 		$settings['LogoLink'] = "http://qemu.org/";
-	}
-	else
-	{
+	} else {
 		$settings['Variant'] = "UNKNOWN";
 		$settings['Logo'] = "Raspberry_Pi_Logo.png";
 	}
-}
-else if ($settings['Platform'] == "BeagleBone Black")
-{
+} else if ($settings['Platform'] == "BeagleBone Black") {
+    $settings['OSImagePrefix'] = "BBB";
 	$settings['LogoLink'] = "http://beagleboard.org/";
 	$settings['BBB_Tethering'] = "1";
 	$settings['SubPlatform'] = trim(file_get_contents("/proc/device-tree/model"));
-    if (preg_match('/PocketBeagle/', $settings['SubPlatform']))
-    {
+    if (preg_match('/PocketBeagle/', $settings['SubPlatform'])) {
         $settings['Variant'] = "PocketBeagle";
         $settings['Logo'] = "beagle_pocket.png";
-    }
-    else if (preg_match('/Green Wireless/', $settings['SubPlatform']))
-    {
+    } else if (preg_match('/Green Wireless/', $settings['SubPlatform'])) {
         $settings['Variant'] = "BeagleBone Green Wireless";
         $settings['Logo'] = "beagle_greenwifi.png";
-    }
-    else if (preg_match('/Green/', $settings['SubPlatform']))
-    {
+    } else if (preg_match('/Green/', $settings['SubPlatform'])) {
         $settings['Variant'] = "BeagleBone Green";
         $settings['Logo'] = "beagle_green.png";
-    }
-    else if (preg_match('/Black Wireless/', $settings['SubPlatform']))
-    {
+    } else if (preg_match('/Black Wireless/', $settings['SubPlatform'])) {
         $settings['Variant'] = "BeagleBone Black Wireless";
         $settings['Logo'] = "beagle_blackwifi.png";
-    }
-    else if (preg_match('/BeagleBone Black/', $settings['SubPlatform']))
-    {
+    } else if (preg_match('/BeagleBone Black/', $settings['SubPlatform'])) {
         $settings['Variant'] = "BeagleBone Black";
         $settings['Logo'] = "beagle_black.png";
-    }
-    else if (preg_match('/SanCloud BeagleBone Enhanced/', $settings['SubPlatform']))
-    {
+    } else if (preg_match('/SanCloud BeagleBone Enhanced/', $settings['SubPlatform'])) {
         $settings['Variant'] = "SanCloud BeagleBone Enhanced";
         $settings['Logo'] = "beagle_sancloud.png";
-    }
-    else
-    {
+    } else {
         $settings['Variant'] = "UNKNOWN";
         $settings['Logo'] = "beagle_logo.png";
     }
-
-    
-}
-else if ($settings['Platform'] == "PogoPlug")
-{
+} else if ($settings['Platform'] == "PogoPlug") {
 	$settings['Logo'] = "pogoplug_logo.png";
 	$settings['LogoLink'] = "";
-}
-else if ($settings['Platform'] == "ODROID")
-{
+} else if ($settings['Platform'] == "ODROID") {
 	$settings['Logo'] = "odroid_logo.gif";
 	$settings['LogoLink'] = "http://www.hardkernel.com/main/main.php";
-}
-else if ($settings['Platform'] == "OrangePi")
-{
+} else if ($settings['Platform'] == "OrangePi") {
 	$settings['Logo'] = "orangepi_logo.png";
 	$settings['LogoLink'] = "http://www.orangepi.org/";
-}
-else if ($settings['Platform'] == "Pine64")
-{
+	$settings['SubPlatform'] = trim(file_get_contents("/sys/firmware/devicetree/base/model"));
+	if (preg_match('/Orange Pi Zero/', $settings['SubPlatform'])) {
+		$settings['Logo'] = "orangepi_zero_logo.png";
+	}
+} else if ($settings['Platform'] == "Pine64") {
 	$settings['Logo'] = "pine64_logo.png";
 	$settings['LogoLink'] = "https://www.pine64.org/";
-}
-else if ($settings['Platform'] == "CHIP")
-{
+} else if ($settings['Platform'] == "CHIP") {
 	$settings['Logo'] = "chip_logo.png";
 	$settings['LogoLink'] = "http://www.getchip.com/";
-}
-else if ($settings['Platform'] == "Debian")
-{
+} else if ($settings['Platform'] == "Debian") {
+    if (file_exists("/.dockerenv")) {
+        $settings['SubPlatform'] = "Docker";
+    }
 	$settings['Logo'] = "debian_logo.png";
 	$settings['LogoLink'] = "https://www.debian.org/";
-}
-else if ($settings['Platform'] == "CHIP")
-{
-	$settings['Logo'] = "chip_logo.png";
-	$settings['LogoLink'] = "http://www.getchip.com/";
-}
-else if ($settings['Platform'] == "Debian")
-{
-	$settings['Logo'] = "debian_logo.png";
-	$settings['LogoLink'] = "https://www.debian.org/";
-}
-else if ($settings['Platform'] == "Linux")
-{
+} else if ($settings['Platform'] == "Ubuntu") {
+	$settings['Logo'] = "ubuntu_logo.png";
+	$settings['LogoLink'] = "https://ubuntu.com/";
+} else if ($settings['Platform'] == "Fedora") {
+	$settings['Logo'] = "fedora_logo.png";
+	$settings['LogoLink'] = "https://getfedora.org/";
+} else if ($settings['Platform'] == "Linux") {
 	$settings['Logo'] = "tux_logo.png";
 	$settings['LogoLink'] = "http://www.linux.com/";
-}
-else if ($settings['Platform'] == "FreeBSD")
-{
+} else if ($settings['Platform'] == "FreeBSD") {
 	$settings['Logo'] = "freebsd_logo.png";
 	$settings['LogoLink'] = "http://www.freebsd.org/";
-}
-else if ($settings['Platform'] == "qemu")
-{
+} else if ($settings['Platform'] == "qemu") {
 	$settings['Logo'] = "QEMU_Logo.png";
 	$settings['LogoLink'] = "http://qemu.org/";
-}
-else
-{
+} else {
 	$settings['Logo'] = "";
 	$settings['LogoLink'] = "";
 }
@@ -432,6 +425,7 @@ $settings['co-bbbStrings'] = $mediaDirectory . "/config/co-bbbStrings.json";
 $settings['universeOutputs'] = $mediaDirectory . "/config/co-universes.json";
 $settings['universeInputs'] = $mediaDirectory . "/config/ci-universes.json";
 $settings['model-overlays'] = $mediaDirectory . "/config/model-overlays.json";
+$settings['scheduleJsonFile'] = $mediaDirectory . "/config/schedule.json";
 $settings['scriptDirectory'] = $scriptDirectory;
 $settings['sequenceDirectory'] = $sequenceDirectory;
 $settings['musicDirectory'] = $musicDirectory;
@@ -451,6 +445,9 @@ $settings['emailguser'] = $emailguser;
 $settings['emailfromtext'] = $emailfromtext;
 $settings['emailtoemail'] = $emailtoemail;
 $settings['outputProcessorsFile'] = $outputProcessorsFile;
+
+if ((isset($settings['masqUIPlatform'])) && ($settings['masqUIPlatform'] != ''))
+    $settings['Platform'] = $settings['masqUIPlatform'];
 
 if (!isset($settings['restartFlag']))
 	$settings['restartFlag'] = 0;
@@ -492,6 +489,17 @@ if ($debug)
 	error_log("emailtoemail: $emailtoemail");
 }
 
+if (!isset($settings['uiLevel']))
+    $settings['uiLevel'] = 0;
+
+$uiLevel = $settings['uiLevel'];
+
+define('MINYEAR', date('Y'));
+define('MAXYEAR', date('Y') + 5);
+
+LoadLocale();
+
+/////////////////////////////////////////////////////////////////////////////
 function GetDirSetting($dir)
 {
 	if ($dir == "Sequences")        { return GetSettingValue('sequenceDirectory'); }
@@ -507,17 +515,24 @@ function GetDirSetting($dir)
 
 	return "";
 }
+/////////////////////////////////////////////////////////////////////////////
+
 
 // $skipJSsettings is only set in fppjson.php and fppxml.php
 // to prevent this JavaScript from being printed
 if (!isset($skipJSsettings)) {
 ?>
 <script type="text/javascript">
+    MINYEAR = <? echo MINYEAR; ?>;
+    MAXYEAR = <? echo MAXYEAR; ?>;
 	var settings = new Array();
 <?
 	foreach ($settings as $key => $value) {
         if (!is_array($value)) {
             printf("	settings['%s'] = \"%s\";\n", $key, $value);
+        } else {
+            $js_array = json_encode($value);
+            printf("    settings['%s'] = %s;\n", $key, $js_array);
         }
 	}
 ?>
@@ -539,4 +554,8 @@ if (!isset($skipJSsettings)) {
 </script>
 <?
 }
+
+// Put variables here that we don't want in the JavaScript settings array
+$settings['htaccessContents'] = "php_value max_input_vars 5000\nphp_value upload_max_filesize 4G\nphp_value post_max_size 4G\n";
+
 ?>

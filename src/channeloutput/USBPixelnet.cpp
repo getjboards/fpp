@@ -22,16 +22,17 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <errno.h>
-#include <string.h>
-#include <unistd.h>
-
-#include "common.h"
-#include "log.h"
 #include "serialutil.h"
 #include "USBPixelnet.h"
 
+extern "C" {
+    USBPixelnetOutput *createUSBPixelnetOutput(unsigned int startChannel,
+                                               unsigned int channelCount) {
+        return new USBPixelnetOutput(startChannel, channelCount);
+    }
+}
 /////////////////////////////////////////////////////////////////////////////
 
 /*
@@ -49,7 +50,6 @@ USBPixelnetOutput::USBPixelnetOutput(unsigned int startChannel,
 	LogDebug(VB_CHANNELOUT, "USBPixelnetOutput::USBPixelnetOutput(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = 4096;
 	m_useDoubleBuffer = 1;
 }
 
@@ -60,51 +60,29 @@ USBPixelnetOutput::~USBPixelnetOutput()
 {
 	LogDebug(VB_CHANNELOUT, "USBPixelnetOutput::~USBPixelnetOutput()\n");
 }
+int USBPixelnetOutput::Init(Json::Value config) {
+	LogDebug(VB_CHANNELOUT, "USBPixelnetOutput::Init()\n");
+    if (config.isMember("device")) {
+        m_deviceName = config["device"].asString();
+    }
+    if (config.isMember("type")) {
+        std::string type = config["type"].asString();
+        if (type == "Pixelnet-Lynx") {
+            LogDebug(VB_CHANNELOUT, "Treating device as Pixelnet-Lynx compatible\n");
+            m_dongleType = PIXELNET_DVC_LYNX;
+        } else if (type == "Pixelnet-Open") {
+            LogDebug(VB_CHANNELOUT, "Treating device as Pixelnet-Open compatible\n");
+            m_dongleType = PIXELNET_DVC_OPEN;
+        }
+    }
 
-/*
- *
- */
-int USBPixelnetOutput::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "USBPixelnetOutput::Init('%s')\n", configStr);
-
-	std::vector<std::string> configElems = split(configStr, ';');
-
-	for (int i = 0; i < configElems.size(); i++)
-	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
-
-		if (elem[0] == "device")
-		{
-			LogDebug(VB_CHANNELOUT, "Using %s for Pixelnet output\n", elem[1].c_str());
-			m_deviceName = elem[1];
-		}
-		else if (elem[0] == "type")
-		{
-			if (elem[1] == "Pixelnet-Lynx")
-			{
-				LogDebug(VB_CHANNELOUT, "Treating device as Pixelnet-Lynx compatible\n");
-				m_dongleType = PIXELNET_DVC_LYNX;
-			}
-			else if (elem[1] == "Pixelnet-Open")
-			{
-				LogDebug(VB_CHANNELOUT, "Treating device as Pixelnet-Open compatible\n");
-				m_dongleType = PIXELNET_DVC_OPEN;
-			}
-		}
-	}
-
-	if ((m_deviceName == "") ||
-		(m_dongleType == PIXELNET_DVC_UNKNOWN))
-	{
-		LogErr(VB_CHANNELOUT, "Invalid Config Str: %s\n", configStr);
-		return 0;
-	}
-
-	m_deviceName.insert(0, "/dev/");
-
+    if ((m_deviceName == "") ||
+        (m_dongleType == PIXELNET_DVC_UNKNOWN)) {
+        LogErr(VB_CHANNELOUT, "Invalid Config.  Unknown device or type.\n");
+        return 0;
+    }
+    m_deviceName = "/dev/" + m_deviceName;
+    
 	LogInfo(VB_CHANNELOUT, "Opening %s for Pixelnet output\n",
 		m_deviceName.c_str());
 
@@ -140,13 +118,12 @@ int USBPixelnetOutput::Init(char *configStr)
 		m_outputPacketSize = 4102;
 	}
 
-	return ThreadedChannelOutputBase::Init(configStr);
+	return ThreadedChannelOutputBase::Init(config);
 }
 
 
-void USBPixelnetOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = m_startChannel + m_channelCount - 1;
+void USBPixelnetOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    addRange(m_startChannel, m_startChannel + m_channelCount - 1);
 }
 
 /*

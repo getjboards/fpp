@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   HTTP API for the Falcon Player Daemon 
  *   Falcon Player project (FPP) 
@@ -24,8 +25,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _HTTPAPI_H
-
 #include <httpserver.hpp>
 #include <jsoncpp/json/json.h>
 
@@ -37,10 +36,10 @@ using namespace httpserver;
 
 class PlayerResource : public http_resource {
   public:
-	const http_response render_GET(const http_request &req);
-	const http_response render_DELETE(const http_request &req);
-	const http_response render_POST(const http_request &req);
-	const http_response render_PUT(const http_request &req);
+	const std::shared_ptr<http_response> render_GET(const http_request &req);
+	const std::shared_ptr<http_response> render_DELETE(const http_request &req);
+	const std::shared_ptr<http_response> render_POST(const http_request &req);
+	const std::shared_ptr<http_response> render_PUT(const http_request &req);
 
   private:
 	void GetRunningEffects(Json::Value &result);
@@ -80,5 +79,3 @@ class APIServer {
 	webserver         *m_ws;
 	PlayerResource    *m_pr;
 };
-
-#endif

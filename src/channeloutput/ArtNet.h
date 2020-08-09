@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   ArtNet output handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _ARTNET_H
-#define _ARTNET_H
-
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <vector>
@@ -36,17 +34,19 @@
 
 class ArtNetOutputData : public UDPOutputData {
 public:
-    ArtNetOutputData(const Json::Value &config);
+    explicit ArtNetOutputData(const Json::Value &config);
     virtual ~ArtNetOutputData();
     
-    virtual bool IsPingable();
-    virtual void PrepareData(unsigned char *channelData);
-    virtual void CreateMessages(std::vector<struct mmsghdr> &ipMsgs);
-    virtual void CreateBroadcastMessages(std::vector<struct mmsghdr> &bMsgs);
-    virtual void AddPostDataMessages(std::vector<struct mmsghdr> &bMsgs);
-    virtual void DumpConfig();
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual bool IsPingable() override;
     
+    virtual void PrepareData(unsigned char *channelData, UDPOutputMessages &msgs) override;
+    virtual void PostPrepareData(unsigned char *channelData, UDPOutputMessages &msgs) override;
+    
+    virtual void DumpConfig() override;
+    virtual void GetRequiredChannelRange(int &min, int & max) override;
+    
+    virtual const std::string &GetOutputTypeString() const override;
+
     int           universe;
     int           universeCount;
     int           priority;
@@ -57,5 +57,3 @@ public:
     std::vector<struct iovec>  anIovecs;
     std::vector<unsigned char *> anHeaders;
 };
-
-#endif /* _ARTNET_H */

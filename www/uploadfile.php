@@ -5,6 +5,13 @@ require_once('config.php');
 ?>
 <head>
 <?php	include 'common/menuHead.inc'; ?>
+
+
+<?php
+    exec($SUDO . " df -k /home/fpp/media/upload |awk '/\/dev\//{printf(\"%d\\n\", $5);}'", $output, $return_val);
+    $freespace = $output[0];
+    unset($output);
+?>
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <title><? echo $pageTitle; ?></title>
 
@@ -17,83 +24,134 @@ require_once('config.php');
 <script type="text/javascript" src="jquery/Spin.js/jquery.spin.js"></script>
 
 <script>
-    $(function() {
+
+function ButtonHandler(table, button) {
+    var selectedCount = $('#tbl' + table + ' tr.selectedEntry').length;
+    var filename = '';
+    var filenames = [];
+    if (selectedCount == 1) {
+        filename = $('#tbl' + table + ' tr.selectedEntry').find('td:first').text();
+    }
+
+    if ((button == 'play') || (button == 'playHere')) {
+        if (selectedCount == 1) {
+            PlayPlaylist(filename, button == 'play' ? 1 : 0);
+        } else {
+            DialogError('Error', 'Error, unable to play multiple sequences at the same time.');
+        }
+    } else if (button == 'download') {
+        var files = [];
+        $('#tbl' + table + ' tr.selectedEntry').each(function() {
+            files.push($(this).find('td:first').text());
+        });
+        DownloadFiles(table, files);
+    } else if (button == 'rename') {
+        if (selectedCount == 1) {
+            RenameFile(table, filename);
+        } else {
+            DialogError('Error', 'Error, unable to rename multiple files at the same time.');
+        }
+    } else if (button == 'copyFile') {
+        if (selectedCount == 1) {
+            CopyFile(table, filename);
+        } else {
+            DialogError('Error', 'Error, unable to copy multiple files at the same time.');
+        }
+    } else if (button == 'delete') {
+        $('#tbl' + table + ' tr.selectedEntry').each(function() {
+            DeleteFile(table, $(this), $(this).find('td:first').text());
+        });
+    } else if (button == 'editScript') {
+        if (selectedCount == 1) {
+            EditScript(filename);
+        } else {
+            DialogError('Error', 'Error, unable to edit multiple files at the same time.');
+        }
+    } else if (button == 'playInBrowser') {
+        if (selectedCount == 1) {
+            PlayFileInBrowser(table, filename);
+        } else {
+            DialogError('Error', 'Error, unable to play multiple files at the same time.');
+        }
+    } else if (button == 'runScript') {
+        if (selectedCount == 1) {
+            RunScript(filename);
+        } else {
+            DialogError('Error', 'Error, unable to run multiple files at the same time.');
+        }
+    } else if (button == 'videoInfo') {
+        if (selectedCount == 1) {
+            GetVideoInfo(filename);
+        } else {
+            DialogError('Error', 'Error, unable to get info for multiple files at the same time.');
+        }
+    } else if (button == 'viewFile') {
+        if (selectedCount == 1) {
+            ViewFile(table, filename);
+        } else {
+            DialogError('Error', 'Error, unable to view multiple files at the same time.');
+        }
+    } else if (button == 'viewImage') {
+        if (selectedCount == 1) {
+            ViewImage(filename);
+        } else {
+            DialogError('Error', 'Error, unable to view multiple files at the same time.');
+        }
+    }
+}
+
+function ClearSelections(table) {
+    $('#tbl' + table + ' tr').removeClass('selectedEntry');
+    DisableButtonClass('single' + table + 'Button');
+    DisableButtonClass('multi' + table + 'Button');
+}
+
+function HandleMouseClick(event, row, table) {
+    HandleTableRowMouseClick(event, row);
+
+    var selectedCount = $('#tbl' + table + ' tr.selectedEntry').length;
+
+    DisableButtonClass('single' + table + 'Button');
+    DisableButtonClass('multi' + table + 'Button');
+
+    if (selectedCount > 1) {
+        EnableButtonClass('multi' + table + 'Button');
+    } else if (selectedCount > 0) {
+        EnableButtonClass('single' + table + 'Button');
+    }
+}
+
+$(function() {
     $('#tblSequences').on('mousedown', 'tr', function(event,ui){
-          $('#tblSequences tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          SequenceNameSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnDownloadSequence','enable');
-		  SetButtonState('#btnRenameSequence','enable');
-		  SetButtonState('#btnDeleteSequence','enable');
+        HandleMouseClick(event, $(this), 'Sequences');
     });
 
     $('#tblMusic').on('mousedown', 'tr', function(event,ui){
-          $('#tblMusic tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          SongNameSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnPlayMusicInBrowser','enable');
-		  SetButtonState('#btnDownloadMusic','enable');
-		  SetButtonState('#btnRenameMusic','enable');
-		  SetButtonState('#btnDeleteMusic','enable');
+        HandleMouseClick(event, $(this), 'Music');
     });
 
     $('#tblVideos').on('mousedown', 'tr', function(event,ui){
-          $('#tblVideos tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          VideoNameSelected  = $(this).find('td:first').text();
-		  //SetButtonState('#btnPlayVideoInBrowser','enable');
-		  SetButtonState('#btnVideoInfo','enable');
-		  SetButtonState('#btnDownloadVideo','enable');
-		  SetButtonState('#btnRenameVideo','enable');
-		  SetButtonState('#btnDeleteVideo','enable');
+        HandleMouseClick(event, $(this), 'Videos');
     });
 
     $('#tblImages').on('mousedown', 'tr', function(event,ui){
-          $('#tblImages tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          ImageNameSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnViewImage','enable');
-		  SetButtonState('#btnDownloadImage','enable');
-		  SetButtonState('#btnDeleteImage','enable');
+        HandleMouseClick(event, $(this), 'Images');
     });
 
     $('#tblEffects').on('mousedown', 'tr', function(event,ui){
-          $('#tblEffects tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          EffectNameSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnDownloadEffect','enable');
-		  SetButtonState('#btnRenameEffect','enable');
-		  SetButtonState('#btnDeleteEffect','enable');
+        HandleMouseClick(event, $(this), 'Effects');
     });
 
     $('#tblScripts').on('mousedown', 'tr', function(event,ui){
-          $('#tblScripts tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          ScriptNameSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnViewScript','enable');
-		  SetButtonState('#btnEditScript','enable');
-		  SetButtonState('#btnRunScript','enable');
-		  SetButtonState('#btnDownloadScript','enable');
-		  SetButtonState('#btnCopyScript','enable');
-		  SetButtonState('#btnRenameScript','enable');
-		  SetButtonState('#btnDeleteScript','enable');
+        HandleMouseClick(event, $(this), 'Scripts');
     });
 
     $('#tblLogs').on('mousedown', 'tr', function(event,ui){
-          $('#tblLogs tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          LogFileSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnViewLog','enable');
-		  SetButtonState('#btnDownloadLog','enable');
-		  SetButtonState('#btnDeleteLog','enable');
+        HandleMouseClick(event, $(this), 'Logs');
     });
 
     $('#tblUploads').on('mousedown', 'tr', function(event,ui){
-          $('#tblUploads tr').removeClass('selectedentry');
-          $(this).addClass('selectedentry');
-          UploadFileSelected  = $(this).find('td:first').text();
-		  SetButtonState('#btnDownloadUpload','enable');
-		  SetButtonState('#btnDeleteUpload','enable');
+        HandleMouseClick(event, $(this), 'Uploads');
     });
 
   });
@@ -189,9 +247,6 @@ h2 {
 .right {
 	text-align: right;
 }
-.selectedentry {
-	background: #888;
-}
 </style>
 </head>
 
@@ -200,7 +255,11 @@ h2 {
 <?php	include 'menu.inc'; ?>
 <div id="fileManager">
   <br />
-  <div class='title'>File Manager</div>
+<div class='title'>File Manager
+<? if ($freespace > 95) { ?>
+&nbsp;&nbsp;-&nbsp;&nbsp;<b><font color='red'>WARNING: storage device is almost full!</font></b>
+<? } ?>
+</div>
   <div id="tabs">
     <ul>
       <li><a href="#tab-sequence">Sequences</a></li>
@@ -222,12 +281,14 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "DownloadFile('Sequences', SequenceNameSelected);" id="btnDownloadSequence" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "RenameFile('Sequences', ScriptNameSelected);" id="btnRenameSequence" class="disableButtons" type="button"  value="Rename" />
-            <input onclick="DeleteFile('Sequences', SequenceNameSelected);" id="btnDeleteSequence" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Sequences');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Sequences', 'play');" class="disableButtons singleSequencesButton" type="button"  value="Play" />
+            <input onclick="ButtonHandler('Sequences', 'playHere');" class="disableButtons singleSequencesButton" type="button"  value="Play Here" />
+            <input onclick="ButtonHandler('Sequences', 'download');" class="disableButtons singleSequencesButton multiSequencesButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Sequences', 'rename');" class="disableButtons singleSequencesButton" type="button"  value="Rename" />
+            <input onclick="ButtonHandler('Sequences', 'delete');" class="disableButtons singleSequencesButton multiSequencesButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>Sequence files must be in the Falcon Player .fseq format and may be converted from various other sequencer formats using <a href='https://github.com/smeighan/xLights' target='_sequencer'>xLights</a> or <a href='https://github.com/pharhp/Light-Elf' target='_sequencer'>Light-Elf</a>.  <a href='https://github.com/smeighan/xLights' target='_sequencer'>xLights v4</a> uses .fseq as its native file format.  <a href='http://www.vixenlights.com' target='_sequencer'>Vixen 3</a> and recent versions of <a href='http://vixenplus.com/'>Vixen+</a> also have the ability to directly export .fseq files.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -235,20 +296,20 @@ h2 {
     <div id="tab-audio">
       <div id= "divMusic">
         <fieldset  class="fs">
-          <legend> Music Files (.mp3/.ogg/.m4a) </legend>
+          <legend> Music Files (.mp3/.ogg/.m4a/.flac) </legend>
           <div id="divMusicData">
             <table id="tblMusic">
             </table>
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "PlayFileInBrowser('Music', SongNameSelected);" id="btnPlayMusicInBrowser" class="disableButtons" type="button"  value="Listen" />
-            <input onclick= "DownloadFile('Music', SongNameSelected);" id="btnDownloadMusic" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "RenameFile('Music', ScriptNameSelected);" id="btnRenameMusic" class="disableButtons" type="button"  value="Rename" />
-            <input onclick= "DeleteFile('Music', SongNameSelected);" id="btnDeleteMusic" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Music');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Music', 'playInBrowser');" id="btnPlayMusicInBrowser" class="disableButtons singleMusicButton" type="button"  value="Listen" />
+            <input onclick="ButtonHandler('Music', 'download');" id="btnDownloadMusic" class="disableButtons singleMusicButton multiMusicButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Music', 'rename');" id="btnRenameMusic" class="disableButtons singleMusicButton" type="button"  value="Rename" />
+            <input onclick="ButtonHandler('Music', 'delete');" id="btnDeleteMusic" class="disableButtons singleMusicButton multiMusicButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>Audio files must be in MP3, OGG, or M4A format.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -263,16 +324,14 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <!--
-            <input onclick= "PlayFileInBrowser('Videos', VideoNameSelected);" id="btnPlayVideoInBrowser" class="disableButtons" type="button"  value="View" />
-            -->
-            <input onclick= "GetVideoInfo(VideoNameSelected);" id="btnVideoInfo" class="disableButtons" type="button"  value="Video Info" />
-            <input onclick= "DownloadFile('Videos', VideoNameSelected);" id="btnDownloadVideo" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "RenameFile('Videos', ScriptNameSelected);" id="btnRenameVideo" class="disableButtons" type="button"  value="Rename" />
-            <input onclick= "DeleteFile('Videos', VideoNameSelected);" id="btnDeleteVideo" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Videos');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Videos', 'playInBrowser');" class="disableButtons singleVideosButton" type="button"  value="View" />
+            <input onclick="ButtonHandler('Videos', 'videoInfo');" class="disableButtons singleVideosButton" type="button"  value="Video Info" />
+            <input onclick="ButtonHandler('Videos', 'download');" class="disableButtons singleVideosButton multiVideosButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Videos', 'rename');" class="disableButtons singleVideosButton" type="button"  value="Rename" />
+            <input onclick="ButtonHandler('Videos', 'delete');" class="disableButtons singleVideosButton multiVideosButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>Video files must be in .mp4 or .mkv format.  H264 video is required for hardware acceleration on the Pi and AAC or MP3 audio are preferred.  Video playback is not currently supported on the BBB.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -287,10 +346,12 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "ViewImage(ImageNameSelected);" id="btnViewImage" class="disableButtons" type="button"  value="View" />
-            <input onclick= "DownloadFile('Images', ImageNameSelected);" id="btnDownloadImage" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "DeleteFile('Images', ImageNameSelected);" id="btnDeleteImage" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Images');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Images', 'viewImage');" class="disableButtons singleImagesButton" type="button"  value="View" />
+            <input onclick="ButtonHandler('Images', 'download');" class="disableButtons singleImagesButton multiImagesButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Images', 'delete');" class="disableButtons singleImagesButton multiImagesButton" type="button"  value="Delete" />
           </div>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -305,12 +366,12 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "DownloadFile('Effects', EffectNameSelected);" id="btnDownloadEffect" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "RenameFile('Effects', ScriptNameSelected);" id="btnRenameEffect" class="disableButtons" type="button"  value="Rename" />
-            <input onclick= "DeleteFile('Effects', EffectNameSelected);" id="btnDeleteEffect" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Effects');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Effects', 'download');" class="disableButtons singleEffectsButton multiEffectsButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Effects', 'rename');" class="disableButtons singleEffectsButton" type="button"  value="Rename" />
+            <input onclick="ButtonHandler('Effects', 'delete');" class="disableButtons singleEffectsButton multiEffectsButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>Effects files are .fseq format files with an .eseq extension.  These special sequence files contain only the channels for a specific effect and always start at channel 1 in the sequence file.  The actual starting channel offset for the Effect is specified when you run it or configure the Effect in an Event.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -325,16 +386,16 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "ViewFile('Scripts', ScriptNameSelected);" id="btnViewScript" class="disableButtons" type="button"  value="View" />
-            <input onclick= "RunScript(ScriptNameSelected);" id="btnRunScript" class="disableButtons" type="button"  value="Run" />
-            <input onclick= "EditScript(ScriptNameSelected);" id="btnEditScript" class="disableButtons" type="button"  value="Edit" />
-            <input onclick= "DownloadFile('Scripts', ScriptNameSelected);" id="btnDownloadScript" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "CopyFile('Scripts', ScriptNameSelected);" id="btnCopyScript" class="disableButtons" type="button"  value="Copy" />
-            <input onclick= "RenameFile('Scripts', ScriptNameSelected);" id="btnRenameScript" class="disableButtons" type="button"  value="Rename" />
-            <input onclick= "DeleteFile('Scripts', ScriptNameSelected);" id="btnDeleteScript" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Scripts');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Scripts', 'viewFile');" class="disableButtons singleScriptsButton" type="button"  value="View" />
+            <input onclick="ButtonHandler('Scripts', 'runScript');" class="disableButtons singleScriptsButton" type="button"  value="Run" />
+            <input onclick="ButtonHandler('Scripts', 'editScript');" class="disableButtons singleScriptsButton" type="button"  value="Edit" />
+            <input onclick="ButtonHandler('Scripts', 'download');" class="disableButtons singleScriptsButton multiScriptsButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Scripts', 'copyFile');" class="disableButtons singleScriptsButton" type="button"  value="Copy" />
+            <input onclick="ButtonHandler('Scripts', 'rename');" class="disableButtons singleScriptsButton" type="button"  value="Rename" />
+            <input onclick="ButtonHandler('Scripts', 'delete');" class="disableButtons singleScriptsButton multiScriptsButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>Scripts must have a .sh, .pl, .pm, .php, or .py extension.  Scripts may be executed inside an event.  These might be used in a show to trigger an external action such as sending a message to a RDS capable FM transmitter or a non-DMX/Pixelnet LED sign.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -349,13 +410,13 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "DownloadZip('Logs');" id="btnZipLogs" class="buttons" type="button" value="Zip" style="float: left;" />
-            <input onclick= "ViewFile('Logs', LogFileSelected);" id="btnViewLog" class="disableButtons" type="button"  value="View" />
-            <input onclick= "DownloadFile('Logs', LogFileSelected);" id="btnDownloadLog" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "DeleteFile('Logs', LogFileSelected);" id="btnDeleteLog" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Logs');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="DownloadZip('Logs');" class="buttons" type="button" value="Zip" />
+            <input onclick="ButtonHandler('Logs', 'viewFile');" class="disableButtons singleLogsButton" type="button"  value="View" />
+            <input onclick="ButtonHandler('Logs', 'download');" class="disableButtons singleLogsButton multiLogsButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Logs', 'delete');" class="disableButtons singleLogsButton multiLogsButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>FPP logs may be viewed or downloaded for submission with bug reports.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>
@@ -370,11 +431,11 @@ h2 {
           </div>
           <hr />
           <div class='right'>
-            <input onclick= "DownloadFile('Uploads', UploadFileSelected);" id="btnDownloadUpload" class="disableButtons" type="button"  value="Download" />
-            <input onclick= "DeleteFile('Uploads', UploadFileSelected);" id="btnDeleteUpload" class="disableButtons" type="button"  value="Delete" />
+            <input onclick="ClearSelections('Uploads');" class="buttons" type="button" value="Clear" style="float: left;" />
+            <input onclick="ButtonHandler('Uploads', 'download');" class="disableButtons singleUploadsButton multiUploadsButton" type="button"  value="Download" />
+            <input onclick="ButtonHandler('Uploads', 'delete');" class="disableButtons singleUploadsButton multiUploadsButton" type="button"  value="Delete" />
           </div>
-          <br />
-          <font size=-1>The upload directory is used as temporary storage when uploading media and sequencee files.  It is also used as permanent storage for other file formats which have no dedicated home.</font>
+          <font size=-1><b>CTRL+Click to select multiple items</b></font>
         </fieldset>
       </div>
     </div>

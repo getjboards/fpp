@@ -23,23 +23,15 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "fpp-pch.h"
 
-#include "settings.h"
-#include "fppversion.h"
-#include "log.h"
+#include "fpp.h"
 
-#include <errno.h>
 #include <libgen.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
 #include <getopt.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <ctype.h>
-#include "common.h"
-
+#include <pwd.h>
 
 const char *fpp_bool_to_string[] = { "false", "true", "default" };
 
@@ -57,13 +49,10 @@ SettingsConfig::~SettingsConfig() {
     if (scriptDirectory) free(scriptDirectory);
     if (pluginDirectory) free(pluginDirectory);
     if (playlistDirectory) free(playlistDirectory);
-    if (universeFile) free(universeFile);
     if (pixelnetFile) free(pixelnetFile);
-    if (scheduleFile) free(scheduleFile);
     if (logFile) free(logFile);
     if (silenceMusic) free(silenceMusic);
     if (settingsFile) free(settingsFile);
-    if (bytesFile) free(bytesFile);
     if (E131interface) free(E131interface);
     
     for (auto &a :keyVal) {
@@ -80,8 +69,17 @@ void initSettings(int argc, char **argv)
 {
     char tmpDir[256];
     char mediaDir[256];
-
+    
+    memset(tmpDir, 0, sizeof(tmpDir));
+    memset(mediaDir, 0, sizeof(mediaDir));
+    
 	settings.binDirectory = strdup(dirname(argv[0]));
+    if (strlen(settings.binDirectory) == 1 && settings.binDirectory[0] == '.') {
+        getcwd(tmpDir, sizeof(tmpDir));
+        free(settings.binDirectory);
+        settings.binDirectory = strdup(tmpDir);
+    }
+
 	settings.fppMode = PLAYER_MODE;
     
     strcpy(tmpDir, settings.binDirectory);
@@ -99,15 +97,10 @@ void initSettings(int argc, char **argv)
 
     if (offset != NULL)
         *offset = 0;
-
+    
     settings.fppDirectory = strdup(tmpDir);
 
-	if (DirectoryExists("/home/fpp"))
-		strcpy(mediaDir, "/home/fpp");
-	else
-		strcpy(mediaDir, "/home/pi");
-
-	strcat(mediaDir, "/media");
+	strcpy(mediaDir, "/home/fpp/media");
 	settings.mediaDirectory = strdup(mediaDir);
 
 	strcpy(tmpDir, mediaDir);
@@ -127,20 +120,15 @@ void initSettings(int argc, char **argv)
 	strcpy(tmpDir, mediaDir);
 	settings.pluginDirectory = strdup(strcat(tmpDir, "/plugins"));
 	strcpy(tmpDir, mediaDir);
-	settings.universeFile = strdup(strcat(tmpDir, "/universes"));
-	strcpy(tmpDir, mediaDir);
 	settings.pixelnetFile = strdup(strcat(tmpDir, "/config/Falcon.FPDV1"));
-	strcpy(tmpDir, mediaDir);
-	settings.scheduleFile = strdup(strcat(tmpDir, "/schedule"));
 	strcpy(tmpDir, mediaDir);
 	settings.logFile = strdup(strcat(tmpDir, "/logs/fppd.log"));
 	strcpy(tmpDir, mediaDir);
 	settings.silenceMusic = strdup(strcat(tmpDir, "/silence.ogg"));
 	strcpy(tmpDir, mediaDir);
-	settings.bytesFile = strdup(strcat(tmpDir, "/bytesReceived"));
-	strcpy(tmpDir, mediaDir);
 	settings.settingsFile = strdup(strcat(tmpDir, "/settings"));
 	settings.daemonize = 1;
+	settings.restarted = 0;
 	settings.E131interface = strdup("eth0");
 	settings.controlMajor = 0;
 	settings.controlMinor = 0;
@@ -202,6 +190,8 @@ char *modeToString(int mode)
 		return strdup("master");
 	else if ( mode == REMOTE_MODE )
 		return strdup("remote");
+	else if ( mode == UNKNOWN_MODE )
+		return strdup("unknown");
 	
 	return NULL;
 }
@@ -330,16 +320,6 @@ int parseSetting(char *key, char *value)
 		else
 			fprintf(stderr, "Failed to apply playlistDirectory\n");
 	}
-	else if ( strcmp(key, "universeFile") == 0 )
-	{
-		if ( strlen(value) )
-		{
-			free(settings.universeFile);
-			settings.universeFile = strdup(value);
-		}
-		else
-			fprintf(stderr, "Failed to apply universeFile\n");
-	}
 	else if ( strcmp(key, "pixelnetFile") == 0 )
 	{
 		if ( strlen(value) )
@@ -349,16 +329,6 @@ int parseSetting(char *key, char *value)
 		}
 		else
 			fprintf(stderr, "Failed to apply pixelnetFile\n");
-	}
-	else if ( strcmp(key, "scheduleFile") == 0 )
-	{
-		if ( strlen(value) )
-		{
-			free(settings.scheduleFile);
-			settings.scheduleFile = strdup(value);
-		}
-		else
-			fprintf(stderr, "Failed to apply scheduleFile\n");
 	}
 	else if ( strcmp(key, "LogLevel") == 0 )
 	{
@@ -394,16 +364,6 @@ int parseSetting(char *key, char *value)
 		else
 			fprintf(stderr, "Failed to apply silenceMusic\n");
 	}
-	else if ( strcmp(key, "bytesFile") == 0 )
-	{
-		if ( strlen(value) )
-		{
-			free(settings.bytesFile);
-			settings.bytesFile = strdup(value);
-		}
-		else
-			fprintf(stderr, "Failed to apply bytesFile\n");
-	}
 	else if ( strcmp(key, "E131interface") == 0 )
 	{
 		if ( strlen(value) )
@@ -424,8 +384,6 @@ int parseSetting(char *key, char *value)
 			else
 				fprintf(stderr, "Error, controlMajor value negative\n");
 		}
-		else
-			fprintf(stderr, "Failed to apply controlMajor setting\n");
 	}
 	else if ( strcmp(key, "controlMinor") == 0 )
 	{
@@ -437,8 +395,6 @@ int parseSetting(char *key, char *value)
 			else
 				fprintf(stderr, "Error, controlMinor value negative\n");
 		}
-		else
-			fprintf(stderr, "Failed to apply controlMinor setting\n");
 	}
 
 	return 1;
@@ -456,8 +412,8 @@ int loadSettings(const char *filename)
 
 	if (file != NULL)
 	{
-		char * line = NULL;
-		size_t len = 0;
+		char * line = (char*)calloc(256, 1);
+		size_t len = 256;
 		ssize_t read;
 		int sIndex = 0;
 
@@ -518,11 +474,7 @@ int loadSettings(const char *filename)
 		return -1;
 	}
 
-	if (getDaemonize())
-		SetLogFile(getLogFile());
-	else
-		SetLogFile("");
-
+    SetLogFile(getLogFile(), !getDaemonize());
 	return 0;
 }
 
@@ -541,9 +493,12 @@ const char *getSetting(const char *setting)
 	return "";
 }
 
-int getSettingInt(const char *setting)
+int getSettingInt(const char *setting, int defaultVal)
 {
 	const char *valueStr = getSetting(setting);
+    if (!valueStr || *valueStr == 0) {
+        return defaultVal;
+    }
 	int   value = strtol(valueStr, NULL, 10);
 
 	LogExcess(VB_SETTING, "getSettingInt(%s) returning %d\n", setting, value);
@@ -556,12 +511,34 @@ int getDaemonize(void)
 	return settings.daemonize;
 }
 
+int getRestarted(void)
+{
+	return settings.restarted;
+}
+
 #ifndef __GNUG__
 inline
 #endif
 FPPMode getFPPmode(void)
 {
 	return settings.fppMode;
+}
+
+const std::string getFPPmodeStr(FPPMode mode)
+{
+    if (mode == UNKNOWN_MODE)
+        mode = settings.fppMode;
+
+    std::string result;
+    char *modePtr = modeToString((int)mode);
+    if (modePtr) {
+        result = modePtr;
+        free(modePtr);
+    } else {
+        result = "unknown";
+    }
+
+    return result;
 }
 
 #ifndef __GNUG__
@@ -617,17 +594,9 @@ char *getPlaylistDirectory(void)
 {
 	return settings.playlistDirectory;
 }
-char *getUniverseFile(void)
-{
-	return settings.universeFile;
-}
 char *getPixelnetFile(void)
 {
 	return settings.pixelnetFile;
-}
-char *getScheduleFile(void)
-{
-	return settings.scheduleFile;
 }
 char *getLogFile(void)
 {
@@ -636,10 +605,6 @@ char *getLogFile(void)
 char *getSilenceMusic(void)
 {
 	return settings.silenceMusic;
-}
-char *getBytesFile(void)
-{
-	return settings.bytesFile;
 }
 
 char *getSettingsFile(void)
@@ -662,80 +627,17 @@ unsigned int getControlMinor(void)
 	return settings.controlMinor;
 }
 
-
-/*
-int saveSettingsFile(void)
-{
-	char buffer[1024]; //TODO: Fix this!!
-	int bytes;
-
-	FILE *fd = fopen(getSettingsFile(),"w");
-	if ( ! fd )
-	{
-		fprintf(stderr, "Failed to create config file: %s\n", getSettingsFile());
-		exit(EXIT_FAILURE);
-	}
-
-	bytes  = fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "daemonize", fpp_bool_to_string[getDaemonize()]);
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	if ( getFPPmode() == PLAYER_MODE )
-		snprintf(buffer, 1024, "%s = %s\n", "fppMode", "player");
-	else if ( getFPPmode() == BRIDGE_MODE )
-		snprintf(buffer, 1024, "%s = %s\n", "fppMode", "bridge");
-	else if ( getFPPmode() == MASTER_MODE )
-		snprintf(buffer, 1024, "%s = %s\n", "fppMode", "master");
-	else if ( getFPPmode() == REMOTE_MODE )
-		snprintf(buffer, 1024, "%s = %s\n", "fppMode", "remote");
-	else
-		exit(EXIT_FAILURE);
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %d\n", "volume", getVolume());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "mediaDirectory", getMediaDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "musicDirectory", getMusicDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "sequenceDirectory", getSequenceDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "eventDirectory", getEventDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "videoDirectory", getVideoDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "effectDirectory", getEffectDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "scriptDirectory", getScriptDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "pluginDirectory", getPluginDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "playlistDirectory", getPlaylistDirectory());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "universeFile", getUniverseFile());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "pixelnetFile", getPixelnetFile());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "scheduleFile", getScheduleFile());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "logFile", getLogFile());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "silenceMusic", getSilenceMusic());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "mpg123Path", getMPG123Path());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %s\n", "bytesFile", getBytesFile());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %d\n", "controlMajor", getControlMajor());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-	snprintf(buffer, 1024, "%s = %d\n", "controlMinor", getControlMinor());
-	bytes += fwrite(buffer, 1, strlen(buffer), fd);
-
-	fclose(fd);
-
-	LogInfo(VB_SETTING, "Wrote config file of size %d\n", bytes);
-
-	return 0;
+static inline bool createFile(const char *file) {
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH;
+    int i = open(file, O_RDWR | O_CREAT | O_TRUNC, mode);
+    if (i < 0) {
+        return false;
+    }
+    struct passwd *pwd = getpwnam("fpp");
+    fchown(i, pwd->pw_uid, pwd->pw_gid);
+    close(i);
+    return true;
 }
-*/
 
 void CheckExistanceOfDirectoriesAndFiles(void)
 {
@@ -820,63 +722,13 @@ void CheckExistanceOfDirectoriesAndFiles(void)
 		}
 	}
 
-	if(!FileExists(getUniverseFile()))
-	{
-		LogWarn(VB_SETTING, "Universe file does not exist, creating it.\n");
-
-		char *cmd, *file = getUniverseFile();
-		cmd = (char *)malloc(strlen(file)+7);
-		snprintf(cmd, strlen(file)+7, "touch %s", file);
-		if ( system(cmd) != 0 )
-		{
-			LogErr(VB_SETTING, "Error: Unable to create universe file.\n");
-			exit(EXIT_FAILURE);
-		}
-		free(cmd);
-	}
-
-	if(!FileExists(getScheduleFile()))
-	{
-		LogWarn(VB_SETTING, "Schedule file does not exist, creating it.\n");
-
-		char *cmd, *file = getScheduleFile();
-		cmd = (char *)malloc(strlen(file)+7);
-		snprintf(cmd, strlen(file)+7, "touch %s", file);
-		if ( system(cmd) != 0 )
-		{
-			LogErr(VB_SETTING, "Error: Unable to create schedule file.\n");
-			exit(EXIT_FAILURE);
-		}
-		free(cmd);
-	}
-	if(!FileExists(getBytesFile()))
-	{
-		LogWarn(VB_SETTING, "Bytes file does not exist, creating it.\n");
-
-		char *cmd, *file = getBytesFile();
-		cmd = (char *)malloc(strlen(file)+7);
-		snprintf(cmd, strlen(file)+7, "touch %s", file);
-		if ( system(cmd) != 0 )
-		{
-			LogErr(VB_SETTING, "Error: Unable to create bytes file.\n");
-			exit(EXIT_FAILURE);
-		}
-		free(cmd);
-	}
-
 	if(!FileExists(getSettingsFile()))
 	{
 		LogWarn(VB_SETTING, "Settings file does not exist, creating it.\n");
-
-		char *cmd, *file = getSettingsFile();
-		cmd = (char *)malloc(strlen(file)+7);
-		snprintf(cmd, strlen(file)+7, "touch %s", file);
-		if ( system(cmd) != 0 )
-		{
+        if (!createFile(getSettingsFile())) {
 			LogErr(VB_SETTING, "Error: Unable to create settings file.\n");
 			exit(EXIT_FAILURE);
 		}
-		free(cmd);
 	}
   
 

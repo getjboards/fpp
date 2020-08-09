@@ -5,6 +5,7 @@ $skipJSsettings = 1;
 
 //Include other scripts
 require_once('common.php');
+require_once('common/settings.php');
 //Includes for API access
 //require_once('fppjson.php');
 require_once('fppxml.php');
@@ -35,7 +36,7 @@ $system_config_areas = array(
             'file' => array(
                 'events' => array('type' => 'dir', 'location' => $eventDirectory),
                 'playlist' => array('type' => 'dir', 'location' => $playlistDirectory),
-                'schedule' => array('type' => 'file', 'location' => $scheduleFile),
+                'schedule' => array('type' => 'file', 'location' => $settings['scheduleJsonFile']),
                 'scripts' => array('type' => 'dir', 'location' => $scriptDirectory),
             ),
             'special' => true
@@ -45,8 +46,9 @@ $system_config_areas = array(
             'friendly_name' => 'System Settings (incl. GPIO Input, Email, Timezone)',
             'file' => array(
                 'system_settings' => array('type' => 'file', 'location' => $settingsFile),
+                'proxies' => array('type' => 'file', 'location' => "$mediaDirectory/config/proxies"),
                 'email' => array('type' => 'file', 'location' => false),
-                'timezone' => array('type' => 'file', 'location' => $timezoneFile)
+				'timezone' => array('type' => 'function', 'location' => array('backup' => 'ReadTimeZone', 'restore' => '')) //We'll handle restore ourselves
             ),
             'special' => true
         ),
@@ -66,9 +68,11 @@ $system_config_areas = array(
 );
 
 //FPP Backup version
-$fpp_backup_version = "2";
+$fpp_backup_version = "3";
 //FPP Backup files directory
 $fpp_backup_location = $settings['configDirectory'] . "/backups";
+//Hold any backup error messages here
+$backup_errors = array();
 
 //Array of plugins
 $system_active_plugins = array();
@@ -147,6 +151,7 @@ if (isset($_POST['btnDownloadConfig'])) {
                 foreach ($tmp_config_areas as $config_key => $config_data) {
                     $setting_file_to_backup = $config_data['file'];
                     $file_data = array();
+					$backup_file_data = '';
                     //if setting file value is an array then there are one or more setting files related to this backup
                     if (is_array($setting_file_to_backup)) {
 //                    if (array_key_exists('special', $setting_file)) {
@@ -294,6 +299,9 @@ if (isset($_POST['btnDownloadConfig'])) {
             //DO IT!
             if (!empty($tmp_settings_data)) {
                 doBackupDownload($tmp_settings_data, $area);
+            }else{
+				$backup_error_string = "BACKUP: Something went wrong while generating backup file for " . ucwords(str_replace("_", " ", $area)) . ", no data was supplied. Have these settings been configured?";
+				$backup_errors[] = $backup_error_string;
             }
         }
     }
@@ -353,22 +361,33 @@ if (isset($_POST['btnDownloadConfig'])) {
                     //work out of backup file is version 2 or not
                     //if it's not a version 2 file, then we can only really restore settings
                     //email can be restored because it's contained in the settings
-                    $is_version_2_backup = false;
-                    if (array_key_exists('fpp_backup_version', $file_contents_decoded) && ($file_contents_decoded['fpp_backup_version'] == $fpp_backup_version)) {
-                        $is_version_2_backup = true;
-                    }
+
+                    //Version 2 backups need to restore the schedule file to the old locations (auto converted on FPPD restart)
+					//Version 3 backups need to restore the schedule to a different file
+					$is_version_2_backup = false;
+					$is_version_3_backup = false;
+                    //Check backup version
+					if (array_key_exists('fpp_backup_version', $file_contents_decoded)) {
+						$_fpp_backup_version = $file_contents_decoded['fpp_backup_version']; //Minimum version is 2
+
+						if ($file_contents_decoded['fpp_backup_version'] == 2) {
+							$is_version_2_backup = true;
+						} else if ($file_contents_decoded['fpp_backup_version'] = $fpp_backup_version) {
+							$is_version_3_backup = true;
+						}
+					}
 
                     //Remove the platform key as it's not used for anything yet
                     unset($file_contents_decoded['platform']);
                     unset($file_contents_decoded['fpp_backup_version']);
 
                     //Restore all areas
-                    if (strtolower($restore_area) == "all" && $is_version_2_backup) {
+                    if (strtolower($restore_area) == "all" && ($is_version_2_backup || $is_version_3_backup)) {
                         // ALL SETTING RESTORE
                         //read each area and process it
                         foreach ($file_contents_decoded as $restore_area_key => $area_data) {
                             //Pass the restore area and data to the restore function
-                            $restore_done = process_restore_data($restore_area_key, $area_data);
+                            $restore_done = process_restore_data($restore_area_key, $area_data, $_fpp_backup_version);
                         }
 
 //                    } else if (strtolower($restore_area) == "email" && $is_version_2_backup) {
@@ -401,14 +420,16 @@ if (isset($_POST['btnDownloadConfig'])) {
                             }
 
                             //Pass the restore area and data to the restore function
-                            $restore_done = process_restore_data($restore_area, $area_data);
+                            $restore_done = process_restore_data($restore_area, $area_data, $_fpp_backup_version);
                         }
                     }
 
                     //All processed
 //                    $restore_done = true;
                 } else {
-                    error_log("The backup " . $rstfname . " data could not be decoded properly. Is it a valid backup file?");
+					$backup_error_string = "RESTORE: The backup " . $rstfname . " data could not be decoded properly. Is it a valid backup file?";
+					$backup_errors[] = $backup_error_string;
+                    error_log($backup_error_string);
                 }
             }
         }
@@ -465,7 +486,8 @@ function read_directory_files($directory, $return_data = true)
             // do something with the file
             // note that '.' and '..' is returned even
             // if file isn't this directory or its parent, add it to the results
-            if ($file != "." && $file != "..") {
+            // also must include ._* files as binary files that OSX may create
+            if ($file[0] != "." || (strlen($file) > 1 && $file[1] != "." && $file[1] != "_")) {
                 // collect the filenames & data
                 if ($return_data == true) {
                     $file_data = explode("\n", file_get_contents($directory . '/' . $file));
@@ -483,11 +505,12 @@ function read_directory_files($directory, $return_data = true)
  * Function to look after backup restorations
  * @param $restore_area String  Area to restore
  * @param $restore_area_data array  Area data as an array
+ * @param $backup_version boolean Version of the backup
  * @return boolean Save result
  */
-function process_restore_data($restore_area, $restore_area_data)
+function process_restore_data($restore_area, $restore_area_data, $backup_version)
 {
-    global $SUDO, $settings, $system_config_areas, $keepMasterSlaveSettings, $keepNetworkSettings, $uploadDataProtected, $settings_restored,
+    global $SUDO, $settings, $mediaDirectory, $scheduleFile, $system_config_areas, $keepMasterSlaveSettings, $keepNetworkSettings, $uploadDataProtected, $settings_restored,
            $network_settings_restored, $network_settings_restored_post_apply, $network_settings_restored_applied_ips,
            $known_ini_config_files, $known_json_config_files;
     global $args;
@@ -516,11 +539,15 @@ function process_restore_data($restore_area, $restore_area_data)
         $restore_area_data = $restore_area_data['area_data'];
     }
 
-//    $is_empty = is_array_empty($restore_area_data);
+    //Should probably skip restoring data if the restore data is actually empty (maybe no config existed when the backup was made)
+    //this is also avoid false negatives of restore failures for areas where there wasn't any data to restore
+	$restore_data_is_empty = (empty($restore_area_data) || is_null($restore_area_data)) ? true : false;
 
+	//////////////////////////////////
+	//// Handle processing of each restore area
     //////////////////////////////////
     //OutputProcessors - OutputProcessors
-    if ($restore_area_key == "outputProcessors") {
+    if ($restore_area_key == "outputProcessors" && !$restore_data_is_empty) {
         //Just overwrite the Output processors file
 		$settings_restored[$restore_area_key]['ATTEMPT'] = true;
 		$channel_remaps_json_filepath = $system_config_areas['outputProcessors']['file'];
@@ -539,7 +566,7 @@ function process_restore_data($restore_area, $restore_area_data)
     }
 
     //CHANNEL MEMORY MAPS - PIXEL OVERLAYS
-    if ($restore_area_key == "channelmemorymaps") {
+    if ($restore_area_key == "channelmemorymaps" && !$restore_data_is_empty) {
         //Overwrite channel outputs JSON
         $channelmemorymaps_filepath = $system_config_areas['channelmemorymaps']['file'];
 		$settings_restored[$restore_area_key]['ATTEMPT'] = true;
@@ -568,7 +595,7 @@ function process_restore_data($restore_area, $restore_area_data)
     }
 
     //CHANNEL INPUTS - E1.31 BRIDGE
-	if ($restore_area_key == "channelInputs") {
+	if ($restore_area_key == "channelInputs" && !$restore_data_is_empty) {
 		//Just overwrite the channeInputs file
 		$channelInputs_filepath = $system_config_areas['channelInputs']['file'];
 
@@ -585,7 +612,7 @@ function process_restore_data($restore_area, $restore_area_data)
 	}
 
     //SHOW SETUP & CHANNEL OUTPUT RESTORATION
-    if ($restore_area_key == "show_setup" || $restore_area_key == "channelOutputs") {
+    if (($restore_area_key == "show_setup" || $restore_area_key == "channelOutputs") && !$restore_data_is_empty) {
         $settings_restored[$restore_area_key] = array();
 
         $script_filenames = array();
@@ -658,6 +685,20 @@ function process_restore_data($restore_area, $restore_area_data)
                                     }
                                 }
 
+								//if restore sub-area is the schedule, determine how to restore it based on the $backup_version
+								//Version 2 backups need to restore the schedule file to the old locations (auto converted on FPPD restart)
+								//Version 3 backups need to restore the schedule to it's new json location
+								if (strtolower($restore_areas_idx) == "schedule") {
+									if ($backup_version == 2)
+									{
+										//Override the restore location so we write to the old schedule file, FPPD will convert this to the new json file
+										$restore_location = $scheduleFile;
+									}
+//									else if ($backup_version == 3){
+//										//restore it to the new json file - don't adjust the path it'll go to configured path
+//									}
+								}
+
                                 //If we have data then write to where it needs to go
                                 if (!empty($final_file_restore_data) && ($restore_type == "dir" || $restore_type == "file")) {
 									$settings_restored[$restore_area_key][$restore_area_data_index]['ATTEMPT'] = true;
@@ -707,7 +748,7 @@ function process_restore_data($restore_area, $restore_area_data)
     }
 
     //PLUGIN SETTING RESTORATION
-    if ($restore_area_key == "plugins") {
+    if ($restore_area_key == "plugins"  && !$restore_data_is_empty) {
         if (is_array($restore_area_data)) {
             //Just overwrite the universes file
             $plugin_settings_path_base = $settings['configDirectory'];
@@ -765,28 +806,14 @@ function process_restore_data($restore_area, $restore_area_data)
                             //Do special things that require some sort of system change
                             //eg. changing piRTC via GUI will fire off a shell command to set it up
                             //we'll also do this to keep consistency
-                            if ($setting_name == 'piRTC') {
-                                SetPiRTC($setting_value);
-                            } else if ($setting_name == "PI_LCD_Enabled") {
-                                //DO a weird work around and set our request params and then call
-                                //the function to enable the LCD
-                                if ($setting_value == 1) {
-                                    $_GET['enabled'] = "true";
-                                } else {
-                                    $_GET['enabled'] = "false";
-                                }
-                                SetPiLCDenabled();
-                            } else if ($setting_name == "AudioOutput") {
+                            if ($setting_name == "AudioOutput") {
                                 $args['value'] = $setting_value;
                                 SetAudioOutput($setting_value);
                             } else if ($setting_name == "volume") {
                                 $_GET['volume'] = trim($setting_value);
                                 SetVolume();
-                            } else if ($setting_name == "ntpServer") {
-                                SetNtpServer($setting_value);
-                                NtpServiceRestart();//Restart NTP client so changes take effect
-                            } else if ($setting_name == "NTP") {
-                                SetNtpState($setting_value);
+                            } else {
+                                ApplySetting($setting_name, $setting_value);
                             }
                         }
 
@@ -842,21 +869,46 @@ function process_restore_data($restore_area, $restore_area_data)
                 }
 
                 //TIMEZONE RESTORATION
-                if ($restore_areas_idx == "timezone") {
-                    //get data out of nested array
-                    $restore_data = $restore_area_data['timezone'][0];
+				if ($restore_areas_idx == "timezone") {
+					//get data out of nested array
+					$restore_data = $restore_area_data['timezone'][0];
 
-                    //Make sure we have an array, there will be 2 indexes, 0 the timezone and 1 a linebreak
-                    if (is_array($restore_data)) {
-                        $data = $restore_data[0];//first index has the timezone, index 1 is empty to due carriage return in file when its backed up
-                        if (!empty($data)) {
+					//Make sure we have an array, there will be 2 indexes, 0 the timezone and 1 a linebreak
+					if (is_array($restore_data) || !is_null($restore_data) ) {
+						//Version 2 backups need to locate the TimeZone data slightly differently due to how it was stored back then
+						if ($backup_version == 2) {
+							$data = $restore_data[0];//first index has the timezone, index 1 is empty to due carriage return in file when its backed up
+						} else {
+							//Version 3 backups - TimeZone data is located at the first index
+							$data = $restore_data;
+						}
+
+						if (!empty($data)) {
 							$settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
-
+							//Timezone isn't stored in a seperate file anymore, it's now a setting
+							WriteSettingToFile('TimeZone', $data);
+							//Update the timezone on the system
 							SetTimezone($data);
-                            $save_result = true;
-                        }
-                    }
-                }
+							$save_result = true;
+						}
+					}
+				}
+
+				//PROXY CONFIG RESTORATION
+				if ($restore_areas_idx == "proxies") {
+					$settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+
+					//Get the restore data out of the array
+					$restore_data = $restore_area_data['proxies'][0];
+					$data = implode("\n", $restore_data);
+
+					//This is a standard file with webserver config, just write it out
+					if (file_put_contents("$mediaDirectory/config/proxies", $data) === FALSE) {
+						$save_result = false;
+					} else {
+						$save_result = true;
+					}
+				}
 
                 $settings_restored[$restore_area_key][$restore_areas_idx]['SUCCESS'] = $save_result;
             }
@@ -864,7 +916,7 @@ function process_restore_data($restore_area, $restore_area_data)
     }
 
 	//Network Settings (Wired and WiFi)
-	if ($restore_area_key == "network") {//If the user doesn't want to keep the existing network settings, we can overwrite them
+	if ($restore_area_key == "network"  && !$restore_data_is_empty) {//If the user doesn't want to keep the existing network settings, we can overwrite them
 		if ($keepNetworkSettings == false) {
 			//Overwrite existing network settings
 			$network_config_filepath = $system_config_areas['network']['file'];
@@ -876,7 +928,7 @@ function process_restore_data($restore_area, $restore_area_data)
 				if (!empty($restore_area_sub_key)) {
 					if ($network_type != $restore_area_sub_key) {
 						//break the loop
-						break;
+						continue;
 					}
 				}
 
@@ -885,12 +937,13 @@ function process_restore_data($restore_area, $restore_area_data)
 				$network_setting_filepath = $network_setting_filepath['location'];
 
 				$network_data = $restore_area_data[$network_type][0];
-				//Check to make sure we have data, so we don't accidently wipe out the network
+				//Check to make sure we have data, so we don't accidentally wipe out the network
 				if (!empty($network_data)) {
 
 					$ini_string = "";
 					foreach ($network_data as $ini_key => $ini_value) {
-						$ini_string .= "$ini_key=\"$ini_value\"\n";
+//						$ini_string .= "$ini_key='$ini_value'\n";
+						$ini_string .= "$ini_value\n";
 					}
 
 					//If we can parse out generated INI string, then it's value.
@@ -922,6 +975,8 @@ function process_restore_data($restore_area, $restore_area_data)
 			}
 		} else {
 			error_log("RESTORE: Failed to restore " . $restore_area_key . " - 'Keep Existing Network Settings' selected - NOT OVERWRITING: ");
+			//no attempt was made so remove the key for tracking attempts
+			unset($settings_restored[$restore_area_key]);
 		}
 
 //		$settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
@@ -946,13 +1001,18 @@ function process_restore_data($restore_area, $restore_area_data)
 //        $settings_restored[$restore_area_key] = $save_result;
 //    }
 
+	//finally if there was no data for the restore area remove it's key for tracking attemps, this is fine here as the seperate restore area tests above will avoid restore areas with no data
+	if ($restore_data_is_empty) {
+		unset($settings_restored[$restore_area_key]);
+	}
+
     //wrote message out
     if (!$save_result) {
         error_log("RESTORE: Failed to restore " . $restore_area . " - " . json_encode($settings_restored));
     }
 
     //Return save result
-    return $save_result;
+    return true;
 }
 
 /**
@@ -972,47 +1032,6 @@ function RestoreScripts($file_names)
 }
 
 /**
- * Sets the timezone (taken from timeconfig.php)
- * @param $timezone_setting String Timezone in correct format
- * @see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones For a list of timezones
- */
-function SetTimezone($timezone_setting)
-{
-    global $SUDO, $mediaDirectory;
-    //TODO: Check timezone for validity
-    $timezone = $timezone_setting;
-    error_log("RESTORE: Changing timezone to '" . $timezone . "'.");
-    if (file_exists('/usr/bin/timedatectl')) {
-        exec($SUDO . " timedatectl set-timezone $timezone", $output, $return_val);
-        unset($output);
-    } else {
-        exec($SUDO . " bash -c \"echo $timezone > /etc/timezone\"", $output, $return_val);
-        unset($output);
-        //TODO: check return
-        exec($SUDO . " dpkg-reconfigure -f noninteractive tzdata", $output, $return_val);
-        unset($output);
-        //TODO: check return
-    }
-    exec(" bash -c \"echo $timezone > $mediaDirectory/timezone\"", $output, $return_val);
-    unset($output);
-    //TODO: check return
-}
-
-/**
- * Sets the PiRTC setting exec's the appropriate command (taken from timeconfig.php)
- * @param $pi_rtc_setting String PIRTC setting
- */
-function SetPiRTC($pi_rtc_setting)
-{
-    global $SUDO, $fppDir;
-
-    $piRTC = $pi_rtc_setting;
-    WriteSettingToFile("piRTC", $piRTC);
-    exec($SUDO . " $fppDir/scripts/piRTC set");
-    error_log("RESTORE: Set RTC: " . $piRTC);
-}
-
-/**
  * Sets the Audio Output device (extracted from fppjson.php)
  * @param $card String soundcard
  * @return  string
@@ -1021,27 +1040,56 @@ function SetAudioOutput($card)
 {
     global $args, $SUDO, $debug;
 
+	global $args, $SUDO, $debug, $settings;
+
 	if ($card != 0 && file_exists("/proc/asound/card$card")) {
-		exec($SUDO . " sed -i 's/card [0-9]/card " . $card . "/' /root/.asoundrc", $output, $return_val);
+		exec($SUDO . " sed -i 's/card [0-9]/card ".$card."/' /root/.asoundrc", $output, $return_val);
 		unset($output);
 		if ($return_val) {
 			error_log("Failed to set audio to card $card!");
 			return;
 		}
-		if ($debug)
+		if ( $debug ) {
 			error_log("Setting to audio output $card");
+		}
 	} else if ($card == 0) {
-		exec($SUDO . " sed -i 's/card [0-9]/card " . $card . "/' /root/.asoundrc", $output, $return_val);
+		exec($SUDO . " sed -i 's/card [0-9]/card ".$card."/' /root/.asoundrc", $output, $return_val);
 		unset($output);
 		if ($return_val) {
 			error_log("Failed to set audio back to default!");
 			return;
 		}
-		if ($debug)
+		if ( $debug )
 			error_log("Setting default audio");
 	}
+	// need to also reset mixer device
+	$AudioMixerDevice = exec("sudo amixer -c $card scontrols | head -1 | cut -f2 -d\"'\"", $output, $return_val);
+	unset($output);
+	if ($return_val == 0) {
+		WriteSettingToFile("AudioMixerDevice", $AudioMixerDevice);
+		if ($settings['Platform'] == "Raspberry Pi" && $card == 0) {
+			$type = exec("sudo aplay -l | grep \"card $card\"", $output, $return_val);
+			if (strpos($type, '[bcm') !== false) {
+				WriteSettingToFile("AudioCard0Type", "bcm");
+			} else {
+				WriteSettingToFile("AudioCard0Type", "unknown");
+			}
+			unset($output);
+		} else {
+			WriteSettingToFile("AudioCard0Type", "unknown");
+		}
+	}
+	return $card;
+}
 
-    return $card;
+/**
+ * Helper function to read the TimeZone setting for backups (no longer stored in the TimeZone file
+ *
+ * @return string
+ */
+function ReadTimeZone(){
+    $TimeZone_setting = ReadSettingFromFile('TimeZone');
+    return $TimeZone_setting;
 }
 
 /**
@@ -1057,6 +1105,11 @@ function LoadPixelnetDMXFile_FPDv1()
     require_once './pixelnetdmxentry.php';
     //Store data in an array instead of session
     $return_data = array();
+    
+    
+    if (filesize($settings['configDirectory'] . "/Falcon.FPDV1") < 1024) {
+        return $return_data;
+    }
 
     $f = fopen($settings['configDirectory'] . "/Falcon.FPDV1", "rb");
     if ($f == FALSE) {
@@ -1154,8 +1207,7 @@ function SavePixelnetDMXFile_FPDv1($restore_data)
  */
 function doBackupDownload($settings_data, $area)
 {
-    global $settings, $protectSensitiveData, $fpp_backup_version, $fpp_backup_location;
-
+    global $settings, $protectSensitiveData, $fpp_backup_version, $fpp_backup_location, $backup_errors;
     if (!empty($settings_data)) {
         //is sensitive data removed (selectively used on restore to skip some processes)
         $settings_data['protected'] = $protectSensitiveData;
@@ -1174,27 +1226,47 @@ function doBackupDownload($settings_data, $area)
         $backup_fname .= date("YmdHis") . ".json";
 
         //check to see fi the backup directory exists
-        if (!file_exists($fpp_backup_location)) {
-            mkdir($fpp_backup_location);
-        }
+		if (!file_exists($fpp_backup_location)) {
+			if (mkdir($fpp_backup_location) == FALSE) {
+			    $backup_error_string = "BACKUP: Something went wrong creating the backup file directory '" . $fpp_backup_location . "' , backup file can't be created (permissions error?) and backup download will fail.";
+				$backup_errors[] = $backup_error_string;
+				error_log($backup_error_string);
+			}
+		} else {
+			//Backup location exists, test if writable
+			if (is_writable($fpp_backup_location) == FALSE) {
+				$backup_error_string = "BACKUP: Something went wrong, '" . $fpp_backup_location . "'  is not writable.";
+				$backup_errors[] = $backup_error_string;
+				error_log($backup_error_string);
+			}
+		}
 
         //Write a copy locally as well
         $backup_local_fpath = $fpp_backup_location . '/' . $backup_fname;
-        //Write data into backup file
-        file_put_contents($backup_local_fpath, json_encode($settings_data));
+        $json = json_encode($settings_data);
 
-        ///Generate the headers to prompt browser to start download
-        header("Content-Disposition: attachment; filename=\"" . $backup_fname . "\"");
-        header("Content-Type: application/json");
-        header("Content-Length: " . filesize($backup_local_fpath));
-        header("Connection: close");
-        //Output the file
-        readfile($backup_local_fpath);
-        //die
-        exit;
+        //Write data into backup file
+		if (file_put_contents($backup_local_fpath, $json) !== FALSE) {
+			///Generate the headers to prompt browser to start download
+			header("Content-Disposition: attachment; filename=\"" . basename($backup_fname) . "\"");
+			header("Content-Type: application/json");
+			header("Content-Length: " . filesize($backup_local_fpath));
+			header("Connection: close");
+			//Output the file
+			readfile($backup_local_fpath);
+			//die
+			exit;
+		} else {
+			$backup_error_string = "BACKUP: Something went wrong while writing the backup file to '" . $backup_local_fpath . "', JSON backup file unable to be downloaded.";
+			$backup_errors[] = $backup_error_string;
+			error_log($backup_error_string);
+		}
+
     } else {
         //no data supplied
-        error_log("BACKUP: Something went wrong while generating backup file for " . $area . ", no data was supplied.");
+		$backup_error_string = "BACKUP: Something went wrong while generating backup file for " .  ucwords(str_replace("_", " ", $area)) . ", no data was supplied. Have these settings been configured?";
+		$backup_errors[] = $backup_error_string;
+        error_log($backup_error_string);
     }
 }
 
@@ -1232,6 +1304,8 @@ function genSelectList($area_name = "backuparea")
 
 /**
  * Returns a list of plugin Config files
+ *
+ * @return array Array of plugins and respective config file data
  */
 function retrievePluginList()
 {
@@ -1240,16 +1314,24 @@ function retrievePluginList()
     $config_files = read_directory_files($settings['configDirectory'], false);
     $plugin_names = array();
 
-    //find the plugin configs
-    foreach ($config_files as $fname => $fdata) {
-        if ((stripos(strtolower($fname), "plugin") !== false) && (stripos(strtolower($fname), ".json") == false)) {
-            //split the string to get jsut the plugin name
-            $plugin_name = explode(".", $fname);
-            $plugin_name = $plugin_name[1];
-            $plugin_names[$plugin_name] = array('type' => 'file', 'location' => $settings['configDirectory'] . "/" . $fname);
-            //array('name' => $plugin_name, 'config' => $fname);
-        }
-    }
+	//find the plugin configs, ignore JSON files
+	foreach ($config_files as $fname => $fdata) {
+		//Make sure we pickup plugin config files, plugin config files are prepended with plugin.
+		if ((stripos(strtolower($fname), "plugin.") !== false)) {
+		    //Fine out the MINE type of the file we're backing up
+			$finfo_open_handle = finfo_open(FILEINFO_MIME_TYPE);
+			$fileInfo = finfo_file($finfo_open_handle, $settings['configDirectory'] . "/" . $fname);
+
+			//If it's a plain text file then we can back it up, things like databases are skipped
+			if (stripos(strtolower($fileInfo), "text") !== FALSE) {
+				//split the string to get just the plugin name
+				$plugin_name = explode(".", $fname);
+				$plugin_name = $plugin_name[1];
+				$plugin_names[$plugin_name] = array('type' => 'file', 'location' => $settings['configDirectory'] . "/" . $fname);
+				//array('name' => $plugin_name, 'config' => $fname);
+			}
+		}
+	}
 
     return $plugin_names;
 }
@@ -1294,13 +1376,28 @@ function is_array_empty($InputVariable)
 
 //Move backup files
 moveBackupFiles_ToBackupDirectory();
+    
 ?>
 <!DOCTYPE html>
 <html>
 <head>
     <?php require_once 'common/menuHead.inc'; ?>
-    <title><? echo $pageTitle; ?></title>
+    <title>FPP - <? echo gethostname(); ?></title>
     <!--    <script>var helpPage = "help/backup.php";</script>-->
+<script>
+</script>
+
+<?
+$backupHosts = Array();
+$data = file_get_contents('http://localhost/api/remotes');
+$arr = json_decode($data, true);
+
+foreach ($arr as $host => $desc) {
+    $backupHosts[$desc] = $host;
+}
+ksort($backupHosts);
+
+?>
     <script type="text/javascript">
         var settings = new Array();
         <?
@@ -1309,7 +1406,15 @@ moveBackupFiles_ToBackupDirectory();
 		$settings['rebootFlag'] = ReadSettingFromFile('rebootFlag');
 
         foreach ($settings as $key => $value) {
-            printf("	settings['%s'] = \"%s\";\n", $key, $value);
+            if (!is_array($value)) {
+                if (preg_match('/\n/', $value))
+                    continue;
+
+                printf("	settings['%s'] = \"%s\";\n", $key, $value);
+            } else {
+                $js_array = json_encode($value);
+                printf("    settings['%s'] = %s;\n", $key, $js_array);
+            }
         }
 
         ?>
@@ -1324,21 +1429,288 @@ moveBackupFiles_ToBackupDirectory();
         else {
             helpPage = "help/" + helpPage;
         }
+
+function GetCopyFlags() {
+    var flags = "";
+    
+    if (document.getElementById("backup.Configuration").checked) {
+        flags += " Configuration";
+    }
+    if (document.getElementById("backup.Playlists").checked) {
+        flags += " Playlists";
+    }
+    if (document.getElementById("backup.Events").checked) {
+        flags += " Events";
+    }
+    if (document.getElementById("backup.Plugins").checked) {
+        flags += " Plugins";
+    }
+    if (document.getElementById("backup.Sequences").checked) {
+        flags += " Sequences";
+    }
+    if (document.getElementById("backup.Effects").checked) {
+        flags += " Effects";
+    }
+    if (document.getElementById("backup.Images").checked) {
+        flags += " Images";
+    }
+    if (document.getElementById("backup.Scripts").checked) {
+        flags += " Scripts";
+    }
+    if (document.getElementById("backup.Music").checked) {
+        flags += " Music";
+    }
+    if (document.getElementById("backup.Videos").checked) {
+        flags += " Videos";
+    }
+    if ((document.getElementById("backup.Backups").checked) &&
+        (direction = document.getElementById("backup.Direction").value == 'TOUSB')) {
+        flags += " Backups";
+    }
+
+    if (flags.length)
+        flags = flags.substring(1);
+
+    return flags;
+}
+
+function PerformCopy() {
+    var dev = document.getElementById("backup.USBDevice").value;
+    var path = document.getElementById("backup.Path").value;
+    var pathSelect = document.getElementById("backup.PathSelect").value;
+    var host = document.getElementById("backup.Host").value;
+    var direction = document.getElementById("backup.Direction").value;
+    var flags = GetCopyFlags();
+
+    var url = "copystorage.php?direction=" + direction;
+
+    if ((direction == 'TOUSB') ||
+        (direction == 'FROMUSB')) {
+        storageLocation = document.getElementById("backup.USBDevice").value;
+    } else if ((direction == 'TOREMOTE') ||
+               (direction == 'FROMREMOTE')) {
+        if (host == '') {
+            DialogError('Copy Failed', 'No host specified');
+            return;
+        }
+
+        storageLocation = host;
+    } else {
+        storageLocation = "/home/fpp/media/backups";
+    }
+
+    if (direction.substring(0,4) == 'FROM') {
+        if (pathSelect == '') {
+            DialogError('Copy Failed', 'No path specified');
+            return;
+        }
+
+        url += '&path=' + pathSelect;
+    } else {
+        if (path == '') {
+            DialogError('Copy Failed', 'No path specified');
+            return;
+        }
+
+        url += '&path=' + path;
+    }
+
+    url += '&storageLocation=' + storageLocation;
+    url += '&flags=' + flags;
+
+    var warningMsg = "Confirm File restore of '" + flags + "' from " + storageLocation + "?\n\nWARNING: This will overwrite any current files with the copies being restored";
+
+    if (document.getElementById("backup.DeleteExtra").checked) {
+        url += '&delete=yes';
+        warningMsg += " and delete any local files which do not exist in the backup.";
+    } else {
+        url += '&delete=no';
+    }
+
+    if (direction.substring(0,4) == 'FROM')
+    {
+        if (!confirm(warningMsg)) {
+            $.jGrowl("Restore canceled.");
+            return;
+        }
+    }
+
+
+    window.location.href = url;
+}
+
+function GetBackupDevices() {
+    $('#backup\\.USBDevice').html('<option>Loading...</option>');
+    $.get("api/backups/devices"
+        ).done(function(data) {
+            var options = "";
+            for (var i = 0; i < data.length; i++) {
+                var desc = data[i].name;
+                if (data[i].vendor != '')
+                    desc += ' - ' + data[i].vendor;
+
+                if (data[i].model != '') {
+                    if (data[i].vendor != '')
+                        desc += ' ';
+                    else
+                        desc += ' - ';
+                    
+                    desc += data[i].model;
+                }
+
+                desc += ' - ' + data[i].size + 'GB';
+                options += "<option value='" + data[i].name + "'>" + desc + "</option>";
+            }
+            $('#backup\\.USBDevice').html(options);
+
+            if ((options != "") &&
+                (document.getElementById("backup.Direction").value == 'FROMUSB'))
+                GetBackupDeviceDirectories();
+        }).fail(function() {
+            $('#backup\\.USBDevice').html('');
+        });
+}
+
+function GetBackupDeviceDirectories() {
+    var dev = document.getElementById("backup.USBDevice").value;
+
+    if (dev == '') {
+        $('#backup\\.PathSelect').html("<option value=''>No USB Device Selected</option>");
+        return;
+    }
+
+    $('#backup\\.PathSelect').html('<option>Loading...</option>');
+    $.get("api/backups/list/" + dev
+        ).done(function(data) {
+            PopulateBackupDirs(data);
+        }).fail(function() {
+            $('#backup\\.PathSelect').html('');
+        });
+}
+
+function USBDeviceChanged() {
+    var direction = document.getElementById("backup.Direction").value;
+    if (direction == 'FROMUSB')
+        GetBackupDeviceDirectories();
+}
+
+function PopulateBackupDirs(data) {
+    var options = "";
+    for (var i = 0; i < data.length; i++) {
+        if (data[i].substring(0,5) != 'ERROR')
+            options += "<option value='" + data[i] + "'>" + data[i] + "</option>";
+        else
+            options += "<option value=''>" + data[i] + "</option>";
+    }
+    $('#backup\\.PathSelect').html(options);
+}
+
+function GetBackupDirsViaAPI(host) {
+    $('#backup\\.PathSelect').html('<option>Loading...</option>');
+    $.get("http://" + host + "/api/backups/list"
+        ).done(function(data) {
+            PopulateBackupDirs(data);
+        }).fail(function() {
+            $('#backup\\.PathSelect').html('');
+        });
+}
+
+function GetBackupHostBackupDirs() {
+    GetBackupDirsViaAPI($('#backup\\.Host').val());
+}
+
+function BackupDirectionChanged() {
+    var direction = document.getElementById("backup.Direction").value;
+
+    switch (direction) {
+        case 'TOUSB':
+            $('.copyUSB').show();
+            $('.copyPath').show();
+            $('.copyPathSelect').hide();
+            $('.copyHost').hide();
+            $('.copyBackups').show();
+            break;
+        case 'FROMUSB':
+            $('.copyUSB').show();
+            $('.copyPath').hide();
+            $('.copyPathSelect').show();
+            $('.copyHost').hide();
+            $('.copyBackups').hide();
+            GetBackupDeviceDirectories();
+            break;
+        case 'TOLOCAL':
+            $('.copyUSB').hide();
+            $('.copyPath').show();
+            $('.copyPathSelect').hide();
+            $('.copyHost').hide();
+            $('.copyBackups').hide();
+            break;
+        case 'FROMLOCAL':
+            $('.copyUSB').hide();
+            $('.copyPath').hide();
+            $('.copyPathSelect').show();
+            $('.copyHost').hide();
+            $('.copyBackups').hide();
+            GetBackupDirsViaAPI('<?php echo $_SERVER['SERVER_ADDR'] ?>');
+            break;
+        case 'TOREMOTE':
+            $('.copyUSB').hide();
+            $('.copyPath').show();
+            $('.copyPathSelect').hide();
+            $('.copyHost').show();
+            $('.copyBackups').hide();
+            break;
+        case 'FROMREMOTE':
+            $('.copyUSB').hide();
+            $('.copyPath').hide();
+            $('.copyPathSelect').show();
+            $('.copyHost').show();
+            $('.copyBackups').hide();
+            GetBackupHostBackupDirs();
+            break;
+    }
+}
+
+GetBackupDevices();
     </script>
 </head>
 <body>
+<style>
+.copyHost {
+    display: none;
+}
+.copyPathSelect {
+    display: none;
+}
+</style>
 <div id="bodyWrapper">
     <?php include 'menu.inc'; ?>
     <br/>
-    <form action="backup.php" method="post" name="frmBackup" enctype="multipart/form-data">
         <div id="global" class="settings">
-            <fieldset>
-                <legend>FPP Settings Backup</legend>
+            <div class='title'>FPP Backups</div>
+            <div id='tabs'>
                 <ul>
-                    <li>
-                        <span style="color: #AA0000"><b>Backups made from FPP v1.x are incompatible with the FPP 2.x system.</b></span>
-                    </li>
+                    <li><a href='#tab-jsonBackup'>JSON Configuration Backup</a></li>
+                    <li><a href='#tab-fileCopy'>File Copy Backup</a></li>
                 </ul>
+            <div id='tab-jsonBackup'>
+                <form action="backup.php" method="post" name="frmBackup" enctype="multipart/form-data">
+                    <?php
+                    //Spit out the backup errors if the backup_errors array isn't empty
+					if (!is_array_empty($backup_errors)) {
+						?>
+                        <div id="rebootFlag" style="display: block; margin-right: auto; margin-left: auto; width: 60%;">Backup failed: <br>
+                            <ul>
+								<?php
+								foreach ($backup_errors as $backup_error) {
+									echo "<li>$backup_error</li>";
+								}
+								?>
+                            </ul>
+                        </div>
+						<?php
+					}
+                    ?>
                 <?php if ($restore_done == true) {
                     ?>
                     <div id="rebootFlag" style="display: block;">Backup Restored, FPPD Restart or Reboot may be required.
@@ -1453,6 +1825,9 @@ moveBackupFiles_ToBackupDirectory();
                 <br/>
                 <fieldset>
                     <legend>Restore Configuration</legend>
+                    <center>
+                        <span style="color: #AA0000"><b>JSON Backups made from FPP v1.x are incompatible with the FPP 3.x and higher system.</b><br><br></span>
+                    </center>
                     Select settings to restore and then choose backup file containing backup data.
                     <br/>
                     <table width="100%">
@@ -1488,14 +1863,61 @@ moveBackupFiles_ToBackupDirectory();
                             <td width="25%"></td>
                             <td width="75%">
                                 <input name="btnRestoreConfig" type="Submit" style="width:30%" class="buttons"
-                                       value="Restore  Configuration">
+                                       value="Restore Configuration">
                             </td>
                         </tr>
                     </table>
                 </fieldset>
-            </fieldset>
+                </form>
+                </div>
+                <div id='tab-fileCopy'>
+                <fieldset><legend>File Copy Backup/Restore</legend>
+                        Copy configuration, sequences, etc... to/from a backup device.
+                        <table>
+<tr><td>Copy Type:</td><td><select id="backup.Direction" onChange='BackupDirectionChanged();'>
+<option value="TOUSB" selected>Backup To USB</option>
+<option value="FROMUSB">Restore From USB</option>
+<option value="TOLOCAL">Backup To Local FPP Backups Directory</option>
+<option value="FROMLOCAL">Restore From Local FPP Backups Directory</option>
+<option value="TOREMOTE">Backup To Remote FPP Backups Directory</option>
+<option value="FROMREMOTE">Restore From Remote FPP Backups Directory</option>
+</select></td></tr>
+<tr class='copyUSB'><td>USB Device:</td><td><select name='backup.USBDevice' id='backup.USBDevice' onChange='USBDeviceChanged();'></select> <input type='button' class='buttons' onClick='GetBackupDevices();' value='Refresh List'></td></tr>
+<tr class='copyHost'><td>Remote Host:</td><td><? PrintSettingSelect('Backup Host', 'backup.Host', 0, 0, '', $backupHosts, '', 'GetBackupHostBackupDirs'); ?></td></tr>
+<tr class='copyPath'><td>Backup Path:</td><td><? PrintSettingTextSaved('backup.Path', 0, 0, 128, 64, '', gethostname()); ?></td></tr>
+<tr class='copyPathSelect'><td>Backup Path:</td><td><select name='backup.PathSelect' id='backup.PathSelect'></select></td></tr>
+<tr><td>What to copy:</td><td>
+<table id="CopyFlagsTable">
+<tr><td>
+    <? PrintSettingCheckbox('Backup Configuration', 'backup.Configuration', 0, 0, 1, 0, "", "", 1, 'Configuration'); ?><br>
+    <? PrintSettingCheckbox('Backup Playlists', 'backup.Playlists', 0, 0, 1, 0, "", "", 1, 'Playlists'); ?><br>
+    </td><td width='10px'></td><td>
+    <? PrintSettingCheckbox('Backup Events', 'backup.Events', 0, 0, 1, 0, "", "", 1, 'Events'); ?><br>
+    <? PrintSettingCheckbox('Backup Plugins', 'backup.Plugins', 0, 0, 1, 0, "", "", 1, 'Plugins'); ?><br>
+    </td><td width='10px'></td><td>
+    <? PrintSettingCheckbox('Backup Sequences', 'backup.Sequences', 0, 0, 1, 0, "", "", 1, 'Sequences'); ?><span style="color: #AA0000">*</span><br>
+    <? PrintSettingCheckbox('Backup Images', 'backup.Images', 0, 0, 1, 0, "", "", 1, 'Images'); ?><br>
+    </td><td width='10px'></td><td>
+    <? PrintSettingCheckbox('Backup Scripts', 'backup.Scripts', 0, 0, 1, 0, "", "", 1, 'Scripts'); ?><br>
+    <? PrintSettingCheckbox('Backup Effects', 'backup.Effects', 0, 0, 1, 0, "", "", 1, 'Effects'); ?><br>
+    </td><td width='10px'></td><td>
+    <? PrintSettingCheckbox('Backup Music', 'backup.Music', 0, 0, 1, 0, "", "", 1, 'Music'); ?><br>
+    <? PrintSettingCheckbox('Backup Videos', 'backup.Videos', 0, 0, 1, 0, "", "", 1, 'Videos'); ?><br>
+    </td><td width='10px'></td><td valign='top' class='copyBackups'>
+    <input type='checkbox' id='backup.Backups'>Backups <span style="color: #AA0000">*</span><br>
+</td></tr></table>
+</td></tr>
+<tr><td>Delete extras:</td><td><input type='checkbox' id='backup.DeleteExtra'> (Delete extra files on destination that do not exist on the source)</td></tr>
+                        <tr><td></td><td>
+                                <input type='button' class="buttons" value="Copy" onClick="PerformCopy();"></input>
+                        </table>
+                        <br>
+                        <span style="color: #AA0000"><b>* Sequence backups may not work correctly when restored on other FPP systems if the sequences are FSEQ v2 files and the Channel Output configurations of the two systems do not match.</b></span><br>
+                        <span style="color: #AA0000" class='copyBackups'><b>* Backing up Backups will copy all local backups to the USB device.</b></span><br>
+                </fieldset>
+                </div>
+            </div>
         </div>
-    </form>
     <div id="dialog" title="Warning!" style="display:none">
         <p>Un-checking this box will disable protection (automatic removal) of sensitive data like passwords.
             <br/> <br/>
@@ -1515,6 +1937,17 @@ moveBackupFiles_ToBackupDirectory();
                 });
             }
         });
+
+            var activeTabNumber =
+<?php
+    if (isset($_GET['tab']))
+        print $_GET['tab'];
+    else
+        print "0";
+?>;
+
+        $("#tabs").tabs({cache: true, active: activeTabNumber, spinner: "", fx: { opacity: 'toggle', height: 'toggle' } });
+
     </script>
     <?php include 'common/footer.inc'; ?>
 </div>

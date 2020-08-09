@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Event Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYEVENT_H
-#define _PLAYLISTENTRYEVENT_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -33,22 +31,20 @@
 class PlaylistEntryEvent : public PlaylistEntryBase {
   public:
 	PlaylistEntryEvent(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryEvent();
+	virtual ~PlaylistEntryEvent();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
 
   private:
 	int  m_majorID;
 	int  m_minorID;
 	int  m_blocking;
 };
-
-#endif

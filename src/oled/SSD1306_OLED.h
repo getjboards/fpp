@@ -1,3 +1,4 @@
+#pragma once
 /*
  * MIT License
 
@@ -28,11 +29,10 @@ SOFTWARE.
  *  Website    : www.deeplyembedded.org
  */
 
-#ifndef SSD1306_OLED_H_
-#define SSD1306_OLED_H_
 
 /* Lib's */
 #include <stdbool.h>
+#include "gfxfont.h"
 
 /* Find Min and Max - MACROS */
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -61,6 +61,7 @@ SOFTWARE.
 
 #define LED_DISPLAY_TYPE_SSD1306 0
 #define LED_DISPLAY_TYPE_SH1106  1
+#define LED_DISPLAY_TYPE_SSD1327 2
 
 /* LCD HxW i.e. 64x128 || WxL i.e. 128x64 */
 extern int LED_DISPLAY_WIDTH;
@@ -154,12 +155,14 @@ extern short oled_write(unsigned char c);
 
 /*SSD1306 Text and Character Handling API's */
 extern void setTextSize(unsigned char s);
+extern void setTextFont(const GFXfont *font);
 extern void setTextColor(short c);
 extern void setTextWrap(bool w);
 extern void drawChar(short x, short y, unsigned char c, short color, short bg, unsigned char size);
 extern short print_str(const char *strPtr);
 extern short println();
 extern short print_strln(const char *strPtr);
+extern short getTextWidth(const char *strPtr);
 
 /*SSD1306 Number Handling API's */
 extern short printNumber(unsigned long n, unsigned char base);
@@ -175,5 +178,3 @@ extern short printNumber_I(int n, int base);
 extern short printNumber_I_ln(int n, int base);
 extern short printFloat(double number, unsigned char digits);
 extern short printFloat_ln(double num, int digits);
-#endif /* SSD1306_OLED_H_ */
-

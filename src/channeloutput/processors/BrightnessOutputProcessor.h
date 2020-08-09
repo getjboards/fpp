@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   RemapOutputProcessor class for Falcon Player (FPP)
  *
@@ -15,9 +16,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _BRIGHTNESSOUTPUTPROCESSOR_H
-#define _BRIGHTNESSOUTPUTPROCESSOR_H
-
 #include "OutputProcessor.h"
 
 class BrightnessOutputProcessor : public OutputProcessor {
@@ -25,13 +23,12 @@ public:
     BrightnessOutputProcessor(const Json::Value &config);
     virtual ~BrightnessOutputProcessor();
     
-    virtual void ProcessData(unsigned char *channelData) const;
+    virtual void ProcessData(unsigned char *channelData) const override;
     
-    virtual OutputProcessorType getType() const { return BRIGHTNESS; }
+    virtual OutputProcessorType getType() const override { return BRIGHTNESS; }
 
-    virtual void GetRequiredChannelRange(int &min, int &max) {
-        min = start;
-        max = start + count - 1;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override {
+        addRange(start, start + count - 1);
     }
 
 protected:
@@ -41,5 +38,3 @@ protected:
     float gamma;
     unsigned char table[256];
 };
-
-#endif

@@ -39,8 +39,8 @@ RemapOutputProcessor::RemapOutputProcessor(const Json::Value &config) {
 
 RemapOutputProcessor::RemapOutputProcessor(int src, int dst, int c, int l, int r) {
     active = true;
-    sourceChannel = src - 1;
-    destChannel = dst - 1;
+    sourceChannel = src;
+    destChannel = dst;
     count = c;
     loops = l;
     reverse = r;
@@ -50,10 +50,11 @@ RemapOutputProcessor::RemapOutputProcessor(int src, int dst, int c, int l, int r
 RemapOutputProcessor::~RemapOutputProcessor() {
     
 }
-void RemapOutputProcessor::GetRequiredChannelRange(int &min, int &max) {
-    min = std::min(sourceChannel, destChannel);
-    max = std::max(sourceChannel, destChannel);
+void RemapOutputProcessor::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    int min = std::min(sourceChannel, destChannel);
+    int max = std::max(sourceChannel, destChannel);
     max += loops * count - 1;
+    addRange(min, max);
 }
 
 void RemapOutputProcessor::ProcessData(unsigned char *channelData) const {

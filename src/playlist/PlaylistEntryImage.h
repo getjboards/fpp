@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Image Class for Falcon Player (FPP)
  *
@@ -23,8 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYIMAGE_H
-#define _PLAYLISTENTRYIMAGE_H
 
 #include <mutex>
 #include <thread>
@@ -43,17 +42,17 @@ using namespace Magick;
 class PlaylistEntryImage : public PlaylistEntryBase, public FrameBuffer {
   public:
 	PlaylistEntryImage(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryImage();
+	virtual ~PlaylistEntryImage();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
 
 	void PrepLoop(void);
 
@@ -99,5 +98,3 @@ class PlaylistEntryImage : public PlaylistEntryBase, public FrameBuffer {
 
 	std::condition_variable m_prepSignal;
 };
-
-#endif

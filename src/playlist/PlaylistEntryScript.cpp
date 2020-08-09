@@ -23,26 +23,20 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "fpp-pch.h"
 
-#include "common.h"
-#include "log.h"
-#include "mpg123.h"
-#include "ogg123.h"
-#include "omxplayer.h"
+#include <sys/types.h>
+#include <sys/wait.h>
+
 #include "PlaylistEntryScript.h"
 #include "scripts.h"
-#include "settings.h"
 
 /*
  *
  */
 PlaylistEntryScript::PlaylistEntryScript(PlaylistEntryBase *parent)
   : PlaylistEntryBase(parent),
-	m_blocking(0)
+	m_blocking(0), m_scriptProcess(0)
 {
     LogDebug(VB_PLAYLIST, "PlaylistEntryScript::PlaylistEntryScript()\n");
 
@@ -71,14 +65,7 @@ int PlaylistEntryScript::Init(Json::Value &config)
 
 	m_scriptFilename = config["scriptName"].asString();
 	m_scriptArgs = config["scriptArgs"].asString();
-	m_blocking = config["blocking"].asInt();
-
-	// FIXME, blocking not supported yet
-	if (m_blocking)
-	{
-		LogErr(VB_PLAYLIST, "ERROR: Blocking scripts are not yet supported\n");
-		m_blocking = 0;
-	}
+	m_blocking = config["blocking"].asBool();
 
 	return PlaylistEntryBase::Init(config);
 }
@@ -96,15 +83,25 @@ int PlaylistEntryScript::StartPlaying(void)
 		return 0;
 	}
 
+    m_startTime = GetTime();
 	PlaylistEntryBase::StartPlaying();
+	m_scriptProcess = RunScript(m_scriptFilename, m_scriptArgs);
+    if (!m_blocking) {
+        m_scriptProcess = 0;
+        FinishPlay();
+        return 0;
+    }
 
-	RunScript(m_scriptFilename, m_scriptArgs, m_blocking);
-
-	FinishPlay();
-
-	return 1;
+	return PlaylistEntryBase::StartPlaying();
 }
-
+int PlaylistEntryScript::Process(void)
+{
+    if (m_scriptProcess && !isChildRunning()) {
+        m_scriptProcess = 0;
+        FinishPlay();
+    }
+    return PlaylistEntryBase::Process();
+}
 /*
  *
  */
@@ -112,24 +109,24 @@ int PlaylistEntryScript::Stop(void)
 {
     LogDebug(VB_PLAYLIST, "PlaylistEntryScript::Stop()\n");
 
-	if (!m_blocking)
-	{
-		// FIXME PLAYLIST, kill the child if we are in non-blocking mode
+	if (m_scriptProcess) {
+        kill(m_scriptProcess, SIGTERM);
+        FinishPlay();
 	}
 
 	return PlaylistEntryBase::Stop();
 }
 
-/*
- *
- */
-int PlaylistEntryScript::HandleSigChild(pid_t pid)
-{
-    LogDebug(VB_PLAYLIST, "PlaylistEntryScript::HandleSigChild(%d)\n", pid);
-
-	FinishPlay();
-
-	return 1;
+bool PlaylistEntryScript::isChildRunning() {
+    if (m_scriptProcess > 0) {
+        int status = 0;
+        if (waitpid(m_scriptProcess, &status, WNOHANG)) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 /*
@@ -150,8 +147,28 @@ Json::Value PlaylistEntryScript::GetConfig(void)
 {
 	Json::Value result = PlaylistEntryBase::GetConfig();
 
-	result["scriptFilename"]      = m_scriptFilename;
-	result["blocking"]            = m_blocking;
+    long long t = GetTime();
+    t -= m_startTime;
+    t /= 1000;
+    t /= 1000;
+	result["scriptFilename"]   = m_scriptFilename;
+	result["blocking"]         = m_blocking;
+	result["secondsElapsed"]   = (Json::UInt64)t;
 
 	return result;
+}
+
+Json::Value PlaylistEntryScript::GetMqttStatus(void)
+{
+    Json::Value result = PlaylistEntryBase::GetMqttStatus();
+    
+    long long t = GetTime();
+    t -= m_startTime;
+    t /= 1000;
+    t /= 1000;
+    result["scriptFilename"]   = m_scriptFilename;
+    result["blocking"]         = m_blocking;
+    result["secondsElapsed"]   = (Json::UInt64)t;
+    
+    return result;
 }

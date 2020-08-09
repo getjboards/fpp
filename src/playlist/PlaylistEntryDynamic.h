@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   PlaylistEntryDynamic Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYDYNAMIC_H
-#define _PLAYLISTENTRYDYNAMIC_H
-
 #include <string>
 #include <vector>
 
@@ -37,18 +35,18 @@
 class PlaylistEntryDynamic : public PlaylistEntryBase {
   public:
 	PlaylistEntryDynamic(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryDynamic();
+	virtual ~PlaylistEntryDynamic();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Prep(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Prep(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
 
   private:
 	int ReadFromCommand(void);
@@ -83,4 +81,3 @@ class PlaylistEntryDynamic : public PlaylistEntryBase {
 	std::string            m_response;
 };
 
-#endif

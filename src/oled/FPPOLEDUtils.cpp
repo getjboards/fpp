@@ -1,482 +1,144 @@
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
+#include "fpp-pch.h"
 
-#include <netinet/in.h>
-#include <netdb.h>
-#include <ifaddrs.h>
-#include <string.h>
-#include <strings.h>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <algorithm>
-
-#include <fcntl.h>
-#include <poll.h>
-
-#include "common.h"
-#include "I2C.h"
-#include "SSD1306_OLED.h"
-
-#include "FPPOLEDUtils.h"
-#include "channeloutput/BBBUtils.h"
 
 #include <linux/wireless.h>
 #include <sys/ioctl.h>
-#include <jsoncpp/json/json.h>
+#include <gpiod.h>
+#include <poll.h>
+#include <sys/mman.h>
 
-static inline int iw_get_ext(
-           int            skfd,        /* Socket to the kernel */
-           const char *   ifname,      /* Device name */
-           int            request,     /* WE ID */
-           struct iwreq * pwrq)        /* Fixed part of the request */
-{
-    strncpy(pwrq->ifr_name, ifname, IFNAMSIZ);
-    return(ioctl(skfd, request, pwrq));
-}
+#include "I2C.h"
 
-#define MAX_PAGE 2
+#include "FPPOLEDUtils.h"
+#include "util/BBBUtils.h"
 
-int FPPOLEDUtils::getSignalStrength(char *iwname) {
-    
-    int sigLevel = 0;
 
-    iw_statistics stats;
-    int           has_stats;
-    iw_range      range;
-    int           has_range;
+#include "OLEDPages.h"
+#include "FPPStatusOLEDPage.h"
 
-    
-    struct iwreq  wrq;
-    char  buffer[std::max(sizeof(iw_range), sizeof(iw_statistics)) * 2];    /* Large enough */
-    iw_range *range_raw;
-    
-    /* Cleanup */
-    bzero(buffer, sizeof(buffer));
-    
-    wrq.u.data.pointer = (caddr_t) buffer;
-    wrq.u.data.length = sizeof(buffer);
-    wrq.u.data.flags = 0;
-    if (iw_get_ext(sockfd, iwname, SIOCGIWRANGE, &wrq) < 0) {
-        //no ranges
-        return sigLevel;
-    }
-    range_raw = (iw_range *) buffer;
-    memcpy((char *) &range, buffer, sizeof(iw_range));
-    if (range.max_qual.qual == 0) {
-        return sigLevel;
-    }
-    wrq.u.data.pointer = (caddr_t) &stats;
-    wrq.u.data.length = sizeof(struct iw_statistics);
-    wrq.u.data.flags = 1;
-    strncpy(wrq.ifr_name, iwname, IFNAMSIZ);
-    if (iw_get_ext(sockfd, iwname, SIOCGIWSTATS, &wrq) < 0) {
-        //no stats
-        return sigLevel;
-    }
-    
-    sigLevel = stats.qual.qual;
-    sigLevel *= 100;
-    sigLevel /= range.max_qual.qual;
-    return sigLevel;
-}
 
-static bool debug = false;
+//shared memory area so other processes can see if the display is on
+//as well as let fppoled know to force it off (if the pins need to be
+//reconfigured so I2C no longer will work)
 
-static int writer(char *data, size_t size, size_t nmemb,
-                  std::string *writerData)
-{
-    if(writerData == NULL)
-        return 0;
-    
-    writerData->append(data, size*nmemb);
-    return size * nmemb;
-}
+struct DisplayStatus {
+    unsigned int i2cBus;
+    volatile unsigned int displayOn;
+    volatile unsigned int forceOff;
+};
+static DisplayStatus *currentStatus;
+static std::string controlPin;
+
+extern I2C_DeviceT I2C_DEV_2;
+
+
+
 FPPOLEDUtils::FPPOLEDUtils(int ledType)
-    : _ledType(ledType), _currentTest(0), _curPage(0), _displayOn(true) {
-    
-    if (_ledType == 2 || _ledType == 4 || _ledType == 6 || _ledType == 8) {
-        setRotation(2);
-    } else if (_ledType) {
-        setRotation(0);
+    : _ledType(ledType), gpiodChips(10)
+{
+    int smfd = shm_open("fppoled", O_CREAT | O_RDWR, 0);
+    ftruncate(smfd, 1024);
+    currentStatus = (DisplayStatus *)mmap(0, 1024, PROT_WRITE | PROT_READ, MAP_SHARED, smfd, 0);
+    close(smfd);
+    int i2cb = OLEDPage::GetI2CBus();
+    currentStatus->i2cBus = i2cb;
+    currentStatus->displayOn = true;
+    currentStatus->forceOff = false;
+
+    for (auto &a : gpiodChips) {
+        a = nullptr;
     }
-    
-    curl = curl_easy_init();
-    curl_easy_setopt(curl, CURLOPT_URL, "http://localhost/api/fppd/status");
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writer);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-    
-    //have to use a socket for ioctl
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    statusPage = nullptr;
 }
 FPPOLEDUtils::~FPPOLEDUtils() {
-    curl_easy_cleanup(curl);
-    close(sockfd);
+    cleanup();
+    delete statusPage;
 }
-
-void FPPOLEDUtils::outputNetwork(int idx, int y) {
-    setCursor(0,y);
-    print_str(networks[idx].c_str());
-    if (signalStrength[idx]) {
-        y = y + 7;
-        int cur = 5;
-        for (int x = 0; x < 7; x++) {
-            if (signalStrength[idx] > cur) {
-                drawLine(127 - (x/2), y, 128, y, WHITE);
-            }
-            y--;
-            cur += 15;
+void FPPOLEDUtils::cleanup() {
+    for (auto &a : actions) {
+        delete a;
+    }
+    actions.clear();
+    for (auto a : gpiodChips) {
+        if (a) {
+            gpiod_chip_close(a);
         }
     }
 }
 
-int FPPOLEDUtils::getLinesPage0(std::vector<std::string> &lines,
-                                Json::Value &result,
-                                bool allowBlank) {
-    std::string status = result["status_name"].asString();
-    std::string mode = result["mode_name"].asString();
-    mode[0] = toupper(mode[0]);
-    std::string line = mode;
-    bool isIdle = (status == "idle" || status == "testing");
-    int maxLines = 6;
-    if (mode != "bridge") {
-        //bridge is always "idle" which isn't really true
-        line += ": " + status;
-    } else {
-        //bridge mode doesn't output a playlist section
-        isIdle = false;
-        maxLines = 5;
-    }
-    if (line.length() > 21) {
-        line.resize(21);
-    }
-    lines.push_back(line);
-    if (!_doFullStatus) {
-        return 1;
-    }
-
-    if (!isIdle) {
-        std::string line = result["current_sequence"].asString();
-        if (line != "" || allowBlank) {
-            lines.push_back(line);
-        }
-        line = result["current_song"].asString();
-        if (line != "" || allowBlank) {
-            lines.push_back(line);
-        }
-        line = result["time_elapsed"].asString();
-        if (line != "" || allowBlank) {
-            if (line != "") {
-                line = "Elapsed: " + line;
-            }
-            lines.push_back(line);
-        }
-        line = result["time_remaining"].asString();
-        if (line != "" || allowBlank) {
-            if (line != "") {
-                line = "Remaining: " + line;
-            }
-            lines.push_back(line);
-        }
-        line = result["current_playlist"]["playlist"].asString();
-        if (line != "" || allowBlank) {
-            if (line != "") {
-                line = "PL: " + line;
-            }
-            lines.push_back(line);
-        }
-    }
-    return maxLines;
-}
-int FPPOLEDUtils::getLinesPage1(std::vector<std::string> &lines,
-                          Json::Value &result,
-                          bool allowBlank) {
-    for (int x = 0; x < result["sensors"].size(); x++) {
-        std::string line;
-        if (result["sensors"][x]["valueType"].asString() == "Temperature") {
-            line = result["sensors"][x]["label"].asString() + result["sensors"][x]["formatted"].asString();
-            line += "C (";
-            float i = result["sensors"][x]["value"].asFloat();
-            i *= 1.8;
-            i += 32;
-            char buf[25];
-            sprintf(buf, "%.1f", i);
-            line += buf;
-            line += "F)";
-        } else {
-            line = result["sensors"][x]["label"].asString() + " " +  result["sensors"][x]["formatted"].asString();
-        }
-        lines.push_back(line);
-    }
-    if (lines.empty()) {
-        return getLinesPage0(lines, result, allowBlank);
-    }
-    return 6;
-}
-int FPPOLEDUtils::outputTopPart(int startY, int count) {
-    setCursor(0,startY);
-    if (networks.size() > 1) {
-        int idx = (count / 3) % networks.size();
-        if (networks.size() == 2 && LED_DISPLAY_HEIGHT == 64) {
-            idx = 0;
-        }
-        outputNetwork(idx, startY);
-        startY += 8;
-        if (LED_DISPLAY_HEIGHT == 64) {
-            if (networks.size() > 1) {
-                idx++;
-                if (idx >= networks.size()) {
-                    idx = 0;
-                }
-                outputNetwork(idx, startY);
-            }
-            startY += 8;
-        }
-    } else {
-        if (count < 30) {
-            print_str("FPP Booting...");
-        } else {
-            print_str("No Network");
-        }
-        startY += 8;
-        if (LED_DISPLAY_HEIGHT == 64) {
-            startY += 8;
-        }
-    }
-    return startY;
-}
-int FPPOLEDUtils::outputBottomPart(int startY, int count) {
-    buffer.clear();
-    bool gotStatus = false;
-    if (curl_easy_perform(curl) == CURLE_OK) {
-        Json::Value result;
-        Json::Reader reader;
-        bool success = reader.parse(buffer, result);
-        if (success) {
-            gotStatus = true;
-            setTextSize(1);
-            setTextColor(WHITE);
-            
-            setCursor(0, startY);
-            
-            std::vector<std::string> lines;
-            std::string line;
-            int maxLines = 5;
-            if (_curPage == 0) {
-                maxLines = getLinesPage0(lines, result, LED_DISPLAY_HEIGHT == 64);
-            } else {
-                maxLines = getLinesPage1(lines, result, LED_DISPLAY_HEIGHT == 64);
-            }
-            if (maxLines > lines.size()) {
-                maxLines = lines.size();
-            }
-            if (LED_DISPLAY_HEIGHT == 64) {
-                for (int x = 0; x < maxLines; x++) {
-                    setCursor(0, startY);
-                    startY += 8;
-                    line = lines[x];
-                    if (line.length() > 21) {
-                        line.resize(21);
-                    }
-                    print_str(line.c_str());
-                }
-            } else {
-                setCursor(0, startY);
-                int idx = count % maxLines;
-                line = lines[idx];
-                if (line.length() > 21) {
-                    line.resize(21);
-                }
-                print_str(line.c_str());
-                startY += 8;
-                idx++;
-                if (idx == maxLines) {
-                    idx = 0;
-                }
-                if (maxLines > 1) {
-                    setCursor(0, startY);
-                    line = lines[idx];
-                    if (line.length() > 21) {
-                        line.resize(21);
-                    }
-                    print_str(line.c_str());
-                }
-            }
-        } else if (debug) {
-            printf("Invalid json\n");
-        }
-    } else if (debug) {
-        printf("Curl returned bad status\n");
-    }
-    if (!gotStatus) {
-        setTextSize(1);
-        setTextColor(WHITE);
-        setCursor(0, startY);
-        if (count < 60) {
-            //if less than 60 seconds since start, we'll assume we are booting up
-            setCursor(10, startY);
-            std::string line = "Booting.";
-            int idx = count % 8;
-            for (int i = 0; i < idx; i++) {
-                line += ".";
-            }
-            print_str(line.c_str());
-            startY += 8;
-        } else {
-            print_str("FPPD is not running...");
-            startY += 8;
-        }
-        if (_imageWidth) {
-            drawBitmap(0, startY, &_image[0], _imageWidth, _imageHeight, WHITE);
-        }
-    }
-    return startY;
-}
 
 
-bool FPPOLEDUtils::doIteration(int count) {
-    if (_ledType == 0) {
-        return false;
-    }
-    bool retVal = false;
-    int lastNSize = networks.size();
-    if ((count % 30) == 0 || networks.size() <= 1) {
-        //every 30 seconds, rescan network for new connections
-        fillInNetworks();
-        //if networks aren't configured or have changed, keep the oled on
-        if (lastNSize != networks.size() || networks.size() <= 1) {
-            retVal = true;
-            _displayOn = true;
-        }
-    }
-    clearDisplay();
-    
-    if (_displayOn) {
-        int startY = 0;
-        setTextSize(1);
-        setTextColor(WHITE);
-        if (_ledType != 8) {
-            startY = outputTopPart(startY, count);
-            if (_ledType != 7 && _ledType != 8) {
-                // two color display doesn't need the separator line
-                if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SSD1306) {
-                    drawLine(0, startY, 127, startY, WHITE);
-                    startY++;
-                } else {
-                    drawLine(0, startY - 1, 127, startY - 1, WHITE);
-                }
-            }
-            startY = outputBottomPart(startY, count);
-        } else {
-            //strange case... with 2 color display flipped, we still need to keep the
-            //network part in the "yellow" which is now below the main part
-            outputBottomPart(0, count);
-            outputTopPart(48, count);
-        }
-    }
-    Display();
-    return retVal;
-}
-
-void FPPOLEDUtils::fillInNetworks() {
-    networks.clear();
-    signalStrength.clear();
-    
-    char hostname[HOST_NAME_MAX];
-    int result;
-    result = gethostname(hostname, HOST_NAME_MAX);
-    std::string hn = "Host: ";
-    hn += hostname;
-    networks.push_back(hn);
-    signalStrength.push_back(0);
-
-    //get all the addresses
-    struct ifaddrs *interfaces,*tmp;
-    getifaddrs(&interfaces);
-    tmp = interfaces;
-    char addressBuf[128];
-    while (tmp) {
-        if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET) {
-            if (strncmp("usb", tmp->ifa_name, 3) != 0) {
-                //skip the usb* interfaces as we won't support multisync on those
-                GetInterfaceAddress(tmp->ifa_name, addressBuf, NULL, NULL);
-                if (strcmp(addressBuf, "127.0.0.1")) {
-                    hn = tmp->ifa_name;
-                    hn += ":";
-                    hn += addressBuf;
-                    networks.push_back(hn);
-                    int i = getSignalStrength(tmp->ifa_name);
-                    signalStrength.push_back(i);
-                }
-            }
-        } else if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET6) {
-            //FIXME for ipv6 multisync
-        } else {
-            //printf("Not a netork: %s\n", tmp->ifa_name);
-        }
-        tmp = tmp->ifa_next;
-    }
-    freeifaddrs(interfaces);
-}
-void FPPOLEDUtils::cycleTest() {
-    _currentTest++;
-    Json::Value val;
-    val["cycleMS"] = 1000;
-    val["enabled"] = 1;
-    val["channelSet"] = "1-1048576";
-    val["channelSetType"] = "channelRange";
-
-    switch (_currentTest) {
-        case 1:
-            val["mode"] = "SingleChase";
-            val["chaseSize"] = 3;
-            val["chaseValue"] = 255;
-            break;
-        case 2:
-            val["mode"] = "RGBChase";
-            val["subMode"] = "RGBChase-RGBA";
-            val["colorPattern"] = "FF000000FF000000FFFFFFFF";
-            break;
-        default:
-            val["mode"] = "SingleChase";
-            val["chaseSize"] = 3;
-            val["chaseValue"] = 255;
-            val["enabled"] = 0;
-            _currentTest = 0;
-            break;
-    }
-    
-    Json::FastWriter writer;
-    std::string data = writer.write(val);
-
-    buffer.clear();
-    CURL *curl = curl_easy_init();
-    curl_easy_setopt(curl, CURLOPT_URL, "http://localhost/fppjson.php");
-    data = "command=setTestMode&data=" + data;
-    
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 50);
-    curl_easy_setopt(curl, CURLOPT_POST, 1);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, -1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writer);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-    curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-}
 
 static const std::string EMPTY_STRING = "";
+
+FPPOLEDUtils::InputAction::~InputAction() {
+    for (auto &a : actions) {
+        delete a;
+    }
+    actions.clear();
+    
+    if (gpiodLine) {
+        gpiod_line_release(gpiodLine);
+    }
+}
+
+
+class GPIODExtenderAction : public FPPOLEDUtils::InputAction::Action {
+public:
+    GPIODExtenderAction(const std::string &a, int min, int max, long long mai, struct gpiod_line *line)
+        : FPPOLEDUtils::InputAction::Action(a, min, max, mai), gpiodLine(line) {}
+    virtual ~GPIODExtenderAction() {
+        if (gpiodLine) {
+            printf("Release %s\n", action.c_str());
+            gpiod_line_release(gpiodLine);
+        }
+    }
+
+    virtual bool checkAction(int i, long long ntimeus) override {
+        int v = gpiod_line_get_value(gpiodLine);
+        return FPPOLEDUtils::InputAction::Action::checkAction(v, ntimeus);
+    }
+
+    struct gpiod_line *gpiodLine = nullptr;
+};
+class GPIOQueryPinAction : public FPPOLEDUtils::InputAction {
+public:
+    GPIOQueryPinAction(const PinCapabilities *p)
+        : FPPOLEDUtils::InputAction(), pin(p) {
+        lastValue = pin->getValue();
+    }
+    virtual ~GPIOQueryPinAction() {
+    }
+    virtual const std::string &checkAction(int i, long long ntimeus) override {
+        int val = pin->getValue();
+        if (val != lastValue) {
+            printf("Val %d     LastVal: %d\n", val, lastValue);
+            for (auto &a : actions) {
+                if (a->checkAction(val, ntimeus)) {
+                    return a->action;
+                }
+            }
+            lastValue = val;
+        }
+        return EMPTY_STRING;
+    }
+    int lastValue = 0;
+    const PinCapabilities *pin = nullptr;
+};
+
+bool FPPOLEDUtils::InputAction::Action::checkAction(int i, long long ntimeus) {
+    if (i <= actionValueMax && i >= actionValueMin
+        && (ntimeus > nextActionTime)) {
+        //at least 10ms since last action.  Should cover any debounce time
+        nextActionTime = ntimeus + minActionInterval;
+        return true;
+    }
+    return false;
+}
 const std::string &FPPOLEDUtils::InputAction::checkAction(int i, long long ntimeus) {
     for (auto &a : actions) {
-        if (i <= a.actionValueMax && i >= a.actionValueMin
-            && (ntimeus > a.nextActionTime)) {
-            //at least 10ms since last action.  Should cover any debounce time
-            a.nextActionTime = ntimeus + a.minActionInterval;
-            return a.action;
+        if (a->checkAction(i, ntimeus)) {
+            return a->action;
         }
     }
     return EMPTY_STRING;
@@ -495,19 +157,10 @@ bool FPPOLEDUtils::checkStatusAbility() {
     }
     std::string file = "/home/fpp/media/tmp/cape-info.json";
     if (FileExists(file)) {
-        std::ifstream t(file);
-        std::stringstream buffer;
-        buffer << t.rdbuf();
-        std::string config = buffer.str();
         Json::Value root;
-        Json::Reader reader;
-        bool success = reader.parse(buffer.str(), root);
-        if (success) {
+        if (LoadJsonFromFile(file, root)) {
             if (root["id"].asString() == "Unsupported") {
                 return false;
-            }
-            if (root["verifiedKeyId"].asString() == "dk") {
-                return true;
             }
         }
     }
@@ -517,48 +170,242 @@ bool FPPOLEDUtils::checkStatusAbility() {
 #endif
 }
 
+bool FPPOLEDUtils::setupControlPin(const std::string &file) {
+    if (FileExists(file)) {
+        Json::Value root;
+        if (LoadJsonFromFile(file, root)) {
+            if (root.isMember("controls")
+                && root["controls"].isMember("I2CEnable")) {
+                controlPin = root["controls"]["I2CEnable"].asString();
+                printf("Using control pin %s\n", controlPin.c_str());
+                
+                const PinCapabilities &pin = PinCapabilities::getPinByName(controlPin);
+                pin.configPin("gpio", true);
+                pin.setValue(1);
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
-bool FPPOLEDUtils::parseInputActions(const std::string &file, std::vector<InputAction> &actions) {
+FPPOLEDUtils::InputAction *FPPOLEDUtils::configureGPIOPin(const std::string &pinName,
+                                                          const std::string &mode,
+                                                          const std::string &edge) {
+    const PinCapabilities &pin = PinCapabilities::getPinByName(pinName);
+    pin.configPin(mode, false);
+#ifdef HASGPIOD
+    const GPIODCapabilities *gpiodPin = dynamic_cast<const GPIODCapabilities*>(pin.ptr());
+    if (gpiodPin) {
+        //it's a gpiod pin and not a native pin, we need to handle these special
+        InputAction *action = new GPIOQueryPinAction(gpiodPin);
+        action->pin = pinName;
+        action->mode = mode;
+
+        action->file = gpiodPin->line.event_get_fd();
+        return action;
+    }
+#endif
+    
+    InputAction *action = new InputAction();
+    action->pin = pinName;
+    action->mode = mode;
+
+    action->gpiodLine = nullptr;
+    if (!gpiodChips[pin.gpioIdx]) {
+        gpiodChips[pin.gpioIdx] = gpiod_chip_open_by_number(pin.gpioIdx);
+    }
+    action->gpiodLine = gpiod_chip_get_line(gpiodChips[pin.gpioIdx], pin.gpio);
+    
+    struct gpiod_line_request_config lineConfig;
+    lineConfig.consumer = "FPPOLED";
+    lineConfig.request_type = GPIOD_LINE_REQUEST_DIRECTION_INPUT;
+    lineConfig.flags = 0;
+    if (gpiod_line_request(action->gpiodLine, &lineConfig, 0) == -1) {
+        printf("Could not config line as input.  Line %d    Offset: %d   Value:%d\n", action->gpiodLine, gpiod_line_offset(action->gpiodLine), pin.getValue());
+    }
+    gpiod_line_release(action->gpiodLine);
+    if (edge == "falling") {
+        lineConfig.request_type = GPIOD_LINE_REQUEST_EVENT_FALLING_EDGE;
+    } else if (edge == "rising") {
+        lineConfig.request_type = GPIOD_LINE_REQUEST_EVENT_RISING_EDGE;
+    } else {
+        lineConfig.request_type = GPIOD_LINE_REQUEST_EVENT_BOTH_EDGES;
+    }
+    lineConfig.flags = 0;
+    if (gpiod_line_request(action->gpiodLine, &lineConfig, 0) == -1) {
+        printf("Could not config line edge for line %d\n", action->gpiodLine);
+    }
+    action->file = gpiod_line_event_get_fd(action->gpiodLine);
+    action->kernelGPIO = pin.kernelGpio;
+    action->gpioChipIdx = pin.gpioIdx;
+    action->gpioChipLine = pin.gpio;
+    return action;
+}
+void FPPOLEDUtils::setInputFlag(const std::string &action) {
+    if (action == "Up") {
+        inputFlags |= 0x01;
+    } else if (action == "Down") {
+        inputFlags |= 0x02;
+    } else if (action == "Back") {
+        inputFlags |= 0x04;
+    } else if (action == "Enter") {
+        inputFlags |= 0x08;
+    } else if (action == "Test") {
+        inputFlags |= 0x10;
+    } else if (action == "Test/Down") {
+        inputFlags |= 0x10;
+        inputFlags |= 0x02;
+    }
+}
+
+bool FPPOLEDUtils::parseInputActionFromGPIO(const std::string &file) {
     char vbuffer[256];
     bool needsPolling = false;
     if (FileExists(file)) {
-        std::ifstream t(file);
-        std::stringstream buffer;
-        buffer << t.rdbuf();
-        std::string config = buffer.str();
         Json::Value root;
-        Json::Reader reader;
-        bool success = reader.parse(buffer.str(), root);
-        if (success) {
+        if (LoadJsonFromFile(file, root)) {
+            for (int x = 0; x < root.size(); x++) {
+                if (!root[x]["enabled"].asBool()) {
+                    continue;
+                }
+                std::string edge = "";
+                std::string actionValue = "";
+                std::string mode = root[x]["mode"].asString();
+                if (mode == "") {
+                    mode = "gpio";
+                }
+                std::string pinName = root[x]["pin"].asString();
+                std::string fallingAction = "";
+                std::string risingAction = "";
+                if (root[x].isMember("falling") && root[x]["falling"]["command"].asString() == "OLED Navigation") {
+                    edge = "falling";
+                    fallingAction = root[x]["falling"]["args"][0].asString();
+                    setInputFlag(fallingAction);
+                }
+                if (root[x].isMember("rising") && root[x]["rising"]["command"].asString() == "OLED Navigation") {
+                    if (edge == "falling") {
+                        edge = "both";
+                    } else {
+                        edge = "rising";
+                    }
+                    risingAction = root[x]["rising"]["args"][0].asString();
+                    setInputFlag(risingAction);
+                }
+                if (edge != "") {
+                    InputAction *action = configureGPIOPin(pinName, mode, edge);
+                    if (risingAction != "") {
+                        printf("Configuring pin %s as input of type %s   (mode: %s, gpio: %d,  file: %d)\n", action->pin.c_str(), risingAction.c_str(), action->mode.c_str(), action->kernelGPIO, action->file);
+                        action->actions.push_back(new FPPOLEDUtils::InputAction::Action(risingAction, 1, 1, 100000));
+                    }
+                    if (fallingAction != "") {
+                        printf("Configuring pin %s as input of type %s   (mode: %s, gpio: %d,  file: %d)\n", action->pin.c_str(), fallingAction.c_str(), action->mode.c_str(), action->kernelGPIO, action->file);
+                        action->actions.push_back(new FPPOLEDUtils::InputAction::Action(fallingAction, 0, 0, 100000));
+                    }
+                    actions.push_back(action);
+                    if (action->file == -1) {
+                        needsPolling = true;
+                    }
+                }
+            }
+        }
+    }
+    return needsPolling;
+}
+
+bool FPPOLEDUtils::parseInputActions(const std::string &file) {
+    char vbuffer[256];
+    bool needsPolling = false;
+    if (FileExists(file)) {
+        Json::Value root;
+        if (LoadJsonFromFile(file, root)) {
             for (int x = 0; x < root["inputs"].size(); x++) {
-                InputAction action;
-                action.pin = root["inputs"][x]["pin"].asString();
-                action.mode = root["inputs"][x]["mode"].asString();
-                if (action.mode.find("gpio") != std::string::npos) {
-                    std::string buttonaction = root["inputs"][x]["type"].asString();
+                InputAction *action = new InputAction();
+                action->pin = root["inputs"][x]["pin"].asString();
+                action->mode = root["inputs"][x]["mode"].asString();
+                action->gpiodLine = nullptr;
+                if (action->mode.find("gpio") != std::string::npos) {
                     std::string edge = root["inputs"][x]["edge"].asString();
                     int actionValue = (edge == "falling" ? 0 : 1);
-    #ifdef PLATFORM_BBB
-                    printf("Configuring pin %s as input of type %s   (mode: %s)\n", action.pin.c_str(), buttonaction.c_str(), action.mode.c_str());
+                    const PinCapabilities &pin = PinCapabilities::getPinByName(action->pin);
 
-                    action.file = getBBBPinByName(action.pin).configPin(action.mode, "in").setEdge(edge).openValueForPoll();
-                    //read the initial value to make sure nothing triggers at start
-                    lseek(action.file, 0, SEEK_SET);
-                    int len = read(action.file, vbuffer, 255);
-                    action.actions.push_back(FPPOLEDUtils::InputAction::Action(buttonaction, actionValue, actionValue, 10000));
+                    pin.configPin(action->mode, false);
+                    if (!gpiodChips[pin.gpioIdx]) {
+                        gpiodChips[pin.gpioIdx] = gpiod_chip_open_by_number(pin.gpioIdx);
+                    }
+                    action->gpiodLine = gpiod_chip_get_line(gpiodChips[pin.gpioIdx], pin.gpio);
+                    
+                    struct gpiod_line_request_config lineConfig;
+                    lineConfig.consumer = "FPPOLED";
+                    lineConfig.request_type = GPIOD_LINE_REQUEST_DIRECTION_INPUT;
+                    lineConfig.flags = 0;
+                    if (gpiod_line_request(action->gpiodLine, &lineConfig, 0) == -1) {
+                        printf("Could not config line as input\n");
+                    }
+                    gpiod_line_release(action->gpiodLine);
+                    if (edge == "falling") {
+                        lineConfig.request_type = GPIOD_LINE_REQUEST_EVENT_FALLING_EDGE;
+                    } else {
+                        lineConfig.request_type = GPIOD_LINE_REQUEST_EVENT_RISING_EDGE;
+                    }
+                    lineConfig.flags = 0;
+                    if (gpiod_line_request(action->gpiodLine, &lineConfig, 0) == -1) {
+                        printf("Could not config line edge\n");
+                    }
+                    action->file = gpiod_line_event_get_fd(action->gpiodLine);
+                    
+                    std::string type = root["inputs"][x]["type"].asString();
+                    if (type == "gpiod") {
+                        //this is the mode for various gpio extenders like the pca9675 chip that
+                        //use a single interrupt line (configured above) fall all the buttons.
+                        //The above will trigger an interupt after which we will need to
+                        //use libgpiod to get the value of each button to figure out
+                        //which triggered the action.  Thus, there are multiple actions
+                        
+                        std::string label = root["inputs"][x]["chip"].asString();
+                        gpiod_chip *chip = getChip(label);
+                        if (chip) {
+                            int lines = gpiod_chip_num_lines(chip);
+                            for (int a = 0; a < root["inputs"][x]["actions"].size(); a++) {
+                                std::string buttonaction = root["inputs"][x]["actions"][a]["action"].asString();
+                                int gpioline = root["inputs"][x]["actions"][a]["line"].asInt();
+                                if (gpioline < lines) {
+                                    gpiod_line *l = gpiod_chip_get_line(chip, gpioline);
+                                    struct gpiod_line_request_config lineConfig;
+                                    lineConfig.consumer = "FPPOLED";
+                                    lineConfig.request_type = GPIOD_LINE_REQUEST_DIRECTION_INPUT;
+                                    lineConfig.flags = 0;
+                                    if (gpiod_line_request(l, &lineConfig, 0) == -1) {
+                                        printf("Could not config line as input\n");
+                                    }
+                                    
+                                    printf("Configuring pin %s as input of type %s   (chip: %s, gpio: %d)\n", action->pin.c_str(), buttonaction.c_str(), label.c_str(), gpioline);
+                                    int v = gpiod_line_get_value(l);
+                                    setInputFlag(buttonaction);
+                                    action->actions.push_back(new GPIODExtenderAction(buttonaction, 0, 0, 100000, l));
+                                }
+                            }
+                        } else {
+                            printf("Could not find gpio chip for %s\n", label.c_str());
+                        }
+                    } else {
+                        printf("Configuring pin %s as input of type %s   (mode: %s, gpio: %d)\n", action->pin.c_str(), type.c_str(), action->mode.c_str(), pin.kernelGpio);
+                        action->actions.push_back(new FPPOLEDUtils::InputAction::Action(type, actionValue, actionValue, 100000));
+                        setInputFlag(type);
+                    }
                     actions.push_back(action);
-    #endif
-                } else if (action.mode == "ain") {
+                } else if (action->mode == "ain") {
                     char path[256];
                     sprintf(path, "/sys/bus/iio/devices/iio:device0/in_voltage%d_raw", root["inputs"][x]["input"].asInt());
                     if (FileExists(path)) {
-                        action.file = open(path, O_RDONLY);
+                        action->file = open(path, O_RDONLY);
                         for (int a = 0; a < root["inputs"][x]["actions"].size(); a++) {
                             std::string buttonaction = root["inputs"][x]["actions"][a]["action"].asString();
                             int minValue = root["inputs"][x]["actions"][a]["minValue"].asInt();
                             int maxValue = root["inputs"][x]["actions"][a]["maxValue"].asInt();
                             printf("Configuring AIN input of type %s  with range %d-%d\n", buttonaction.c_str(), minValue, maxValue);
-                            action.actions.push_back(FPPOLEDUtils::InputAction::Action(buttonaction, minValue, maxValue, 250000));
+                            action->actions.push_back(new FPPOLEDUtils::InputAction::Action(buttonaction, minValue, maxValue, 250000));
+                            setInputFlag(buttonaction);
                         }
                         
                         actions.push_back(action);
@@ -572,115 +419,82 @@ bool FPPOLEDUtils::parseInputActions(const std::string &file, std::vector<InputA
     return needsPolling;
 }
 
-// trim from start (in place)
-static inline void ltrim(std::string &s) {
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
-        return !std::isspace(ch);
-    }));
-}
-// trim from end (in place)
-static inline void rtrim(std::string &s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
-        return !std::isspace(ch);
-    }).base(), s.end());
-}
-// trim from both ends (in place)
-static inline void trim(std::string &s) {
-    ltrim(s);
-    rtrim(s);
-}
-static std::vector<std::string> splitAndTrim(const std::string& s, char seperator) {
-    std::vector<std::string> output;
-    std::string::size_type prev_pos = 0, pos = 0;
-    while((pos = s.find(seperator, pos)) != std::string::npos) {
-        std::string substring( s.substr(prev_pos, pos-prev_pos) );
-        trim(substring);
-        if (substring != "") {
-            output.push_back(substring);
-        }
-        prev_pos = ++pos;
-    }
-    std::string substring = s.substr(prev_pos, pos-prev_pos);
-    trim(substring);
-    if (substring != "") {
-        output.push_back(substring); // Last word
-    }
-    return output;
-}
-static unsigned char reverselookup[16] = {
-    0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe,
-    0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf, };
-
-static inline uint8_t reverse(uint8_t n) {
-    // Reverse the top and bottom nibble then swap them.
-    return (reverselookup[n&0b1111] << 4) | reverselookup[n>>4];
-}
-void FPPOLEDUtils::readImage() {
-    _imageWidth = 0;
-    _imageHeight = 0;
-    if (FileExists("/home/fpp/media/tmp/cape-image.xbm")) {
-        std::ifstream file("/home/fpp/media/tmp/cape-image.xbm");
-        if (file.is_open()) {
-            std::string line;
-            bool readingBytes = false;
-            while (std::getline(file, line)) {
-                trim(line);
-                if (!readingBytes) {
-                    if (line.find("_width") != std::string::npos) {
-                        std::vector<std::string> v = splitAndTrim(line, ' ');
-                        _imageWidth = std::stoi(v[2]);
-                    } else if (line.find("_height") != std::string::npos) {
-                        std::vector<std::string> v = splitAndTrim(line, ' ');
-                        _imageHeight = std::stoi(v[2]);
-                    } else if (line.find("{") != std::string::npos) {
-                        readingBytes = true;
-                        line = line.substr(line.find("{") + 1);
-                    }
-                }
-                if (readingBytes) {
-                    std::vector<std::string> v = splitAndTrim(line, ',');
-                    for (auto &s : v) {
-                        if (s.find("}") != std::string::npos) {
-                            readingBytes = false;
-                            break;
-                        }
-                        int i = std::stoi(s, 0, 16);
-                        uint8_t t8 = (uint8_t)i;
-                        t8 = ~t8;
-                        t8 = reverse(t8);
-                        _image.push_back((uint8_t)t8);
-                    }
-                }
+gpiod_chip * FPPOLEDUtils::getChip(const std::string &n) {
+    for (auto &a : gpiodChips) {
+        if (a) {
+            if (n == gpiod_chip_label(a) || n == gpiod_chip_name(a)) {
+                return a;
             }
-            file.close();
         }
     }
+    // did not find
+    gpiod_chip *chip = gpiod_chip_open_lookup(n.c_str());
+    if (chip) {
+        gpiodChips.push_back(chip);
+    }
+    return chip;
 }
 
 void FPPOLEDUtils::run() {
-    std::vector<InputAction> actions;
     char vbuffer[256];
-    bool needsPolling = parseInputActions("/home/fpp/media/tmp/cape-inputs.json", actions);
-    _doFullStatus = checkStatusAbility();
+    setupControlPin("/home/fpp/media/tmp/cape-info.json");
+    bool needsPolling = parseInputActions("/home/fpp/media/tmp/cape-inputs.json");
+    needsPolling |= parseInputActionFromGPIO("/home/fpp/media/config/gpio.json");
     std::vector<struct pollfd> fdset(actions.size());
-    
-    readImage();
     
     if (actions.size() == 0 && _ledType == 0) {
         //no display and no actions, nothing to do.
         exit(0);
     }
+
+    OLEDPage::SetHas4DirectionControls((inputFlags & 0x0F) == 0x0F);
     
-    int count = 0;
+    statusPage = new FPPStatusOLEDPage();
+    if (!checkStatusAbility()) {
+        //statusPage->disableFullStatus();
+    }
+    OLEDPage::SetCurrentPage(statusPage);
+    
     long long lastUpdateTime = 0;
     long long ntime = GetTime();
     long long lastActionTime = GetTime();
     while (true) {
+        bool forcedOff = currentStatus->forceOff;
+        if (OLEDPage::IsForcedOff() && !forcedOff) {
+            //turning back on
+            if (controlPin != "") {
+                printf("Re-enabling I2C Bus via pin: %s\n", controlPin.c_str());
+                const PinCapabilities &pin = PinCapabilities::getPinByName(controlPin);
+                pin.configPin("gpio", true);
+                pin.setValue(1);
+            }
+            OLEDPage::SetForcedOff(forcedOff);
+            currentStatus->displayOn = true;
+            OLEDPage::SetCurrentPage(statusPage);
+            lastActionTime = GetTime();
+        } else if (!OLEDPage::IsForcedOff() && forcedOff) {
+            if (currentStatus->displayOn) {
+                if (OLEDPage::GetOLEDType() != OLEDPage::OLEDType::NONE) {
+                    OLEDPage::displayOff();
+                }
+            }
+            if (controlPin != "") {
+                printf("Disabling I2C Bus via pin: %s\n", controlPin.c_str());
+                const PinCapabilities &pin = PinCapabilities::getPinByName(controlPin);
+                pin.configPin("gpio", true);
+                pin.setValue(0);
+            }
+            OLEDPage::SetForcedOff(forcedOff);
+            currentStatus->displayOn = false;
+            OLEDPage::SetCurrentPage(statusPage);
+        }
         if (ntime > (lastUpdateTime + 1000000)) {
-            count++;
-            if (doIteration(count)) {
+            bool displayOn = currentStatus->displayOn;
+            if (OLEDPage::GetCurrentPage()
+                && OLEDPage::GetCurrentPage()->doIteration(displayOn)) {
                 lastActionTime = GetTime();
             }
+            currentStatus->displayOn = displayOn;
             lastUpdateTime = ntime;
         }
         if (actions.empty()) {
@@ -688,51 +502,69 @@ void FPPOLEDUtils::run() {
             ntime = GetTime();
         } else {
             memset((void*)&fdset[0], 0, sizeof(struct pollfd) * actions.size());
+            int actionCount = 0;
             for (int x = 0; x < actions.size(); x++) {
-                fdset[x].fd = actions[x].file;
-                fdset[x].events = POLLPRI;
+                if (actions[x]->mode != "ain" && actions[x]->file >= 0) {
+                    fdset[actionCount].fd = actions[x]->file;
+                    fdset[actionCount].events = POLLIN | POLLPRI;
+                    actions[x]->pollIndex = actionCount;
+                    actionCount++;
+                }
             }
 
-            int rc = poll(&fdset[0], actions.size(), needsPolling ? 100 : 1000);
+            if (actionCount) {
+                poll(&fdset[0], actionCount, needsPolling ? 100 : 1000);
+            } else {
+                usleep(100000);
+            }
             ntime = GetTime();
-            
             for (int x = 0; x < actions.size(); x++) {
                 std::string action;
-                if ((fdset[x].revents & POLLPRI)) {
-                    lseek(fdset[x].fd, 0, SEEK_SET);
-                    int len = read(fdset[x].fd, vbuffer, 255);
-                    vbuffer[len] = 0;
+                if (actions[x]->mode == "ain") {
+                    lseek(actions[x]->file, 0, SEEK_SET);
+                    int len = read(actions[x]->file, vbuffer, 255);
                     int v = atoi(vbuffer);
-                    action = actions[x].checkAction(v, ntime);
-                } else if (actions[x].mode == "ain") {
-                    lseek(fdset[x].fd, 0, SEEK_SET);
-                    int len = read(fdset[x].fd, vbuffer, 255);
-                    int v = atoi(vbuffer);
-                    action = actions[x].checkAction(v, ntime);
+                    action = actions[x]->checkAction(v, ntime);
+                } else if (actions[x]->file == -1) {
+                    action = actions[x]->checkAction(0, ntime);
+                } else if (fdset[actions[x]->pollIndex].revents) {
+                    struct gpiod_line_event event;
+                    if (gpiod_line_event_read_fd(fdset[actions[x]->pollIndex].fd, &event) >= 0) {
+                        int v = gpiod_line_get_value(actions[x]->gpiodLine);
+                        action = actions[x]->checkAction(v, ntime);
+                    }
                 }
-                if (action != "" && !_displayOn) {
+                if (action != "" && !currentStatus->displayOn) {
                     //just turn the display on if button is hit
-                    _displayOn = true;
-                    lastUpdateTime = 0;
-                    lastActionTime = ntime;
-                } else if (action != "") {
+                    if (!currentStatus->forceOff) {
+                        currentStatus->displayOn = true;
+                        OLEDPage::SetCurrentPage(statusPage);
+                        lastUpdateTime = 0;
+                        lastActionTime = ntime;
+                    } else if ((action == "Test" || action == "Test/Down") && ((ntime - lastActionTime) > 70000)){
+                        printf("Action: %s\n", action.c_str());
+                        lastUpdateTime = 0;
+                        lastActionTime = ntime;
+                        if (OLEDPage::GetCurrentPage()) {
+                            OLEDPage::GetCurrentPage()->doAction(action);
+                        }
+                    }
+                } else if (action != "" && ((ntime - lastActionTime) > 70000)) { //account for some debounce time
                     printf("Action: %s\n", action.c_str());
                     //force immediate update
                     lastUpdateTime = 0;
                     lastActionTime = ntime;
-                    if (action == "Test"
-                        || action == "Test/Down") {
-                        cycleTest();
-                    } else if (action == "Enter") {
-                        _curPage++;
-                        if (_curPage == MAX_PAGE) {
-                            _curPage = 0;
-                        }
+                    if (OLEDPage::GetCurrentPage()) {
+                        OLEDPage::GetCurrentPage()->doAction(action);
                     }
                 }
             }
-            if (ntime > (lastActionTime + 120000000)) {
-                _displayOn = false;
+            if (ntime > (lastActionTime + 180000000)) {
+                if (OLEDPage::GetCurrentPage() != statusPage) {
+                    OLEDPage::SetCurrentPage(statusPage);
+                }
+                OLEDPage::displayOff();
+                currentStatus->displayOn = false;
             }
         }
     }

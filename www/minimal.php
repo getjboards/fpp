@@ -7,15 +7,8 @@ require_once('common.php');
 
 $kernel_version = exec("uname -r");
 
-$fpp_head_version = "v" . exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ describe --tags", $output, $return_val);
-if ( $return_val != 0 )
-    $fpp_head_version = "Unknown";
-unset($output);
-
-$git_branch = exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ branch --list | grep '\\*' | awk '{print \$2}'", $output, $return_val);
-if ( $return_val != 0 )
-    $git_branch = "Unknown";
-unset($output);
+$fpp_head_version = "v" . getFPPVersion();
+$git_branch = getFPPBranch();
 
 if (!preg_match("/^$git_branch(-.*)?$/", $fpp_head_version))
     $fpp_head_version .= " ($git_branch branch)";
@@ -23,10 +16,9 @@ if (!preg_match("/^$git_branch(-.*)?$/", $fpp_head_version))
 $IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v ^$ | grep -v lo | grep -v eth0:0 | grep -v usb | grep -v SoftAp | grep -v 'can.' | sed -e 's/://g' | while read iface ; do /sbin/ifconfig \$iface | grep 'inet ' | awk '{print \$2}'; done")));
 
 ?>
-<script type="text/javascript" src="js/jquery-3.3.1.min.js"></script>
-<script type="text/javascript" src="js/jquery-migrate-3.0.1.min.js"></script>
+<script type="text/javascript" src="js/jquery-latest.min.js"></script>
 <script type="text/javascript" src="js/jquery-ui.min.js"></script>
-<script type="text/javascript" src="js/jquery.ui.touch-punch.min.js"></script>
+<script type="text/javascript" src="js/jquery.ui.touch-punch.js"></script>
 <script type="text/javascript" src="js/jquery.jgrowl.min.js"></script>
 <link rel="stylesheet" href="css/jquery-ui.css" />
 <link rel="stylesheet" href="css/jquery.jgrowl.min.css" />
@@ -129,7 +121,7 @@ $IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v
 
 
 </head>
-<body onLoad="GetFPPDmode();StatusPopulatePlaylists();GetFPPStatus();bindVisibilityListener();GetVolume();">
+<body onLoad="GetFPPDmode();PopulatePlaylists(true);GetFPPStatus();bindVisibilityListener();GetVolume();">
 <div id="bodyWrapper">
   <div class="header">
     <div class="headerCenter"><div class="siteName"><? echo $settings['Title']; ?></div>
@@ -220,7 +212,7 @@ $IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v
           </tr>
           <tr>
             <td class='controlHeader'>Playlist:</td>
-            <td><select id="selStartPlaylist" name="selStartPlaylist" size="1" onClick="SelectStatusPlaylistEntryRow();PopulateStatusPlaylistEntries(true,'',true);" onChange="PopulateStatusPlaylistEntries(true,'',true);"></select>
+            <td><select id="playlistSelect" name="playlistSelect" size="1" onClick="SelectStatusPlaylistEntryRow();PopulateStatusPlaylistEntries(true,'',true);" onChange="PopulateStatusPlaylistEntries(true,'',true);"></select>
             	&nbsp;Repeat: <input type="checkbox" id="chkRepeat"></input>
 				</td>
           </tr>
@@ -240,13 +232,14 @@ $IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v
       <div id="playerControls" style="margin-top: 10px">
         <input id= "btnPlay" type="button"  class ="buttons"value="Play" onClick="StartPlaylistNow();">
         <input id= "btnStopGracefully" type="button"  class ="buttons"value="Stop Gracefully" onClick="StopGracefully();">
+        <input id= "btnStopGracefullyAfterLoop" type="button"  class ="buttons"value="Stop After Loop" onClick="StopGracefullyAfterLoop();">
         <input id= "btnStopNow" type="button" class ="buttons" value="Stop Now" onClick="StopNow();">
 		<hr>
        	<input id="btnShowPlaylistDetails" type="button" class='buttons' value="Show Details" onClick="ShowPlaylistDetails();">
        	<input id="btnHidePlaylistDetails" type="button" class='buttons' value="Hide Details" onClick="HidePlaylistDetails();" style='display: none;'>
        </div>
     	<div id="playerStatusBottom" style='margins: 5px'>
-		<div id='statusPlaylistDetailsWrapper' style='display: none;'>
+		<div id='playlistDetailsWrapper' style='display: none;'>
         <table width="100%">
           <tr>
 			<td class='controlHeader'>Position:</td>
@@ -303,6 +296,6 @@ $IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v
 		</div>
 </div>
 </div>
-<center><a href='/index.php'>Return to Full UI</a></center><br>
+<center><a href='index.php'>Return to Full UI</a></center><br>
 </body>
 </html>

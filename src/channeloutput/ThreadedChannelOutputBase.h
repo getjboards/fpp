@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   ChannelOutputBase class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _THREADEDCHANNELOUTPUTBASE_H
-#define _THREADEDCHANNELOUTPUTBASE_H
-
 #include <string>
 #include <vector>
 
@@ -42,11 +40,10 @@ class ThreadedChannelOutputBase : public ChannelOutputBase {
 	virtual ~ThreadedChannelOutputBase();
 
 
-	virtual int   Init(Json::Value config);
-	virtual int   Init(char *configStr);
-	virtual int   Close(void)  override;
+	virtual int   Init(Json::Value config) override;
+	virtual int   Close(void) override;
 
-    virtual int   SendData(unsigned char *channelData)  override;
+    virtual int   SendData(unsigned char *channelData) override;
 
 	void          OutputThread(void);
 
@@ -54,12 +51,14 @@ class ThreadedChannelOutputBase : public ChannelOutputBase {
 	int           Init(void);
 
   protected:
-	virtual void  DumpConfig(void);
+	virtual void  DumpConfig(void) override;
 	virtual int   RawSendData(unsigned char *channelData) = 0;
+    virtual void  WaitTimedOut() {}
 	int           StartOutputThread(void);
 	int           StopOutputThread(void);
 	int           SendOutputBuffer(void);
 
+    unsigned int     m_maxWait;
 	unsigned int     m_threadIsRunning;
 	unsigned int     m_runThread;
 	volatile unsigned int     m_dataWaiting;
@@ -74,5 +73,3 @@ class ThreadedChannelOutputBase : public ChannelOutputBase {
 	unsigned char   *m_outBuf;
 
 };
-
-#endif /* #ifndef _CHANNELOUTPUTBASE_H */

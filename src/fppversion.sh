@@ -28,11 +28,18 @@ git status > /dev/null 2>&1
 SOURCE_VERSION=$(git describe --dirty || git describe || echo Unknown)
 MAJOR_VERSION=$(echo ${SOURCE_VERSION} | cut -f1 -d\.)
 MINOR_VERSION=$(echo ${SOURCE_VERSION} | cut -f1 -d- | cut -f2 -d\.)
+PATCH_VERSION=$(echo ${SOURCE_VERSION} | cut -f1 -d- | cut -f3 -d\.)
 
-if [ "x${MINOR_VERSION}" = "xx" ]
-then
+
+if [ "x${MINOR_VERSION}" = "xx" ]; then
 	SUBV=$(echo ${SOURCE_VERSION} | cut -f2 -d-)
 	MINOR_VERSION=$((1000 + $SUBV))
+    PATCH_VERSION=""
+    TRIPLET_VERSION="${MAJOR_VERSION}.${MINOR_VERSION}"
+elif [ "x${PATCH_VERSION}" = "x"  ]; then
+    TRIPLET_VERSION="${MAJOR_VERSION}.${MINOR_VERSION}.0"
+else
+    TRIPLET_VERSION="${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION}"
 fi
 
 case "${SOURCE_VERSION}" in
@@ -55,8 +62,6 @@ esac
 cat > fppversion.c.new <<EOF
 #include <stdio.h>
 
-#include "log.h"
-
 const char *getFPPVersion(void) {
 	return "${SOURCE_VERSION}";
 }
@@ -67,6 +72,10 @@ const char *getFPPMajorVersion(void) {
 
 const char *getFPPMinorVersion(void) {
 	return "${MINOR_VERSION}";
+}
+
+const char *getFPPVersionTriplet(void) {
+    return "${TRIPLET_VERSION}";
 }
 
 const char *getFPPBranch(void) {
@@ -110,6 +119,14 @@ function getFPPMinorVersion() {
 	return "${MINOR_VERSION}";
 }
 
+function getFPPPatchVersion() {
+	return "${PATCH_VERSION}";
+}
+
+function getFPPVersionTriplet() {
+    return "${TRIPLET_VERSION}";
+}
+
 function getFPPBranch() {
 	return "${BRANCH}";
 }
@@ -137,6 +154,14 @@ function getFPPMinorVersion() {
 	return "${MINOR_VERSION}";
 }
 
+function getFPPPatchVersion() {
+	return "${PATCH_VERSION}";
+}
+
+function getFPPVersionTriplet() {
+    return "${TRIPLET_VERSION}";
+}
+
 function getFPPBranch() {
 	return "${BRANCH}";
 }
@@ -144,4 +169,18 @@ function getFPPBranch() {
 <?
 }
 ?>
+EOF
+
+cat > ./fppversion_defines.h <<EOF
+#pragma once
+#define FPP_VERSION_DEFINES
+#define FPP_MAJOR_VERSION ${MAJOR_VERSION}
+#define FPP_MINOR_VERSION ${MINOR_VERSION}
+#define FPP_FULL_VERSION ${MAJOR_VERSION}.${MINOR_VERSION}
+#define FPP_FULL_VERSION_STR "${MAJOR_VERSION}.${MINOR_VERSION}"
+#define FPP_TRIPLET_VERSION ${TRIPLET_VERSION}
+#define FPP_TRIPLET_VERSION_STR "${TRIPLET_VERSION}"
+#define FPP_SOURCE_VERSION_STR "${SOURCE_VERSION}"
+#define FPP_BRANCH ${BRANCH}
+#define FPP_BRANCH_STR "${BRANCH}"
 EOF

@@ -58,24 +58,25 @@
  *   - byte  45      = 0xd2 = (210)
  *   - bytes 46 - 1485 = RGB Data
  */
+#include "fpp-pch.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <netinet/ether.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <unistd.h>
-#include <cmath>
 
-
-#include "common.h"
 #include "Linsn-RV9.h"
-#include "log.h"
+
+
+extern "C" {
+    LinsnRV9Output *createOutputLinsnRV9(unsigned int startChannel,
+                                           unsigned int channelCount) {
+        return new LinsnRV9Output(startChannel, channelCount);
+    }
+}
+
 
 /*
  *
@@ -121,8 +122,6 @@ LinsnRV9Output::LinsnRV9Output(unsigned int startChannel, unsigned int channelCo
 
 	struct FormatCode fc_c2 = { 0xc2, 1024, 512, 1632, 0x1f };
 	m_formatCodes.push_back(fc_c2);
-
-	m_maxChannels = m_formatCodes[m_formatCodes.size()-1].width * m_formatCodes[m_formatCodes.size()-1].height * 3;
 }
 
 /*
@@ -367,15 +366,16 @@ int LinsnRV9Output::Close(void)
 }
 
 
-void LinsnRV9Output::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = m_startChannel + m_channelCount - 1;
+void LinsnRV9Output::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    addRange(m_startChannel, m_startChannel + m_channelCount - 1);
 }
 /*
  *
  */
 void LinsnRV9Output::PrepData(unsigned char *channelData)
 {
+	m_matrix->OverlaySubMatrices(channelData);
+
 	unsigned char *r = NULL;
 	unsigned char *g = NULL;
 	unsigned char *b = NULL;

@@ -23,28 +23,23 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <fstream>
-#include <sstream>
-#include <string>
+#include "fpp-pch.h"
 
-#include <boost/algorithm/string/replace.hpp>
-
-#include "common.h"
-#include "log.h"
 #include "PlaylistEntryBoth.h"
+#include "PlaylistEntryCommand.h"
 #include "PlaylistEntryEffect.h"
 #include "PlaylistEntryEvent.h"
 #include "PlaylistEntryMedia.h"
 #include "PlaylistEntryMQTT.h"
 #include "PlaylistEntryPause.h"
-#include "PlaylistEntryPixelOverlay.h"
 #include "PlaylistEntryRemap.h"
 #include "PlaylistEntryScript.h"
 #include "PlaylistEntrySequence.h"
 #include "PlaylistEntryURL.h"
 #include "PlaylistEntryVolume.h"
 #include "PlaylistEntryDynamic.h"
-#include "settings.h"
+#include "Playlist.h"
+
 
 /*
  *
@@ -79,12 +74,18 @@ int PlaylistEntryDynamic::Init(Json::Value &config)
 	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Init()\n");
 
 	m_subType = config["subType"].asString();
-	m_data = config["data"].asString();
 
 	m_drainQueue = config["drainQueue"].asInt();
 
 	if (config.isMember("pluginHost"))
 		m_pluginHost = config["pluginHost"].asString();
+
+	if (m_subType == "file")
+		m_data = config["dataFile"].asString();
+	else if (m_subType == "plugin")
+		m_data = config["dataPlugin"].asString();
+	else if (m_subType == "url")
+		m_data = config["dataURL"].asString();
 
 	if ((m_subType == "plugin") || (m_subType == "url"))
 	{
@@ -110,10 +111,17 @@ int PlaylistEntryDynamic::Init(Json::Value &config)
 			return 0;
 		}
 
-		curl_easy_setopt(m_curl, CURLOPT_COOKIEFILE, "");
+		status = curl_easy_setopt(m_curl, CURLOPT_COOKIEFILE, "");
 		if (status != CURLE_OK)
 		{
 			LogErr(VB_PLAYLIST, "curl_easy_setopt() Error initializing cookie jar: %s\n", curl_easy_strerror(status));
+			return 0;
+		}
+
+		status = curl_easy_setopt(m_curl, CURLOPT_TIMEOUT, 5L);
+		if (status != CURLE_OK)
+		{
+			LogErr(VB_PLAYLIST, "curl_easy_setopt() Error setting timeout: %s\n", curl_easy_strerror(status));
 			return 0;
 		}
 	}
@@ -182,7 +190,12 @@ int PlaylistEntryDynamic::Process(void)
 		m_playlistEntries[m_currentEntry]->Process();
 		if (m_playlistEntries[m_currentEntry]->IsFinished())
 		{
-			if (m_currentEntry < (m_playlistEntries.size() - 1))
+			if ((playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+				(playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP))
+			{
+				FinishPlay();
+			}
+			else if (m_currentEntry < (m_playlistEntries.size() - 1))
 			{
 				m_currentEntry++;
 				m_playlistEntries[m_currentEntry]->StartPlaying();
@@ -218,7 +231,7 @@ int PlaylistEntryDynamic::Stop(void)
 		return 1;
 	}
 
-	return 0;
+	return PlaylistEntryBase::Stop();
 }
 
 /*
@@ -338,7 +351,6 @@ int PlaylistEntryDynamic::ReadFromURL(std::string url)
 int PlaylistEntryDynamic::ReadFromString(std::string jsonStr)
 {
 	Json::Value root;
-	Json::Reader reader;
 	PlaylistEntryBase *playlistEntry = NULL;
 
 	LogDebug(VB_PLAYLIST, "ReadFromString(): String:\n%s\n", jsonStr.c_str());
@@ -349,8 +361,7 @@ int PlaylistEntryDynamic::ReadFromString(std::string jsonStr)
 		return 0;
 	}
 
-	bool success = reader.parse(jsonStr, root);
-	if (!success)
+	if (!LoadJsonFromString(jsonStr, root))
 	{
 		LogErr(VB_PLAYLIST, "Error parsing JSON: %s\n", jsonStr.c_str());
 		return 0;
@@ -358,18 +369,27 @@ int PlaylistEntryDynamic::ReadFromString(std::string jsonStr)
 
 	ClearPlaylistEntries();
 
-	if (!root.isMember("playlistEntries"))
-	{
+	Json::Value entries;
+	if (root.isMember("mainPlaylist"))
+		entries = root["mainPlaylist"];
+	else if (root.isMember("leadIn"))
+		entries = root["leadIn"];
+	else if (root.isMember("leadOut"))
+		entries = root["leadOut"];
+	else if (root.isMember("playlistEntries"))
+		entries = root["playlistEntries"];
+	else
 		return 0;
-	}
 
-	for (int i = 0; i < root["playlistEntries"].size(); i++)
+	for (int i = 0; i < entries.size(); i++)
 	{
-		Json::Value pe = root["playlistEntries"][i];
+		Json::Value pe = entries[i];
 		playlistEntry = NULL;
 
 		if (pe["type"].asString() == "both")
 			playlistEntry = new PlaylistEntryBoth();
+		else if (pe["type"].asString() == "command")
+			playlistEntry = new PlaylistEntryCommand();
 		else if (pe["type"].asString() == "effect")
 			playlistEntry = new PlaylistEntryEffect();
 		else if (pe["type"].asString() == "event")
@@ -380,8 +400,6 @@ int PlaylistEntryDynamic::ReadFromString(std::string jsonStr)
 			playlistEntry = new PlaylistEntryMQTT();
 		else if (pe["type"].asString() == "pause")
 			playlistEntry = new PlaylistEntryPause();
-		else if (pe["type"].asString() == "pixelOverlay")
-			playlistEntry = new PlaylistEntryPixelOverlay();
 		else if (pe["type"].asString() == "remap")
 			playlistEntry = new PlaylistEntryRemap();
 		else if (pe["type"].asString() == "script")

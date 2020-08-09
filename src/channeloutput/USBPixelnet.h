@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Pixelnet USB handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _USBPIXELNET_H
-#define _USBPIXELNET_H
-
 #include <string>
 
 #include "ThreadedChannelOutputBase.h"
@@ -33,16 +31,16 @@
 class USBPixelnetOutput : public ThreadedChannelOutputBase {
   public:
 	USBPixelnetOutput(unsigned int startChannel, unsigned int channelCount);
-	~USBPixelnetOutput();
+	virtual ~USBPixelnetOutput();
 
-	int Init(char *configStr);
-	int Close(void);
+    virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual int RawSendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	enum DongleType {
@@ -59,5 +57,3 @@ class USBPixelnetOutput : public ThreadedChannelOutputBase {
 	int            m_fd;
 	DongleType     m_dongleType;
 };
-
-#endif /* _USBPIXELNET_H */

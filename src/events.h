@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Events handler for Falcon Player (FPP)
  *
@@ -23,22 +24,34 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-// events.h
-#ifndef EVENTS_H_
-#define EVENTS_H_
+#include <string>
+#include <vector>
+#include <jsoncpp/json/json.h>
 
-typedef struct fppevent {
-	char  majorID;
-	char  minorID;
-	char *name;
-	char *effect;
-	int   startChannel;
-	char *script;
-	char *scriptArgs;
-} FPPevent;
+#define MAX_EVENT_MAJOR 25
+#define MAX_EVENT_MINOR 25
 
+
+class FPPEvent {
+public:
+    FPPEvent(const std::string &id);
+    FPPEvent(uint8_t major, uint8_t minor);
+    const Json::Value &toJsonValue() const { return event; };
+    void save();
+        
+    static std::string getEventFileName(const std::string &id);
+    std::string getEventFileName();
+    
+    int getMajorId();
+    int getMinorId();
+    std::string getName();
+private:
+    void Load(const std::string &id);
+    Json::Value event;
+};
+
+void UpgradeEvents();
 int TriggerEvent(const char major, const char minor);
 int TriggerEventByID(const char *ID);
-FPPevent* LoadEvent(const char *id);
+FPPEvent* LoadEvent(const char *id);
 
-#endif

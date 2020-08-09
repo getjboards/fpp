@@ -23,8 +23,9 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "log.h"
+#include "fpp-pch.h"
 #include "PlaylistEntryBoth.h"
+#include "mediadetails.h"
 
 PlaylistEntryBoth::PlaylistEntryBoth(PlaylistEntryBase *parent)
   : PlaylistEntryBase(parent),
@@ -63,6 +64,9 @@ int PlaylistEntryBoth::Init(Json::Value &config)
     }
     m_mediaName = m_mediaEntry->GetMediaName();
 
+    // the media will drive the timing, not the fseq
+    m_sequenceEntry->disableAdjustTiming();
+    
 	if (!m_sequenceEntry->Init(config))
 		return 0;
 
@@ -76,6 +80,7 @@ int PlaylistEntryBoth::StartPlaying(void)
 {
 	LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::StartPlaying()\n");
 
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
 	if (!CanPlay())
 	{
 		FinishPlay();
@@ -89,18 +94,30 @@ int PlaylistEntryBoth::StartPlaying(void)
     if (!m_mediaEntry) {
         LogDebug(VB_PLAYLIST, "Skipping media playlist entry, likely blacklisted audio: %s\n", m_mediaName.c_str());
     }
-
-	if (!m_sequenceEntry->StartPlaying())
-	{
+    if (!m_sequenceEntry->PreparePlay()) {
+        LogDebug(VB_PLAYLIST, "Problems starting sequence: %s\n", m_sequenceEntry->GetSequenceName().c_str());
+    }
+    if (getFPPmode() == MASTER_MODE && m_mediaEntry && m_mediaEntry->m_openTime) {
+        long long st = GetTimeMS() - m_mediaEntry->m_openTime;
+        if (st < PlaylistEntryMedia::m_openStartDelay) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(PlaylistEntryMedia::m_openStartDelay - st - 2));
+        }
+    }
+    
+	if (!m_sequenceEntry->StartPlaying()) {
+        LogDebug(VB_PLAYLIST, "Could not start sequence: %s\n", m_sequenceEntry->GetSequenceName().c_str());
         if (m_mediaEntry) {
             m_mediaEntry->Stop();
         }
+        FinishPlay();
 		return 0;
 	}
     if (m_mediaEntry && !m_mediaEntry->StartPlaying()) {
+        LogDebug(VB_PLAYLIST, "Could not start media: %s\n", m_mediaName.c_str());
         delete m_mediaEntry;
         m_mediaEntry = nullptr;
         m_sequenceEntry->Stop();
+        FinishPlay();
         return 0;
     }
 
@@ -112,6 +129,9 @@ int PlaylistEntryBoth::StartPlaying(void)
  */
 int PlaylistEntryBoth::Process(void)
 {
+    LogExcess(VB_PLAYLIST, "PlaylistEntryBoth::Process()\n");
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+
 	if (m_mediaEntry) m_mediaEntry->Process();
 	m_sequenceEntry->Process();
 
@@ -138,8 +158,9 @@ int PlaylistEntryBoth::Process(void)
 int PlaylistEntryBoth::Stop(void)
 {
 	LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::Stop()\n");
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
 
-	if (m_mediaEntry) m_mediaEntry->Stop();
+    if (m_mediaEntry) m_mediaEntry->Stop();
 	m_sequenceEntry->Stop();
 
 	return PlaylistEntryBase::Stop();
@@ -150,10 +171,32 @@ int PlaylistEntryBoth::Stop(void)
  */
 void PlaylistEntryBoth::Dump(void)
 {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
 	PlaylistEntryBase::Dump();
 
 	if (m_mediaEntry) m_mediaEntry->Dump();
 	m_sequenceEntry->Dump();
+}
+
+uint64_t PlaylistEntryBoth::GetLengthInMS() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    uint64_t m = m_mediaEntry ? m_mediaEntry->GetLengthInMS() : 0;
+    uint64_t s = m_sequenceEntry ? m_sequenceEntry->GetLengthInMS() : 0;
+    if (m && m < s) {
+        //media drives it, when media completes, we stop
+        return m;
+    }
+    return s;
+}
+uint64_t PlaylistEntryBoth::GetElapsedMS() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry) {
+        return m_mediaEntry->GetElapsedMS();
+    }
+    if (m_sequenceEntry) {
+        return m_sequenceEntry->GetElapsedMS();
+    }
+    return 0;
 }
 
 /*
@@ -161,6 +204,7 @@ void PlaylistEntryBoth::Dump(void)
  */
 Json::Value PlaylistEntryBoth::GetConfig(void)
 {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
 	Json::Value result = PlaylistEntryBase::GetConfig();
 
     if (m_mediaEntry) {
@@ -175,3 +219,48 @@ Json::Value PlaylistEntryBoth::GetConfig(void)
 	return result;
 }
 
+Json::Value PlaylistEntryBoth::GetMqttStatus(void)
+{
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+	Json::Value result = PlaylistEntryBase::GetMqttStatus();
+    if (m_mediaEntry) {
+        uint64_t l = m_mediaEntry->GetLengthInMS();
+        uint64_t e = m_mediaEntry->GetElapsedMS();
+        result["secondsRemaining"] = (int)((l-e) / 1000);
+        result["secondsTotal"] = (int)(l / 1000);
+        result["secondsElapsed"] = (int)(e / 1000);
+		result["mediaName"] = m_mediaEntry->GetMediaName();
+	}
+	if (m_sequenceEntry) {
+        Json::Value se = m_sequenceEntry->GetMqttStatus();
+		result["sequenceName"] = se["sequenceName"];
+       	result["secondsRemaining"] = se["secondsRemaining"];
+       	result["secondsTotal"] = se["secondsTotal"];
+       	result["secondsElapsed"] = se["secondsElapsed"];
+	}
+
+    result["mediaTitle"] = MediaDetails::INSTANCE.title;
+    result["mediaArtist"] = MediaDetails::INSTANCE.artist;
+
+
+	return result;
+}
+
+
+void PlaylistEntryBoth::Pause() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry) m_mediaEntry->Pause();
+    m_sequenceEntry->Pause();
+}
+bool PlaylistEntryBoth::IsPaused() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry) {
+        return m_mediaEntry->IsPaused();
+    }
+    return m_sequenceEntry->IsPaused();
+}
+void PlaylistEntryBoth::Resume() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry) m_mediaEntry->Resume();
+    m_sequenceEntry->Resume();
+}

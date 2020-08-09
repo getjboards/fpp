@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   BeagleBone Black PRU 48-string handler for Falcon Player (FPP)
  *
@@ -23,13 +24,11 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _BBB48STRING_H
-#define _BBB48STRING_H
 
 #include <string>
 #include <vector>
 
-#include "BBBUtils.h"
+#include "util/BBBPruUtils.h"
 #include "ChannelOutputBase.h"
 #include "PixelString.h"
 
@@ -51,16 +50,16 @@ typedef struct {
 class BBB48StringOutput : public ChannelOutputBase {
   public:
     BBB48StringOutput(unsigned int startChannel, unsigned int channelCount);
-    ~BBB48StringOutput();
+    virtual ~BBB48StringOutput();
 
-    int Init(Json::Value config);
-    int Close(void);
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-    int SendData(unsigned char *channelData);
-    void PrepData(unsigned char *channelData);
-    void DumpConfig(void);
+    virtual int SendData(unsigned char *channelData) override;
+    virtual void PrepData(unsigned char *channelData) override;
+    virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
     void StopPRU(bool wait = true);
@@ -83,5 +82,3 @@ class BBB48StringOutput : public ChannelOutputBase {
     BBBPru             *m_pru0;
     BBB48StringData    *m_pru0Data;
 };
-
-#endif /* _BBB48STRING_H */

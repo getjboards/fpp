@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   MediaOutputBase class for Falcon Player (FPP)
  *
@@ -22,9 +23,6 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
-
-#ifndef _MEDIAOUTPUTBASE_H
-#define _MEDIAOUTPUTBASE_H
 
 #include <string>
 #include <vector>
@@ -52,10 +50,10 @@ class MediaOutputBase {
 	MediaOutputBase();
 	virtual ~MediaOutputBase();
 
-	virtual int   Start(void);
+	virtual int   Start(int msTime = 0);
 	virtual int   Stop(void);
 	virtual int   Process(void);
-	virtual int   AdjustSpeed(int delta);
+	virtual int   AdjustSpeed(float masterPos);
 	virtual void  SetVolume(int volume);
 	virtual int   Close(void);
 
@@ -66,7 +64,8 @@ class MediaOutputBase {
 	pid_t              m_childPID;
 
   protected:
-
+    bool isChildRunning();
+    
 	unsigned int       m_isPlaying;
 	int                m_childPipe[2];
 	fd_set             m_activeFDSet;
@@ -74,5 +73,3 @@ class MediaOutputBase {
 
 	pthread_mutex_t    m_outputLock;
 };
-
-#endif /* #ifndef _MEDIAOUTPUTBASE_H */

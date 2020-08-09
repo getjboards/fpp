@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Channel Test code for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _CHANNELTESTER_H
-#define _CHANNELTESTER_H
-
 #include <string>
 
 #include <pthread.h>
@@ -36,7 +34,7 @@
 class ChannelTester {
   public:
     ChannelTester();
-	~ChannelTester();
+	virtual ~ChannelTester();
 
 	int  SetupTest(std::string configStr);
 
@@ -45,10 +43,10 @@ class ChannelTester {
 
 	std::string GetConfig(void);
 
+    
+    static ChannelTester INSTANCE;
   private:
 	TestPatternBase *m_testPattern;
 	pthread_mutex_t  m_testLock;
 	std::string      m_configStr;
 };
-
-#endif /* _CHANNELTESTER_H */

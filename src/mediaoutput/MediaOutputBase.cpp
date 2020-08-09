@@ -23,16 +23,13 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <vector>
+#include "fpp-pch.h"
 
 #include <errno.h>
-#include <string.h>
 #include <sys/time.h>
-#include <unistd.h>
+#include <sys/wait.h>
 
 #include "MediaOutputBase.h"
-#include "common.h"
-#include "log.h"
 
 MediaOutputBase::MediaOutputBase(void)
   : m_isPlaying(0),
@@ -58,7 +55,7 @@ MediaOutputBase::~MediaOutputBase()
 /*
  *
  */
-int MediaOutputBase::Start(void)
+int MediaOutputBase::Start(int msTime)
 {
 	return 0;
 }
@@ -105,19 +102,14 @@ int MediaOutputBase::Close(void)
 /*
  *
  */
-int MediaOutputBase::AdjustSpeed(int delta)
-{
-	(void)delta;
-
+int MediaOutputBase::AdjustSpeed(float masterPos) {
 	return 1;
 }
 
 /*
  *
  */
-void MediaOutputBase::SetVolume(int volume)
-{
-	(void)volume;
+void MediaOutputBase::SetVolume(int volume) {
 }
 
 /*
@@ -129,11 +121,24 @@ int MediaOutputBase::IsPlaying(void)
 
 	pthread_mutex_lock(&m_outputLock);
 
-	if (m_childPID > 0)
-		result = 1;
+    if (m_childPID > 0) {
+        result = 1;
+    }
 
 	pthread_mutex_unlock(&m_outputLock);
 
 	return result;
+}
+
+bool MediaOutputBase::isChildRunning() {
+    if (m_childPID > 0) {
+        int status = 0;
+        if (waitpid(m_childPID, &status, WNOHANG)) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 

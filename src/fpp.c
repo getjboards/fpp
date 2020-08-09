@@ -22,22 +22,16 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
 #include "fpp.h"
 #include "fppversion.h"
-#include "log.h"
 #include "command.h"
 
-#include <errno.h>
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 
 int socket_fd;
 struct sockaddr_un server_address;
@@ -55,6 +49,7 @@ socklen_t address_length;
 
 int main (int argc, char *argv[])
 {
+  memset(command, 0, sizeof(command));
   SetupDomainSocket();
   if(argc>1)
   {
@@ -93,6 +88,12 @@ int main (int argc, char *argv[])
       sprintf(command,"StopGracefully");
       SendCommand(command);
     }
+    // Stop gracefully After Loop - example "fpp -L"
+    else if(strncmp(argv[1],"-L",2) == 0)
+    {
+      sprintf(command,"StopGracefullyAfterLoop");
+      SendCommand(command);
+    }
     // Stop now - example "fpp -d"
     else if(strncmp(argv[1],"-d",2) == 0)
     {
@@ -103,6 +104,12 @@ int main (int argc, char *argv[])
     else if(strncmp(argv[1],"-q",2) == 0)
     {
       sprintf(command,"q");
+      SendCommand(command);
+    }
+    // Restart fppd daemon
+    else if(strncmp(argv[1],"-r",2) == 0)
+    {
+      sprintf(command,"restart");
       SendCommand(command);
     }
     // Reload schedule example "fpp -R"
@@ -153,12 +160,6 @@ int main (int argc, char *argv[])
       sprintf(command,"t,%s,",argv[2]);
       SendCommand(command);
     }
-    // Send a raw command to fppd for debugging
-    else if((strncmp(argv[1],"-C",2) == 0) &&  argc > 2)
-    {
-      sprintf(command,"%s,",argv[2]);
-      SendCommand(command);
-    }
     else if(strncmp(argv[1],"-h",2) == 0)
     {
       Usage(argv[0]);
@@ -185,20 +186,32 @@ int main (int argc, char *argv[])
       SendCommand(command);
     }
     // Configure the given GPIO to the given mode
-    else if((strncmp(argv[1],"-G",2) == 0) &&  argc > 2)
-    {
-      sprintf(command,"SetupExtGPIO,%s,%s,",argv[2],argv[3]);
-      SendCommand(command);
-    }
+    else if((strncmp(argv[1],"-G",2) == 0) &&  argc == 3) {
+        sprintf(command,"SetupExtGPIO,%s,",argv[2]);
+        SendCommand(command);
+    } else if((strncmp(argv[1],"-G",2) == 0) &&  argc == 4) {
+        sprintf(command,"SetupExtGPIO,%s,%s,",argv[2],argv[3]);
+        SendCommand(command);
     // Set the given GPIO to the given value
-    else if((strncmp(argv[1],"-g",2) == 0) &&  argc > 2)
-    {
-      sprintf(command,"ExtGPIO,%s,%s,%s",argv[2],argv[3],argv[4]);
-      SendCommand(command);
-    }
-    else
-    {
-      Usage(argv[0]);
+    } else if((strncmp(argv[1],"-g",2) == 0) &&  argc == 3) {
+        sprintf(command,"ExtGPIO,%s",argv[2]);
+        SendCommand(command);
+    } else if((strncmp(argv[1],"-g",2) == 0) &&  argc == 5) {
+        sprintf(command,"ExtGPIO,%s,%s,%s",argv[2],argv[3],argv[4]);
+        SendCommand(command);
+    } else if((strncmp(argv[1],"-C",2) == 0)) {
+        Json::Value val;
+        val["command"] = argv[2];
+        for (int x = 3; x < argc; x++) {
+            val["args"].append(argv[x]);
+        }
+        std::string js = SaveJsonToString(val);
+        std::string resp;
+        urlPost("http://localhost/api/command", js, resp);
+        printf("Result: %s\n", resp.c_str());
+        return 0;
+    } else {
+        Usage(argv[0]);
     }
   }
   else
@@ -220,7 +233,9 @@ void SetupDomainSocket(void)
   return;
  }
 
- mkdir(FPP_SOCKET_PATH, 0777);
+    mkdir(FPP_SOCKET_PATH, 0777);
+    chmod(FPP_SOCKET_PATH, 0777);
+
  memset(&client_address, 0, sizeof(struct sockaddr_un));
  client_address.sun_family = AF_UNIX;
  strcpy(client_address.sun_path, FPP_CLIENT_SOCKET);
@@ -245,6 +260,7 @@ void SetupDomainSocket(void)
  */
 void SendCommand(const char * com)
 {
+    printf("Sending command %s\n", com);
  int max_timeout = 4000;
  int i=0;
  bytes_sent = sendto(socket_fd, com, strlen(com), 0,
@@ -304,19 +320,22 @@ void Usage(char *appname)
 "                                 step     - single-step a paused sequence\n"
 "                                 stepback - step a paused sequence backwards\n"
 "  -S                           - Stop Playlist gracefully\n"
+"  -L                           - Stop Playlist gracefully after current loop\n"
 "  -d                           - Stop Playlist immediately\n"
 "  -q                           - Shutdown fppd daemon\n"
+"  -r                           - Restart fppd daemon\n"
 "  -R                           - Reload schedule config file\n"
 "  -e EFFECTNAME[,CH[,LOOP]]    - Start Effect EFFECTNAME with optional\n"
 "                                 start channel set to CH and optional\n"
 "                                 looping if LOOP is set to 1\n"
 "  -E EFFECTNAME                - Stop Effect EFFECTNAME\n"
 "  -t EVENTNAME                 - Trigger Event EVENTNAME\n"
-"  -G GPIO,MODE                 - Configure the given GPIO to MODE. MODEs include:\n"
+"  -G GPIO MODE                 - Configure the given GPIO to MODE. MODEs include:\n"
 "                                 Input    - Set to Input. For PiFace inputs this only enables the pull-up\n"
 "                                 Output   - Set to Output. (This is not needed for PiFace outputs)\n"
 "                                 SoftPWM  - Set to Software PWM.\n"
-"  -g GPIO,MODE,VALUE           - Set the given GPIO to VALUE applicable to the given MODEs defined above\n"
+"  -g GPIO MODE VALUE           - Set the given GPIO to VALUE applicable to the given MODEs defined above\n"
 "                                 VALUE is ignored for Input mode\n"
+"  -C FPPCOMMAND ARG1 ARG2 ...  - Trigger the FPP Command\n"
 "\n", appname);
 }

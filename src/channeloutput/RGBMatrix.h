@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   librgbmatrix handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _RGBMATRIX_H
-#define _RGBMATRIX_H
-
 #include <string>
 
 #include "Matrix.h"
@@ -43,18 +41,18 @@ using rgb_matrix::FrameCanvas;
 class RGBMatrixOutput : public ChannelOutputBase {
   public:
 	RGBMatrixOutput(unsigned int startChannel, unsigned int channelCount);
-	~RGBMatrixOutput();
+	virtual ~RGBMatrixOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	void PrepData(unsigned char *channelData);
+	virtual void PrepData(unsigned char *channelData) override;
 
-	int SendData(unsigned char *channelData);
+	virtual int SendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	GPIO        *m_gpio;
@@ -78,5 +76,3 @@ class RGBMatrixOutput : public ChannelOutputBase {
     
     uint8_t      m_gammaCurve[256];
 };
-
-#endif /* _RGBMATRIX_H */

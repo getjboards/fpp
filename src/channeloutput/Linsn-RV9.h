@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Linsn RV9 Channel Output driver for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _LINSNRV9_H
-#define _LINSNRV9_H
-
 #include <arpa/inet.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
@@ -44,17 +42,17 @@
 class LinsnRV9Output : public ChannelOutputBase {
   public:
 	LinsnRV9Output(unsigned int startChannel, unsigned int channelCount);
-	~LinsnRV9Output();
+	virtual ~LinsnRV9Output();
 
-	int  Init(Json::Value config);
-	int  Close(void);
+	virtual int  Init(Json::Value config) override;
+	virtual int  Close(void) override;
 
-	void PrepData(unsigned char *channelData);
-	int  SendData(unsigned char *channelData);
+	virtual void PrepData(unsigned char *channelData) override;
+	virtual int  SendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	void HandShake(void);
@@ -111,5 +109,3 @@ class LinsnRV9Output : public ChannelOutputBase {
 	unsigned char m_srcMAC[6];
 	unsigned char m_dstMAC[6];
 };
-
-#endif

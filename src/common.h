@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Common functions for Falcon Player (FPP)
  *
@@ -23,15 +24,11 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
  
-#ifndef _COMMON_H
-#define _COMMON_H
-
 #include <stdint.h>
 
 #include <vector>
 #include <string>
 
-#include <jsoncpp/json/json.h>
 
 /////////////////////////////////////////////////////////////////////////////
 // printf macros for printing bitmaps
@@ -66,9 +63,11 @@
 
 
 long long GetTime(void);
+long long GetTimeMS(void);
 int       DirectoryExists(const char * Directory);
 int       FileExists(const char * File);
 int       FileExists(const std::string &File);
+int       Touch(const std::string &File);
 void      HexDump(const char *title, const void *data, int len);
 int       GetInterfaceAddress(const char *interface, char *addr, char *mask, char *gw);
 char     *FindInterfaceForIP(char *ip);
@@ -79,14 +78,55 @@ int       GetCurrentDateInt(int daysOffset = 0);
 int       CurrentDateInRange(int startDate, int endDate);
 void      CloseOpenFiles(void);
 
+std::string GetFileContents(const std::string &filename);
+void TrimWhiteSpace(std::string &s);
+
 uint8_t   ReverseBitsInByte(uint8_t n);
 
-void      MergeJsonValues(Json::Value &a, Json::Value &b);
+bool SetFilePerms(const std::string &filename);
+bool SetFilePerms(const char *file);
 
-Json::Value JSONStringToObject(const std::string &str);
+#ifndef PLATFORM_OSX
+#include <jsoncpp/json/json.h>
+void      MergeJsonValues(Json::Value &a, Json::Value &b);
+Json::Value LoadJsonFromFile(const std::string &filename);
+Json::Value LoadJsonFromString(const std::string &str);
+bool LoadJsonFromString(const std::string &str, Json::Value &root);
+bool LoadJsonFromFile(const std::string &filename, Json::Value &root);
+bool LoadJsonFromFile(const char *filename, Json::Value &root);
+std::string SaveJsonToString(const Json::Value &root, const std::string &indentation = "");
+bool SaveJsonToString(const Json::Value &root, std::string &str, const std::string &indentation);
+bool SaveJsonToFile(const Json::Value &root, const std::string &filename, const std::string &indentation = "\t");
+bool SaveJsonToFile(const Json::Value &root, const char *filename, const char *indentation = "\t");
+#endif
 
 std::string tail(std::string const& source, size_t const length);
 std::vector<std::string> &split(const std::string &s, char delim, std::vector<std::string> &elems);
 std::vector<std::string> split(const std::string &s, char delim);
 
-#endif
+// splits the string on , but also honors any double/single quotes so commas within strings are preserved
+std::vector<std::string> splitWithQuotes(const std::string &s, char delim = ',');
+
+bool startsWith(const std::string &str, const std::string &prefix);
+bool endsWith(const std::string& str, const std::string& suffix);
+bool contains(const std::string &str, const std::string &v);
+void replaceAll(std::string& str, const std::string& from, const std::string& to);
+bool replaceStart(std::string& str, const std::string& from, const std::string& to = "");
+bool replaceEnd(std::string& str, const std::string& from, const std::string& to = "");
+void toUpper(std::string& str);
+void toLower(std::string& str);
+std::string toUpperCopy(const std::string& str);
+std::string toLowerCopy(const std::string& str);
+
+std::string getSimpleHTMLTTag(const std::string &html, const std::string &searchStr, const std::string &skipStr, const std::string &endStr);
+std::string getSimpleXMLTag(const std::string &xml, const std::string &tag);
+
+// URL Helpers
+bool urlHelper(const std::string method, const std::string &url, const std::string &data, std::string &resp, const unsigned int timeout = 30);
+bool urlHelper(const std::string method, const std::string &url, std::string &resp, const unsigned int timeout = 30);
+bool urlGet(const std::string url, std::string &resp);
+bool urlPost(const std::string url, const std::string data, std::string &resp);
+bool urlPut(const std::string url, const std::string data, std::string &resp);
+bool urlDelete(const std::string url, const std::string data, std::string &resp);
+bool urlDelete(const std::string url, std::string &resp);
+

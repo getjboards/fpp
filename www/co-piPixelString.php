@@ -8,6 +8,9 @@ function MapPixelStringSubType(type) {
 function MapPixelStringSubTypeVersion(version) {
     return 1;
 }
+function GetPixelStringTiming() {
+    return 0;
+}
 </script>
 
 <?
@@ -76,11 +79,19 @@ function addPixelOutput()
 		protocol = 'apa102';
 		protocols = 'apa102,lpd6803,lpd8806';
 	}
+	else if (type == 'X11PixelStrings')
+	{
+		portCount = 32;
+		protocol = 'X11';
+		protocols = 'X11';
+	}
 
 	str += '<b>' + type + ' Output</b><br>';
 	str += "Output Enabled: <input type='checkbox' id='" + type + "_Output_0_enable' checked><br>";
 
-	str += "<table id='" + type + "_Output_0' type='" + type + "' ports='" + portCount + "' class='outputTable'>";
+    str += "<div class='fppTableWrapper'>" +
+        "<div class='fppTableContents'>";
+	str += "<table id='" + type + "_Output_0' type='" + type + "' ports='" + portCount + "'>";
 	str += pixelOutputTableHeader();
 	str += "<tbody>";
 
@@ -93,6 +104,8 @@ function addPixelOutput()
 
 	str += "</tbody>";
 	str += "</table>";
+    str += "</div>";
+    str += "</div>";
 
 	$('#pixelOutputs').append(str);
 
@@ -139,6 +152,11 @@ function populatePixelStringOutputs(data)
                 if (protocol == '')
                     protocol = 'ws2801';
             }
+            else if (type == 'X11PixelStrings')
+            {
+                protocol = 'X11';
+                protocols = 'X11';
+            }
 
             str += "Output Enabled: <input type='checkbox' id='" + type + "_Output_0_enable'";
 
@@ -148,7 +166,9 @@ function populatePixelStringOutputs(data)
             str += "><br>";
 
             str += '<b>' + type + ' Output</b><br>';
-            str += "<table id='" + type + "_Output_0' type='" + type + "' ports='" + output.outputCount + "' class='outputTable'>";
+            str += "<div class='fppTableWrapper'>" +
+                "<div class='fppTableContents'>";
+            str += "<table id='" + type + "_Output_0' type='" + type + "' ports='" + output.outputCount + "'>";
             str += pixelOutputTableHeader();
             str += "<tbody>";
 
@@ -179,6 +199,8 @@ function populatePixelStringOutputs(data)
 
             str += "</tbody>";
             str += "</table>";
+            str += "</div>";
+            str += "</div>";
 
             $('#pixelOutputs').append(str);
 
@@ -206,7 +228,7 @@ function savePixelStringOutputs() {
 
 	$.post("fppjson.php", postData).done(function(data) {
 		$.jGrowl("Pixel String Output Configuration Saved");
-		SetRestartFlag();
+		SetRestartFlag(1);
 	}).fail(function() {
 		DialogError("Save Pixel String Outputs", "Save Failed");
 	});
@@ -222,11 +244,19 @@ $(document).ready(function() {
 	<div id='divPixelStrings'>
 		<b>New Type:</b>
 		<select id='pixelOutputType'>
+<?
+if ($settings['Platform'] == "Raspberry Pi") {
+?>
 			<option value='RPIWS281X'>RPIWS281X</option>
 			<option value='spixels'>spixels</option>
 <!--
 			<option value='SPI-WS2801'>SPI-WS2801</option>
 -->
+<? } else { ?>
+			<option value='X11PixelStrings'>X11 Pixel Strings</option>
+<?
+}
+?>
 		</select>
 
 		<input type='button' onClick='addPixelOutput();' value='Add Output'>

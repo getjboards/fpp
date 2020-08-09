@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   RemapOutputProcessor class for Falcon Player (FPP)
  *
@@ -15,9 +16,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _COLORORDEROUTPUTPROCESSOR_H
-#define _COLORORDEROUTPUTPROCESSOR_H
-
 #include "OutputProcessor.h"
 
 class ColorOrderOutputProcessor : public OutputProcessor {
@@ -25,13 +23,12 @@ public:
     ColorOrderOutputProcessor(const Json::Value &config);
     virtual ~ColorOrderOutputProcessor();
     
-    virtual void ProcessData(unsigned char *channelData) const;
+    virtual void ProcessData(unsigned char *channelData) const override;
     
-    virtual OutputProcessorType getType() const { return COLORORDER; }
+    virtual OutputProcessorType getType() const override { return COLORORDER; }
 
-    virtual void GetRequiredChannelRange(int &min, int &max) {
-        min = start;
-        max = start + (count * 3) - 1;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override {
+        addRange(start, start + (count * 3) - 1);
     }
 
 protected:
@@ -39,5 +36,3 @@ protected:
     int count;
     int order;
 };
-
-#endif

@@ -22,43 +22,32 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
 #include "falcon.h"
 #include "fpp.h"
 #include "fppd.h"
-#include "log.h"
 #include "command.h"
 #include "Scheduler.h"
 #include "e131bridge.h"
-#include "mediaoutput.h"
-#include "settings.h"
-#include "Sequence.h"
+#include "mediaoutput/mediaoutput.h"
 #include "effects.h"
 #include "playlist/Playlist.h"
 #include "Plugins.h"
-#include "FPD.h"
 #include "events.h"
-#include "channeloutput.h"
-#include "E131.h"
+#include "channeloutput/FPD.h"
+#include "channeloutput/channeloutput.h"
+#include "channeloutput/E131.h"
 #include "gpio.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 #include <signal.h>
 #include <sys/select.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 
-#include <jsoncpp/json/json.h>
 
-extern PluginCallbackManager pluginCallbackManager;
-
- int socket_fd;
+ int socket_fd = -1;
  struct sockaddr_un server_address;
  int integer_buffer;
  int fppdStartTime = 0;
@@ -67,11 +56,15 @@ extern PluginCallbackManager pluginCallbackManager;
 static void exit_handler(int signum)
 {
     LogInfo(VB_GENERAL, "Caught signal %d\n",signum);
-    CloseCommand();
+    char buf[256] = {0};
     if(mediaOutputStatus.status == MEDIAOUTPUTSTATUS_PLAYING) {
         CloseMediaOutput();
     }
-    exit(signum);
+    ShutdownFPPD();
+    sleep(1);
+
+    
+    CloseCommand();
 }
 
  int Command_Initialize()
@@ -88,6 +81,7 @@ static void exit_handler(int signum)
      }
 
      mkdir(FPP_SOCKET_PATH, 0777);
+     chmod(FPP_SOCKET_PATH, 0777);
      
      fcntl(socket_fd, F_SETFL, O_NONBLOCK);
      memset(&server_address, 0, sizeof(server_address));
@@ -113,8 +107,11 @@ static void exit_handler(int signum)
 
  void CloseCommand()
  {
-     close(socket_fd);
-     unlink(FPP_SERVER_SOCKET);
+     if (socket_fd >= 0) {
+         close(socket_fd);
+         unlink(FPP_SERVER_SOCKET);
+         socket_fd = -1;
+     }
  }
 
 
@@ -136,7 +133,7 @@ char *ProcessCommand(char *command, char *response)
     if (!strcmp(CommandStr, "s")) {
         scheduler->GetNextScheduleStartText(NextScheduleStartText);
         scheduler->GetNextPlaylistText(NextPlaylist);
-        if(FPPstatus==FPP_STATUS_IDLE) {
+        if (playlist->getPlaylistStatus() == FPP_STATUS_IDLE) {
             if (getFPPmode() == REMOTE_MODE) {
                 int secsElapsed = 0;
                 int secsRemaining = 0;
@@ -144,9 +141,9 @@ char *ProcessCommand(char *command, char *response)
                 char mediaFilename[1024];
 
                 if (sequence->IsSequenceRunning()) {
-                    strcpy(seqFilename, sequence->m_seqFilename);
-                    secsElapsed = sequence->m_seqSecondsElapsed;
-                    secsRemaining = sequence->m_seqSecondsRemaining;
+                    strcpy(seqFilename, sequence->m_seqFilename.c_str());
+                    secsElapsed = sequence->m_seqMSElapsed / 1000;
+                    secsRemaining = sequence->m_seqMSRemaining / 100;
                 } else {
                     strcpy(seqFilename, "");
                 }
@@ -167,9 +164,9 @@ char *ProcessCommand(char *command, char *response)
                         getFPPmode(),
                         1,
                         getVolume(),
-                        sequence->m_seqFilename,
-                        sequence->m_seqSecondsElapsed,
-                        sequence->m_seqSecondsRemaining,
+                        sequence->m_seqFilename.c_str(),
+                        sequence->m_seqMSElapsed / 1000,
+                        sequence->m_seqMSRemaining / 1000,
                         NextPlaylist,
                         NextScheduleStartText);
             } else {
@@ -185,7 +182,7 @@ char *ProcessCommand(char *command, char *response)
                 //printf(" %s\n", pl.toStyledString().c_str());
                 sprintf(response,"%d,%d,%d,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%d\n",
                     getFPPmode(),
-                    FPPstatus,
+                    playlist->getPlaylistStatus(),
                     getVolume(),
                     pl["name"].asString().c_str(),
                     pl["currentEntry"]["type"].asString().c_str(),
@@ -193,7 +190,6 @@ char *ProcessCommand(char *command, char *response)
                     pl["currentEntry"]["type"].asString() == "both"
                         ? pl["currentEntry"]["media"]["mediaFilename"].asString().c_str()
                         : pl["currentEntry"]["mediaFilename"].asString().c_str() ,
-//							pl["currentEntry"]["entryID"].asInt() + 1,
                     playlist->GetPosition(),
                     pl["size"].asInt(),
                     pl["currentEntry"]["type"].asString() == "both"
@@ -208,30 +204,28 @@ char *ProcessCommand(char *command, char *response)
             } else if (pl["currentEntry"]["type"] == "sequence") {
                 sprintf(response,"%d,%d,%d,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%d\n",
                     getFPPmode(),
-                    FPPstatus,
+                    playlist->getPlaylistStatus(),
                     getVolume(),
                     pl["name"].asString().c_str(),
                     pl["currentEntry"]["type"].asString().c_str(),
                     pl["currentEntry"]["sequenceName"].asString().c_str(),
                     "",
-//							pl["currentEntry"]["entryID"].asInt() + 1,
                     playlist->GetPosition(),
                     pl["size"].asInt(),
-                    sequence->m_seqSecondsElapsed,
-                    sequence->m_seqSecondsRemaining,
+                    sequence->m_seqMSElapsed /1000,
+                    sequence->m_seqMSRemaining / 1000,
                     NextPlaylist,
                     NextScheduleStartText,
                     pl["repeat"].asInt());
             } else {
                 sprintf(response,"%d,%d,%d,%s,%s,%s,%s,%d,%d,%d,%d,%s,%s,%d\n",
                     getFPPmode(),
-                    FPPstatus,
+                    playlist->getPlaylistStatus(),
                     getVolume(),
                     pl["name"].asString().c_str(),
                     pl["currentEntry"]["type"].asString().c_str(),
                     "",
                     "",
-//							pl["currentEntry"]["entryID"].asInt() + 1,
                     playlist->GetPosition(),
                     pl["size"].asInt(),
                     pl["currentEntry"]["type"].asString() == "pause" ? pl["currentEntry"]["duration"].asInt() - pl["currentEntry"]["remaining"].asInt() : 0,
@@ -260,8 +254,8 @@ char *ProcessCommand(char *command, char *response)
                 // to stop the playlist
                 scheduler->CheckIfShouldBePlayingNow(1);
                 sprintf(response,"%d,%d,Playlist Started,,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS);
-            } else if (playlist->Play(s, entry, repeat, 0)) {
-                FPPstatus = FPP_STATUS_PLAYLIST_PLAYING;
+            }
+            if (playlist->Play(s, entry, repeat, 0)) {
                 sprintf(response,"%d,%d,Playlist Started,,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS);
 		    } else {
                 sprintf(response,"%d,%d,Error Starting Playlist,,,,,,,,,,\n",getFPPmode(),COMMAND_FAILED);
@@ -271,20 +265,33 @@ char *ProcessCommand(char *command, char *response)
         }
     } else if ((!strcmp(CommandStr, "S")) ||
                (!strcmp(CommandStr, "StopGracefully"))) {
-        if (FPPstatus==FPP_STATUS_PLAYLIST_PLAYING) {
+        if ((playlist->getPlaylistStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+            (playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
             playlist->StopGracefully(1);
             scheduler->ReLoadCurrentScheduleInfo();
             sprintf(response,"%d,%d,Playlist Stopping Gracefully,,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS);
         } else {
             sprintf(response,"%d,Not playing,,,,,,,,,,,\n",COMMAND_FAILED);
         }
+    } else if ((!strcmp(CommandStr, "L")) ||
+               (!strcmp(CommandStr, "StopGracefullyAfterLoop"))) {
+        if ((playlist->getPlaylistStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+            (playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY)) {
+            playlist->StopGracefully(1,1);
+            scheduler->ReLoadCurrentScheduleInfo();
+            sprintf(response,"%d,%d,Playlist Stopping Gracefully After Loop,,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS);
+        } else {
+            sprintf(response,"%d,Not playing,,,,,,,,,,,\n",COMMAND_FAILED);
+        }
     } else if ((!strcmp(CommandStr, "d")) ||
                (!strcmp(CommandStr, "StopNow"))) {
-        if (FPPstatus==FPP_STATUS_PLAYLIST_PLAYING || FPPstatus==FPP_STATUS_STOPPING_GRACEFULLY) {
+        if ((playlist->getPlaylistStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+			(playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+			(playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
             playlist->StopNow(1);
             scheduler->ReLoadCurrentScheduleInfo();
             sprintf(response,"%d,%d,Playlist Stopping Now,,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS);
-        } else if ((FPPstatus == FPP_STATUS_IDLE) &&
+        } else if ((playlist->getPlaylistStatus() == FPP_STATUS_IDLE) &&
                    (sequence->IsSequenceRunning())) {
             sequence->CloseSequenceFile();
             sprintf(response,"%d,%d,Sequence Stopping Now,,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS);
@@ -292,8 +299,9 @@ char *ProcessCommand(char *command, char *response)
             sprintf(response,"%d,%d,Not playing,,,,,,,,,,\n",getFPPmode(),COMMAND_FAILED);
         }
     } else if (!strcmp(CommandStr, "R")) {
+        scheduler->ReloadScheduleFile();
         scheduler->ReLoadNextScheduleInfo();
-        if (FPPstatus==FPP_STATUS_IDLE) {
+        if (playlist->getPlaylistStatus() == FPP_STATUS_IDLE) {
             scheduler->ReLoadCurrentScheduleInfo();
             scheduler->CheckIfShouldBePlayingNow();
         }
@@ -308,13 +316,18 @@ char *ProcessCommand(char *command, char *response)
         }
     } else if (!strcmp(CommandStr, "q")) {
         // Quit/Shutdown fppd
-        if ((FPPstatus == FPP_STATUS_PLAYLIST_PLAYING) ||
-            (FPPstatus == FPP_STATUS_STOPPING_GRACEFULLY)) {
+        if ((playlist->getPlaylistStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+            (playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+            (playlist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
             playlist->StopNow(1);
             sleep(2);
         }
 
         ShutdownFPPD();
+
+        sleep(1);
+    } else if (!strcmp(CommandStr, "restart")) {
+        ShutdownFPPD(true);
 
         sleep(1);
     } else if (!strcmp(CommandStr, "e")) {
@@ -333,17 +346,17 @@ char *ProcessCommand(char *command, char *response)
     } else if (!strcmp(CommandStr, "t")) {
         // Trigger an event
         s = strtok(NULL,",");
-        pluginCallbackManager.eventCallback(s, "command");
+        PluginManager::INSTANCE.eventCallback(s, "command");
         i = TriggerEventByID(s);
         if (i >= 0)
             sprintf(response,"%d,%d,Event Triggered,%d,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS,i);
         else
             sprintf(response,"%d,%d,Event Failed,,,,,,,,,,\n",getFPPmode(),COMMAND_FAILED);
     } else if (!strcmp(CommandStr, "GetTestMode")) {
-        strcpy(response, channelTester->GetConfig().c_str());
+        strcpy(response, ChannelTester::INSTANCE.GetConfig().c_str());
         strcat(response, "\n");
     } else if (!strcmp(CommandStr, "SetTestMode")) {
-        if (channelTester->SetupTest(std::string(s + strlen(s) + 1)))
+        if (ChannelTester::INSTANCE.SetupTest(std::string(s + strlen(s) + 1)))
         {
             sprintf(response, "0,%d,Test Mode Activated,,,,,,,,,\n",
                 COMMAND_SUCCESS);
@@ -405,13 +418,14 @@ char *ProcessCommand(char *command, char *response)
     } else if (!strcmp(CommandStr, "GetFPPDUptime")) {
         sprintf(response,"%d,%d,FPPD Uptime,%ld,,,,,,,,,\n",getFPPmode(),COMMAND_SUCCESS, time(NULL) - fppdStartTime);
     } else if (!strcmp(CommandStr, "StartSequence")) {
-        if ((FPPstatus == FPP_STATUS_IDLE) &&
+        if ((playlist->getPlaylistStatus() == FPP_STATUS_IDLE) &&
             (!sequence->IsSequenceRunning())) {
             s = strtok(NULL,",");
             s2 = strtok(NULL,",");
             if (s && s2) {
                 i = atoi(s2);
                 sequence->OpenSequenceFile(s, 0, i);
+                sequence->StartSequence();
             } else {
                 LogDebug(VB_COMMAND, "Invalid command: %s\n", command);
             }
@@ -420,7 +434,7 @@ char *ProcessCommand(char *command, char *response)
                     "sequence is already running\n");
         }
     } else if (!strcmp(CommandStr, "StopSequence")) {
-        if ((FPPstatus == FPP_STATUS_IDLE) &&
+        if ((playlist->getPlaylistStatus() == FPP_STATUS_IDLE) &&
             (sequence->IsSequenceRunning())) {
             sequence->CloseSequenceFile();
         } else {
@@ -429,34 +443,35 @@ char *ProcessCommand(char *command, char *response)
         }
     } else if (!strcmp(CommandStr, "ToggleSequencePause")) {
         if ((sequence->IsSequenceRunning()) &&
-            ((FPPstatus == FPP_STATUS_IDLE) ||
-             ((FPPstatus != FPP_STATUS_IDLE) &&
+            ((playlist->getPlaylistStatus() == FPP_STATUS_IDLE) ||
+             ((playlist->getPlaylistStatus() != FPP_STATUS_IDLE) &&
               (playlist->GetInfo()["currentEntry"]["type"] == "sequence")))) {
             sequence->ToggleSequencePause();
         }
     } else if (!strcmp(CommandStr, "SingleStepSequence")) {
         if ((sequence->IsSequenceRunning()) &&
             (sequence->SequenceIsPaused()) &&
-            ((FPPstatus == FPP_STATUS_IDLE) ||
-             ((FPPstatus != FPP_STATUS_IDLE) &&
+            ((playlist->getPlaylistStatus() == FPP_STATUS_IDLE) ||
+             ((playlist->getPlaylistStatus() != FPP_STATUS_IDLE) &&
               (playlist->GetInfo()["currentEntry"]["type"] == "sequence")))) {
             sequence->SingleStepSequence();
         }
     } else if (!strcmp(CommandStr, "SingleStepSequenceBack")) {
         if ((sequence->IsSequenceRunning()) &&
             (sequence->SequenceIsPaused()) &&
-            ((FPPstatus == FPP_STATUS_IDLE) ||
-             ((FPPstatus != FPP_STATUS_IDLE) &&
+            ((playlist->getPlaylistStatus() == FPP_STATUS_IDLE) ||
+             ((playlist->getPlaylistStatus() != FPP_STATUS_IDLE) &&
               (playlist->GetInfo()["currentEntry"]["type"] == "sequence")))) {
             sequence->SingleStepSequenceBack();
         }
     } else if (!strcmp(CommandStr, "NextPlaylistItem")) {
-        switch (FPPstatus)
+        switch (playlist->getPlaylistStatus())
         {
             case FPP_STATUS_IDLE:
                 sprintf(response,"%d,%d,No playlist running\n",getFPPmode(),COMMAND_FAILED);
                 break;
             case FPP_STATUS_PLAYLIST_PLAYING:
+            case FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP:
                 sprintf(response,"%d,%d,Skipping to next playlist item\n",getFPPmode(),COMMAND_SUCCESS);
                 playlist->NextItem();
                 break;
@@ -465,11 +480,12 @@ char *ProcessCommand(char *command, char *response)
                 break;
         }
     } else if (!strcmp(CommandStr, "PrevPlaylistItem")) {
-        switch (FPPstatus) {
+        switch (playlist->getPlaylistStatus()) {
             case FPP_STATUS_IDLE:
                 sprintf(response,"%d,%d,No playlist running\n",getFPPmode(),COMMAND_FAILED);
                 break;
             case FPP_STATUS_PLAYLIST_PLAYING:
+            case FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP:
                 sprintf(response,"%d,%d,Skipping to previous playlist item\n",getFPPmode(),COMMAND_SUCCESS);
                 playlist->PrevItem();
                 break;

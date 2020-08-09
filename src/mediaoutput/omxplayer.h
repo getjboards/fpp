@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   omxplayer driver for Falcon Player (FPP)
  *
@@ -23,24 +24,21 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _OMXPLAYER_H
-#define _OMXPLAYER_H
-
 #include "MediaOutputBase.h"
 
 class omxplayerOutput : public MediaOutputBase {
   public:
 	omxplayerOutput(std::string mediaFilename, MediaOutputStatus *status);
-	~omxplayerOutput();
+	virtual ~omxplayerOutput();
 
-	virtual int  Start(void);
-	virtual int  Stop(void);
-	virtual int  Process(void);
-    virtual int  IsPlaying(void);
-    virtual int  Close(void);
+	virtual int  Start(int msTime = 0) override;
+	virtual int  Stop(void) override;
+	virtual int  Process(void) override;
+    virtual int  IsPlaying(void) override;
+    virtual int  Close(void) override;
 
-	int  AdjustSpeed(int delta);
-	void SetVolume(int volume);
+	virtual int  AdjustSpeed(float masterPos) override;
+	virtual void SetVolume(int volume) override;
 
   private:
 	int  GetVolumeShift(int volume);
@@ -51,6 +49,7 @@ class omxplayerOutput : public MediaOutputBase {
 	int  m_volumeShift;
     bool m_beforeFirstTick;
     char *m_omxBuffer;
+    
+    int m_speedDelta;
+    int m_speedDeltaCount;
 };
-
-#endif

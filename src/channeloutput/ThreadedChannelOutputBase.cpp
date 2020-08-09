@@ -23,16 +23,10 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <vector>
-
-#include <errno.h>
-#include <string.h>
+#include "fpp-pch.h"
 #include <sys/time.h>
-#include <unistd.h>
 
 #include "ThreadedChannelOutputBase.h"
-#include "common.h"
-#include "log.h"
 
 ThreadedChannelOutputBase::ThreadedChannelOutputBase(unsigned int startChannel,
 	 unsigned int channelCount)
@@ -42,6 +36,7 @@ ThreadedChannelOutputBase::ThreadedChannelOutputBase(unsigned int startChannel,
 	m_dataWaiting(0),
 	m_useDoubleBuffer(0),
 	m_threadID(0),
+    m_maxWait(0),
 	m_inBuf(NULL),
 	m_outBuf(NULL)
 {
@@ -73,14 +68,7 @@ int ThreadedChannelOutputBase::Init(void)
 
 int ThreadedChannelOutputBase::Init(Json::Value config)
 {
-    int i = ChannelOutputBase::Init(config);
-	return i && Init();
-}
-
-int ThreadedChannelOutputBase::Init(char *configStr)
-{
-    int i = ChannelOutputBase::Init(configStr);
-    return i && Init();
+	return ChannelOutputBase::Init(config) && Init();
 }
 
 int ThreadedChannelOutputBase::Close(void)
@@ -113,6 +101,7 @@ int ThreadedChannelOutputBase::SendData(unsigned char *channelData)
     }
     
     pthread_cond_signal(&m_sendCond);
+    return 0;
 }
 
 int ThreadedChannelOutputBase::SendOutputBuffer(void)
@@ -129,6 +118,7 @@ int ThreadedChannelOutputBase::SendOutputBuffer(void)
 	}
 
 	RawSendData(m_outBuf);
+    return m_channelCount;
 }
 
 void ThreadedChannelOutputBase::DumpConfig(void)
@@ -149,6 +139,7 @@ void *RunChannelOutputBaseThread(void *data)
 	ThreadedChannelOutputBase *output = reinterpret_cast<ThreadedChannelOutputBase*>(data);
 
 	output->OutputThread();
+    return nullptr;
 }
 
 int ThreadedChannelOutputBase::StartOutputThread(void)
@@ -226,22 +217,26 @@ void ThreadedChannelOutputBase::OutputThread(void)
 	while (m_runThread) {
 		// Wait for more data
 		pthread_mutex_lock(&m_sendLock);
+        long long nowTime = GetTime();
 		LogExcess(VB_CHANNELOUT, "ThreadedChannelOutputBase thread: sent: %lld, elapsed: %lld\n",
-			GetTime(), GetTime() - wakeTime);
+			nowTime, nowTime - wakeTime);
 
 		if (m_useDoubleBuffer)
 			pthread_mutex_lock(&m_bufLock);
 
-		if (m_dataWaiting) {
+		if (m_dataWaiting || m_maxWait) {
 			if (m_useDoubleBuffer)
 				pthread_mutex_unlock(&m_bufLock);
 
 			gettimeofday(&tv, NULL);
 			ts.tv_sec = tv.tv_sec;
-			ts.tv_nsec = (tv.tv_usec + 200000) * 1000;
+            if (m_maxWait) {
+                ts.tv_nsec = (tv.tv_usec*1000) + (m_maxWait*1000000);
+            } else {
+                ts.tv_nsec = (tv.tv_usec + 200000) * 1000;
+            }
 
-			if (ts.tv_nsec >= 1000000000)
-			{
+			if (ts.tv_nsec >= 1000000000) {
 				ts.tv_sec  += 1;
 				ts.tv_nsec -= 1000000000;
 			}
@@ -254,12 +249,13 @@ void ThreadedChannelOutputBase::OutputThread(void)
 			pthread_cond_wait(&m_sendCond, &m_sendLock);
 		}
 
-		wakeTime = GetTime();
-		LogExcess(VB_CHANNELOUT, "ThreadedChannelOutputBase thread: woke: %lld\n", GetTime());
 		pthread_mutex_unlock(&m_sendLock);
 
 		if (!m_runThread)
 			continue;
+
+        wakeTime = GetTime();
+        LogExcess(VB_CHANNELOUT, "ThreadedChannelOutputBase thread: woke: %lld\n", wakeTime);
 
 		// See if there is any data waiting to process or if we timed out
 		if (m_useDoubleBuffer)
@@ -273,6 +269,7 @@ void ThreadedChannelOutputBase::OutputThread(void)
 		} else {
 			if (m_useDoubleBuffer)
 				pthread_mutex_unlock(&m_bufLock);
+            WaitTimedOut();
 		}
 	}
 

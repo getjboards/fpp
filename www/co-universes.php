@@ -44,10 +44,10 @@ $(document).ready(function() {
 		scroll: true
 	}).disableSelection();
 
-	$('#tblUniverses').on('mousedown', 'tr', function(event,ui){
-		$('#tblUniverses tr').removeClass('selectedEntry');
+	$('#tblUniversesBody').on('mousedown', 'tr', function(event,ui){
+		$('#tblUniversesBody tr').removeClass('selectedEntry');
 		$(this).addClass('selectedEntry');
-		var items = $('#tblUniverses tr');
+		var items = $('#tblUniversesBody tr');
 		UniverseSelected  = items.index(this);
 	});
 
@@ -109,12 +109,17 @@ function PopulateInterfaces()
 
 				<div style="overflow: hidden; padding: 10px;">
 					<b>Enable E1.31 / ArtNet / DDP Output:</b> <input type="checkbox" id="E131Enabled"/><br><br>
-					Source Interface: <select id="selE131interfaces" onChange="SetE131interface();"><? PopulateInterfaces(); ?></select>
+					Source Interface: <select id="selE131interfaces"><? PopulateInterfaces(); ?></select>
+    <span
+    <? if ($uiLevel < 1) { ?>
+        style="display:none;"
+    <? } ?>
+    ><br>Multi-Threaded:&nbsp;<input id="E131ThreadedOutput" type="checkbox" checked /><b>*</b></span>
 					<br><br>
 
 					<div>
 						<form>
-							Universe Count: <input id="txtUniverseCount" class="default-value" type="text" value="Enter Universe Count" size="3" maxlength="3" /><input id="btnUniverseCount" onclick="SetUniverseCount(0);" type="button"  class="buttons" value="Set" />
+							Outputs Count: <input id="txtUniverseCount" class="default-value" type="text" value="Enter Universe Count" size="3" maxlength="3" /><input id="btnUniverseCount" onclick="SetUniverseCount(0);" type="button"  class="buttons" value="Set" />
 						</form>
 					</div>
 					<form id="frmUniverses">
@@ -129,12 +134,36 @@ function PopulateInterfaces()
 							</tr>
 						</table>
 
-						<table id="tblUniverses" class='channelOutputTable'>
+                        <div class='fppTableWrapper'>
+                            <div class='fppTableContents'>
+						<table id="tblUniverses" class='universeTable fullWidth'>
 							<thead id='tblUniversesHead'>
+                                <tr>
+                                    <th rowspan=2 title='Output Number'>Out<br>put</th>
+                                    <th rowspan=2 title='Output Enabled/Disabled status'>Act<br>ive</th>
+                                    <th rowspan=2 title='User Description'>Description</th>
+                                    <th rowspan=2 title='Output Type'>Output<br>Type</th>
+                                    <th rowspan=2 title='Unicast IP Address'>Unicast<br>Address</th>
+                                    <th colspan=2>FPP Channel</th>
+                                    <th colspan=4>Universe</th>
+                                    <th rowspan=2 title='Monitor controller'>Mon<br>itor</th>
+                                    <th rowspan=2 title='Suppress Duplicate network packets'>De<br>Dup</th>
+                                    <th rowspan=2 title='Test ping controller'>Ping</th>
+                                </tr>
+                                <tr>
+                                    <th title='FPP Start Channel'>Start</th>
+                                    <th title='FPP End Channel'>End</th>
+                                    <th title='Universe Number'>#</th>
+                                    <th title='Universe Count for this controller'>Count</th>
+                                    <th title='Universe size'>Size</th>
+                                    <th title='Universe Priority'>Priority</th>
+                                </tr>
 							</thead>
 							<tbody id='tblUniversesBody'>
 							</tbody>
 						</table>
+                            </div>
+                        </div>
 						<span style="font-size:12px; font-family:Arial; margin-left:15px;">(Drag entry to reposition) </span>
 					</form>
 				</div>

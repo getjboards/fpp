@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   ChannelOutputBase class for Falcon Player (FPP)
  *
@@ -23,16 +24,12 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _CHANNELOUTPUTBASE_H
-#define _CHANNELOUTPUTBASE_H
-
 #include <string>
 #include <vector>
+#include <functional>
 
 #include <jsoncpp/json/json.h>
 
-#include "channeloutput.h"
-#include "../Sequence.h"
 
 class ChannelOutputBase {
   public:
@@ -42,27 +39,21 @@ class ChannelOutputBase {
 
 	unsigned int  ChannelCount(void) { return m_channelCount; }
 	unsigned int  StartChannel(void) { return m_startChannel; }
-	int           MaxChannels(void)  { return m_maxChannels; }
 
-	virtual int   Init(Json::Value config);
-	virtual int   Init(char *configStr);
-	virtual int   Close(void);
+    virtual int   Init(Json::Value config);
+    virtual int   Close(void);
     
     virtual void  PrepData(unsigned char *channelData) {}
 	virtual int   SendData(unsigned char *channelData) = 0;
 
 
-    virtual void  GetRequiredChannelRange(int &min, int & max) = 0;
-  private:
-	int   Init(void);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) = 0;
 
   protected:
 	virtual void  DumpConfig(void);
+    virtual void  ConvertToCSV(Json::Value config, char *configStr);
 
 	std::string      m_outputType;
-	unsigned int     m_maxChannels;
 	unsigned int     m_startChannel;
 	unsigned int     m_channelCount;
 };
-
-#endif /* #ifndef _CHANNELOUTPUTBASE_H */

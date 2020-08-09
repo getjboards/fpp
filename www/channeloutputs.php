@@ -5,6 +5,7 @@
 require_once("common.php");
 require_once('config.php');
 require_once('universeentry.php');
+require_once('fppdefines.php');
 include 'common/menuHead.inc';
 
 //$settings['Platform'] = "Raspberry Pi"; // Uncomment for testing
@@ -22,8 +23,12 @@ if (isSet($settings['cape-info'])) {
 }
 if (!isset($currentCapeInfo['provides'])) {
     $currentCapeInfo['provides'][] = "all";
-} else if ($settings["showAllOptions"] == 1) {
+    if (isset($settings['FalconHardwareDetected']) && ($settings['FalconHardwareDetected'] == 1)) {
+        $currentCapeInfo['provides'][] = "fpd";
+    }
+} else if (isset($settings["showAllOptions"]) && $settings["showAllOptions"] == 1) {
     $currentCapeInfo['provides'][] = "all";
+    $currentCapeInfo['provides'][] = "fpd";
 }
 ?>
 
@@ -76,8 +81,11 @@ function GetChannelOutputConfig()
 
 	config.channelOutputs = [];
 
-	config.channelOutputs.push(GetLEDPanelConfig());
+    var lpc = GetLEDPanelConfig();
+	config.channelOutputs.push(lpc);
 
+    channelOutputs = config;
+    UpdateChannelOutputLookup();
 	var result = JSON.stringify(config);
 	return result;
 }
@@ -91,7 +99,7 @@ function SaveChannelOutputsJSON()
 	$.post("fppjson.php", postData
 	).done(function(data) {
 		$.jGrowl(" Channel Output configuration saved");
-		SetRestartFlag();
+		SetRestartFlag(1);
 	}).fail(function() {
 		DialogError("Save Channel Output Config", "Save Failed");
 	});
@@ -125,8 +133,16 @@ $channelOutputsJSON = "";
 if (file_exists($settings['channelOutputsJSON']))
 {
 	$channelOutputsJSON = file_get_contents($settings['channelOutputsJSON']);
+    $channelOutputs = json_decode($channelOutputsJSON, true);
 	$channelOutputsJSON = preg_replace("/\n|\r/", "", $channelOutputsJSON);
 	$channelOutputsJSON = preg_replace("/\"/", "\\\"", $channelOutputsJSON);
+}
+
+// If led panels are enabled, make sure the page is displayed even if the cape is a string cape (could be a colorlight output)
+if ($channelOutputs != null && $channelOutputs['channelOutputs'] != null && $channelOutputs['channelOutputs'][0] != null ) {
+    if ($channelOutputs['channelOutputs'][0]['type'] == "LEDPanelMatrix" && $channelOutputs['channelOutputs'][0]['enabled'] == 1) {
+        $currentCapeInfo["provides"][] = 'panels';
+    }
 }
 
 ?>
@@ -136,8 +152,10 @@ function handleCOKeypress(e)
 	if (e.keyCode == 113) {
 		if (currentTabTitle == "Pi Pixel Strings")
 			setPixelStringsStartChannelOnNextRow();
-        if (currentTabTitle == "BBB Strings")
-            setPixelStringsStartChannelOnNextRow();
+		else if (currentTabTitle == "BBB Strings")
+			setPixelStringsStartChannelOnNextRow();
+		else if (currentTabTitle == "X11 Pixel Strings")
+			setPixelStringsStartChannelOnNextRow();
 	}
 }
 
@@ -176,59 +194,11 @@ $(document).ready(function(){
 		else
 			$tabs.unbind('tabsload');
 	}).tabs('load',currentLoadingTab);
+
+    $(document).tooltip();
 });
 
 </script>
-<!-- FIXME, move this to CSS to standardize the UI -->
-<style>
-.tblheader{
-    background-color:#CCC;
-    text-align:center;
-}
-.tblheader td {
-    border: solid 2px #888888;
-    text-align:center;
-}
-tr.rowUniverseDetails
-{
-    border:thin solid;
-    border-color:#CCC;
-}
-
-tr.rowUniverseDetails td
-{
-    padding:1px 5px;
-}
-
-.channelOutputTable
-{
-    border:thin;
-    border-color:#333;
-    border-collapse: collapse;
-}
-
-#tblUniverses th {
-	vertical-align: bottom;
-	text-align: center;
-	border: solid 2px #888888;
-    font-size: 0.8em;
-}
-
-#tblUniverses td {
-	text-align: center;
-}
-
-#tblUniverses input[type=text] {
-	text-align: center;
-	width: 100%;
-}
-#tblUniverses input[type=number] {
-    text-align: center;
-    width: 100%;
-}
-
-</style>
-
 <title><? echo $pageTitle; ?></title>
 </head>
 <body>
@@ -244,7 +214,7 @@ tr.rowUniverseDetails td
 <?
 	if ($settings['Platform'] == "Raspberry Pi")
 	{
-        if (in_array('all', $currentCapeInfo["provides"]) || in_array('fpd', $currentCapeInfo["provides"])) {
+        if (in_array('fpd', $currentCapeInfo["provides"])) {
             echo "<li><a href='#tab-fpd'>Falcon Pixelnet/DMX</a></li>\n";
         }
         if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
@@ -256,7 +226,13 @@ tr.rowUniverseDetails td
             echo "<li><a href='#tab-BBB48String'>BBB Strings</a></li>\n";
         }
 	}
-    if (in_array('all', $currentCapeInfo["provides"]) || in_array('panels', $currentCapeInfo["provides"])) {
+    if ((file_exists('/usr/include/X11/Xlib.h')) &&
+        ($settings['Platform'] == "Linux")) {
+        echo "<li><a href='#tab-PixelStrings'>X11 Pixel Strings</a></li>\n";
+    }
+    if (in_array('all', $currentCapeInfo["provides"])
+	|| in_array('panels', $currentCapeInfo["provides"])
+	|| !in_array('strings', $currentCapeInfo["provides"])) {
         echo "<li><a href='#tab-LEDPanels'>LED Panels</a></li>\n";
     }
 ?>
@@ -271,7 +247,7 @@ include_once('co-universes.php');
 
 if ($settings['Platform'] == "Raspberry Pi")
 {
-    if (in_array('all', $currentCapeInfo["provides"]) || in_array('fpd', $currentCapeInfo["provides"])) {
+    if (in_array('fpd', $currentCapeInfo["provides"])) {
         include_once('co-fpd.php');
     }
     if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
@@ -279,7 +255,9 @@ if ($settings['Platform'] == "Raspberry Pi")
     }
 }
 
-if (in_array('all', $currentCapeInfo["provides"]) || in_array('panels', $currentCapeInfo["provides"])) {
+if (in_array('all', $currentCapeInfo["provides"]) 
+    || in_array('panels', $currentCapeInfo["provides"])
+    || !in_array('strings', $currentCapeInfo["provides"])) {
     include_once('co-ledPanels.php');
 }
 
@@ -288,6 +266,11 @@ if ($settings['Platform'] == "BeagleBone Black")
     if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
         include_once('co-bbbStrings.php');
     }
+}
+
+if ((file_exists('/usr/include/X11/Xlib.h')) &&
+    ($settings['Platform'] == "Linux")) {
+    include_once('co-piPixelString.php');
 }
 
 include_once("co-other.php");

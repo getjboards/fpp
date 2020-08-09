@@ -22,18 +22,11 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <string>
-#include <mutex>
-#include <array>
-#include <string.h>
 
-#include "common.h"
 #include "effects.h"
-#include "channeloutputthread.h"
-#include "log.h"
-#include "Sequence.h"
-#include "settings.h"
+#include "channeloutput/channeloutputthread.h"
 #include "fseq/FSEQFile.h"
 
 
@@ -45,7 +38,7 @@ public:
     ~FPPeffect() { if (fp) delete fp; }
     
     std::string name;
-    V2FSEQFile *fp;
+    FSEQFile *fp;
     int       loop;
     int       background;
     uint32_t  currentFrame;
@@ -54,6 +47,7 @@ public:
 static int        effectCount = 0;
 static int        pauseBackgroundEffects = 0;
 static std::array<FPPeffect*, MAX_EFFECTS> effects;
+static std::list<std::pair<uint32_t, uint32_t>> clearRanges;
 static std::mutex effectsLock;
 
 /*
@@ -72,11 +66,11 @@ int InitEffects(void)
 		LogInfo(VB_EFFECT, "Automatically starting background effect "
 			"sequence %s\n", localFilename.c_str());
 
-		StartEffect(localFilename.c_str(), 0, 1);
+		StartEffect(localFilename.c_str(), 0, 1, true);
 	} else if (FileExists(localFilename)) {
 		LogInfo(VB_EFFECT, "Automatically starting background effect sequence "
 			"background.eseq\n");
-		StartEffect("background", 0, 1);
+		StartEffect("background", 0, 1, true);
 	}
 
 	pauseBackgroundEffects = getSettingInt("pauseBackgroundEffects");
@@ -115,52 +109,22 @@ int IsEffectRunning(void)
 	int result = 0;
     std::unique_lock<std::mutex> lock(effectsLock);
 	result = effectCount;
+    if (!clearRanges.empty()) {
+        ++result;
+    }
 	return result;
 }
 
-/*
- * Start a new effect offset at the specified channel number
- */
-int StartEffect(const std::string &effectName, int startChannel, int loop)
-{
-	int   effectID = -1;
-    int   frameTime = 50;
-	LogInfo(VB_EFFECT, "Starting effect %s at channel %d\n", effectName.c_str(), startChannel);
-
+int StartEffect(FSEQFile *fseq, const std::string &effectName, int loop, bool bg) {
     std::unique_lock<std::mutex> lock(effectsLock);
-	if (effectCount >= MAX_EFFECTS) {
-		LogErr(VB_EFFECT, "Unable to start effect %s, maximum number of effects already running\n", effectName.c_str());
-		return effectID;
-	}
-
-    std::string filename = getEffectDirectory();
-    filename += "/";
-    filename += effectName;
-    filename += ".eseq";
-
-    FSEQFile *fseq = FSEQFile::openFSEQFile(filename);
-	if (!fseq) {
-		LogErr(VB_EFFECT, "Unable to open effect: %s\n", filename.c_str());
-		return effectID;
-	}
-    V2FSEQFile *v2fseq = dynamic_cast<V2FSEQFile*>(fseq);
-    if (!v2fseq) {
-        delete fseq;
-        LogErr(VB_EFFECT, "Effect file not a correct eseq file: %s\n", filename.c_str());
-        return effectID;
+    if (effectCount >= MAX_EFFECTS) {
+        LogErr(VB_EFFECT, "Unable to start effect %s, maximum number of effects already running\n", effectName.c_str());
+        return -1;
     }
+    int   effectID = -1;
+    int   frameTime = 50;
 
-	if (v2fseq->m_sparseRanges.size() == 0){
-		LogErr(VB_EFFECT, "eseq file must have at least one model range.");
-        delete fseq;
-		return effectID;
-	}
-
-	if (startChannel != 0) {
-		// This will need to change if/when we support multiple models per file
-        v2fseq->m_sparseRanges[0].first = startChannel - 1;
-	}
-    frameTime = v2fseq->getStepTime();
+    frameTime = fseq->getStepTime();
 	effectID = GetNextEffectID();
 
 	if (effectID < 0) {
@@ -171,21 +135,10 @@ int StartEffect(const std::string &effectName, int startChannel, int loop)
 
 	effects[effectID] = new FPPeffect;
 	effects[effectID]->name = effectName;
-	effects[effectID]->fp = v2fseq;
+	effects[effectID]->fp = fseq;
 	effects[effectID]->loop = loop;
-	effects[effectID]->background = 0;
+	effects[effectID]->background = bg;
 
-	if (effectName == "background") {
-		effects[effectID]->background = 1;
-	} else if ((getFPPmode() == REMOTE_MODE) &&
-			 (effectName.find("background_") == 0)) {
-        std::string localFilename = "background_";
-		localFilename += getSetting("HostName");
-
-        if (localFilename == effectName) {
-			effects[effectID]->background = 1;
-        }
-	}
 	effectCount++;
     int tmpec = effectCount;
     lock.unlock();
@@ -203,6 +156,61 @@ int StartEffect(const std::string &effectName, int startChannel, int loop)
 	return effectID;
 }
 
+int StartFSEQAsEffect(const std::string &fseqName, int loop, bool bg) {
+    LogInfo(VB_EFFECT, "Starting FSEQ %s as effect\n", fseqName.c_str());
+
+
+    std::string filename = getSequenceDirectory();
+    filename += "/";
+    filename += fseqName;
+    filename += ".fseq";
+
+    FSEQFile *fseq = FSEQFile::openFSEQFile(filename);
+    if (!fseq) {
+        LogErr(VB_EFFECT, "Unable to open effect: %s\n", filename.c_str());
+        return -1;
+    }
+    return StartEffect(fseq, fseqName, loop, bg);
+}
+
+/*
+ * Start a new effect offset at the specified channel number
+ */
+int StartEffect(const std::string &effectName, int startChannel, int loop, bool bg)
+{
+    LogInfo(VB_EFFECT, "Starting effect %s at channel %d\n", effectName.c_str(), startChannel);
+
+
+    std::string filename = getEffectDirectory();
+    filename += "/";
+    filename += effectName;
+    filename += ".eseq";
+
+    FSEQFile *fseq = FSEQFile::openFSEQFile(filename);
+    if (!fseq) {
+        LogErr(VB_EFFECT, "Unable to open effect: %s\n", filename.c_str());
+        return -1;
+    }
+    V2FSEQFile *v2fseq = dynamic_cast<V2FSEQFile*>(fseq);
+    if (!v2fseq) {
+        delete fseq;
+        LogErr(VB_EFFECT, "Effect file not a correct eseq file: %s\n", filename.c_str());
+        return -1;
+    }
+
+    if (v2fseq->m_sparseRanges.size() == 0){
+        LogErr(VB_EFFECT, "eseq file must have at least one model range.");
+        delete fseq;
+        return -1;
+    }
+
+    if (startChannel != 0) {
+        // This will need to change if/when we support multiple models per file
+        v2fseq->m_sparseRanges[0].first = startChannel - 1;
+    }
+    return StartEffect(v2fseq, effectName, loop, bg);
+}
+
 /*
  * Helper function to stop an effect, assumes effectsLock is already held
  */
@@ -210,6 +218,21 @@ void StopEffectHelper(int effectID)
 {
 	FPPeffect *e = NULL;
 	e = effects[effectID];
+    
+    if (e->fp) {
+        V2FSEQFile *v2fseq = dynamic_cast<V2FSEQFile*>(e->fp);
+        if (v2fseq && v2fseq->m_sparseRanges.size() != 0) {
+            for (auto &a : v2fseq->m_sparseRanges) {
+                clearRanges.push_back(std::pair<uint32_t, uint32_t>(a.first, a.second));
+            }
+            for (auto &a : v2fseq->m_rangesToRead) {
+                clearRanges.push_back(std::pair<uint32_t, uint32_t>(a.first, a.second));
+            }
+        } else {
+            //not sparse and not eseq, entire range
+            clearRanges.push_back(std::pair<uint32_t, uint32_t>(0, e->fp->getChannelCount()));
+        }
+    }
     delete e;
 	effects[effectID] = NULL;
 	effectCount--;
@@ -230,8 +253,9 @@ int StopEffect(const std::string &effectName)
     lock.unlock();
 
 	if ((!IsEffectRunning()) &&
-		(!sequence->IsSequenceRunning()))
+        (!sequence->IsSequenceRunning())) {
 		sequence->SendBlankingData();
+    }
 
 	return 1;
 }
@@ -254,8 +278,9 @@ int StopEffect(int effectID)
     lock.unlock();
 
 	if ((!IsEffectRunning()) &&
-		(!sequence->IsSequenceRunning()))
+        (!sequence->IsSequenceRunning())) {
 		sequence->SendBlankingData();
+    }
 
 	return 1;
 }
@@ -300,12 +325,16 @@ int OverlayEffect(int effectID, char *channelData)
     }
     e->currentFrame++;
     if (d) {
-        d->readFrame((uint8_t*)channelData);
+        d->readFrame((uint8_t*)channelData, FPPD_MAX_CHANNELS);
         delete d;
         return 1;
-    }
-    else
+    } else {
         StopEffectHelper(effectID);
+        for (auto &rng : clearRanges) {
+            memset(&channelData[rng.first], 0, rng.second);
+        }
+        clearRanges.clear();
+    }
 
     return 0;
 }
@@ -319,6 +348,12 @@ int OverlayEffects(char *channelData)
 	int  dataRead = 0;
 
     std::unique_lock<std::mutex> lock(effectsLock);
+    
+    //for effects that have been stopped, we need to clear the data 
+    for (auto &rng : clearRanges) {
+        memset(&channelData[rng.first], 0, rng.second);
+    }
+    clearRanges.clear();
 
 	if (effectCount == 0) {
 		return 0;

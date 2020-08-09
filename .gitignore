@@ -2,6 +2,8 @@
 .*.swp
 *.pyc
 .buildpath
+*.gch
+*.gch.sum
 build/
 SD/*.xz
 lib/librgbmatrix.so
@@ -9,10 +11,13 @@ src/fpp
 src/fppmm
 src/fppd
 src/fppoled
+src/fppcapedetect
 src/fppversion.c
+src/fppversion_defines.h
 src/fsequtils
 src/util/seqdump
 src/Makefile.local
+src/libfpp*.so
 cscope.out
 tags
 pixelnetDMX
@@ -23,11 +28,13 @@ _notes
 www/.htpasswd
 www/.config.php
 www/fppversion.php
+www/fppdefines.php
 external/rasclock/modules.order
 external/rasclock/Module.symvers
 external/rasclock/rtc-pcf2127a.*
 external/rasclock/.rtc-pcf2127a.*
 external/rasclock/.tmp_versions/*
+external/RF24/librf24-bcm.*
 plugins/
 .idea/
 ._*

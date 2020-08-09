@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   DDP Channel Output driver for Falcon Player (FPP)
  *
@@ -18,9 +19,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _DDPOUTPUT_H
-#define _DDPOUTPUT_H
-
 #include <list>
 #include "UDPOutput.h"
 
@@ -32,14 +30,15 @@
 
 class DDPOutputData : public UDPOutputData {
 public:
-    DDPOutputData(const Json::Value &config);
+    explicit DDPOutputData(const Json::Value &config);
     virtual ~DDPOutputData();
     
-    virtual bool IsPingable() { return true; }
-    virtual void PrepareData(unsigned char *channelData);
-    virtual void CreateMessages(std::vector<struct mmsghdr> &ipMsgs);
-    virtual void DumpConfig();
+    virtual bool IsPingable() override { return true; }
+    virtual void PrepareData(unsigned char *channelData, UDPOutputMessages &msgs) override;
+    virtual void DumpConfig() override;
     
+    virtual const std::string &GetOutputTypeString() const override;
+
     char          sequenceNumber;
     
     sockaddr_in   ddpAddress;
@@ -48,6 +47,3 @@ public:
     struct iovec *ddpIovecs = nullptr;
     unsigned char **ddpBuffers = nullptr;
 };
-
-
-#endif

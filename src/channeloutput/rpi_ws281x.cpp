@@ -22,23 +22,21 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 
-
-#include "common.h"
-#include "log.h"
 #include "rpi_ws281x.h"
-#include "Sequence.h" // for FPPD_MAX_CHANNELS
-#include "settings.h"
 
+
+extern "C" {
+    RPIWS281xOutput *createOutputRPIWS281X(unsigned int startChannel,
+                                           unsigned int channelCount) {
+        return new RPIWS281xOutput(startChannel, channelCount);
+    }
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -70,8 +68,6 @@ RPIWS281xOutput::RPIWS281xOutput(unsigned int startChannel, unsigned int channel
 {
 	LogDebug(VB_CHANNELOUT, "RPIWS281xOutput::RPIWS281xOutput(%u, %u)\n",
 		startChannel, channelCount);
-
-	m_maxChannels = FPPD_MAX_CHANNELS;
 }
 
 /*
@@ -161,20 +157,22 @@ int RPIWS281xOutput::Close(void)
 	return ThreadedChannelOutputBase::Close();
 }
 
-void RPIWS281xOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
-    
+void RPIWS281xOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
     PixelString *ps = NULL;
     for (int s = 0; s < m_strings.size(); s++) {
         ps = m_strings[s];
         int inCh = 0;
+        int min = FPPD_MAX_CHANNELS;
+        int max = 0;
         for (int p = 0; p < ps->m_outputChannels; p++) {
             int ch = ps->m_outputMap[inCh++];
-            if (ch < (FPPD_MAX_CHANNELS - 3)) {
+            if (ch < FPPD_MAX_CHANNELS) {
                 min = std::min(min, ch);
                 max = std::max(max, ch);
             }
+        }
+        if (min < max) {
+            addRange(min, max);
         }
     }
 }

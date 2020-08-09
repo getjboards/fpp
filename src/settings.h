@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Setting manager for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef __SETTINGS_H__
-#define __SETTINGS_H__
-
 #include <stdbool.h>
 #include <map>
 #include <string>
@@ -33,6 +31,7 @@
 #define MAXBUF 1024
 
 typedef enum fppMode {
+	UNKNOWN_MODE = 0x00,
 	BRIDGE_MODE = 0x01,
 	PLAYER_MODE = 0x02,
 	/* Skip 0x04 since MASTER_MODE is a bitmask of player 0x02 & master 0x04 */
@@ -46,6 +45,7 @@ public:
     ~SettingsConfig();
     
     int        daemonize;
+    int        restarted;
     FPPMode    fppMode;
     int        alwaysTransmit;
     char    *binDirectory = nullptr;
@@ -59,13 +59,10 @@ public:
     char    *scriptDirectory = nullptr;
     char    *pluginDirectory = nullptr;
     char    *playlistDirectory = nullptr;
-    char    *universeFile = nullptr;
     char    *pixelnetFile = nullptr;
-    char    *scheduleFile = nullptr;
     char    *logFile = nullptr;
     char    *silenceMusic = nullptr;
     char    *settingsFile = nullptr;
-    char    *bytesFile = nullptr;
     char    *E131interface = nullptr;
     
     unsigned int controlMajor;
@@ -78,22 +75,22 @@ public:
 void initSettings(int argc, char **argv);
 char *trimwhitespace(const char *str, int quotesAlso = 1);
 char *modeToString(int mode);
+const std::string getFPPmodeStr(FPPMode mode = UNKNOWN_MODE);
 void usage(char *appname);
 
 
 // Action functions
-int parseArguments(int argc, char **argv);
 int loadSettings(const char *filename);
 void CreateSettingsFile(char * file);
 void CheckExistanceOfDirectoriesAndFiles(void);
-int saveSettingsFile(void);
 int parseSetting(char *key, char *value);
 
 // Getters
 const char *getSetting(const char *setting);
-int   getSettingInt(const char *setting);
+int   getSettingInt(const char *setting, int defaultVal = 0);
 
 int getDaemonize(void);
+int getRestarted(void);
 FPPMode getFPPmode(void);
 int  getAlwaysTransmit(void);
 char *getBinDirectory(void);
@@ -109,14 +106,10 @@ char *getPluginDirectory(void);
 char *getPlaylistDirectory(void);
 char *getUniverseFile(void);
 char *getPixelnetFile(void);
-char *getScheduleFile(void);
 char *getLogFile(void);
 char *getSilenceMusic(void);
-char *getBytesFile(void);
 char *getSettingsFile(void);
 char *getE131interface(void);
 unsigned int getControlMajor(void);
 unsigned int getControlMinor(void);
 
-
-#endif //__SETTINGS_H__

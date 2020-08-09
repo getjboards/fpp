@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Generic Serial handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _GENERICSERIAL_H
-#define _GENERICSERIAL_H
-
 #include <string>
 
 #include "ThreadedChannelOutputBase.h"
@@ -35,16 +33,15 @@
 class GenericSerialOutput : public ThreadedChannelOutputBase {
   public:
 	GenericSerialOutput(unsigned int startChannel, unsigned int channelCount);
-	~GenericSerialOutput();
+	virtual ~GenericSerialOutput();
 
-	int Init(char *configStr);
+    virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int Close(void);
+	virtual int RawSendData(unsigned char *channelData) override;
 
-	int RawSendData(unsigned char *channelData);
-
-	void DumpConfig(void);
-    virtual void GetRequiredChannelRange(int &min, int & max);
+	virtual void DumpConfig(void) override;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	std::string m_deviceName;
@@ -57,5 +54,3 @@ class GenericSerialOutput : public ThreadedChannelOutputBase {
 	int         m_packetSize;
 	char       *m_data;
 };
-
-#endif /* #ifdef _GENERICSERIAL_H */

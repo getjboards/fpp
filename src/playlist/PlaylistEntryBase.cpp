@@ -23,12 +23,8 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <boost/algorithm/string/replace.hpp>
-
-#include "log.h"
+#include "fpp-pch.h"
 #include "PlaylistEntryBase.h"
-
-int PlaylistEntryBase::m_playlistEntryCount = 0;
 
 /*
  *
@@ -40,12 +36,12 @@ PlaylistEntryBase::PlaylistEntryBase(PlaylistEntryBase *parent)
 	m_isFinished(0),
 	m_playOnce(0),
 	m_playCount(0),
-	m_nextItem(-1),
 	m_isPrepped(0),
+	m_deprecated(0),
 	m_parent(parent)
 {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryBase::PlaylistEntryBase()\n");
 	m_type = "base";
-	m_playlistEntryID = m_playlistEntryCount++;
 }
 
 /*
@@ -82,14 +78,12 @@ int PlaylistEntryBase::Init(Json::Value &config)
  */
 int PlaylistEntryBase::CanPlay(void)
 {
-	if (m_playOnce && (m_playCount > 0))
-	{
+	if (m_playOnce && (m_playCount > 0)) {
 		LogDebug(VB_PLAYLIST, "%s item exceeds play count\n", m_type.c_str());
 		return 0;
 	}
 
-	if (!m_enabled)
-	{
+	if (!m_enabled) {
 		LogDebug(VB_PLAYLIST, "%s item disabled\n", m_type.c_str());
 		return 0;
 	}
@@ -204,13 +198,21 @@ void PlaylistEntryBase::Dump(void)
 {
 	LogDebug(VB_PLAYLIST, "---- Playlist Entry ----\n");
 	LogDebug(VB_PLAYLIST, "Entry Type: %s\n", m_type.c_str());
-	LogDebug(VB_PLAYLIST, "Entry ID  : %d\n", m_playlistEntryID);
 	LogDebug(VB_PLAYLIST, "Entry Note: %s\n", m_note.c_str());
 }
 
 /*
  *
  */
+Json::Value PlaylistEntryBase::GetMqttStatus(void)
+{
+	Json::Value result;
+	result["type"]       = m_type;
+	result["playOnce"]   = m_playOnce;
+
+	return result;
+}
+
 Json::Value PlaylistEntryBase::GetConfig(void)
 {
 	Json::Value result = m_config;
@@ -222,7 +224,7 @@ Json::Value PlaylistEntryBase::GetConfig(void)
 	result["isFinished"] = m_isFinished;
 	result["playOnce"]   = m_playOnce;
 	result["playCount"]  = m_playCount;
-	result["entryID"]    = m_playlistEntryID;
+	result["deprecated"] = m_deprecated;
 
 	return result;
 }
@@ -236,7 +238,7 @@ std::string PlaylistEntryBase::ReplaceMatches(std::string in)
 
 	LogDebug(VB_PLAYLIST, "In: '%s'\n", in.c_str());
 
-	boost::replace_all(out, "%t", m_type);
+	replaceAll(out, "%t", m_type);
 
 	LogDebug(VB_PLAYLIST, "Out: '%s'\n", out.c_str());
 

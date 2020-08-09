@@ -163,10 +163,10 @@ echo ""
 dd if=/opt/backup/uboot/MLO of=${DEVICE} count=1 seek=1 conv=notrunc bs=128k
 dd if=/opt/backup/uboot/u-boot.img of=${DEVICE} count=2 seek=1 conv=notrunc bs=384k
 
-if [ "$1" = "ext4" ]; then
-    prepareEXT4Partitions
-else
+if [ "$1" = "btrfs" ]; then
     prepareBTRFSPartitions
+else
+    prepareEXT4Partitions
 fi
 
 
@@ -175,7 +175,7 @@ echo "Copy files rootfs"
 echo ""
 
 #copy files
-time rsync -aAxv /ID.txt /bin /boot /dev /etc /home /lib /lost+found /media /mnt /opt /proc /root /run /sbin /srv /sys /tmp /usr /var /tmp/rootfs --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/uEnv.txt || true
+time rsync -aAXxv /ID.txt /bin /boot /dev /etc /home /lib /lost+found /media /mnt /opt /proc /root /run /sbin /srv /sys /tmp /usr /var /tmp/rootfs --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found --exclude=/uEnv.txt || true
 
 echo "---------------------------------------"
 echo "Configure /boot"
@@ -193,10 +193,10 @@ rm -f boot
 ln -sf . boot
 cd /
 
-if [ "$1" = "ext4" ]; then
-    adjustEnvEXT4
-else
+if [ "$1" = "btrfs" ]; then
     adjustEnvBTRFS
+else
+    adjustEnvEXT4
 fi
 
 echo "---------------------------------------"
@@ -205,7 +205,7 @@ echo ""
 
 #configure fstab
 echo "debugfs  /sys/kernel/debug  debugfs  defaults  0  0" >> /tmp/rootfs/etc/fstab
-echo "tmpfs         /tmp        tmpfs   nodev,nosuid,size=10M 0 0" >> /tmp/rootfs/etc/fstab
+echo "tmpfs         /tmp        tmpfs   nodev,nosuid,size=50M 0 0" >> /tmp/rootfs/etc/fstab
 echo "tmpfs         /var/tmp    tmpfs   nodev,nosuid,size=50M 0 0" >> /tmp/rootfs/etc/fstab
 echo "#####################################" >> /tmp/rootfs/etc/fstab
 echo "#/dev/sda1     /home/fpp/media  auto    defaults,noatime,nodiratime,exec,nofail,flush,uid=500,gid=500  0  0" >> /tmp/rootfs/etc/fstab

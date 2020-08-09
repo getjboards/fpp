@@ -22,8 +22,8 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <signal.h>
@@ -31,8 +31,6 @@
 #include <ctype.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 #include <math.h>
@@ -41,20 +39,11 @@
 #include <net/if.h>
 #include <netdb.h>
 
-#include <fstream>
-#include <sstream>
-#include <string>
-
-#include <jsoncpp/json/json.h>
-
 #include "channeloutput.h"
 #include "channeloutputthread.h"
-#include "common.h"
 #include "ArtNet.h"
 #include "FPD.h"
 #include "fpp.h"
-#include "log.h"
-#include "settings.h"
 
 
 #define MAX_ARTNET_UNIVERSE_COUNT    512
@@ -62,8 +51,6 @@
 #define ARTNET_SYNC_PACKET_LENGTH    14
 
 #define ARTNET_DEST_PORT        6454
-#define ARTNET_SOURCE_PORT      58302
-#define ARTNET_SYNC_SOURCE_PORT 58303
 
 #define ARTNET_SEQUENCE_INDEX   12
 #define ARTNET_UNIVERSE_INDEX   14
@@ -101,6 +88,11 @@ static struct iovec ArtNetSyncIovecs = { (void*)ArtNetSyncPacket, ARTNET_SYNC_PA
 static struct sockaddr_in   ArtNetSyncAddress;
 
 
+static const std::string ARTNETTYPE = "ArtNet";
+
+const std::string &ArtNetOutputData::GetOutputTypeString() const {
+    return ARTNETTYPE;
+}
 
 ArtNetOutputData::ArtNetOutputData(const Json::Value &config)
 : UDPOutputData(config), sequenceNumber(1), universeCount(1) {
@@ -111,7 +103,7 @@ ArtNetOutputData::ArtNetOutputData(const Json::Value &config)
     
     memset((char *) &ArtNetSyncAddress, 0, sizeof(sockaddr_in));
     ArtNetSyncAddress.sin_family = AF_INET;
-    ArtNetSyncAddress.sin_port = htons(0);
+    ArtNetSyncAddress.sin_port = htons(ARTNET_DEST_PORT);
     ArtNetSyncAddress.sin_addr.s_addr = inet_addr("255.255.255.255");
 
     universe = config["id"].asInt();
@@ -135,23 +127,10 @@ ArtNetOutputData::ArtNetOutputData(const Json::Value &config)
     if (type == ARTNET_TYPE_BROADCAST) {
         anAddress.sin_addr.s_addr = inet_addr("255.255.255.255");
     } else {
-        bool isAlpha = false;
-        for (int x = 0; x < ipAddress.length(); x++) {
-            isAlpha |= isalpha(ipAddress[x]);
-        }
-        
-        if (isAlpha) {
-            struct hostent* uhost = gethostbyname(ipAddress.c_str());
-            if (!uhost) {
-                LogErr(VB_CHANNELOUT,
-                       "Error looking up E1.31 hostname: %s\n",
-                       ipAddress.c_str());
-                valid = false;
-            }
-            
-            anAddress.sin_addr.s_addr = *((unsigned long*)uhost->h_addr);
-        } else {
-            anAddress.sin_addr.s_addr = inet_addr(ipAddress.c_str());
+        anAddress.sin_addr.s_addr = toInetAddr(ipAddress, valid);
+        if (!valid && active) {
+            WarningHolder::AddWarning("Could not resolve host name " + ipAddress + " - disabling output");
+            active = false;
         }
     }
     
@@ -191,51 +170,56 @@ bool ArtNetOutputData::IsPingable() {
     return type == ARTNET_TYPE_UNICAST;
 }
 
-
-void ArtNetOutputData::PrepareData(unsigned char *channelData) {
+void ArtNetOutputData::PrepareData(unsigned char *channelData, UDPOutputMessages &messages) {
     if (valid && active) {
+        //ALL ArtNet messages must go out on the same socket
+        //and the socket MUST have the source port of ARTNET_DEST_PORT
+        //as per the ArtNet protocol
+        if (messages.GetSocket(ARTNET_DEST_PORT) == -1) {
+            messages.ForceSocket(ARTNET_DEST_PORT, UDPOutput::INSTANCE->createSocket(ARTNET_DEST_PORT, true));
+        }
+        
         unsigned char *cur = channelData + startChannel - 1;
-        for (int x = 0; x < universeCount; x++) {
-            anHeaders[x][ARTNET_SEQUENCE_INDEX] = sequenceNumber;
-            anIovecs[x * 2 + 1].iov_base = (void*)cur;
-            cur += channelCount;
-        }
-    }
-    sequenceNumber++;
-}
-void ArtNetOutputData::CreateMessages(std::vector<struct mmsghdr> &udpMsgs) {
-    if (valid && active && type == ARTNET_TYPE_UNICAST) {
-        for (int x = 0; x < universeCount; x++) {
-            struct mmsghdr msg;
-            memset(&msg, 0, sizeof(msg));
+        int start = startChannel - 1;
+        bool skipped = false;
+        bool allSkipped = true;
 
-            msg.msg_hdr.msg_name = &anAddress;
-            msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
-            msg.msg_hdr.msg_iov = &anIovecs[x * 2];
-            msg.msg_hdr.msg_iovlen = 2;
-            msg.msg_len = channelCount + ARTNET_HEADER_LENGTH;
-            udpMsgs.push_back(msg);
-        }
-    }
-}
-void ArtNetOutputData::CreateBroadcastMessages(std::vector<struct mmsghdr> &bMsgs) {
-    if (valid && active && type == ARTNET_TYPE_BROADCAST) {
+        std::vector<struct mmsghdr> &msgs = messages[ARTNET_DEST_PORT];
         for (int x = 0; x < universeCount; x++) {
-            struct mmsghdr msg;
-            memset(&msg, 0, sizeof(msg));
-            
-            msg.msg_hdr.msg_name = &anAddress;
-            msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
-            msg.msg_hdr.msg_iov = &anIovecs[x * 2];
-            msg.msg_hdr.msg_iovlen = 2;
-            msg.msg_len = channelCount + ARTNET_HEADER_LENGTH;
-            bMsgs.push_back(msg);
+            if (NeedToOutputFrame(channelData, startChannel - 1, start, channelCount)) {
+                struct mmsghdr msg;
+                memset(&msg, 0, sizeof(msg));
+                msg.msg_hdr.msg_name = &anAddress;
+                msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
+                msg.msg_hdr.msg_iov = &anIovecs[x * 2];
+                msg.msg_hdr.msg_iovlen = 2;
+                msg.msg_len = channelCount + ARTNET_HEADER_LENGTH;
+                msgs.push_back(msg);
+                
+                anHeaders[x][ARTNET_SEQUENCE_INDEX] = sequenceNumber;
+                anIovecs[x * 2 + 1].iov_base = (void*)cur;
+                allSkipped = false;
+            } else {
+                skipped = true;
+            }
+            cur += channelCount;
+            start += channelCount;
+        }
+        sequenceNumber++;
+        if (sequenceNumber == 0) {
+            sequenceNumber++;
+        }
+        if (skipped) {
+            skippedFrames++;
+        }
+        if (!allSkipped) {
+            SaveFrame(channelData);
         }
     }
 }
-void ArtNetOutputData::AddPostDataMessages(std::vector<struct mmsghdr> &bMsgs) {
+void ArtNetOutputData::PostPrepareData(unsigned char *channelData, UDPOutputMessages &msgs) {
     if (valid && active) {
-        for (auto msg : bMsgs) {
+        for (auto msg : msgs[ARTNET_DEST_PORT]) {
             if (msg.msg_hdr.msg_iov == &ArtNetSyncIovecs) {
                 //already added, skip
                 return;
@@ -250,7 +234,7 @@ void ArtNetOutputData::AddPostDataMessages(std::vector<struct mmsghdr> &bMsgs) {
         msg.msg_hdr.msg_iov = &ArtNetSyncIovecs;
         msg.msg_hdr.msg_iovlen = 1;
         msg.msg_len = ARTNET_SYNC_PACKET_LENGTH;
-        bMsgs.push_back(msg);
+        msgs[ARTNET_DEST_PORT].push_back(msg);
     }
 }
 

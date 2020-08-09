@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Media Class for Falcon Player (FPP)
  *
@@ -23,52 +24,65 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYMEDIA_H
-#define _PLAYLISTENTRYMEDIA_H
 
 #include <string>
 
 #include "PlaylistEntryBase.h"
-#include "mediaoutput.h"
+#include "mediaoutput/mediaoutput.h"
 
 class PlaylistEntryMedia : public PlaylistEntryBase {
   public:
 	PlaylistEntryMedia(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryMedia();
+	virtual ~PlaylistEntryMedia();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-    int  PreparePlay();
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+    virtual int  PreparePlay();
+	virtual int  StartPlaying(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
+    
+    virtual void Pause() override;
+    virtual bool IsPaused() override;
+    virtual void Resume() override;
 
-	int  HandleSigChild(pid_t pid);
+	virtual int  HandleSigChild(pid_t pid) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
+	virtual Json::Value GetMqttStatus(void) override;
 
 	std::string GetMediaName(void) { return m_mediaFilename; }
 
+    virtual uint64_t GetLengthInMS() override;
+    virtual uint64_t GetElapsedMS() override;
+    
 	int   m_status;
-	int   m_secondsElapsed;
-	int   m_subSecondsElapsed;
-	int   m_secondsRemaining;
-	int   m_subSecondsRemaining;
-	int   m_minutesTotal;
-	int   m_secondsTotal;
-	float m_mediaSeconds;
-	int   m_speedDelta;
+
+    long long m_openTime;
+    static int m_openStartDelay;
 
   private:
 	int OpenMediaOutput(void);
 	int CloseMediaOutput(void);
 
+    unsigned int  m_fileSeed;
+    int           GetFileList(void);
+    std::string   GetNextRandomFile(void);
+
 	std::string        m_mediaFilename;
     std::string        m_videoOutput;
 	MediaOutputBase   *m_mediaOutput;
 	pthread_mutex_t    m_mediaOutputLock;
+    
+    uint64_t           m_duration;
+
+    std::string              m_fileMode;
+    std::vector<std::string> m_files;
+    
+    
+    int                m_pausedTime;
+    MediaOutputStatus  m_pausedStatus;
 };
 
-#endif

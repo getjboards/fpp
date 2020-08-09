@@ -23,20 +23,18 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <string.h>
-#include <strings.h>
-#include <unistd.h>
-
-#include <jsoncpp/json/json.h>
+#include "fpp-pch.h"
 
 #include "ChannelTester.h"
-#include "common.h"
-#include "log.h"
 
 // Test Patterns
 #include "RGBChase.h"
+#include "RGBCycle.h"
 #include "RGBFill.h"
 #include "SingleChase.h"
+
+
+ChannelTester ChannelTester::INSTANCE;
 
 
 /*
@@ -75,16 +73,13 @@ ChannelTester::~ChannelTester()
 int ChannelTester::SetupTest(std::string configStr)
 {
 	LogDebug(VB_CHANNELOUT, "ChannelTester::SetupTest()\n");
+    LogDebug(VB_CHANNELOUT, "     %s\n", configStr.c_str());
 
 	Json::Value config;
-	Json::Reader reader;
 	int result = 0;
 	std::string patternName;
 
-	m_configStr = "";
-
-	bool success = reader.parse(configStr, config);
-	if (!success)
+	if (!LoadJsonFromString(configStr, config))
 	{
 		LogErr(VB_CHANNELOUT,
 			"Error parsing Test Pattern config string: '%s'\n",
@@ -116,6 +111,8 @@ int ChannelTester::SetupTest(std::string configStr)
 				m_testPattern = new TestPatternRGBChase();
 			else if (patternName == "RGBFill")
 				m_testPattern = new TestPatternRGBFill();
+			else if (patternName == "RGBCycle")
+				m_testPattern = new TestPatternRGBCycle();
 		}
 
 		if (m_testPattern)

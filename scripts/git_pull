@@ -7,25 +7,44 @@ BINDIR=$(cd $(dirname $0) && pwd)
 
 teeOutput
 
-if curl --silent --head https://github.com | grep "Content-Type: text/html; charset=utf-8" >/dev/null; then
-	GITBRANCH=$(cd ${FPPDIR} && git branch | grep "^\*" | sed -e "s/\*\s//")
-
-	echo "Upgrading git revision from branch ${GITBRANCH}"
-
-	remountRootReadWrite
-
-	if [ "x${FPPDIR}" = "x/opt/fpp" ]
-	then
-		cd ${FPPDIR} && $SUDO git pull && $SUDO git fetch --tags && $SUDO git submodule sync && $SUDO git submodule update --init
-	else
-		cd ${FPPDIR} && sudo -u ${FPPUSER} git pull && sudo -u ${FPPUSER} git fetch --tags && sudo -u ${FPPUSER} git submodule sync && sudo -u ${FPPUSER} git submodule update --init
-	fi
-
-    sudo ${SCRIPTDIR}/upgrade_config
-	compileBinaries
-
-	remountRootReadOnlyIfNeeded
-else
-	echo "Can not access github, unable to pull git updates"
+SOURCEIP=$(getSetting UpgradeSource)
+if [ "x${SOURCEIP}" == "x" ]; then
+    SOURCEIP=github.com
 fi
 
+HTTPURL="http://${SOURCEIP}/git"
+if [ "${SOURCEIP}" == "github.com" ]; then
+    HTTPURL="https://github.com/"
+fi
+
+if curl --silent --head "${HTTPURL}" | grep -i "Content-Type: text/html; charset" >/dev/null; then
+
+    if [ "${SOURCEIP}" == "github.com" ]; then
+        sudo git remote set-url origin "https://github.com/FalconChristmas/fpp.git"
+    else
+        sudo git remote set-url origin "http://${SOURCEIP}/git/"
+    fi
+    GITBRANCH=$(cd ${FPPDIR} && git branch | grep "^\*" | sed -e "s/\*\s//")
+
+    echo "Upgrading git revision from branch ${GITBRANCH}"
+
+    if [ "x${FPPDIR}" = "x/opt/fpp" ]
+    then
+        cd ${FPPDIR} && $SUDO git pull && $SUDO git fetch --tags -f
+        if [ "${SOURCEIP}" == "github.com" ]; then
+            cd ${FPPDIR} && $SUDO git submodule sync && $SUDO git submodule update --init
+        fi
+    else
+        cd ${FPPDIR} && sudo -u ${FPPUSER} git pull && sudo -u ${FPPUSER} git fetch --tags -f && sudo -u ${FPPUSER} git submodule sync && sudo -u ${FPPUSER} git submodule update --init
+    fi
+
+    sudo ${SCRIPTDIR}/upgrade_config
+    compileBinaries
+else
+    echo "Can not access ${HTTPURL}, unable to pull git updates"
+
+    if [ ! -x ${FPPBINDIR}/fppd ]; then
+        echo "${FPPBINDIR}/fppd doesn't exist, need to build it"
+        compileBinaries
+    fi
+fi

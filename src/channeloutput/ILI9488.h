@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   ILI9488 Channel Output driver for Falcon Player (FPP)
  *
@@ -23,26 +24,22 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _ILI9488_H
-#define _ILI9488_H
-
 #include "ThreadedChannelOutputBase.h"
 
 class ILI9488Output : public ThreadedChannelOutputBase {
   public:
 	ILI9488Output(unsigned int startChannel, unsigned int channelCount);
-	~ILI9488Output();
+	virtual ~ILI9488Output();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual int RawSendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max) {
-        min = m_startChannel;
-        max = min + m_pixels * 3 - 1;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override {
+        addRange(m_startChannel, m_startChannel + m_pixels * 3 - 1);
     }
 
   private:
@@ -70,5 +67,3 @@ class ILI9488Output : public ThreadedChannelOutputBase {
 	void SetRowRange(unsigned int y1, unsigned int y2);
 	void SetRegion(unsigned int x1, unsigned int y1, unsigned int x2, unsigned int y2);
 };
-
-#endif

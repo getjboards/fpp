@@ -2,10 +2,10 @@
 Instructions for creating a new FPP SD image package for the Raspberry Pi
 =============================================================================
 
-Install the latest Raspbian Stretch Lite image to the SD card.  The last
-version tested is 2018-06-27-raspbian-stretch-lite.zip
+Install the latest Raspbian Buster Lite image to the SD card.  The last
+version tested is 2020-05-27-raspios-buster-lite-armhf.zip
 
-Resize the root partition to 2.4GiB using fdisk (substitute the proper device
+Resize the root partition to 3.5GB using fdisk (substitute the proper device
 for your SD card).
 
     fdisk /dev/sdg
@@ -16,10 +16,10 @@ for your SD card).
     n
     p
     2
-	(Replace 98304 with the original start block of partition 2 noted earlier)
-    98304
+	(Replace 540672 with the original start block of partition 2 noted earlier)
+    540672
 	(FIXME, downsize this value once install is tested)
-    +3000M
+    +3500M
     p
     w
 
@@ -48,11 +48,19 @@ we have the partition mounted:
 
 Remove the SD card and boot it up in a Pi.
 
+
+Do a system upgrade to make sure everything is at the latest versions
+    sudo apt-get update
+    sudo apt-get dist-upgrade
+    sudo apt-get clean
+
+Reboot again to pick up the latest kernel that may have been installed with the dist-upgrade
+
+
 On the Pi, run the FPP installer:
-	wget -O ./FPP_Install.sh \
-		http://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
+	wget -O ./FPP_Install.sh https://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
 	chmod 700 ./FPP_Install.sh
-	sudo ./FPP_Install.sh --build-omxplayer
+	sudo ./FPP_Install.sh --img
 
 This will install FPP and perform all required changes to the root filesystem
 and add the FPP user, install required packages, etc.
@@ -64,12 +72,8 @@ up.
 	sudo shutdown -r now
 
 If you are installing to create a SD image zip, do the following:
-    If you did the above on a armv7 Pi, you will need to boot the new image up
-    on a armv6 device (or vice versa) to compile the Wifi drivers for the other
-    architecture/kernel.  Boot up and then run:
-    cd /opt/fpp/SD
-    sudo ./FPP-Wifi-Drivers.sh
-
+    apt-get remove -y --purge --autoremove raspberrypi-kernel-headers
+    apt-get clean
 
 	# Reboot to make sure things take
 	sudo shutdown -r now
@@ -92,17 +96,25 @@ If you are installing to create a SD image zip, do the following:
 Put the SD card back in a Linux system and run the following (substitute
 the proper device name for your SD card in place of '/dev/sdg'):
 
-	NOTE: The 3000 on the "BLOCK=" line below must match the new size of the
+	NOTE: The 3800 on the "BLOCK=" line below must be at least the new size of the
 	      second partition created at the top of this document using fdisk.
 
-	VERSION=v2.x-Pi
-	BLOCKS=$(echo "(50 + 3000) / 4" | bc)
-	sudo time dd if=/dev/sdg bs=4M count=${BLOCKS} > FPP-${VERSION}.img
+	VERSION=v4.0-Pi
+	BLOCKS=3800
+	sudo time dd if=/dev/sdg bs=1M count=${BLOCKS} > FPP-${VERSION}.img
 	time zip -9 FPP-$VERSION.zip FPP-${VERSION}.img
 	unzip -v FPP-$VERSION.zip
 
 This will create a file called FPP-${VERSION}.zip that can be distributed
 for testing/release.
+
+
+# To create the squashfs image needed for OS updates
+# On a separate Linux box:  (this will take a LOOOONG time)
+apt-get install squashfs-tools
+mount /dev/sda2 /mnt
+mount /dev/sda1 /mnt/boot
+mksquashfs /mnt /home/fpp/media/pi-4.0.sqfs -comp xz
 
 =============================================================================
 

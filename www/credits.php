@@ -3,20 +3,8 @@
 <?php
 require_once('config.php');
 
-$a = session_id();
-
-if(empty($a))
-{
-  session_start();
-}
-$_SESSION['session_id'] = session_id();
-//ini_set('display_errors', 'On');
 error_reporting(E_ALL);
-
-$fpp_version = "v" . exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ describe --tags", $output, $return_val);
-if ( $return_val != 0 )
-	$fpp_version = "Unknown";
-unset($output);
+$fpp_version = "v" . getFPPVersion();
 
 ?>
 
@@ -78,11 +66,10 @@ a:visited {
 		<a href='https://github.com/jgarff/rpi_ws281x'>rpi_ws281x</a> by Jeremy Garff.  Used for driving WS281x pixels directly off the Pi's GPIO header.<br />
 		<a href='https://github.com/hzeller/rpi-rgb-led-matrix'>rpi-rgb-led-matrix</a> by Henner Zeller.  Used for driving HUB75 panels directly off the Pi's GPIO header.<br />
 		<a href='https://github.com/TMRh20/RF24'>RF24</a>. Used for driving nRF24L01 output for Komby.<br />
-		<a href='https://www.openlighting.org/'>OLA</a> by the Open Lighting Project (not currently in FPP UI).<br />
 		<br />
         <hr width=180 />
 		<br />
-        Copyright &copy; 2013-2018
+        Copyright &copy; 2013-2020
       </div>
     </div>
     </fieldset>

@@ -23,11 +23,7 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdlib.h>
-#include <string.h>
-
-#include "log.h"
-#include "mqtt.h"
+#include "fpp-pch.h"
 #include "PlaylistEntryMQTT.h"
 
 /*
@@ -39,6 +35,7 @@ PlaylistEntryMQTT::PlaylistEntryMQTT(PlaylistEntryBase *parent)
     LogDebug(VB_PLAYLIST, "PlaylistEntryMQTT::PlaylistEntryMQTT()\n");
 
 	m_type = "mqtt";
+	m_deprecated = 1;
 }
 
 /*

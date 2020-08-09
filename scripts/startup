@@ -8,29 +8,13 @@
 
 BINDIR=$(cd $(dirname $0) && pwd)
 
-# See if we should be running from /home/pi/fpp
-if [ "x${BINDIR}" == "x/opt/fpp/scripts" -a -f "/home/pi/fpp/scripts/startup" ]
-then
-	exec /home/pi/fpp/scripts/startup
-fi
-
-# See if we should be running from /home/fpp/fpp
-if [ "x${BINDIR}" == "x/opt/fpp/scripts" -a -f "/home/fpp/fpp/scripts/startup" ]
-then
-	exec /home/fpp/fpp/scripts/startup
-fi
-
 . ${BINDIR}/common
 . ${BINDIR}/functions
 
 teeOutput
 
 echo "FPP - Setting up for the Falcon Player on the ${FPPPLATFORM} platform"
-
 checkTimeAgainstUSNO
-
-# Configure fallback IP if necessary
-ConfigureFallbackIP
 
 # Print/Say the IP address
 WaitForInterfacesUp
@@ -101,31 +85,10 @@ fi
 echo "FPP - Starting FPP boot script"
 ${BINDIR}/fpp_boot
 
-if [ "${FPPPLATFORM}" = "Raspberry Pi" ]
-then
-	PiLCDenabled=$(getSetting PI_LCD_Enabled)
-
-	if [ "x${PiLCDenabled}" = "x1" ]
-	then
-	  echo "FPP - Checking for configured LCD, LCD Enabled, starting LCD daemon"
-	  ${FPPDIR}/scripts/lcd/fppLCD start
-	else
-	  echo "FPP - Checking for configured LCD, LCD Disabled"
-	fi
-fi
-
 ##############################################################################
 # Leave these things till last so user can see output of anything above here
 ##############################################################################
-SCREENSAVER=$(getSetting screensaver)
-if [ "x${SCREENSAVER}" = "x1" ]
-then
-	echo "FPP - Turning ON screen blanking"
-	setterm -blank 1
-else
-	echo "FPP - Turning OFF screen blanking"
-	setterm -blank 0
-fi
+applyScreenBlankSetting
 
 if [ "$_IP" ]; then
   echo "FPP - Found IP(s): $_IP"

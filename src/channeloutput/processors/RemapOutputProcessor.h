@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   RemapOutputProcessor class for Falcon Player (FPP)
  *
@@ -15,9 +16,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _REMAPOUTPUTPROCESSOR_H
-#define _REMAPOUTPUTPROCESSOR_H
-
 #include "OutputProcessor.h"
 
 class RemapOutputProcessor : public OutputProcessor {
@@ -26,9 +24,9 @@ public:
     RemapOutputProcessor(int src, int dst, int count, int loop, int reverse);
     virtual ~RemapOutputProcessor();
     
-    virtual void ProcessData(unsigned char *channelData) const;
+    virtual void ProcessData(unsigned char *channelData) const override;
     
-    virtual OutputProcessorType getType() const { return REMAP; }
+    virtual OutputProcessorType getType() const override { return REMAP; }
 
     int getSourceChannel() const { return sourceChannel;}
     int getDestChannel() const { return destChannel;}
@@ -36,7 +34,7 @@ public:
     int getLoops() const { return loops;}
     int getReverse() const { return reverse;}
     
-    virtual void GetRequiredChannelRange(int &min, int &max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
 protected:
     int sourceChannel;
@@ -45,5 +43,3 @@ protected:
     int loops;
     int reverse;
 };
-
-#endif

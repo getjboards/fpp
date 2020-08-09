@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   BeagleBone Black PRU Matrix handler for Falcon Player (FPP)
  *
@@ -17,14 +18,11 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _BBBMATRIX_H
-#define _BBBMATRIX_H
-
 #include <string>
 
 #include "Matrix.h"
 #include "PanelMatrix.h"
-#include "BBBPruUtils.h"
+#include "util/BBBPruUtils.h"
 
 #include "ChannelOutputBase.h"
 
@@ -44,6 +42,7 @@ typedef struct {
     volatile unsigned command;
     volatile unsigned response;
     
+    volatile uint16_t pwmBrightness[8];
     uint32_t stats[3 * MAX_STATS]; //3 values per collection
 } __attribute__((__packed__)) BBBPruMatrixData;
 
@@ -53,21 +52,25 @@ class BBBMatrix : public ChannelOutputBase {
     BBBMatrix(unsigned int startChannel, unsigned int channelCount);
     virtual ~BBBMatrix();
     
-    int Init(Json::Value config);
-    int Close(void);
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
     
-    void PrepData(unsigned char *channelData);
+    virtual void PrepData(unsigned char *channelData) override;
     
-    int SendData(unsigned char *channelData);
+    virtual int SendData(unsigned char *channelData) override;
     
-    void DumpConfig(void);
+    virtual void DumpConfig(void) override;
     
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
     void calcBrightnessFlags(std::vector<std::string> &sargs);
     void printStats();
+    bool configureControlPin(const std::string &ctype, Json::Value &root, std::ofstream &outputFile);
+    void configurePanelPins(int x, Json::Value &root, std::ofstream &outputFile, int *minPort);
+    void configurePanelPin(int x, const std::string &color, int row, Json::Value &root, std::ofstream &outputFile, int *minPort);
     
+
     BBBPru      *m_pru;
     BBBPru      *m_pruCopy;
     BBBPruMatrixData *m_pruData;
@@ -86,7 +89,7 @@ class BBBMatrix : public ChannelOutputBase {
     int          m_panelScan; 
     FPPColorOrder m_colorOrder;
 
-    uint8_t      *m_outputFrame;
+    uint32_t     *m_gpioFrame;
     int          m_panels;
     int          m_rows;
     int          m_width;
@@ -94,14 +97,30 @@ class BBBMatrix : public ChannelOutputBase {
     int          m_rowSize;
     
     bool         m_evenFrame;
+    bool         m_outputByRow;
+    bool         m_outputBlankData;
+    std::vector<int> m_bitOrder;
     
     int          m_timing;
     InterleaveHandler *m_handler;
     
-    uint32_t     brightnessValues[8];
-    uint32_t     delayValues[8];
-    uint8_t      gammaCurve[256];
+    uint32_t     brightnessValues[12];
+    uint32_t     delayValues[12];
+    uint16_t     gammaCurve[256];
+    
+    class GPIOPinInfo {
+    public:
+        class {
+        public:
+            uint8_t r_gpio = 0;
+            uint32_t r_pin = 0;
+            uint8_t g_gpio = 0;
+            uint32_t g_pin = 0;
+            uint8_t b_gpio = 0;
+            uint32_t b_pin = 0;
+        } row[2];
+    } m_pinInfo[8];
+    
+    std::vector<std::string> m_usedPins;
     
 };
-
-#endif

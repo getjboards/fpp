@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Base Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYBASE_H
-#define _PLAYLISTENTRYBASE_H
-
 #include <pthread.h>
 
 #include <string>
@@ -47,6 +45,10 @@ class PlaylistEntryBase {
 	virtual int  Prep(void);
 	virtual int  Process(void);
 	virtual int  Stop(void);
+    
+    virtual void Pause() {}
+    virtual bool IsPaused() { return false; }
+    virtual void Resume() {}
 
 	virtual int  HandleSigChild(pid_t pid);
 
@@ -54,16 +56,26 @@ class PlaylistEntryBase {
 
 	virtual Json::Value GetConfig(void);
 
-	virtual std::string ReplaceMatches(std::string in);
+	virtual Json::Value GetMqttStatus(void);
 
-	int          GetPlaylistEntryID(void) { return m_playlistEntryID; }
+	virtual std::string ReplaceMatches(std::string in);
+    
+    virtual uint64_t GetLengthInMS() { return 0; }
+    virtual uint64_t GetElapsedMS() { return 0; }
 
 	std::string  GetType(void) { return m_type; }
-	std::string  GetNextSection(void) { return m_nextSection; }
-	int          GetNextItem(void) { return m_nextItem; }
 	int          IsPrepped(void) { return m_isPrepped; }
+    
+    
+    enum class PlaylistBranchType {
+        None,
+        Index,
+        Offset
+    };
+    virtual PlaylistBranchType GetNextBranchType() { return PlaylistBranchType::None; }
+    virtual std::string  GetNextSection(void) { return ""; }
+    virtual int          GetNextItem(void) { return 0; }
 
-	static int   m_playlistEntryCount;
 
   protected:
 	int          CanPlay(void);
@@ -77,14 +89,10 @@ class PlaylistEntryBase {
 	int          m_isFinished;
 	int          m_playOnce;
 	int          m_playCount;
-	std::string  m_nextSection;
-	int          m_nextItem;
 	int          m_isPrepped;
+	int          m_deprecated;
 
-	int          m_playlistEntryID;
 
 	Json::Value  m_config;
 	PlaylistEntryBase *m_parent;
 };
-
-#endif

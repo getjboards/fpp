@@ -23,9 +23,8 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "common.h"
+#include "fpp-pch.h"
 #include "fppd.h" // for channelTester
-#include "log.h"
 #include "PlaylistEntryChannelTest.h"
 
 #define STOP_CONFIG_JSON "{ \"enabled\": 0 }"
@@ -84,7 +83,7 @@ int PlaylistEntryChannelTest::StartPlaying(void)
 	m_startTime = GetTime();
 	m_endTime = m_startTime + (m_duration * 1000000);
 
-	channelTester->SetupTest(m_testConfig);
+    ChannelTester::INSTANCE.SetupTest(m_testConfig);
 
 	return PlaylistEntryBase::StartPlaying();
 }
@@ -100,7 +99,7 @@ int PlaylistEntryChannelTest::Process(void)
 	if (m_isStarted && m_isPlaying && (GetTime() >= m_endTime))
 	{
 		std::string stopConfig(STOP_CONFIG_JSON);
-		channelTester->SetupTest(stopConfig);
+		ChannelTester::INSTANCE.SetupTest(stopConfig);
 
 		m_finishTime = GetTime();
 
@@ -118,7 +117,7 @@ int PlaylistEntryChannelTest::Stop(void)
 	LogDebug(VB_PLAYLIST, "PlaylistEntryChannelTest::Stop()\n");
 
 	std::string stopConfig(STOP_CONFIG_JSON);
-	channelTester->SetupTest(stopConfig);
+	ChannelTester::INSTANCE.SetupTest(stopConfig);
 
 	m_finishTime = GetTime();
 
@@ -148,15 +147,15 @@ Json::Value PlaylistEntryChannelTest::GetConfig(void)
 	Json::Value result = PlaylistEntryBase::GetConfig();
 
 	result["duration"] = m_duration;
-	result["startTime"] = m_startTime;
-	result["endTime"] = m_endTime;
-	result["finishTime"] = m_finishTime;
+	result["startTime"] = (Json::UInt64)m_startTime;
+	result["endTime"] = (Json::UInt64)m_endTime;
+	result["finishTime"] = (Json::UInt64)m_finishTime;
 	result["testConfig"] = m_testConfig;
 
 	if (m_isPlaying)
-		result["remaining"] = (m_endTime - GetTime()) / 1000000;
+		result["remaining"] = (Json::UInt64)((m_endTime - GetTime()) / 1000000);
 	else
-		result["remaining"] = 0;
+		result["remaining"] = (Json::UInt64)0;
 
 	return result;
 }

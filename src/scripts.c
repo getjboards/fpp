@@ -22,32 +22,28 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <boost/algorithm/string/predicate.hpp>
-
-#include "common.h"
-#include "log.h"
-#include "settings.h"
+#include "scripts.h"
 
 /*
  * Fork and run a script with accompanying args
  */
-void RunScript(std::string script, std::string scriptArgs, int blocking)
+pid_t RunScript(std::string script, std::string scriptArgs)
+{
+	std::vector<std::pair<std::string,std::string>> envVars;
+
+	return RunScript(script, scriptArgs, envVars);
+}
+
+pid_t RunScript(std::string script, std::string scriptArgs, std::vector<std::pair<std::string, std::string>> envVars)
 {
 	pid_t pid = 0;
 	char  userScript[1024];
 	char  eventScript[1024];
 
+    LogDebug(VB_EVENT, "Script %s:  Args: %s\n", script.c_str(), scriptArgs.c_str());
+    
 	// Setup the script from our user
 	strcpy(userScript, getScriptDirectory());
 	strcat(userScript, "/");
@@ -58,16 +54,11 @@ void RunScript(std::string script, std::string scriptArgs, int blocking)
 	memcpy(eventScript, getFPPDirectory(), sizeof(eventScript));
 	strncat(eventScript, "/scripts/eventScript", sizeof(eventScript)-strlen(eventScript)-1);
 
-	// FIXME, add blocking support
-	blocking = 0;
-
-	if (!blocking)
-		pid = fork();
+    pid = fork();
 
 	if (pid == 0) // Event Script process
 	{
-		if (!blocking)
-			CloseOpenFiles();
+		CloseOpenFiles();
 
 		char *args[128];
 		char *token = strtok(userScript, " ");
@@ -89,22 +80,34 @@ void RunScript(std::string script, std::string scriptArgs, int blocking)
 		{
 			if (tmpPart == "")
 			{
-				if (boost::starts_with(parts[p], "\""))
+				if (startsWith(parts[p], "\""))
 				{
 					quote = "\"";
 
-					// Skip the beginning quote
 					tmpPart = parts[p].substr(1);
 				}
-				else if (boost::starts_with(parts[p], "'"))
+				else if (startsWith(parts[p], "'"))
 				{
 					quote = "'";
-					tmpPart = parts[p];
+					tmpPart = parts[p].substr(1);
 				}
 				else
 				{
 					args[i] = strdup(parts[p].c_str());
 					i++;
+				}
+
+				if ((tmpPart != "") && (quote != "") && (endsWith(tmpPart, quote)))
+				{
+					args[i] = strdup(tmpPart.c_str());
+
+					// Chop off the ending quote
+					args[i][strlen(args[i])-1] = 0;
+
+					i++;
+
+					quote = "";
+					tmpPart = "";
 				}
 			}
 			else
@@ -112,7 +115,7 @@ void RunScript(std::string script, std::string scriptArgs, int blocking)
 				tmpPart += " ";
 				tmpPart += parts[p];
 
-				if (boost::ends_with(parts[p], quote))
+				if (endsWith(parts[p], quote))
 				{
 					args[i] = strdup(tmpPart.c_str());
 
@@ -132,28 +135,27 @@ void RunScript(std::string script, std::string scriptArgs, int blocking)
 		setenv("FPP_SCRIPT", script.c_str(), 0);
 		setenv("FPP_SCRIPTARGS", scriptArgs.c_str(), 0);
 
-		if (blocking)
+		for (int ev = 0; ev < envVars.size(); ev++)
 		{
-			// FIXME, add blocking support
-
-			// need to free args[] entries here as well
+			setenv(envVars[ev].first.c_str(), envVars[ev].second.c_str(), 0);
 		}
-		else
-		{
-			if (chdir(getScriptDirectory()))
-			{
-				LogErr(VB_EVENT, "Unable to change directory to %s: %s\n",
-					getScriptDirectory(), strerror(errno));
-				exit(EXIT_FAILURE);
-			}
 
-			execvp(eventScript, args);
+        if (chdir(getScriptDirectory()))
+        {
+            LogErr(VB_EVENT, "Unable to change directory to %s: %s\n",
+                getScriptDirectory(), strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        for (int x = 0; x < i; x++) {
+            LogExcess(VB_EVENT, "Script Arg %d:  %s\n", x, args[x]);
+        }
+        execvp(eventScript, args);
 
-			LogErr(VB_EVENT, "RunScript(), ERROR, we shouldn't be here, "
-				"this means that execvp() failed trying to run '%s %s': %s\n",
-				eventScript, args[0], strerror(errno));
-			exit(EXIT_FAILURE);
-		}
-	}
+        LogErr(VB_EVENT, "RunScript(), ERROR, we shouldn't be here, "
+            "this means that execvp() failed trying to run '%s %s': %s\n",
+            eventScript, args[0], strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    return pid;
 }
 

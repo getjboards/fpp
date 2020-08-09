@@ -28,67 +28,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <algorithm>
 
 #include "common.h"
-#include "channeloutput.h"
 #include "log.h"
 #include "Sequence.h"
 #include "settings.h"
-#include "ColorLight-5a-75.h"
-#include "DebugOutput.h"
-#include "FBMatrix.h"
-#include "FBVirtualDisplay.h"
+#include "channeloutput.h"
+#include "ChannelOutputBase.h"
+#include "Warnings.h"
+
+//old style that still need porting
 #include "FPD.h"
-#include "GenericSerial.h"
-#include "GPIO.h"
-#include "GPIO595.h"
-#include "HTTPVirtualDisplay.h"
-#include "Linsn-RV9.h"
-#include "LOR.h"
-#include "SPInRF24L01.h"
-#include "RHL_DVI_E131.h"
-#include "USBDMX.h"
-#include "USBPixelnet.h"
-#include "USBRelay.h"
-#include "USBRenard.h"
-#include "Triks-C.h"
-#include "UDPOutput.h"
-
-#ifdef USE_X11
-#  include "X11Matrix.h"
-#  include "X11VirtualDisplay.h"
-#endif
-
-#if defined(PLATFORM_PI) || defined(PLATFORM_ODROID)
-#  include "RGBMatrix.h"
-#endif
-
-#ifdef USEWIRINGPI
-#  include "Hill320.h"
-#  include "MAX7219Matrix.h"
-#  include "MCP23017.h"
-#endif
-
-#ifdef PLATFORM_PI
-#  include "ILI9488.h"
-#  include "SPIws2801.h"
-#  include "rpi_ws281x.h"
-#  include "spixels.h"
-#endif
-
-#ifdef PLATFORM_BBB
-#  include "BBB48String.h"
-#  include "BBBSerial.h"
-#  include "BBBMatrix.h"
-#endif
-
-#ifdef USEOLA
-#  include "OLAOutput.h"
-#endif
 
 #include "processors/OutputProcessor.h"
 
@@ -104,11 +60,76 @@ static int LoadOutputProcessors(void);
 OutputProcessors         outputProcessors;
 
 static std::vector<std::pair<uint32_t, uint32_t>> outputRanges;
-const std::vector<std::pair<uint32_t, uint32_t>> GetOutputRanges() {
+
+const std::vector<std::pair<uint32_t, uint32_t>> &GetOutputRanges() {
     if (outputRanges.empty()) {
         outputRanges.push_back(std::pair<uint32_t, uint32_t>(0, FPPD_MAX_CHANNELS));
     }
     return outputRanges;
+}
+// we'll sort the ranges that the outputs have registered and combine any overlaps
+// or close ranges to keep the range list smaller
+static void sortRanges() {
+    std::map<uint32_t, uint32_t> ranges;
+    //sort
+    for (auto &a : outputRanges) {
+        uint32_t cur = ranges[a.first];
+        if (cur) {
+            ranges[a.first] = std::max(a.second, cur);
+        } else {
+            ranges[a.first] = a.second;
+        }
+    }
+    outputRanges.clear();
+    std::pair<uint32_t, uint32_t> cur(FPPD_MAX_CHANNELS, FPPD_MAX_CHANNELS);
+    for (auto &a : ranges) {
+        if (cur.first == FPPD_MAX_CHANNELS) {
+            cur.first = a.first;
+            cur.second = a.second;
+        } else {
+            if (a.first <= (cur.first + cur.second + 1025)) {
+                // overlap or within 1025 channels of an overlap, need to combine
+                // if the two ranges are "close" (wthin 1025 channels) we'll combine
+                // as the overhead of doing ranges wouldn't benefit with a small gap
+                uint32_t max = cur.first + cur.second - 1;
+                uint32_t amax = a.first + a.second -1 ;
+                max = std::max(max, amax);
+                cur.second = max - cur.first + 1;
+            } else {
+                outputRanges.push_back(cur);
+                cur.first = a.first;
+                cur.second = a.second;
+            }
+        }
+    }
+    if (cur.first != FPPD_MAX_CHANNELS) {
+        outputRanges.push_back(cur);
+    }
+    
+    if (outputRanges.empty()) {
+        cur.first = 0;
+        cur.second = 8;
+        outputRanges.push_back(cur);
+    }
+}
+static void addRange(uint32_t min, uint32_t max) {
+    // having the reads be aligned to intervals of 8 can help performance so
+    // we'll expand the range a bit to align things better
+    //round minimum down to interval of 8
+
+    min &= 0xFFFFFFF8;
+    max += 8;
+    max &= 0xFFFFFFF8;
+    max -= 1;
+    
+    for (auto &r : outputRanges) {
+        int rm = r.first + r.second - 1;
+        if (min >= r.first && max <= rm) {
+            //within the range, don't add it
+            return;
+        }
+    }
+    outputRanges.push_back(std::pair<uint32_t, uint32_t>(min, max - min + 1));
 }
 
 
@@ -168,87 +189,23 @@ void ChannelOutputJSON2CSV(Json::Value config, char *configStr)
 	}
 }
 
-Json::Value ChannelOutputCSV2JSON(char *deviceConfig)
-{
-	Json::Value result;
+// in some of these cases, we could symlink the shlib and add additional createXXXOutput methods
+static std::map<std::string, std::string> OUTPUT_REMAPS = {
+    {"VirtualDisplay", "FBVirtualDisplay"},
+    {"VirtualMatrix", "FBMatrix" },
+    {"DMX-Pro", "USBDMX"},
+    {"DMX-Open", "USBDMX"},
+    {"Pixelnet-Lynx", "USBPixelnet"},
+    {"Pixelnet-Open", "USBPixelnet"},
+    {"universes", "UDPOutput"}
+};
 
-	char *s;
-
-	s = strtok(deviceConfig, ",");
-	if (!s)
-	{
-		LogErr(VB_CHANNELOUT, "Error parsing CSV, empty string??");
-		return result;
-	}
-
-	result["enabled"] = atoi(s);
-
-	s = strtok(NULL, ",");
-	if (!s)
-	{
-		LogErr(VB_CHANNELOUT,
-			"Error parsing CSV '%s', could not determine type",
-			deviceConfig);
-		result["enabled"] = 0;
-		return result;
-	}
-
-	result["type"] = s;
-
-	s = strtok(NULL, ",");
-	if (!s)
-	{
-		LogErr(VB_CHANNELOUT,
-			"Error parsing CSV '%s', could not determine startChannel",
-			deviceConfig);
-		result["enabled"] = 0;
-		return result;
-	}
-
-	result["startChannel"] = atoi(s);
-
-	s = strtok(NULL, ",");
-	if (!s)
-	{
-		LogErr(VB_CHANNELOUT,
-			"Error parsing CSV '%s', could not determine channelCount",
-			deviceConfig);
-		result["enabled"] = 0;
-		return result;
-	}
-
-	result["channelCount"] = atoi(s);
-
-	s = strtok(NULL, ";");
-
-	while (s)
-	{
-		char tmp[128];
-		char *div = NULL;
-
-		strcpy(tmp, s);
-		div = strchr(tmp, '=');
-
-		if (div)
-		{
-			*div = '\0';
-			div++;
-
-			result[tmp] = div;
-		}
-
-		s = strtok(NULL, ";");
-	}
-
-	return result;
-}
 
 /*
  *
  */
 int InitializeChannelOutputs(void) {
 	Json::Value root;
-	Json::Reader reader;
 	int i = 0;
 
 	channelOutputFrame = 0;
@@ -259,11 +216,7 @@ int InitializeChannelOutputs(void) {
 
 	// Reset index so we can start populating the outputs array
 	i = 0;
-    int maximumNeededChannel = 0;
-    int minimumNeededChannel = FPPD_MAX_CHANNELS;
-
-	if (FPDOutput.isConfigured())
-	{
+	if (FPDOutput.isConfigured()) {
 		channelOutputs[i].startChannel = getSettingInt("FPDStartChannelOffset");
 		channelOutputs[i].outputOld = &FPDOutput;
 
@@ -275,9 +228,8 @@ int InitializeChannelOutputs(void) {
             LogInfo(VB_CHANNELOUT, "FPD:  Determined range needed %d - %d\n",
                     m1, m2);
             
-            minimumNeededChannel = std::min(minimumNeededChannel, m1);
-            maximumNeededChannel = std::max(maximumNeededChannel, m2);
-
+            addRange(m1, m2);
+            
 			i++;
 			LogDebug(VB_CHANNELOUT, "Configured FPD Channel Output\n");
 		} else {
@@ -288,10 +240,10 @@ int InitializeChannelOutputs(void) {
 	// FIXME, build this list dynamically
 	const char *configFiles[] = {
         "/config/co-universes.json",
-		"/config/channeloutputs.json",
 		"/config/co-other.json",
 		"/config/co-pixelStrings.json",
         "/config/co-bbbStrings.json",
+        "/config/channeloutputs.json",
 		NULL
 		};
 
@@ -310,15 +262,7 @@ int InitializeChannelOutputs(void) {
 
 		if (FileExists(filename))
 		{
-			std::ifstream t(filename);
-			std::stringstream buffer;
-
-			buffer << t.rdbuf();
-
-			std::string config = buffer.str();
-
-			bool success = reader.parse(buffer.str(), root);
-			if (!success)
+			if (!LoadJsonFromFile(filename, root))
 			{
 				LogErr(VB_CHANNELOUT, "Error parsing %s\n", filename);
 				return 0;
@@ -349,117 +293,43 @@ int InitializeChannelOutputs(void) {
 
 				channelOutputs[i].startChannel = start;
 				channelOutputs[i].channelCount = count;
+                std::string libnamePfx = "";
 
 				// First some Channel Outputs enabled everythwere
 				if (type == "LEDPanelMatrix") {
-					if (outputs[c]["subType"] == "ColorLight5a75")
-						channelOutputs[i].output = new ColorLight5a75Output(start, count);
-					else if (outputs[c]["subType"] == "LinsnRV9")
-						channelOutputs[i].output = new LinsnRV9Output(start, count);
-#if defined(PLATFORM_PI) || defined(PLATFORM_ODROID)
-					else if (outputs[c]["subType"] == "RGBMatrix")
-						channelOutputs[i].output = new RGBMatrixOutput(start, count);
-#endif
-#ifdef PLATFORM_BBB
-					else if (outputs[c]["subType"] == "LEDscapeMatrix")
-						channelOutputs[i].output = new BBBMatrix(start, count);
-#endif
-					else
-					{
-						LogErr(VB_CHANNELOUT, "LEDPanelmatrix subType '%s' not valid\n", outputs[c]["subType"].asString().c_str());
-						continue;
-					}
-#ifdef PLATFORM_BBB
-				} else if (type == "BBB48String" && f != 0) {
-					channelOutputs[i].output = new BBB48StringOutput(start, count);
-				} else if (type == "BBBSerial" && f != 0) {
-					channelOutputs[i].output = new BBBSerialOutput(start, count);
-#endif
-				} else if (type == "FBVirtualDisplay") {
-					channelOutputs[i].output = (ChannelOutputBase*)new FBVirtualDisplayOutput(0, FPPD_MAX_CHANNELS);
-				} else if (type == "HTTPVirtualDisplay") {
-					channelOutputs[i].output = (ChannelOutputBase*)new HTTPVirtualDisplayOutput(0, FPPD_MAX_CHANNELS);
-				} else if (type == "RHLDVIE131") {
-					channelOutputs[i].output = (ChannelOutputBase*)new RHLDVIE131Output(start, count);
-				} else if (type == "USBRelay") {
-					channelOutputs[i].output = new USBRelayOutput(start, count);
-				// NOW some platform or config specific Channel Outputs
-#ifdef USEOLA
-				} else if (type == "OLA") {
-					channelOutputs[i].output = new OLAOutput(start, count);
-#endif
-				} else if (type == "VirtualDisplay") {
-					channelOutputs[i].output = (ChannelOutputBase*)new FBVirtualDisplayOutput(0, FPPD_MAX_CHANNELS);
-				} else if (type == "USBRelay") {
-					channelOutputs[i].output = new USBRelayOutput(start, count);
-#if USEWIRINGPI
-				} else if (type == "Hill320") {
-					channelOutputs[i].output = new Hill320Output(start, count);
-				} else if (type == "MAX7219Matrix") {
-					channelOutputs[i].output = new MAX7219MatrixOutput(start, count);
-				} else if (type == "MCP23017") {
-					channelOutputs[i].output = new MCP23017Output(start, count);
-#endif
-#ifdef PLATFORM_PI
-				} else if (type == "ILI9488") {
-					channelOutputs[i].output = new ILI9488Output(start, count);
-				} else if (type == "RPIWS281X") {
-					channelOutputs[i].output = new RPIWS281xOutput(start, count);
-				} else if (type == "spixels") {
-					channelOutputs[i].output = new SpixelsOutput(start, count);
-				} else if (type == "SPI-WS2801") {
-					channelOutputs[i].output = new SPIws2801Output(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "SPI-nRF24L01") {
-					channelOutputs[i].outputOld = &SPInRF24L01Output;
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-#endif
-#ifdef USE_X11
-				} else if (type == "X11Matrix") {
-					channelOutputs[i].output = new X11MatrixOutput(start, count);
-				} else if (type == "X11VirtualDisplay") {
-					channelOutputs[i].output = (ChannelOutputBase*)new X11VirtualDisplayOutput(0, FPPD_MAX_CHANNELS);
-#endif
-				}else if ((type == "Pixelnet-Lynx") ||
-						  (type == "Pixelnet-Open"))
-				{
-					channelOutputs[i].output = new USBPixelnetOutput(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if ((type == "DMX-Pro") ||
-						   (type == "DMX-Open")) {
-					channelOutputs[i].output = new USBDMXOutput(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if ((type == "VirtualMatrix") ||
-						   (type == "FBMatrix")) {
-					channelOutputs[i].output = new FBMatrixOutput(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "GPIO") {
-					channelOutputs[i].output = new GPIOOutput(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "GPIO-595") {
-					channelOutputs[i].output = new GPIO595Output(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "GenericSerial") {
-					channelOutputs[i].output = new GenericSerialOutput(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "LOR") {
-					channelOutputs[i].outputOld = &LOROutput;
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "Renard") {
-					channelOutputs[i].outputOld = &USBRenardOutput;
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "Triks-C") {
-					channelOutputs[i].outputOld = &TriksCOutput;
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-				} else if (type == "Debug") {
-					channelOutputs[i].output = new DebugOutput(start, count);
-					ChannelOutputJSON2CSV(outputs[c], csvConfig);
-                } else if (type == "universes") {
-                    channelOutputs[i].output = new UDPOutput(start, count);
-				} else {
-					LogErr(VB_CHANNELOUT, "Unknown Channel Output type: %s\n", type.c_str());
-					continue;
-				}
+                    //for LED matrices, the driver is determined by the subType
+                    libnamePfx = "matrix-";
+                    type = outputs[c]["subType"].asString();
+                } else if (OUTPUT_REMAPS.find(type) != OUTPUT_REMAPS.end()) {
+                    type = OUTPUT_REMAPS[type];
+                }
+
+                if (channelOutputs[i].outputOld == nullptr && channelOutputs[i].output == nullptr) {
+                    std::string libname = "libfpp-co-" + libnamePfx + type + ".so";
+                    void *handle = dlopen(libname.c_str(), RTLD_NOW);
+                    if (handle == NULL){
+                        LogErr(VB_CHANNELOUT, "Unknown Channel Output type: %s - Error: %s\n", type.c_str(), dlerror());
+                        continue;
+                    }
+                    ChannelOutputBase* (*fptr)(unsigned int, unsigned int);
+                    std::string methodName = "createOutput" + type;
+                    std::replace( methodName.begin(), methodName.end(), '-', '_');
+                    *(void **)(&fptr) = dlsym(handle, methodName.c_str());
+                    if (fptr == nullptr) {
+                        //some use createOutputFoo and others may use createFooOutput
+                        std::string methodName = "create" + type + "Output";
+                        std::replace( methodName.begin(), methodName.end(), '-', '_');
+                        *(void **)(&fptr) = dlsym(handle, methodName.c_str());
+                    }
+                    if (fptr == nullptr) {
+                        LogErr(VB_CHANNELOUT, "Could not create Channel Output type: %s\n", type.c_str());
+                        WarningHolder::AddWarning("Could not create output type " + type + ". Check logs for details.");
+                        dlclose(handle);
+                        continue;
+                    }
+                    channelOutputs[i].output = fptr(start, count);
+                    channelOutputs[i].libHandle = handle;
+                }
 
 				if ((channelOutputs[i].outputOld) &&
 					(channelOutputs[i].outputOld->open(csvConfig, &channelOutputs[i].privData)))
@@ -479,24 +349,29 @@ int InitializeChannelOutputs(void) {
                     int m2 = m1 + channelOutputs[i].channelCount - 1;
                     LogInfo(VB_CHANNELOUT, "%s %d:  Determined range needed %d - %d\n",
                             type.c_str(), i, m1, m2);
-                    minimumNeededChannel = std::min(minimumNeededChannel, m1);
-                    maximumNeededChannel = std::max(maximumNeededChannel, m2);
+                    addRange(m1, m2);
 					i++;
-				} else if ((channelOutputs[i].output) &&
-						   (((!csvConfig[0]) && (channelOutputs[i].output->Init(outputs[c]))) ||
-							((csvConfig[0]) && (channelOutputs[i].output->Init(csvConfig))))) {
-                               
-                               
-                    int m1, m2;
-                    channelOutputs[i].output->GetRequiredChannelRange(m1, m2);
-                    minimumNeededChannel = std::min(minimumNeededChannel, m1);
-                    maximumNeededChannel = std::max(maximumNeededChannel, m2);
-                    LogInfo(VB_CHANNELOUT, "%s %d:  Determined range needed %d - %d\n",
-                            type.c_str(), i, minimumNeededChannel, maximumNeededChannel);
+                } else if (channelOutputs[i].output) {
+                    
+                    if (channelOutputs[i].output->Init(outputs[c])) {
+                        channelOutputs[i].output->GetRequiredChannelRanges([type, i](int m1, int m2) {
+                            LogInfo(VB_CHANNELOUT, "%s %d:  Determined range needed %d - %d\n",
+                                    type.c_str(), i, m1, m2);
+                            addRange(m1, m2);
 
-                    i++;
+                        });
+                        i++;
+                    } else {
+                        WarningHolder::AddWarning("Could not initialize output type " + type + ". Check logs for details.");
+                        delete channelOutputs[i].output;
+                        channelOutputs[i].output = nullptr;
+                        if (channelOutputs[i].libHandle) {
+                            dlclose(channelOutputs[i].libHandle);
+                        }
+                    }
 				} else {
 					LogErr(VB_CHANNELOUT, "ERROR Opening %s Channel Output\n", type.c_str());
+                    WarningHolder::AddWarning("Could not create output type " + type + ". Check logs for details.");
 					continue;
 				}
 
@@ -510,27 +385,19 @@ int InitializeChannelOutputs(void) {
 	LogDebug(VB_CHANNELOUT, "%d Channel Outputs configured\n", channelOutputCount);
 
 	LoadOutputProcessors();
-    int m1, m2;
-    outputProcessors.GetRequiredChannelRange(m1, m2);
-    minimumNeededChannel = std::min(minimumNeededChannel, m1);
-    maximumNeededChannel = std::max(maximumNeededChannel, m2);
-    if (maximumNeededChannel < minimumNeededChannel) {
-        maximumNeededChannel = minimumNeededChannel = 0;
+    outputProcessors.GetRequiredChannelRanges([](int m1, int m2) {
+        LogInfo(VB_CHANNELOUT, "OutputProcessor:  Determined range needed %d - %d\n", m1, m2);
+        addRange(m1, m2);
+    });
+    if (getControlMajor() || getControlMinor()) {
+        int min = std::min(getControlMajor(), getControlMinor());
+        int max = std::max(getControlMajor(), getControlMinor());
+        addRange(min, max);
     }
-    // having the reads be aligned to intervals of 8 can help performance so
-    // we'll expand the range a bit to align things better
-    //round minimum down to interval of 8
-    if (minimumNeededChannel > 0) {
-        minimumNeededChannel--;
+    sortRanges();
+    for (auto &r : outputRanges) {
+        LogInfo(VB_CHANNELOUT, "Determined range needed %d - %d\n", r.first, r.first + r.second - 1);
     }
-    minimumNeededChannel &= 0xFFFFFFF8;
-    maximumNeededChannel += 8;
-    maximumNeededChannel &= 0xFFFFFFF8;
-    maximumNeededChannel -= 1;
-    
-    outputRanges.push_back(std::pair<uint32_t, uint32_t>(minimumNeededChannel, maximumNeededChannel - minimumNeededChannel + 1));
-
-    LogInfo(VB_CHANNELOUT, "Determined range needed %d - %d\n", minimumNeededChannel, maximumNeededChannel);
 
 	return 1;
 }
@@ -590,12 +457,6 @@ int SendChannelData(const char *channelData) {
         }
     }
 
-
-	channelOutputFrame++;
-
-	// Reset channelOutputFrame every week @ 50ms timing
-	if (channelOutputFrame > 12096000)
-		channelOutputFrame = 0;
     return 0;
 }
 
@@ -630,10 +491,10 @@ void StopOutputThreads(void) {
 /*
  *
  */
-int CloseChannelOutputs(void) {
+void CloseChannelOutputs(void) {
 	int i = 0;
 
-	for (i = 0; i < channelOutputCount; i++) {
+	for (i = channelOutputCount-1; i >= 0; i--) {
 		if (channelOutputs[i].outputOld)
 			channelOutputs[i].outputOld->close(channelOutputs[i].privData);
 		else if (channelOutputs[i].output)
@@ -643,10 +504,13 @@ int CloseChannelOutputs(void) {
 			free(channelOutputs[i].privData);
 	}
     
-    for (i = 0; i < channelOutputCount; i++) {
+    for (i = channelOutputCount-1; i >= 0; i--) {
         if (channelOutputs[i].output) {
             delete channelOutputs[i].output;
             channelOutputs[i].output = NULL;
+            if (channelOutputs[i].libHandle) {
+                dlclose(channelOutputs[i].libHandle);
+            }
         }
     }
 }
@@ -655,7 +519,6 @@ int CloseChannelOutputs(void) {
 int LoadOutputProcessors(void) {
 	char filename[1024];
 	Json::Value root;
-	Json::Reader reader;
 
 	strcpy(filename, getMediaDirectory());
 	strcat(filename, "/config/outputprocessors.json");
@@ -665,15 +528,7 @@ int LoadOutputProcessors(void) {
 
 	LogDebug(VB_CHANNELOUT, "Loading Output Processors.\n");
 
-	std::ifstream t(filename);
-	std::stringstream buffer;
-
-	buffer << t.rdbuf();
-
-	std::string config = buffer.str();
-
-	bool success = reader.parse(buffer.str(), root);
-	if (!success)
+	if (!LoadJsonFromFile(filename, root))
 	{
 		LogErr(VB_CHANNELOUT, "Error parsing %s\n", filename);
 		return 0;

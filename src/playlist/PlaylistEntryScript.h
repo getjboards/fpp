@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Script Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYSCRIPT_H
-#define _PLAYLISTENTRYSCRIPT_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -35,23 +33,24 @@ class PlaylistEntryScript : public PlaylistEntryBase {
 	PlaylistEntryScript(PlaylistEntryBase *parent = NULL);
 	~PlaylistEntryScript();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+    virtual int  Process(void) override;
+	virtual int  Stop(void) override;
 
-	int  HandleSigChild(pid_t pid);
+    
+    bool isChildRunning();
+	virtual void Dump(void) override;
 
-	void Dump(void);
-
-	Json::Value GetConfig(void);
-
+	virtual Json::Value GetConfig(void) override;
+    virtual Json::Value GetMqttStatus(void) override;
 	std::string GetScriptName(void) { return m_scriptFilename; }
 
   private:
 	std::string        m_scriptFilename;
 	std::string        m_scriptArgs;
-	int                m_blocking;
+	bool                m_blocking;
+    int                 m_scriptProcess;
+    long long           m_startTime;
 };
-
-#endif

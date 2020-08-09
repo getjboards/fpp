@@ -3,6 +3,7 @@
 <?php
 require_once('config.php');
 require_once('common.php');
+require_once('fppdefines.php');
 
 function PrintSequenceOptions()
 {
@@ -238,9 +239,13 @@ function GetTestMode()
 				$('#testModeEnabled').prop('checked', true);
 				lastEnabledState = 1;
 
-				$("#testModeCycleMSText").html(data.cycleMS);
-				$("#testModeCycleMS").slider("value", data.cycleMS);
-
+                if (data.hasOwnProperty('cycleMS')) {
+                    $("#testModeCycleMSText").html(data.cycleMS);
+                    $("#testModeCycleMS").slider("value", data.cycleMS);
+                } else {
+                    $("#testModeCycleMSText").html(1000);
+                    $("#testModeCycleMS").slider("value", 1000);
+                }
 				if (data.mode == "SingleChase")
 				{
 					$("input[name=testModeMode][value=SingleChase]").prop('checked', true);
@@ -253,6 +258,12 @@ function GetTestMode()
 					$("input[name=testModeMode][value=" + data.subMode + "]").prop('checked', true);
 					if (data.subMode == "RGBChase-RGBCustom")
 						$('#testModeRGBCustomPattern').val(data.colorPattern);
+				}
+				else if (data.mode == "RGBCycle")
+				{
+					$("input[name=testModeMode][value=" + data.subMode + "]").prop('checked', true);
+					if (data.subMode == "RGBCycle-RGBCustom")
+						$('#testModeRGBCycleCustomPattern').val(data.colorPattern);
 				}
 				else if (data.mode == "RGBFill")
 				{
@@ -294,7 +305,7 @@ function SetTestMode()
 	var startChannel = parseInt($('#testModeStartChannel').val());
 	var endChannel = parseInt($('#testModeEndChannel').val());
 	var chaseSize = parseInt($('#testModeChaseSize').val());
-	var maxChannel = 1048576;
+	var maxChannel = 8*1024*1024;
 	var channelSetType = "channelRange";
 	var colorOrder = $('#colorOrder').val();
 
@@ -364,8 +375,7 @@ function SetTestMode()
 		var data = {};
 		var channelSet = "" + startChannel + "-" + endChannel;
 
-		if (mode == "SingleChase")
-		{
+		if (mode == "SingleChase") {
 			data =
 				{
 					mode: "SingleChase",
@@ -373,32 +383,19 @@ function SetTestMode()
 					chaseSize: chaseSize,
 					chaseValue: colorS
 				};
-		}
-		else if (mode.substring(0,9) == "RGBChase-")
-		{
+		} else if (mode.substring(0,9) == "RGBChase-") {
 			var colorPattern = strR + strG + strB;
-
-			if (mode == "RGBChase-RGB")
-			{
+			if (mode == "RGBChase-RGB") {
 				colorPattern = strR + strG + strB;
-			}
-			else if (mode == "RGBChase-RGBN")
-			{
+			} else if (mode == "RGBChase-RGBN") {
 				colorPattern = strR + strG + strB + "000000";
-			}
-			else if (mode == "RGBChase-RGBA")
-			{
+			} else if (mode == "RGBChase-RGBA") {
 				colorPattern = strR + strG + strB + "FFFFFF";
-			}
-			else if (mode == "RGBChase-RGBAN")
-			{
+			} else if (mode == "RGBChase-RGBAN") {
 				colorPattern = strR + strG + strB + "FFFFFF000000";
-			}
-			else if (mode == "RGBChase-RGBCustom")
-			{
+			} else if (mode == "RGBChase-RGBCustom") {
 				colorPattern = $('#testModeRGBCustomPattern').val();
 			}
-
 			data =
 				{
 					mode: "RGBChase",
@@ -406,9 +403,27 @@ function SetTestMode()
 					cycleMS: cycleMS,
 					colorPattern: colorPattern
 				};
-		}
-		else if (mode == "SingleFill")
-		{
+		} else if (mode.substring(0,9) == "RGBCycle-") {
+			var colorPattern = strR + strG + strB;
+			if (mode == "RGBCycle-RGB") {
+				colorPattern = strR + strG + strB;
+			} else if (mode == "RGBCycle-RGBN") {
+				colorPattern = strR + strG + strB + "000000";
+			} else if (mode == "RGBCycle-RGBA") {
+				colorPattern = strR + strG + strB + "FFFFFF";
+			} else if (mode == "RGBCycle-RGBAN") {
+				colorPattern = strR + strG + strB + "FFFFFF000000";
+			} else if (mode == "RGBCycle-RGBCustom") {
+				colorPattern = $('#testModeRGBCycleCustomPattern').val();
+			}
+			data =
+				{
+					mode: "RGBCycle",
+					subMode: mode,
+					cycleMS: cycleMS,
+					colorPattern: colorPattern
+				};
+		} else if (mode == "SingleFill") {
 			data =
 				{
 					mode: "RGBFill",
@@ -416,9 +431,7 @@ function SetTestMode()
 					color2: colorS,
 					color3: colorS
 				};
-		}
-		else if (mode == "RGBFill")
-		{
+		} else if (mode == "RGBFill") {
 			data =
 				{
 					mode: "RGBFill",
@@ -431,7 +444,6 @@ function SetTestMode()
 		data.enabled = enabled;
 		data.channelSet = channelSet;
 		data.channelSetType = channelSetType;
-
 
 		var postData = "command=setTestMode&data=" + JSON.stringify(data);
 
@@ -465,6 +477,9 @@ function AppendFillToCustom()
 
 	var currentValue = $('#testModeRGBCustomPattern').val();
 	$('#testModeRGBCustomPattern').val(currentValue + newTriplet);
+
+    currentValue = $('#testModeRGBCycleCustomPattern').val();
+    $('#testModeRGBCycleCustomPattern').val(currentValue + newTriplet);
 
 	SetTestMode();
 }
@@ -618,6 +633,38 @@ $(document).ready(function(){
 	GetTestMode();
 });
 
+
+<?
+$testStartChannel = 1;
+$testEndChannel = FPPD_MAX_CHANNELS;
+if (file_exists("/home/fpp/media/fpp-info.json")) {
+    $content = file_get_contents("/home/fpp/media/fpp-info.json");
+    $json = json_decode($content, true);
+    $channelRanges = $json['channelRanges'];
+    if ($channelRanges != "") {
+        $testStartChannel = FPPD_MAX_CHANNELS;
+        $testEndChannel = 1;
+        $ranges = explode(',', $channelRanges);
+        foreach ($ranges as $range) {
+            $minmax = explode('-', $channelRanges);
+            
+            if ($minmax[0] < $testStartChannel) {
+                $testStartChannel = $minmax[0] + 1;
+            }
+            if ($minmax[1] > $testEndChannel) {
+                $testEndChannel = $minmax[1] + 1;
+            }
+        }
+        
+        if ($testEndChannel < $testStartChannel) {
+            $tmp = $testEndChannel;
+            $testEndChannel = $testStartChannel;
+            $testStartChannel = $tmp;
+        }
+    }
+}
+?>
+
 </script>
 <div id="bodyWrapper">
   <?php include 'menu.inc'; ?>
@@ -639,16 +686,12 @@ $(document).ready(function(){
 				<b>Channel Range to Test</b><br>
 				<table border=0 cellspacing='2' cellpadding='2'>
 				<tr><td>Start Channel:</td>
-						<td><input type='text' size='6' maxlength='6' value='1' id='testModeStartChannel' onChange='SetTestMode();' onkeypress='this.onchange();' onpaste='this.onchange();' oninput='this.onchange();'> (1-1048576)</td>
-<!--
-						<td>Universe Size:</td>
-						<td><input type='text' size=4 maxlength=4 value='512' id='testUniverseSize'></td>
--->
+						<td><input type='text' size='7' maxlength='7' value='<?=$testStartChannel ?>' id='testModeStartChannel' onChange='SetTestMode();' onkeypress='this.onchange();' onpaste='this.onchange();' oninput='this.onchange();'> (1-<? echo FPPD_MAX_CHANNELS; ?>)</td>
 						<td width=40>&nbsp;</td>
 						<td>Model Name:</td>
 						<td>
 							<select onChange='UpdateStartEndFromModel();' id='modelName'>
-								<option value='1,1048576'>-- All Channels --</option>
+								<option value='1,<?=$testEndChannel?>'>-- All Channels --</option>
 <?
 
 if (file_exists($settings['model-overlays'])) {
@@ -665,18 +708,14 @@ if (file_exists($settings['model-overlays'])) {
 							</td>
 						</tr>
 				<tr><td>End Channel:</td>
-						<td><input type='text' size='6' maxlength='6' value='1048576' id='testModeEndChannel' onChange='SetTestMode();' onkeypress='this.onchange();' onpaste='this.onchange();' oninput='this.onchange();'> (1-1048576)</td>
-<!--
-						<td>Universe #:</td>
-						<td><input type='text' size=5 maxlength=5 value='1' id='testUniverseNumber'></td>
--->
+						<td><input type='text' size='7' maxlength='7' value='<?=$testEndChannel?>' id='testModeEndChannel' onChange='SetTestMode();' onkeypress='this.onchange();' onpaste='this.onchange();' oninput='this.onchange();'> (1-<? echo FPPD_MAX_CHANNELS; ?>)</td>
 						</tr>
 				</table>
 				<br>
 				<span style='float: left'>Update Interval: </span><span id="testModeCycleMS"></span> <span style='float: left' id='testModeCycleMSText'>1000</span><span style='float: left'> ms</span></br>
 				<hr>
 				<div id='testModeModeDiv'>
-				<b>Test Patterns</b><br><br>
+<b>Test Patterns:</b><br><small>Note: RGB patterns have NO knowledge of output setups, models, etc...  "R" is the first channel, "G" is the second, etc... If channels do not line up, the colors displayed on pixels may not match.</small><br>
 				<table border=0 cellpadding=0 cellspacing=0>
 				<tr><td colspan=3><b>RGB Patterns:</b></td></tr>
 				<tr><td colspan=3>&nbsp;<b>Color Order:</b>
@@ -694,6 +733,11 @@ if (file_exists($settings['model-overlays'])) {
 				<tr><td><input type='radio' name='testModeMode' value='RGBChase-RGBN' onChange='SetTestMode();'></td><td><b>Chase: R-G-B-None</b></td></tr>
 				<tr><td><input type='radio' name='testModeMode' value='RGBChase-RGBAN' onChange='SetTestMode();'></td><td><b>Chase: R-G-B-All-None</b></td></tr>
 				<tr><td><input type='radio' name='testModeMode' value='RGBChase-RGBCustom' onChange='SetTestMode();'></td><td><b>Chase: Custom Pattern: </b> <input id='testModeRGBCustomPattern' size='36' maxlength='72' value='FF000000FF000000FF' onChange='SetTestMode();' onkeypress='this.onchange();' onpaste='this.onchange();' oninput='this.onchange();'> (6 hex digits per RGB triplet)</td></tr>
+                <tr><td><input type='radio' name='testModeMode' value='RGBCycle-RGB' onChange='SetTestMode();'></td><td><b>Cycle: R-G-B</b></td></tr>
+				<tr><td><input type='radio' name='testModeMode' value='RGBCycle-RGBA' onChange='SetTestMode();'></td><td><b>Cycle: R-G-B-All</b></td></tr>
+				<tr><td><input type='radio' name='testModeMode' value='RGBCycle-RGBN' onChange='SetTestMode();'></td><td><b>Cycle: R-G-B-None</b></td></tr>
+				<tr><td><input type='radio' name='testModeMode' value='RGBCycle-RGBAN' onChange='SetTestMode();'></td><td><b>Cycle: R-G-B-All-None</b></td></tr>
+				<tr><td><input type='radio' name='testModeMode' value='RGBCycle-RGBCustom' onChange='SetTestMode();'></td><td><b>Cycle: Custom Pattern: </b> <input id='testModeRGBCycleCustomPattern' size='36' maxlength='72' value='FF000000FF000000FF' onChange='SetTestMode();' onkeypress='this.onchange();' onpaste='this.onchange();' oninput='this.onchange();'> (6 hex digits per RGB triplet)</td></tr>
 				<tr><td><input type='radio' name='testModeMode' value='RGBFill' onChange='SetTestMode();'></td><td><div class="container"><div><b>Fill:</b></div><div class="color-box"></div></div><div style='clear: both'></div></td></tr>
 				<tr><td>&nbsp;</td><td>
 					<table border=0 cellspacing=10 cellpadding=0>

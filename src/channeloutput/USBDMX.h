@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   USB DMX handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _USBDMX_H
-#define _USBDMX_H
-
 #include <string>
 
 #include "ThreadedChannelOutputBase.h"
@@ -33,21 +31,20 @@
 class USBDMXOutput : public ThreadedChannelOutputBase {
   public:
 	USBDMXOutput(unsigned int startChannel, unsigned int channelCount);
-	~USBDMXOutput();
+	virtual ~USBDMXOutput();
 
-	int Init(char *configStr);
+    virtual int Init(Json::Value config) override;
 
-	int Close(void);
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual int RawSendData(unsigned char *channelData) override;
+    virtual void WaitTimedOut() override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
-	int RawSendDataOpen(unsigned char *channelData);
-	int RawSendDataPro(unsigned char *channelData);
 
     enum DongleType {
 		DMX_DVC_UNKNOWN,
@@ -59,9 +56,7 @@ class USBDMXOutput : public ThreadedChannelOutputBase {
 
 	std::string m_deviceName;
 	int         m_fd;
-	char        m_outputData[513];
-	char        m_dmxHeader[5];
-	char        m_dmxFooter[1];
+	char        m_outputData[513 + 6];
+    int         m_dataOffset;
+    int         m_dataLen;
 };
-
-#endif /* #ifdef _USBDMX_H */

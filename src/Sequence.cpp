@@ -23,46 +23,40 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-// This #define must be before any #include's
-#define _FILE_OFFSET_BITS 64
+#include "fpp-pch.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <inttypes.h>
 
-#include "E131.h"
-#include "channeloutputthread.h"
-#include "common.h"
 #include "events.h"
 #include "effects.h"
-#include "fpp.h" // for FPPstatus && #define-d status values
 #include "fppd.h"
-#include "log.h"
 #include "MultiSync.h"
-#include "PixelOverlay.h"
-#include "Sequence.h"
-#include "settings.h"
-#include <chrono>
+#include "overlays/PixelOverlay.h"
+#include "Plugins.h"
+#include "channeloutput/E131.h"
+#include "channeloutput/channeloutputthread.h"
+#include "playlist/Playlist.h"
+#include "channeloutput/channeloutput.h"
+
 using namespace std::literals;
 using namespace std::chrono_literals;
 using namespace std::literals::chrono_literals;
 
 #include "mediaoutput/SDLOut.h"
 
-Sequence *sequence = NULL;
+#define SEQUENCE_CACHE_FRAMECOUNT 40
 
+Sequence *sequence = NULL;
 Sequence::Sequence()
   :
-    m_seqDuration(0),
-    m_seqSecondsElapsed(0),
-    m_seqSecondsRemaining(0),
+    m_seqMSDuration(0),
+    m_seqMSElapsed(0),
     m_seqMSRemaining(0),
     m_seqFile(nullptr),
     m_seqStarting(0),
@@ -78,12 +72,18 @@ Sequence::Sequence()
     m_lastFrameRead(-1),
     m_doneRead(false),
     m_shuttingDown(false),
-    m_dataProcessed(false)
+    m_dataProcessed(false),
+    m_seqFilename(""),
+    m_bridgeData(nullptr)
 {
-    m_seqFilename[0] = 0;
     memset(m_seqData, 0, sizeof(m_seqData));
+    for (int x = 0; x < 4; x++) {
+        m_seqData[FPPD_OFF_CHANNEL + x] = 0;
+        m_seqData[FPPD_WHITE_CHANNEL] = 0xFF;
+    }
 
     m_seqControlRawIDs = getSettingInt("RawEventIDs");
+    m_blankBetweenSequences = getSettingInt("blankBetweenSequences");
 }
 
 Sequence::~Sequence()
@@ -97,6 +97,9 @@ Sequence::~Sequence()
     clearCaches();
     if (m_seqFile) {
         delete m_seqFile;
+    }
+    if (m_bridgeData) {
+        free(m_bridgeData);
     }
 }
 void Sequence::clearCaches() {
@@ -126,11 +129,13 @@ void Sequence::ReadFramesLoop() {
         }
         int cacheSize = frameCache.size();
         if (frameCache.size() < SEQUENCE_CACHE_FRAMECOUNT && m_seqStarting < 2 && m_seqFile && !m_doneRead) {
-            uint64_t frame = m_lastFrameRead + 1;
+            uint32_t frame = (m_lastFrameRead + 1);
             if (frame < m_seqFile->getNumFrames()) {
                 lock.unlock();
                 
+                long long start = GetTimeMS();
                 std::unique_lock<std::mutex> readlock(readFileLock);
+                long long lockt = GetTimeMS();
                 FSEQFile *file = m_seqFile;
                 FSEQFile::FrameData *fd = nullptr;
                 if (m_doneRead || file == nullptr) {
@@ -138,8 +143,20 @@ void Sequence::ReadFramesLoop() {
                 } else {
                     fd = m_seqFile->getFrame(frame);
                 }
+                long long unlock = GetTimeMS();
                 readlock.unlock();
-                
+                long long end = GetTimeMS();
+                long long total = end - start;
+                if (total > 20 || fd == nullptr) {
+                    uint32_t lfr = m_lastFrameRead;
+                    int lt = lockt - start;
+                    int ul = end - unlock;
+                    int gf = unlock - lockt;
+                    
+                    LogDebug(VB_SEQUENCE, "Problem reading frame %d:   %X    Time: %d ms     Last: %d     Lock: %d   GetFrame: %d   Unlock: %d\n",
+                             frame, fd, ((int)total), lfr,  lt, gf, ul);
+                }
+
                 lock.lock();
                 if (fd) {
                     if (m_lastFrameRead == (frame - 1)) {
@@ -148,7 +165,7 @@ void Sequence::ReadFramesLoop() {
 
                         lock.unlock();
                         frameLoadedSignal.notify_all();
-                        std::this_thread::sleep_for(5ms);
+                        std::this_thread::sleep_for(1ms);
                         lock.lock();
                     } else {
                         //a skip is in progress, we don't need this frame anymore
@@ -156,8 +173,11 @@ void Sequence::ReadFramesLoop() {
                     }
                 }
             } else {
-                frameLoadedSignal.notify_all();
                 m_doneRead = true;
+                lock.unlock();
+                frameLoadedSignal.notify_all();
+                std::this_thread::sleep_for(1ms);
+                lock.lock();
             }
         } else {
             frameLoadSignal.wait_for(lock, 25ms);
@@ -165,20 +185,34 @@ void Sequence::ReadFramesLoop() {
     }
 }
 
-int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSecond) {
-    LogDebug(VB_SEQUENCE, "OpenSequenceFile(%s, %d, %d)\n", filename, startFrame, startSecond);
+int Sequence::OpenSequenceFile(const std::string &filename, int startFrame, int startSecond) {
+    LogDebug(VB_SEQUENCE, "OpenSequenceFile(%s, %d, %d)\n", filename.c_str(), startFrame, startSecond);
 
-    if (!filename || !filename[0]) {
-        LogErr(VB_SEQUENCE, "Empty Sequence Filename!\n", filename);
+    if (filename == "") {
+        LogErr(VB_SEQUENCE, "Empty Sequence Filename!\n", filename.c_str());
         return 0;
     }
 
-    
     size_t bytesRead = 0;
     std::unique_lock<std::recursive_mutex> seqLock(m_sequenceLock);
 
+
+    if (m_seqFile) {
+        if (m_seqFilename == filename
+            && m_seqStarting) {
+            //same filename AND we haven't started yet, we can continue
+            return 1;
+        }
+    }
+
+    
     if (IsSequenceRunning())
         CloseSequenceFile();
+    
+    if (m_seqFile) {
+        delete m_seqFile;
+        m_seqFile = nullptr;
+    }
 
     m_seqStarting = 2;
     m_doneRead = false;
@@ -192,21 +226,21 @@ int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSe
     lock.unlock();
     
     m_seqPaused   = 0;
-    m_seqDuration = 0;
-    m_seqSecondsElapsed = 0;
-    m_seqSecondsRemaining = 0;
+    m_seqMSDuration = 0;
+    m_seqMSElapsed = 0;
+    m_seqMSRemaining = 0;
     SetChannelOutputFrameNumber(m_lastFrameRead + 1);
     if (m_readThread == nullptr) {
         m_readThread = new std::thread(ReadSequenceDataThread, this);
     }
 
-    strcpy(m_seqFilename, filename);
+    m_seqFilename = filename;
 
     char tmpFilename[2048];
     unsigned char tmpData[2048];
     strcpy(tmpFilename,(const char *)getSequenceDirectory());
     strcat(tmpFilename,"/");
-    strcat(tmpFilename, filename);
+    strcat(tmpFilename, filename.c_str());
 
     if (getFPPmode() == REMOTE_MODE)
         CheckForHostSpecificFile(getSetting("HostName"), tmpFilename);
@@ -220,7 +254,12 @@ int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSe
         m_seqStarting = 0;
         return 0;
     }
-    
+    if (getFPPmode() == MASTER_MODE) {
+        seqLock.unlock();
+        multiSync->SendSeqOpenPacket(filename);
+        seqLock.lock();
+    }
+
     m_seqFile = nullptr;
     FSEQFile *seqFile = FSEQFile::openFSEQFile(tmpFilename);
     if (seqFile == NULL) {
@@ -228,15 +267,6 @@ int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSe
             tmpFilename);
         m_seqStarting = 0;
         return 0;
-    }
-
-    if (getFPPmode() == MASTER_MODE) {
-        seqLock.unlock();
-        multiSync->SendSeqSyncStartPacket(filename);
-
-        // Give the remotes a head start spining up so they are ready
-        std::this_thread::sleep_for(10ms);
-        seqLock.lock();
     }
 
     m_seqStepTime = seqFile->getStepTime();
@@ -249,12 +279,11 @@ int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSe
         if (m_lastFrameRead < -1) m_lastFrameRead = -1;
     }
 
-    seqFile->prepareRead(GetOutputRanges());
+    seqFile->prepareRead(GetOutputRanges(), startFrame < 0 ? 0 : startFrame);
     // Calculate duration
     m_seqMSRemaining = seqFile->getNumFrames() * seqFile->getStepTime();
-    m_seqDuration = m_seqMSRemaining;
-    m_seqDuration /= 1000;
-    m_seqSecondsRemaining = m_seqDuration;
+    m_seqMSDuration = m_seqMSRemaining;
+    m_seqMSElapsed = 0;
     SetChannelOutputRefreshRate(m_seqRefreshRate);
     
     
@@ -262,7 +291,6 @@ int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSe
     m_seqFile = seqFile;
     m_seqStarting = 1;  //beyond header, read loop can start reading frames
     frameLoadSignal.notify_all();
-    m_seqStarting = 0;
     m_seqPaused = 0;
     m_seqSingleStep = 0;
     m_seqSingleStepBack = 0;
@@ -272,19 +300,44 @@ int Sequence::OpenSequenceFile(const char *filename, int startFrame, int startSe
     StartChannelOutputThread();
 
 
+    m_numSeek = 0;
     LogDebug(VB_SEQUENCE, "seqRefreshRate        : %d\n", m_seqRefreshRate);
-    LogDebug(VB_SEQUENCE, "seqDuration           : %d\n", m_seqDuration);
+    LogDebug(VB_SEQUENCE, "seqMSDuration         : %d\n", m_seqMSDuration);
     LogDebug(VB_SEQUENCE, "seqMSRemaining        : %d\n", m_seqMSRemaining);
     return 1;
 }
 
-int Sequence::SeekSequenceFile(int frameNumber) {
+void Sequence::StartSequence() {
+    if (!IsSequenceRunning() && m_seqFile) {
+        if (getFPPmode() == MASTER_MODE) {
+            multiSync->SendSeqSyncStartPacket(m_seqFilename);
+        }
+        m_seqStarting = 0;
+        StartChannelOutputThread();
+    }
+}
+
+void Sequence::StartSequence(const std::string &filename, int frameNumber) {
+    std::unique_lock<std::recursive_mutex> seqLock(m_sequenceLock);
+    if (sequence->m_seqFilename != filename) {
+        CloseSequenceFile();
+        OpenSequenceFile(filename, frameNumber);
+    }
+    if (sequence->m_seqFilename == filename) {
+        StartSequence();
+        if (frameNumber != 0) {
+            SeekSequenceFile(frameNumber);
+        }
+    }
+}
+
+void Sequence::SeekSequenceFile(int frameNumber) {
     LogDebug(VB_SEQUENCE, "SeekSequenceFile(%d)\n", frameNumber);
 
     std::unique_lock<std::recursive_mutex> seqLock(m_sequenceLock);
     if (!IsSequenceRunning()) {
         LogErr(VB_SEQUENCE, "No sequence is running\n");
-        return 0;
+        return;
     }
     seqLock.unlock();
     
@@ -302,19 +355,23 @@ int Sequence::SeekSequenceFile(int frameNumber) {
     if (!frameCache.empty() && frameNumber < frameCache.front()->frame) {
         clearCaches();
     }
-    LogDebug(VB_SEQUENCE, "Seeking to %d.   Last read is %d\n", frameNumber, (int)m_lastFrameRead);
     if (frameCache.empty()) {
+        LogDebug(VB_SEQUENCE, "Seeking to %d.   Last read is %d\n", frameNumber, (int)m_lastFrameRead);
         m_lastFrameRead = frameNumber - 1;
         frameLoadSignal.notify_all();
+
+        if ((frameNumber < 100) && (getFPPmode() == REMOTE_MODE)) {
+            m_numSeek++;
+            if (m_numSeek > 6) {
+                WarningHolder::AddWarning("Multiple Frame Skips During Playback - Likely Slow Network");
+            }
+        }
     }
     lock.unlock();
     frameLoadSignal.notify_all();
+    
 }
 
-
-char *Sequence::CurrentSequenceFilename(void) {
-    return m_seqFilename;
-}
 
 int Sequence::IsSequenceRunning(void) {
     if (m_seqFile && !m_seqStarting)
@@ -323,18 +380,26 @@ int Sequence::IsSequenceRunning(void) {
     return 0;
 }
 
-int Sequence::IsSequenceRunning(char *filename) {
+int Sequence::IsSequenceRunning(const std::string &filename) {
     int result = 0;
 
     std::unique_lock<std::recursive_mutex> seqLock(m_sequenceLock);
-    if ((!strcmp(sequence->m_seqFilename, filename)) && m_seqFile)
-        result = 1;
+    if (sequence->m_seqFilename == filename)
+        result = sequence->IsSequenceRunning();
 
     return result;
 }
 
 void Sequence::BlankSequenceData(void) {
-    memset(m_seqData, 0, sizeof(m_seqData));
+    LogDebug(VB_SEQUENCE, "BlankSequenceData()\n");
+    for (auto &a : GetOutputRanges()) {
+        memset(&m_seqData[a.first], 0, a.second);
+    }
+    if (m_bridgeData) {
+        for (auto &a : GetOutputRanges()) {
+            memset(&m_bridgeData[a.first], 0, a.second);
+        }
+    }
 }
 
 int Sequence::SequenceIsPaused(void) {
@@ -395,6 +460,7 @@ void Sequence::ReadSequenceData(bool forceFirstFrame) {
         std::unique_lock<std::mutex> lock(frameCacheLock);
         if (frameCache.empty() && !m_doneRead) {
             //wait up to the step time, if we don't have the frame, bail
+            frameLoadSignal.notify_all();
             frameLoadedSignal.wait_for(lock, std::chrono::milliseconds(m_seqStepTime - 1));
         }
         if (!frameCache.empty()) {
@@ -408,16 +474,15 @@ void Sequence::ReadSequenceData(bool forceFirstFrame) {
             lock.unlock();
             frameLoadSignal.notify_all();
             
-            data->readFrame((uint8_t*)m_seqData);
+            data->readFrame((uint8_t*)m_seqData, FPPD_MAX_CHANNELS);
             SetChannelOutputFrameNumber(data->frame);
-            m_seqSecondsElapsed = data->frame * m_seqStepTime;
-            m_seqSecondsElapsed /= 1000;
-            m_seqSecondsRemaining = m_seqDuration - m_seqSecondsElapsed;
+            m_seqMSElapsed = data->frame * m_seqStepTime;
+            m_seqMSRemaining = m_seqMSDuration - m_seqMSElapsed;
             m_dataProcessed = false;
         } else if (m_doneRead) {
             lock.unlock();
-            m_seqSecondsElapsed = m_seqDuration;
-            m_seqSecondsRemaining = m_seqDuration - m_seqSecondsElapsed;
+            m_seqMSElapsed = m_seqMSDuration;
+            m_seqMSRemaining = 0;
             CloseSequenceFile();
         } else {
             if (m_lastFrameRead > 0) {
@@ -425,7 +490,7 @@ void Sequence::ReadSequenceData(bool forceFirstFrame) {
                 m_lastFrameRead++;
                 if (!pastFrameCache.empty()) {
                     //and copy the last frame data
-                    pastFrameCache.back()->readFrame((uint8_t*)m_seqData);
+                    pastFrameCache.back()->readFrame((uint8_t*)m_seqData, FPPD_MAX_CHANNELS);
                     m_dataProcessed = false;
                 }
             }
@@ -433,9 +498,9 @@ void Sequence::ReadSequenceData(bool forceFirstFrame) {
             frameLoadSignal.notify_all();
         }
     } else {
-        if (getFPPmode() != REMOTE_MODE || getSettingInt("blankBetweenSequences")) {
+        if (m_blankBetweenSequences) {
             BlankSequenceData();
-        } else {
+        } else if (getFPPmode() == REMOTE_MODE) {
             //on a remote, we will get a "stop" and then a "start" a short time later
             //we don't want to blank immediately (unless the master tells us to)
             //so we don't get black blinks on the remote.  We'll wait the equivalent
@@ -445,19 +510,32 @@ void Sequence::ReadSequenceData(bool forceFirstFrame) {
             } else {
                 m_remoteBlankCount++;
             }
+        } else if (!playlist->IsPlaying()
+                   && (getFPPmode() & PLAYER_MODE)) {
+            //Standalone or Master, but not playlist running (so not between sequences)
+            //yet we are likely outputting something (overlay, etc...)  Need to blank
+            BlankSequenceData();
         }
     }
 }
 
 void Sequence::ProcessSequenceData(int ms, int checkControlChannels) {
+    if (m_bridgeData) {
+        // copy the latest bridge data to the sequence data
+        for (auto &a : GetOutputRanges()) {
+            memcpy(&m_seqData[a.first], &m_bridgeData[a.first], a.second);
+        }
+    }
+    PluginManager::INSTANCE.modifySequenceData(ms, (uint8_t*)m_seqData);
+    
     if (IsEffectRunning())
         OverlayEffects(m_seqData);
 
     if (SDLOutput::IsOverlayingVideo()) {
         SDLOutput::ProcessVideoOverlay(ms);
     }
-    if (PixelOverlayManager::INSTANCE.UsingMemoryMapInput()) {
-        PixelOverlayManager::INSTANCE.OverlayMemoryMap(m_seqData);
+    if (PixelOverlayManager::INSTANCE.hasActiveOverlays()) {
+        PixelOverlayManager::INSTANCE.doOverlays((uint8_t*)m_seqData);
     }
 
     if (checkControlChannels && getControlMajor() && getControlMinor())
@@ -465,8 +543,7 @@ void Sequence::ProcessSequenceData(int ms, int checkControlChannels) {
         char thisMajor = m_seqData[getControlMajor()-1];
         char thisMinor = m_seqData[getControlMinor()-1];
 
-        // Change to '== 1' in FPP v3.x and change 'RawEventIDs' setting to match
-        if (m_seqControlRawIDs <= 1)
+        if (m_seqControlRawIDs == 1)
         {
             thisMajor = NormalizeControlValue(thisMajor);
             thisMinor = NormalizeControlValue(thisMinor);
@@ -483,8 +560,10 @@ void Sequence::ProcessSequenceData(int ms, int checkControlChannels) {
         }
     }
 
-    if (channelTester->Testing())
-        channelTester->OverlayTestData(m_seqData);
+    if (ChannelTester::INSTANCE.Testing())
+        ChannelTester::INSTANCE.OverlayTestData(m_seqData);
+    
+    PluginManager::INSTANCE.modifyChannelData(ms, (uint8_t*)m_seqData);
     
     PrepareChannelData(m_seqData);
     m_dataProcessed = true;
@@ -506,14 +585,14 @@ void Sequence::SendBlankingData(void) {
     SendSequenceData();
 }
 
-void Sequence::CloseIfOpen(char *filename) {
+void Sequence::CloseIfOpen(const std::string &filename) {
     std::unique_lock<std::recursive_mutex> seqLock(m_sequenceLock);
-    if (!strcmp(m_seqFilename, filename))
+    if (m_seqFilename == filename)
         CloseSequenceFile();
 }
 
 void Sequence::CloseSequenceFile(void) {
-    LogDebug(VB_SEQUENCE, "CloseSequenceFile() %s\n", m_seqFilename);
+    LogDebug(VB_SEQUENCE, "CloseSequenceFile() %s\n", m_seqFilename.c_str());
 
     if (getFPPmode() == MASTER_MODE)
         multiSync->SendSeqSyncStopPacket(m_seqFilename);
@@ -534,14 +613,16 @@ void Sequence::CloseSequenceFile(void) {
     lock.unlock();
     frameLoadedSignal.notify_all();
     
-    m_seqFilename[0] = '\0';
+    m_seqFilename = "";
     m_seqPaused = 0;
 
     if ((!IsEffectRunning()) &&
         ((getFPPmode() != REMOTE_MODE) &&
-         (FPPstatus != FPP_STATUS_PLAYLIST_PLAYING)) ||
-        (getSettingInt("blankBetweenSequences")))
+         (playlist->getPlaylistStatus() != FPP_STATUS_PLAYLIST_PLAYING)) ||
+        (m_blankBetweenSequences)) {
         SendBlankingData();
+    }
+    
 }
 
 /*
@@ -556,3 +637,10 @@ char Sequence::NormalizeControlValue(char in) {
     return result;
 }
 
+void Sequence::SetBridgeData(uint8_t *data, int startChannel, int len) {
+    if (!m_bridgeData) {
+        m_bridgeData = (uint8_t*)calloc(1, FPPD_MAX_CHANNEL_NUM);
+    }
+    memcpy(&m_bridgeData[startChannel], data, len);
+    setDataNotProcessed();
+}

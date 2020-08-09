@@ -23,8 +23,7 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "common.h"
-#include "log.h"
+#include "fpp-pch.h"
 #include "PlaylistEntryPause.h"
 
 /*
@@ -34,7 +33,8 @@ PlaylistEntryPause::PlaylistEntryPause(PlaylistEntryBase *parent)
   : PlaylistEntryBase(parent),
 	m_duration(0.0f),
 	m_startTime(0),
-	m_endTime(0)
+	m_endTime(0),
+    m_pausedRemaining(0)
 {
 	LogDebug(VB_PLAYLIST, "PlaylistEntryPause::PlaylistEntryPause()\n");
 
@@ -58,7 +58,7 @@ int PlaylistEntryPause::Init(Json::Value &config)
 	m_duration = config["duration"].asFloat();
 	m_endTime = 0;
 	m_finishTime = 0;
-
+    m_pausedRemaining = 0;
 	return PlaylistEntryBase::Init(config);
 }
 
@@ -73,12 +73,12 @@ int PlaylistEntryPause::StartPlaying(void)
 		FinishPlay();
 		return 0;
 	}
-
+    m_pausedRemaining = 0;
 	// Calculate end time as m_duation number of seconds from now
-	m_startTime = GetTime();
+	m_startTime = GetTimeMS();
     
     double tmp = m_duration;
-    tmp *= 1000000.0;
+    tmp *= 1000.0;
 	m_endTime = m_startTime + tmp;
 
 	return PlaylistEntryBase::StartPlaying();
@@ -93,9 +93,9 @@ int PlaylistEntryPause::Process(void)
 		return 0;
     }
 
-    long long now = GetTime();
+    long long now = GetTimeMS();
 	if (m_isStarted && m_isPlaying && (now >= m_endTime)) {
-		m_finishTime = GetTime();
+		m_finishTime = GetTimeMS();
 		FinishPlay();
 	}
 
@@ -109,11 +109,25 @@ int PlaylistEntryPause::Stop(void)
 {
 	LogDebug(VB_PLAYLIST, "PlaylistEntryPause::Stop()\n");
 
-	m_finishTime = GetTime();
+	m_finishTime = GetTimeMS();
 	FinishPlay();
-
+    m_pausedRemaining = 0;
 	return PlaylistEntryBase::Stop();
 }
+
+uint64_t PlaylistEntryPause::GetLengthInMS() {
+    float f = m_duration; //duration is in seconds
+    f *= 1000;
+    return f;
+}
+uint64_t PlaylistEntryPause::GetElapsedMS() {
+    long long now = GetTimeMS();
+    if (m_isStarted && m_isPlaying) {
+        return now - m_endTime;
+    }
+    return 0;
+}
+
 
 /*
  *
@@ -136,16 +150,36 @@ Json::Value PlaylistEntryPause::GetConfig(void)
 {
 	Json::Value result = PlaylistEntryBase::GetConfig();
 
+    long long now = GetTimeMS();
+    if (IsPaused()) {
+        m_endTime = now + m_pausedRemaining;
+        float d = m_duration * 1000;
+        m_startTime = m_endTime - d;
+    }
+    
 	result["duration"] = m_duration;
-	result["startTime"] = m_startTime;
-	result["endTime"] = m_endTime;
-	result["finishTime"] = m_finishTime;
+	result["startTime"] = (Json::UInt64)m_startTime;
+	result["endTime"] = (Json::UInt64)m_endTime;
+	result["finishTime"] = (Json::UInt64)m_finishTime;
 
 	if (m_isPlaying)
-		result["remaining"] = (m_endTime - GetTime()) / 1000000;
+		result["remaining"] = (Json::UInt64)((m_endTime - now) / 1000);
 	else
-		result["remaining"] = 0;
+		result["remaining"] = (Json::UInt64)0;
 
 	return result;
 }
 
+
+void PlaylistEntryPause::Pause() {
+    long long now = GetTimeMS();
+    m_pausedRemaining = m_endTime - now;
+}
+bool PlaylistEntryPause::IsPaused() {
+    return m_pausedRemaining != 0;
+}
+void PlaylistEntryPause::Resume() {
+    long long now = GetTimeMS();
+    m_endTime = now + m_pausedRemaining;
+    m_pausedRemaining = 0;
+}

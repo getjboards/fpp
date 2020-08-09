@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Effect Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYEFFECT_H
-#define _PLAYLISTENTRYEFFECT_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -33,17 +31,17 @@
 class PlaylistEntryEffect : public PlaylistEntryBase {
   public:
 	PlaylistEntryEffect(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryEffect();
+	virtual ~PlaylistEntryEffect();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	virtual Json::Value GetConfig(void) override;
 
   private:
 	std::string m_effectName;
@@ -53,4 +51,3 @@ class PlaylistEntryEffect : public PlaylistEntryBase {
 	int         m_effectID;
 };
 
-#endif

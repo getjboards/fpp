@@ -17,9 +17,11 @@
 #include "OutputProcessor.h"
 
 #include "RemapOutputProcessor.h"
+#include "HoldValueOutputProcessor.h"
 #include "SetValueOutputProcessor.h"
 #include "BrightnessOutputProcessor.h"
 #include "ColorOrderOutputProcessor.h"
+#include "ThreeToFourOutputProcessor.h"
 #include "log.h"
 
 
@@ -64,7 +66,7 @@ void OutputProcessors::loadFromJSON(const Json::Value &config, bool clear) {
     if (clear) {
         removeAll();
     }
-    for( Json::Value::const_iterator itr = config.begin() ; itr != config.end() ; itr++ ) {
+    for (Json::Value::const_iterator itr = config.begin() ; itr != config.end() ; ++itr) {
         std::string name = itr.key().asString();
         if (name == "outputProcessors") {
             Json::Value val = *itr;
@@ -84,10 +86,14 @@ OutputProcessor *OutputProcessors::create(const Json::Value &config) {
         return new RemapOutputProcessor(config);
     } else if (type == "Brightness") {
         return new BrightnessOutputProcessor(config);
+    } else if (type == "Hold Value") {
+        return new HoldValueOutputProcessor(config);
     } else if (type == "Set Value") {
         return new SetValueOutputProcessor(config);
     } else if (type == "Reorder Colors") {
         return new ColorOrderOutputProcessor(config);
+    } else if (type == "Three to Four") {
+        return new ThreeToFourOutputProcessor(config);
     } else {
         LogErr(VB_CHANNELOUT, "Unknown OutputProcessor type: %s\n", type.c_str());
     }
@@ -105,14 +111,9 @@ OutputProcessor *OutputProcessors::find(std::function<bool(OutputProcessor*)> f)
     return nullptr;
 }
 
-void OutputProcessors::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
-    int m1, m2;
+void OutputProcessors::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
     for (OutputProcessor *a : processors) {
-        a->GetRequiredChannelRange(m1, m2);
-        min = std::min(min, m1);
-        max = std::max(max, m2);
+        a->GetRequiredChannelRanges(addRange);
     }
 }
 

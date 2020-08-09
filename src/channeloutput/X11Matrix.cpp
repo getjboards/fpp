@@ -23,17 +23,20 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include "fpp-pch.h"
 
-#include "common.h"
-#include "log.h"
+#include <X11/Xutil.h>
+
 #include "serialutil.h"
-#include "Sequence.h"
 #include "X11Matrix.h"
 
+
+extern "C" {
+    X11MatrixOutput *createX11MatrixOutput(unsigned int startChannel,
+                                           unsigned int channelCount) {
+        return new X11MatrixOutput(startChannel, channelCount);
+    }
+}
 /////////////////////////////////////////////////////////////////////////////
 
 /*
@@ -52,7 +55,8 @@ X11MatrixOutput::X11MatrixOutput(unsigned int startChannel,
 	LogDebug(VB_CHANNELOUT, "X11MatrixOutput::X11MatrixOutput(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = FPPD_MAX_CHANNELS;
+	XInitThreads();
+
 	m_useDoubleBuffer = 1;
 }
 
@@ -85,13 +89,17 @@ int X11MatrixOutput::Init(Json::Value config)
 
 	m_scaleWidth = m_scale * m_width;
 	m_scaleHeight = m_scale * m_height;
-	m_imageData = new char[m_scaleWidth * m_scaleHeight * 4];
+	m_imageData = (char *)calloc(m_scaleWidth * m_scaleHeight * 4, 1);
 
 	// Initialize X11 Window here
-	m_display = XOpenDisplay(getenv("DISPLAY"));
+    const char *dsp = getenv("DISPLAY");
+    if (dsp == nullptr) {
+        dsp = ":0";
+    }
+	m_display = XOpenDisplay(dsp);
 	if (!m_display)
 	{
-		LogDebug(VB_CHANNELOUT, "Unable to connect to X Server\n");
+		LogErr(VB_CHANNELOUT, "Unable to connect to X Server: %s\n", dsp);
 		return 0;
 	}
 
@@ -112,9 +120,9 @@ int X11MatrixOutput::Init(Json::Value config)
 		m_scaleWidth, m_scaleHeight, 24);
 
 	m_gc = XCreateGC(m_display, m_pixmap, 0, &values);
-	if (m_gc < 0)
-	{
-		LogDebug(VB_CHANNELOUT, "Unable to create GC\n");
+    int32_t tgc = reinterpret_cast<uintptr_t>(m_gc);
+	if (tgc < 0) {
+		LogErr(VB_CHANNELOUT, "Unable to create GC\n");
 		return 0;
 	}
 
@@ -142,13 +150,16 @@ int X11MatrixOutput::Close(void)
 
 	// Close X11 Window here
 
-	XLockDisplay(m_display);
-	XDestroyWindow(m_display, m_window);
-	XFreePixmap(m_display, m_pixmap);
-	XFreeGC(m_display, m_gc);
-	XCloseDisplay(m_display);
-	XUnlockDisplay(m_display);
-	delete [] m_imageData;
+    if (m_display) {
+        XLockDisplay(m_display);
+        XDestroyWindow(m_display, m_window);
+        XFreePixmap(m_display, m_pixmap);
+        XFreeGC(m_display, m_gc);
+        XDestroyImage(m_image);
+        XUnlockDisplay(m_display);
+        XCloseDisplay(m_display);
+    }
+    m_display = nullptr;
 
 	return ThreadedChannelOutputBase::Close();
 }
@@ -210,9 +221,8 @@ int X11MatrixOutput::RawSendData(unsigned char *channelData)
 /*
  *
  */
-void X11MatrixOutput::GetRequiredChannelRange(int &min, int & max) {
-	min = m_startChannel;
-	max = min + m_channelCount - 1;
+void X11MatrixOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    addRange(m_startChannel, m_startChannel + m_channelCount - 1);
 }
 
 /*

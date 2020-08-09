@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   USB Relay handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _USBRELAY_H
-#define _USBRELAY_H
-
 #include <string>
 
 #include "ChannelOutputBase.h"
@@ -33,16 +31,16 @@
 class USBRelayOutput : public ChannelOutputBase {
   public:
 	USBRelayOutput(unsigned int startChannel, unsigned int channelCount);
-	~USBRelayOutput();
+	virtual ~USBRelayOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+    virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int SendData(unsigned char *channelData);
+	virtual int SendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	enum RelayType {
@@ -56,5 +54,3 @@ class USBRelayOutput : public ChannelOutputBase {
 	RelayType    m_subType;
 	int          m_relayCount;
 };
-
-#endif /* _USBRELAY_H */

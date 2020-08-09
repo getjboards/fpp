@@ -23,21 +23,21 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <termios.h>
-#include <unistd.h>
+#include "fpp-pch.h"
 
-#include "common.h"
-#include "log.h"
-#include "settings.h"
+#include <fcntl.h>
+#include <termios.h>
+
 #include "serialutil.h"
 #include "GenericSerial.h"
 
 /////////////////////////////////////////////////////////////////////////////
-
+extern "C" {
+    GenericSerialOutput *createGenericSerialOutput(unsigned int startChannel,
+                                               unsigned int channelCount) {
+        return new GenericSerialOutput(startChannel, channelCount);
+    }
+}
 /*
  *
  */
@@ -54,7 +54,6 @@ GenericSerialOutput::GenericSerialOutput(unsigned int startChannel, unsigned int
 	LogDebug(VB_CHANNELOUT, "GenericSerialOutput::GenericSerialOutput(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = GENERICSERIAL_MAX_CHANNELS;
 	m_useDoubleBuffer = 1;
 }
 
@@ -66,49 +65,29 @@ GenericSerialOutput::~GenericSerialOutput()
 	LogDebug(VB_CHANNELOUT, "GenericSerialOutput::~GenericSerialOutput()\n");
 }
 
-/*
- *
- */
-int GenericSerialOutput::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "GenericSerialOutput::Init('%s')\n", configStr);
+int GenericSerialOutput::Init(Json::Value config) {
+	LogDebug(VB_CHANNELOUT, "GenericSerialOutput::Init()\n");
 
-	std::vector<std::string> configElems = split(configStr, ';');
-
-	for (int i = 0; i < configElems.size(); i++)
-	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
-
-		if (elem[0] == "device")
-		{
-			LogDebug(VB_CHANNELOUT, "Using %s for Generic Serial output\n",
-				elem[1].c_str());
-
-			m_deviceName = elem[1];
-		}
-		else if (elem[0] == "speed")
-		{
-			m_speed = atoi(elem[1].c_str());
-		}
-		else if (elem[0] == "header")
-		{
-			m_header = elem[1];
-			m_headerSize = strlen(m_header.c_str());
-		}
-		else if (elem[0] == "footer")
-		{
-			m_footer = elem[1];
-			m_footerSize = strlen(m_footer.c_str());
-		}
-	}
-
+    if (config.isMember("device")) {
+        m_deviceName = config["device"].asString();
+        LogDebug(VB_CHANNELOUT, "Using %s for Generic Serial output\n",
+            m_deviceName.c_str());
+    }
+    if (config.isMember("speed")) {
+        m_speed = config["speed"].asInt();
+    }
+    if (config.isMember("footer")) {
+        m_footer = config["footer"].asString();
+        m_footerSize = m_header.length();
+    }
+    if (config.isMember("header")) {
+        m_header = config["header"].asString();
+        m_headerSize = m_header.length();
+    }
 	m_packetSize = m_headerSize + m_channelCount + m_footerSize;
 
 	m_data = new char[m_packetSize + 1];
-	if (!m_data)
-	{
+	if (!m_data) {
 		LogErr(VB_CHANNELOUT, "Could not allocate channel data buffer\n");
 		return 0;
 	}
@@ -124,19 +103,17 @@ int GenericSerialOutput::Init(char *configStr)
 
 	m_fd = SerialOpen(m_deviceName.c_str(), m_speed, "8N1");
 
-	if (m_fd < 0)
-	{
+	if (m_fd < 0) {
 		LogErr(VB_CHANNELOUT, "Error %d opening %s: %s\n",
 			errno, m_deviceName.c_str(), strerror(errno));
 		return 0;
 	}
 
-	return ThreadedChannelOutputBase::Init(configStr);
+	return ThreadedChannelOutputBase::Init(config);
 }
 
-void GenericSerialOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = min + m_channelCount - 1;
+void GenericSerialOutput::GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) {
+    addRange(m_startChannel, m_startChannel + m_channelCount - 1);
 }
 
 /*

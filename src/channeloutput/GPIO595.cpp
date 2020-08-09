@@ -22,55 +22,38 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
+#include "fpp-pch.h"
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include "common.h"
-#include "log.h"
-#include "settings.h"
 
 #include "GPIO595.h"
 
-#ifdef USEWIRINGPI
-#   include "wiringPi.h"
-#elif defined(PLATFORM_BBB)
-#   include "channeloutput/BBBUtils.h"
-#   define INPUT "in"
-#   define OUTPUT "out"
-#   define HIGH   1
-#   define LOW   0
-#   define pinMode(a, b)         configBBBPin(a, "gpio", b)
-#   define digitalWrite(a,b)     setBBBPinValue(a, b)
-#   define delayMicroseconds(a)     0
-#else
-#   define pinMode(a, b)
-#   define digitalWrite(a, b)
-#   define delayMicroseconds(a)     0
-#endif
 
 #define GPIO595_MAX_CHANNELS  128
 
 /////////////////////////////////////////////////////////////////////////////
 
 
+extern "C" {
+    GPIO595Output *createGPIO_595Output(unsigned int startChannel,
+                                    unsigned int channelCount) {
+        return new GPIO595Output(startChannel, channelCount);
+    }
+}
+
 /*
  *
  */
 GPIO595Output::GPIO595Output(unsigned int startChannel, unsigned int channelCount)
   : ThreadedChannelOutputBase(startChannel, channelCount),
-	m_clockPin(-1),
-	m_dataPin(-1),
-	m_latchPin(-1)
+	m_clockPin(nullptr),
+	m_dataPin(nullptr),
+	m_latchPin(nullptr)
 {
 	LogDebug(VB_CHANNELOUT, "GPIO595Output::GPIO595Output(%u, %u)\n",
 		startChannel, channelCount);
 
-	m_maxChannels = GPIO595_MAX_CHANNELS;
 }
 
 /*
@@ -80,55 +63,40 @@ GPIO595Output::~GPIO595Output()
 {
 	LogDebug(VB_CHANNELOUT, "GPIO595Output::~GPIO595Output()\n");
 }
+int GPIO595Output::Init(Json::Value config) {
 
-/*
- *
- */
-int GPIO595Output::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "GPIO595Output::Init('%s')\n", configStr);
+	LogDebug(VB_CHANNELOUT, "GPIO595Output::Init()\n");
 
-	std::vector<std::string> configElems = split(configStr, ';');
+    if (config.isMember("clockPin")) {
+        int p = config["clockPin"].asInt();
+        m_clockPin = PinCapabilities::getPinByGPIO(p).ptr();
+    }
+    if (config.isMember("dataPin")) {
+        int p = config["dataPin"].asInt();
+        m_dataPin = PinCapabilities::getPinByGPIO(p).ptr();
+    }
+    if (config.isMember("latchPin")) {
+        int p = config["latchPin"].asInt();
+        m_latchPin = PinCapabilities::getPinByGPIO(p).ptr();
+    }
 
-	for (int i = 0; i < configElems.size(); i++)
+	if ((m_clockPin == nullptr) ||
+		(m_dataPin == nullptr) ||
+		(m_latchPin == nullptr))
 	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
-
-		if (elem[0] == "gpio")
-		{
-			LogDebug(VB_CHANNELOUT, "Using GPIO %s for output\n",
-				elem[1].c_str());
-
-			std::vector<std::string> gpios = split(elem[1], '-');
-			if ((elem[1].length() == 8) &&
-				(gpios.size() == 3))
-			{
-				m_clockPin = atoi(gpios[0].c_str());
-				m_dataPin  = atoi(gpios[1].c_str());
-				m_latchPin = atoi(gpios[2].c_str());
-			}
-		}
-	}
-
-	if ((m_clockPin == -1) ||
-		(m_dataPin == -1) ||
-		(m_latchPin == -1))
-	{
-		LogErr(VB_CHANNELOUT, "Invalid Config Str: %s\n", configStr);
+		LogErr(VB_CHANNELOUT, "GPIO595 Invalid Config\n");
 		return 0;
 	}
 
-	digitalWrite(m_clockPin, LOW);
-	digitalWrite(m_dataPin,  LOW);
-	digitalWrite(m_latchPin, HIGH);
+    m_clockPin->configPin("gpio", true);
+    m_dataPin->configPin("gpio", true);
+    m_latchPin->configPin("gpio", true);
+    
+    m_clockPin->setValue(0);
+    m_dataPin->setValue(0);
+    m_latchPin->setValue(1);
 
-	pinMode(m_clockPin, OUTPUT);
-	pinMode(m_dataPin,  OUTPUT);
-	pinMode(m_latchPin, OUTPUT);
-
-	return ThreadedChannelOutputBase::Init(configStr);
+	return ThreadedChannelOutputBase::Init(config);
 }
 
 /*
@@ -149,26 +117,25 @@ int GPIO595Output::RawSendData(unsigned char *channelData)
 	LogDebug(VB_CHANNELOUT, "GPIO595Output::RawSendData(%p)\n", channelData);
 
 	// Drop the latch low
-	digitalWrite(m_latchPin, LOW);
-	delayMicroseconds(1);
+    m_latchPin->setValue(0);
+    std::this_thread::sleep_for(std::chrono::microseconds(1));
 
 	// Output one bit per channel along with a clock tick
 	int i = 0;
-	for (i = m_channelCount - 1; i >= 0; i--)
-	{
+	for (i = m_channelCount - 1; i >= 0; i--) {
 		// We only support basic On/Off.  non-zero channel value == On
-		digitalWrite(m_dataPin, channelData[i]);
+        m_dataPin->setValue(channelData[i]);
 
 		// Send a clock tick
-		digitalWrite(m_clockPin, HIGH);
-		delayMicroseconds(1);
-		digitalWrite(m_clockPin, LOW);
-		delayMicroseconds(1);
+        m_clockPin->setValue(1);
+        std::this_thread::sleep_for(std::chrono::microseconds(1));
+        m_clockPin->setValue(0);
+        std::this_thread::sleep_for(std::chrono::microseconds(1));
 	}
 
 	// Bring the latch high to push the bits out of the chip
-	digitalWrite(m_latchPin, HIGH);
-	delayMicroseconds(1);
+    m_latchPin->setValue(1);
+    std::this_thread::sleep_for(std::chrono::microseconds(1));
 
 	return m_channelCount;
 }
@@ -180,9 +147,9 @@ void GPIO595Output::DumpConfig(void)
 {
 	LogDebug(VB_CHANNELOUT, "GPIO595Output::DumpConfig()\n");
 
-	LogDebug(VB_CHANNELOUT, "    Clock Pin: %d\n", m_clockPin);
-	LogDebug(VB_CHANNELOUT, "    Data Pin : %d\n", m_dataPin);
-	LogDebug(VB_CHANNELOUT, "    Latch Pin: %d\n", m_latchPin);
+    LogDebug(VB_CHANNELOUT, "    Clock Pin: %d\n", m_clockPin ? m_clockPin->kernelGpio : -1);
+	LogDebug(VB_CHANNELOUT, "    Data Pin : %d\n", m_dataPin ? m_dataPin->kernelGpio : -1);
+	LogDebug(VB_CHANNELOUT, "    Latch Pin: %d\n", m_latchPin ? m_latchPin->kernelGpio : -1);
 
 	ThreadedChannelOutputBase::DumpConfig();
 }

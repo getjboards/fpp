@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   PlaylistEntryURL Class for Falcon Player (FPP)
  *
@@ -22,10 +23,6 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
-
-#ifndef _PLAYLISTENTRYURL_H
-#define _PLAYLISTENTRYURL_H
-
 #include <string>
 
 #include <curl/curl.h>
@@ -35,19 +32,18 @@
 class PlaylistEntryURL : public PlaylistEntryBase {
   public:
 	PlaylistEntryURL(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryURL();
+	virtual ~PlaylistEntryURL();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Stop(void) override;
 
-	std::string ReplaceMatches(std::string in);
+	virtual std::string ReplaceMatches(std::string in) override;
 
-	void Dump(void);
+	virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+	Json::Value GetConfig(void) override;
 
   private:
 	int ProcessData(void *buffer, size_t size, size_t nmemb);
@@ -61,7 +57,4 @@ class PlaylistEntryURL : public PlaylistEntryBase {
 	std::string            m_response;
 
 	CURL                  *m_curl;
-	CURLM                 *m_curlm;
 };
-
-#endif

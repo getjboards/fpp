@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   X11 Matrix handler for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _X11MATRIX_H
-#define _X11MATRIX_H
-
 #include <X11/Xlib.h>
 
 #include "ThreadedChannelOutputBase.h"
@@ -33,16 +31,16 @@
 class X11MatrixOutput : public ThreadedChannelOutputBase {
   public:
 	X11MatrixOutput(unsigned int startChannel, unsigned int channelCount);
-	~X11MatrixOutput();
+	virtual ~X11MatrixOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual int RawSendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-	virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void  GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
   	int         m_width;
@@ -61,5 +59,3 @@ class X11MatrixOutput : public ThreadedChannelOutputBase {
 
 	std::string m_title;
 };
-
-#endif /* _X11MATRIX_H */

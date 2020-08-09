@@ -2,20 +2,17 @@
 
 $kernel_version = exec("uname -r");
 
-$fpp_head_version = "v" . exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ describe --tags", $output, $return_val);
-if ( $return_val != 0 ) 
-	$fpp_head_version = "Unknown";
-unset($output);
-
-$git_branch = exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ branch --list | grep '\\*' | awk '{print \$2}'", $output, $return_val);
-if ( $return_val != 0 )
-	$git_branch = "Unknown";
-unset($output);
+$fpp_head_version = "v" . getFPPVersion();
+$git_branch = getFPPBranch();
 
 if (!preg_match("/^$git_branch(-.*)?$/", $fpp_head_version))
 	$fpp_head_version .= " ($git_branch branch)";
 
 $IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v ^$ | grep -v lo | grep -v eth0:0 | grep -v usb | grep -v SoftAp | grep -v 'can.' | sed -e 's/://g' | while read iface ; do /sbin/ifconfig \$iface | grep 'inet ' | awk '{print \$2}'; done")));
+$ipStr = '';
+if (count($IPs)) {
+    $ipStr = '(' . join(' ', $IPs) . ')';
+}
 ?>
 
 <?php require_once(dirname(__FILE__)."/config.php"); ?>
@@ -39,7 +36,7 @@ function list_plugin_entries($menu)
 						if ($first)
 						{
 							$first = 0;
-							echo "<li><b><font color='white' size=-1>-=- Plugins -=-</font></b></li>\n";
+							echo "<li><b><font color='white' size=-1>- - - - - - - Plugins - - - - - - -</font></b></li>\n";
 						}
 
 						-include_once($pluginDirectory."/".$plugin."/".$menu."_menu.inc");
@@ -52,7 +49,7 @@ function list_plugin_entries($menu)
 						if ($first)
 						{
 							$first = 0;
-							echo "<li><b><font color='white' size=-1>-=- Plugins -=-</font></b></li>\n";
+							echo "<li><b><font color='white' size=-1>- - - - - - - Plugins - - - - - - -</font></b></li>\n";
 						}
 
 						-include($pluginDirectory."/".$plugin."/menu.inc");
@@ -66,10 +63,15 @@ function list_plugin_entries($menu)
 
   <div style='float: right'><a href='#' class='nonULLink' onClick='ClearRestartFlag(); ClearRebootFlag();'><img src='images/1x1.png' width='5' height='5' style="vertical-align: top;"></a></div>
   <div class="header">
-    <div class="headerLeft"><a href="http://www.falconchristmas.com"><img src="images/falconlogo.png" class="logo" /></a></div>
+    <div class="headerLeft"><a href="https://falconchristmas.com/forum/"><img src="images/falconlogo.png" class="logo" /></a></div>
     <div class="headerCenter"><div class="siteName"><? echo $settings['Title']; ?></div>
-      Version: <a href='about.php' class='nonULLink'><?php echo $fpp_head_version; ?></a>&nbsp;&nbsp;Host: <? echo "<a href='networkconfig.php' class='nonULLink'>" . $settings['HostName'] . "</a> (" . join(' ', $IPs) . ")"; ?>
+      Version: <a href='about.php' class='nonULLink headerLink'><?php echo $fpp_head_version; ?></a>&nbsp;&nbsp;Host:&nbsp;
 <?
+    if (!file_exists("/etc/fpp/desktop")) {
+        echo "<a href='networkconfig.php' class='nonULLink headerLink'>" . $settings['HostName'] . "</a> " . $ipStr;
+    } else {
+        echo "" . gethostname() . "&nbsp;" . $ipStr;
+    }
 	if (file_exists("/etc/fpp/rfs_version") && exec('grep "^[^#].*/home/pi/media" /etc/fstab') )
 	{
 		$mounted = 0;
@@ -110,9 +112,19 @@ function list_plugin_entries($menu)
             if ($settings['LogoLink'] != "") echo "<a href='" . $settings['LogoLink'] . "' target='_blank'>";
 		    if ($settings['Logo'] != "") echo "<img src='images/" . $settings['Logo'] . "' class='logo'>";
 		    if ($settings['LogoLink'] != "") echo "</a>";
-if (isSet($settings['cape-info']) && isSet($settings['cape-info']['vendor']) && isSet($settings['cape-info']['vendor']['image'])) {
-echo "<a href=\"" . $settings['cape-info']['vendor']['url'] . "\"><img style='max-width:125px; max-height:60px;' src=\"". $settings['cape-info']['vendor']['image'] . "?sn=" . $settings['cape-info']['serialNumber'] . "&id=" . $settings['cape-info'][id] . "\"></a>";
-}
+            if (isSet($settings['cape-info']) && isSet($settings['cape-info']['vendor']) && isSet($settings['cape-info']['vendor']['image'])) {
+                $landing = $settings['cape-info']['vendor']['url'];
+                if (isSet($settings['cape-info']['vendor']['landingPage'])) {
+                    $landing = $settings['cape-info']['vendor']['landingPage'];
+                }
+                $iurl = $settings['cape-info']['vendor']['image'] . "?sn=" . $settings['cape-info']['serialNumber'] . "&id=" . $settings['cape-info']['id'];
+                $landing = $landing . "?sn=" . $settings['cape-info']['serialNumber'] . "&id=" . $settings['cape-info']['id'];
+                if (isset($settings['cape-info']['cs']) && $settings['cape-info']['cs'] != "") {
+                    $iurl = $iurl . "&cs=" . $settings['cape-info']['cs'];
+                    $landing = $landing . "&cs=" . $settings['cape-info']['cs'];
+                }
+                echo "<a href=\"" . $landing . "\"><img style='max-width:125px; max-height:60px;' src=\"" . $iurl . "\"></a>";
+            }
           ?>
 
 		</div>
@@ -122,17 +134,31 @@ echo "<a href=\"" . $settings['cape-info']['vendor']['url'] . "\"><img style='ma
     <ul id="fppMenu" class="sm sm-clean">
       <li><a>Status/Control</a>
         <ul>
-          <li><a href="/">Status Page</a></li>
-          <li><a href="uipassword.php">Set UI Password</a></li>
-          <li><a href="timeconfig.php">Config/Set Time</a></li>
-          <li><a href="networkconfig.php">Network</a></li>
+          <li><a href="index.php">Status Page</a></li>
+<?
+if (!file_exists("/etc/fpp/desktop")) {
+          echo "<li><a href='networkconfig.php'>Network</a></li>";
+}
+?>
           <li><a href="multisync.php">MultiSync</a></li>
           <li><a href="settings.php">FPP Settings</a></li>
           <li><a href="backup.php">FPP Backup</a></li>
-          <li><a href="email.php">Email Settings</a></li>
+          <li><a href="proxies.php">Proxy Settings</a></li>
           <li><a href="events.php">Events</a></li>
           <li><a href="effects.php">Effects</a></li>
           <li><a href="testing.php">Display Testing</a></li>
+          <?
+          if (file_exists($settings['co-other'])) {
+            $js = json_decode(file_get_contents($settings['co-other']), true);
+            foreach($js["channelOutputs"] as $key => $val) {
+                if (($val["enabled"] == 1) && ($val["type"] == "HTTPVirtualDisplay")) {
+                echo "<li><a href='virtualdisplaywrapper.php'>Virtual Display</a></li>";
+                }
+            }
+          
+          }
+          ?>
+          
           <?php list_plugin_entries("status"); ?>
         </ul>
       </li>
@@ -141,8 +167,8 @@ echo "<a href=\"" . $settings['cape-info']['vendor']['url'] . "\"><img style='ma
           <li><a href="uploadfile.php">File Manager</a></li>
           <li><a href="playlists.php">Playlists</a></li>
           <li><a href="scheduler.php">Scheduler</a></li>
-		  <li><a href="plugins.php">Plugin Manager</a></li>
           <li><a href="scriptbrowser.php">Script Repository Browser</a></li>
+          <li><a href="plugins.php">Plugin Manager</a></li>
           <?php list_plugin_entries("content"); ?>
         </ul>
       </li>
@@ -158,8 +184,12 @@ echo "<a href=\"" . $settings['cape-info']['vendor']['url'] . "\"><img style='ma
       </li>
       <li><a>Help</a>
         <ul>
+          <li><a href="https://falconchristmas.github.io/FPP_Manual(4.0).pdf" target="_blank">FPP Manual</a></li>
           <li><a href="http://falconchristmas.com/wiki/index.php/Falcon_FPP" target="_blank">Wiki/Help</a></li>
           <li><a href="help.php">Help Index</a></li>
+<? if ($settings['uiLevel'] > 0) { ?>
+          <li><a href="apihelp.php">REST API Help</a></li>
+<? } ?>
           <li><a href="cliHelp.php">fpp &amp; fppmm Usage</a></li>
           <li><a href="troubleshooting.php">Troubleshooting Commands</a></li>
           <li><a href="http://<?php echo $_SERVER['SERVER_ADDR'] ?>:4200" target="_new">SSH Shell</a></li>
@@ -182,6 +212,22 @@ echo "<a href=\"" . $settings['cape-info']['vendor']['url'] . "\"><img style='ma
   }
 ?>
   </div>
+<?  if (!file_exists("/opt/fpp/src/fppd")) { ?>
+<div id='rebuildPopup' title='FPP Upgrade' style="display: none">
+    <textarea style='width: 99%; height: 97%;' disabled id='rebuildText'>
+    </textarea>
+</div>
+<script>
+function RebuildFPPD() {
+    $('#rebuildPopup').dialog({ height: 600, width: 900, title: "Rebuild FPP" });
+    $('#rebuildPopup').dialog( "moveToTop" );
+    $('#rebuildText').html('');
+    StreamURL('manualUpdate.php?wrapped=1', 'rebuildText');
+}
+</script>
+  <div id="compileFPPDBanner">FPPD not found. Rebuild required - <input name="btnRebuild" onClick="RebuildFPPD();" type="button" class = "buttons" value="Rebuild"></div>
+<? } ?>
+  <div id='unsupportedBrowser'>FPP will not work with this browser.  Chrome, Firefox, or Edge is strongly recommended.</div>
   <div id='rebootFlag'>Base configuration has changed. Reboot Required - <input name="btnReboot" onClick="RebootPi();" type="button" class = "buttons" value="Reboot">
 <?
   if (basename($_SERVER['PHP_SELF']) == "developer.php")
@@ -203,7 +249,23 @@ function handleKeypress(e) {
 	}
 };
 
+function CheckBrowser() {
+    var ua = window.navigator.userAgent;
+    var msie = ua.indexOf('MSIE '); // IE<11
+    var trident = ua.indexOf('Trident/'); // IE11
+    if (msie > 0 || trident > 0) {
+       // IE 10 or older => return version number
+        $('#unsupportedBrowser').show();
+    } else {
+        $('#unsupportedBrowser').hide();
+    }
+    if(navigator.userAgent.indexOf('Mac') > 0) {
+        $('body').addClass('mac-os');
+    }
+}
+
 $(document).ready(function() {
+    CheckBrowser();
 	$(document).on('keydown', handleKeypress);
 
 	CheckRestartRebootFlags();

@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Ron's Holiday Lights DVI to E1.31 Channel Output for Falcon Player (FPP)
  *
@@ -22,10 +23,6 @@
  *   You should have received a copy of the GNU General Public License
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
-
-#ifndef _RHL_DVI_E131_H
-#define _RHL_DVI_E131_H
-
 #include <linux/fb.h>
 
 #include "ChannelOutputBase.h"
@@ -33,19 +30,16 @@
 class RHLDVIE131Output : public ChannelOutputBase {
   public:
 	RHLDVIE131Output(unsigned int startChannel, unsigned int channelCount);
-	~RHLDVIE131Output();
+	virtual ~RHLDVIE131Output();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int SendData(unsigned char *channelData);
+	virtual int SendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max) {
-        //FIXME??
-        min = 0; max = FPPD_MAX_CHANNELS;
-    }
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override;
 
   private:
 	int     m_fbFd;
@@ -61,5 +55,3 @@ class RHLDVIE131Output : public ChannelOutputBase {
 	struct fb_var_screeninfo m_vInfoOrig;
 	struct fb_fix_screeninfo m_fInfo;
 };
-
-#endif /* _RHL_DVI_E131_H */

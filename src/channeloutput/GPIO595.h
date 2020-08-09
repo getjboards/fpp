@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   GPIO attached 74HC595 Shift Register handler for Falcon Player (FPP)
  *
@@ -23,33 +24,29 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _GPIO595_H
-#define _GPIO595_H
-
 #include "ThreadedChannelOutputBase.h"
+#include "util/GPIOUtils.h"
 
 class GPIO595Output : public ThreadedChannelOutputBase {
   public:
 	GPIO595Output(unsigned int startChannel, unsigned int channelCount);
-	~GPIO595Output();
+	virtual ~GPIO595Output();
 
-	int Init(char *configStr);
+    virtual int Init(Json::Value config) override;
 
-	int Close(void);
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual int RawSendData(unsigned char *channelData) override;
 
-	void DumpConfig(void);
+	virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max) {
-        min = m_startChannel;
-        max = min + m_channelCount - 1;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)> &addRange) override {
+        addRange(m_startChannel, m_startChannel + m_channelCount - 1);
     }
     
   private:
-	int m_clockPin;
-	int m_dataPin;
-	int m_latchPin;
+	const PinCapabilities * m_clockPin;
+	const PinCapabilities * m_dataPin;
+	const PinCapabilities * m_latchPin;
 };
 
-#endif

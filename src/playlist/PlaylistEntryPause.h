@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   Playlist Entry Pause Class for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _PLAYLISTENTRYPAUSE_H
-#define _PLAYLISTENTRYPAUSE_H
-
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -35,21 +33,29 @@ class PlaylistEntryPause : public PlaylistEntryBase {
 	PlaylistEntryPause(PlaylistEntryBase *parent = NULL);
 	~PlaylistEntryPause();
 
-	int  Init(Json::Value &config);
+	virtual int  Init(Json::Value &config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+	virtual int  StartPlaying(void) override;
+	virtual int  Process(void) override;
+	virtual int  Stop(void) override;
+    
+    virtual void Pause() override;
+    virtual bool IsPaused() override;
+    virtual void Resume() override;
 
-	void Dump(void);
+    
+    virtual uint64_t GetLengthInMS() override;
+    virtual uint64_t GetElapsedMS() override;
 
-	Json::Value GetConfig(void);
+	virtual void Dump(void) override;
+
+	virtual Json::Value GetConfig(void) override;
 
   private:
 	float                m_duration;
 	long long            m_startTime;
 	long long            m_endTime;
 	long long            m_finishTime;
+    
+    long long            m_pausedRemaining;
 };
-
-#endif

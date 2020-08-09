@@ -23,24 +23,26 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdlib.h>
-#include <string.h>
+#include "fpp-pch.h"
 
-#include <boost/algorithm/string.hpp>
+#if __GNUC__ >= 8
+#  include <filesystem>
+using namespace std::filesystem;
+#else
+#  include <experimental/filesystem>
+using namespace std::experimental::filesystem;
+#endif
 
-#include "log.h"
+#include <sys/wait.h>
+
 #include "mediadetails.h"
-#include "mpg123.h"
-#include "mqtt.h"
 #include "MultiSync.h"
-#include "ogg123.h"
-#include "omxplayer.h"
 #include "PlaylistEntryMedia.h"
 #include "Plugins.h"
-#include "SDLOut.h"
-#include "settings.h"
+#include "Playlist.h"
 
-extern MediaDetails mediaDetails;
+
+int PlaylistEntryMedia::m_openStartDelay = -1;
 
 /*
  *
@@ -48,21 +50,19 @@ extern MediaDetails mediaDetails;
 PlaylistEntryMedia::PlaylistEntryMedia(PlaylistEntryBase *parent)
   : PlaylistEntryBase(parent),
 	m_status(0),
-	m_secondsElapsed(0),
-	m_subSecondsElapsed(0),
-	m_secondsRemaining(0),
-	m_subSecondsRemaining(0),
-	m_minutesTotal(0),
-	m_secondsTotal(0),
-	m_mediaSeconds(0.0),
-	m_speedDelta(0),
 	m_mediaOutput(NULL),
-    m_videoOutput("--Default--")
+    m_videoOutput("--Default--"),
+    m_openTime(0),
+    m_fileMode("single"),
+    m_duration(0),
+    m_pausedTime(-1)
 {
     LogDebug(VB_PLAYLIST, "PlaylistEntryMedia::PlaylistEntryMedia()\n");
-
+    if (m_openStartDelay == -1) {
+        m_openStartDelay = getSettingInt("openStartDelay");
+    }
 	m_type = "media";
-
+	m_fileSeed = (unsigned int)time(NULL);
 	pthread_mutex_init(&m_mediaOutputLock, NULL);
 }
 
@@ -81,45 +81,72 @@ int PlaylistEntryMedia::Init(Json::Value &config)
 {
     LogDebug(VB_PLAYLIST, "PlaylistEntryMedia::Init()\n");
 
-	if (!config.isMember("mediaName"))
-	{
-		LogErr(VB_PLAYLIST, "Missing mediaName entry\n");
-		return 0;
-	}
+    if (config.isMember("fileMode")) {
+        m_fileMode = config["fileMode"].asString();
+    }
 
-	m_mediaFilename = config["mediaName"].asString();
-    
+    if (m_fileMode == "single") {
+        if (config.isMember("mediaName")) {
+            m_mediaFilename = config["mediaName"].asString();
+        } else {
+            LogErr(VB_PLAYLIST, "Missing mediaName entry\n");
+            return 0;
+        }
+    } else {
+        if (GetFileList()) {
+            m_mediaFilename = GetNextRandomFile();
+        } else {
+            LogErr(VB_PLAYLIST, "Error, no files found when trying to play random file in %s mode\n",
+                m_fileMode.c_str());
+            return 0;
+        }
+    }
+
     if (config.isMember("videoOut")) {
         m_videoOutput = config["videoOut"].asString();
     }
-
-	return PlaylistEntryBase::Init(config);
+    m_pausedTime = -1;
+    return PlaylistEntryBase::Init(config);
 }
 
 
 int PlaylistEntryMedia::PreparePlay() {
-    LogDebug(VB_PLAYLIST, "PlaylistEntryMedia::StartPlaying()\n");
+    LogDebug(VB_PLAYLIST, "PlaylistEntryMedia::PreparePlay()\n");
     
     if (!CanPlay()) {
         FinishPlay();
         return 0;
     }
-    
+
+    if (m_fileMode != "single") {
+        if (m_files.size()) {
+            m_mediaFilename = GetNextRandomFile();
+        } else {
+            if (GetFileList()) {
+                m_mediaFilename = GetNextRandomFile();
+            } else {
+                LogErr(VB_PLAYLIST, "Error, no files found when trying to play random file in %s mode\n",
+                    m_fileMode.c_str());
+                return 0;
+            }
+        }
+    }
     if (!OpenMediaOutput()) {
         FinishPlay();
         return 0;
     }
 
+    if (getFPPmode() == MASTER_MODE)
+        multiSync->SendMediaOpenPacket(m_mediaFilename);
+
+    m_openTime = GetTimeMS();
     if (mqtt) {
         mqtt->Publish("playlist/media/status", m_mediaFilename);
-        mqtt->Publish("playlist/media/title", mediaDetails.title);
-        mqtt->Publish("playlist/media/artist", mediaDetails.artist);
+        mqtt->Publish("playlist/media/title", MediaDetails::INSTANCE.title);
+        mqtt->Publish("playlist/media/artist", MediaDetails::INSTANCE.artist);
     }
-    
-    pluginCallbackManager.mediaCallback();
     return 1;
 }
-
 
 /*
  *
@@ -128,6 +155,13 @@ int PlaylistEntryMedia::StartPlaying(void)
 {
     LogDebug(VB_PLAYLIST, "PlaylistEntryMedia::StartPlaying()\n");
 
+    if (getFPPmode() == MASTER_MODE && m_openTime) {
+        long long st = GetTimeMS() - m_openTime;
+        if (st < m_openStartDelay) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(m_openStartDelay - st));
+        }
+    }
+    
     if (m_mediaOutput == nullptr) {
         if (PreparePlay() == 0) {
             return 0;
@@ -137,11 +171,14 @@ int PlaylistEntryMedia::StartPlaying(void)
         return 0;
     }
 
-
+    float f = mediaOutputStatus.mediaSeconds * 1000;
+    if (f > m_duration) {
+        m_duration = f;
+    }
     pthread_mutex_lock(&m_mediaOutputLock);
 
     if (getFPPmode() == MASTER_MODE)
-        multiSync->SendMediaSyncStartPacket(m_mediaFilename.c_str());
+        multiSync->SendMediaSyncStartPacket(m_mediaFilename);
     
     if (!m_mediaOutput->Start()) {
         LogErr(VB_MEDIAOUT, "Could not start media %s\n", m_mediaOutput->m_mediaFilename.c_str());
@@ -150,8 +187,6 @@ int PlaylistEntryMedia::StartPlaying(void)
         pthread_mutex_unlock(&m_mediaOutputLock);
         return 0;
     }
-    
-    mediaOutputStatus.speedDelta = 0;
     
     pthread_mutex_unlock(&m_mediaOutputLock);
 
@@ -179,6 +214,8 @@ int PlaylistEntryMedia::Process(void)
             CloseMediaOutput();
             pthread_mutex_lock(&m_mediaOutputLock);
         }
+    } else {
+        FinishPlay();
     }
 
 	pthread_mutex_unlock(&m_mediaOutputLock);
@@ -187,6 +224,28 @@ int PlaylistEntryMedia::Process(void)
 
 	return PlaylistEntryBase::Process();
 }
+
+uint64_t PlaylistEntryMedia::GetLengthInMS() {
+    if (m_duration == 0) {
+        MediaDetails details;
+        details.ParseMedia(m_mediaFilename.c_str());
+        m_duration = details.lengthMS;
+    }
+    return m_duration;
+}
+uint64_t PlaylistEntryMedia::GetElapsedMS() {
+    if (m_mediaOutput) {
+        float f = mediaOutputStatus.secondsElapsed * 1000;
+        f += mediaOutputStatus.subSecondsElapsed * 10;  // subSec is in 1/100th second
+        if (f > m_duration) {
+            m_duration = f;
+        }
+        return f;
+    }
+    return 0;
+}
+
+
 
 /*
  *
@@ -261,11 +320,8 @@ int PlaylistEntryMedia::OpenMediaOutput(void)
 	if (m_mediaOutput) {
 		pthread_mutex_unlock(&m_mediaOutputLock);
 		CloseMediaOutput();
+        pthread_mutex_lock(&m_mediaOutputLock);
 	}
-	else
-		pthread_mutex_unlock(&m_mediaOutputLock);
-
-	pthread_mutex_lock(&m_mediaOutputLock);
 
 	std::string tmpFile = m_mediaFilename;
 	std::size_t found = tmpFile.find_last_of(".");
@@ -277,9 +333,12 @@ int PlaylistEntryMedia::OpenMediaOutput(void)
 		return 0;
 	}
 
-	std::string ext = boost::algorithm::to_lower_copy(tmpFile.substr(found + 1));
+	std::string ext = toLowerCopy(tmpFile.substr(found + 1));
 
     LogDebug(VB_PLAYLIST, "PlaylistEntryMedia - Starting %s\n", tmpFile.c_str());
+
+    MediaDetails::INSTANCE.ParseMedia(m_mediaFilename.c_str());
+    PluginManager::INSTANCE.mediaCallback(playlist->GetInfo(), MediaDetails::INSTANCE);
 
     std::string vOut = m_videoOutput;
     if (vOut == "--Default--") {
@@ -293,48 +352,15 @@ int PlaylistEntryMedia::OpenMediaOutput(void)
 #endif
     }
 
-	if ((ext == "mp3") ||
-		(ext == "m4a") ||
-		(ext == "ogg"))
-	{
-#if !defined(PLATFORM_BBB)
-		if (getSettingInt("LegacyMediaOutputs"))
-		{
-			if (ext == "mp3") {
-				m_mediaOutput = new mpg123Output(tmpFile, &mediaOutputStatus);
-			} else if (ext == "ogg") {
-				m_mediaOutput = new ogg123Output(tmpFile, &mediaOutputStatus);
-			}
-		}
-		else
-#endif
-			m_mediaOutput = new SDLOutput(tmpFile, &mediaOutputStatus, "--Disabled--");
-#ifdef PLATFORM_PI
-	}
-	else if (((ext == "mp4") ||
-			 (ext == "mkv")) && vOut == "--HDMI--")
-	{
-		m_mediaOutput = new omxplayerOutput(tmpFile, &mediaOutputStatus);
-#endif
-    } else if ((ext == "mp4") ||
-               (ext == "mkv") ||
-               (ext == "avi")) {
-        m_mediaOutput = new SDLOutput(tmpFile, &mediaOutputStatus, vOut);
-	}
-	else
-	{
-		pthread_mutex_unlock(&mediaOutputLock);
-		LogDebug(VB_MEDIAOUT, "No Media Output handler for %s\n", tmpFile.c_str());
-		return 0;
-	}
+    m_mediaOutput = CreateMediaOutput(tmpFile, vOut);
 
 	if (!m_mediaOutput)
 	{
 		pthread_mutex_unlock(&m_mediaOutputLock);
+        LogDebug(VB_MEDIAOUT, "No Media Output handler for %s\n", tmpFile.c_str());
 		return 0;
 	}
 
-    ParseMedia(m_mediaFilename.c_str());
     pthread_mutex_unlock(&m_mediaOutputLock);
 
 
@@ -359,7 +385,7 @@ int PlaylistEntryMedia::CloseMediaOutput(void)
 	}
 
     if (getFPPmode() == MASTER_MODE)
-        multiSync->SendMediaSyncStopPacket(m_mediaFilename.c_str());
+        multiSync->SendMediaSyncStopPacket(m_mediaFilename);
 
 	if (m_mediaOutput->m_childPID) {
 		pthread_mutex_unlock(&m_mediaOutputLock);
@@ -378,22 +404,115 @@ int PlaylistEntryMedia::CloseMediaOutput(void)
 /*
  *
  */
+int PlaylistEntryMedia::GetFileList(void)
+{
+    std::string dir;
+
+    m_files.clear();
+
+    if (m_fileMode == "randomVideo")
+        dir = getVideoDirectory();
+    else if (m_fileMode == "randomAudio")
+        dir = getMusicDirectory();
+
+    for (auto &cp : recursive_directory_iterator(dir)) {
+        std::string entry = cp.path().string();
+        m_files.push_back(entry);
+    }
+
+    LogDebug(VB_PLAYLIST, "%d images in %s directory\n", m_files.size(), dir.c_str());
+
+    return m_files.size();
+}
+
+/*
+ *
+ */
+std::string PlaylistEntryMedia::GetNextRandomFile(void)
+{
+    std::string filename;
+
+    if (!m_files.size())
+        GetFileList();
+
+    if (!m_files.size()) {
+        LogWarn(VB_PLAYLIST, "No files found in GetNextRandomFile()\n");
+        return filename;
+    }
+
+    int i = rand_r(&m_fileSeed) % m_files.size();
+    filename = m_files[i];
+    m_files.erase(m_files.begin() + i);
+
+    LogDebug(VB_PLAYLIST, "GetNextRandomFile() = %s\n", filename.c_str());
+
+    return filename;
+}
+
+/*
+ *
+ */
 Json::Value PlaylistEntryMedia::GetConfig(void)
 {
 	Json::Value result = PlaylistEntryBase::GetConfig();
-
-
+    MediaOutputStatus status = IsPaused() ? m_pausedStatus : mediaOutputStatus;
 	result["mediaFilename"]       = m_mediaFilename;
-	result["status"]              = mediaOutputStatus.status;
-	result["secondsElapsed"]      = mediaOutputStatus.secondsElapsed;
-	result["subSecondsElapsed"]   = mediaOutputStatus.subSecondsElapsed;
-	result["secondsRemaining"]    = mediaOutputStatus.secondsRemaining;
-	result["subSecondsRemaining"] = mediaOutputStatus.subSecondsRemaining;
-	result["minutesTotal"]        = mediaOutputStatus.minutesTotal;
-	result["secondsTotal"]        = mediaOutputStatus.secondsTotal;
-	result["mediaSeconds"]        = mediaOutputStatus.mediaSeconds;
-	result["speedDelta"]          = mediaOutputStatus.speedDelta;
+	result["status"]              = status.status;
+	result["secondsElapsed"]      = status.secondsElapsed;
+	result["subSecondsElapsed"]   = status.subSecondsElapsed;
+	result["secondsRemaining"]    = status.secondsRemaining;
+	result["subSecondsRemaining"] = status.subSecondsRemaining;
+	result["minutesTotal"]        = status.minutesTotal;
+	result["secondsTotal"]        = status.secondsTotal;
+	result["mediaSeconds"]        = status.mediaSeconds;
 
 	return result;
 }
 
+Json::Value PlaylistEntryMedia::GetMqttStatus(void)
+{
+	Json::Value result = PlaylistEntryBase::GetMqttStatus();
+    MediaOutputStatus status = IsPaused() ? m_pausedStatus : mediaOutputStatus;
+	result["secondsElapsed"]    = status.secondsElapsed;
+	result["secondsRemaining"]  = status.secondsRemaining;
+	result["secondsTotal"]      = status.minutesTotal * 60 + status.secondsTotal;
+	result["mediaName"]         = m_mediaFilename;
+	result["mediaTitle"]        = MediaDetails::INSTANCE.title;
+	result["mediaArtist"]       = MediaDetails::INSTANCE.artist;
+
+	return result;
+}
+
+
+void PlaylistEntryMedia::Pause() {
+    m_pausedStatus = mediaOutputStatus;
+    m_pausedTime = GetElapsedMS();
+    CloseMediaOutput();
+    if (mqtt) {
+        mqtt->Publish("playlist/media/status", "");
+        mqtt->Publish("playlist/media/title", "");
+        mqtt->Publish("playlist/media/artist", "");
+    }
+}
+bool PlaylistEntryMedia::IsPaused() {
+    return m_pausedTime >= 0;
+}
+void PlaylistEntryMedia::Resume() {
+    if (m_pausedTime >= 0) {
+        PreparePlay();
+
+        pthread_mutex_lock(&m_mediaOutputLock);
+        if (getFPPmode() == MASTER_MODE)
+            multiSync->SendMediaSyncStartPacket(m_mediaFilename);
+
+        if (!m_mediaOutput->Start(m_pausedTime)) {
+            LogErr(VB_MEDIAOUT, "Could not start media %s\n", m_mediaOutput->m_mediaFilename.c_str());
+            delete m_mediaOutput;
+            m_mediaOutput = nullptr;
+            pthread_mutex_unlock(&m_mediaOutputLock);
+        }
+        m_pausedTime = -1;
+        mediaOutputStatus = m_pausedStatus;
+        pthread_mutex_unlock(&m_mediaOutputLock);
+    }
+}

@@ -5,10 +5,16 @@
 
 RTCDEVICE="/dev/rtc0"
 
-if [ "${FPPPLATFORM}" = "BeagleBone Black" ]
-then
-	RTCDEVICE="/dev/rtc1"
+if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+    if [ -f "/sys/class/rtc/rtc0/name" ]; then
+        RTCNAME=$(</sys/class/rtc/rtc0/name)
+        if [[ $RTCNAME == *"omap_rtc"* ]]; then
+            RTCDEVICE="/dev/rtc1"
+        fi
+    fi
 fi
 
-hwclock -s -f ${RTCDEVICE}
+if [ -e ${RTCDEVICE} ]; then
+    hwclock -s -f ${RTCDEVICE}  > /dev/null 2>&1
+fi
 

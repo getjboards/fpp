@@ -5,7 +5,6 @@
 // GET /api/sequence
 function GetSequences() {
     global $settings;
-    $result = Array();
     $sequences = Array();
     
     $dir = $settings['sequenceDirectory'];
@@ -13,9 +12,8 @@ function GetSequences() {
         array_push($sequences, basename($filename, ".fseq"));
     }
     
-    $result['sequences'] = $sequences;
     
-    return json($result);
+    return json($sequences);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -49,11 +47,14 @@ function GetSequenceMetaData() {
     $file = $settings['sequenceDirectory'] . "/" . $sequence;
     if (substr( $file, -5 ) != ".fseq") {
         $file = $file . ".fseq";
-    }    
-    $cmd = "/opt/fpp/src/fsequtils -j $file 2>&1";
-    exec( $cmd, $output);
-    $js = json_decode($output[0]);
-    return json($js);
+    }
+    if (file_exists($file)) {
+        $cmd = "/opt/fpp/src/fsequtils -j \"$file\" 2>&1";
+        exec( $cmd, $output);
+        $js = json_decode($output[0]);
+        return json($js);
+    }
+    halt(404, "Not found");
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -73,7 +74,12 @@ function PostSequence() {
     }
     fclose($fp);
     fclose($putdata);
-    return 0;
+
+    $resp = Array();
+    $resp['Status'] = 'OK';
+    $resp['Message'] = '';
+
+    return json($resp);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -88,7 +94,12 @@ function DeleteSequences() {
     if (file_exists($file)) {
         unlink($file);
     }
-    return 0;
+
+    $resp = Array();
+    $resp['Status'] = 'OK';
+    $resp['Message'] = '';
+
+    return json($resp);
 }
 
 

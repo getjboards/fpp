@@ -1,3 +1,4 @@
+#pragma once
 /*
  *   X11VirtualDisplay Channel Output for Falcon Player (FPP)
  *
@@ -23,9 +24,6 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef _X11VIRTUALDISPLAY_H
-#define _X11VIRTUALDISPLAY_H
-
 #include <X11/Xlib.h>
 #include <string>
 #include <vector>
@@ -35,12 +33,13 @@
 class X11VirtualDisplayOutput : protected VirtualDisplayOutput {
   public:
 	X11VirtualDisplayOutput(unsigned int startChannel, unsigned int channelCount);
-	~X11VirtualDisplayOutput();
+	virtual ~X11VirtualDisplayOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+	virtual int Init(Json::Value config) override;
+	virtual int Close(void) override;
 
-	int RawSendData(unsigned char *channelData);
+	virtual void PrepData(unsigned char *channelData) override;
+	virtual int  SendData(unsigned char *channelData) override;
 
   private:
 	char       *m_imageData;
@@ -51,5 +50,3 @@ class X11VirtualDisplayOutput : protected VirtualDisplayOutput {
 	Pixmap      m_pixmap;
 	XImage     *m_image;
 };
-
-#endif /* _X11VIRTUALDISPLAY_H */
