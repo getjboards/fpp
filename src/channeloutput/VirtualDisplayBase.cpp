@@ -1,0 +1,633 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <cctype>
+#include <climits>
+#include <cstdint>
+
+#include <set>
+#include <tuple>
+
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+
+#include <Magick++.h>
+
+#include <magick/type.h>
+
+#include "../Sequence.h"
+#include "../common.h"
+#include "../log.h"
+#include "../settings.h"
+
+#include "VirtualDisplayBase.h"
+#include "ChannelOutputSetup.h"
+
+/////////////////////////////////////////////////////////////////////////////
+// To disable interpolated scaling on the GPU, add this to config.txt under /boot:
+// scaling_kernel=8
+
+/*
+ *
+ */
+VirtualDisplayBaseOutput::VirtualDisplayBaseOutput(unsigned int startChannel,
+                                                   unsigned int channelCount) :
+    ChannelOutput(startChannel, channelCount),
+    m_backgroundFilename("virtualdisplaybackground.jpg"),
+    m_backgroundBrightness(0.5),
+    m_width(1280),
+    m_height(1024),
+    m_bytesPerPixel(3),
+    m_bpp(24),
+    m_scale(1.0),
+    m_previewWidth(800),
+    m_previewHeight(600),
+    m_colorOrder("RGB"),
+    m_virtualDisplay(NULL),
+    m_pixelSize(2),
+    m_rgb565map(nullptr),
+    m_allowDuplicatePixels(false) {  // Default: filter duplicates for 2D mode
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayBaseOutput::VirtualDisplayBaseOutput(%u, %u)\n",
+             startChannel, channelCount);
+}
+
+/*
+ *
+ */
+VirtualDisplayBaseOutput::~VirtualDisplayBaseOutput() {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayBaseOutput::~VirtualDisplayBaseOutput()\n");
+
+    if (m_rgb565map) {
+        for (int r = 0; r < 32; r++) {
+            for (int g = 0; g < 64; g++) {
+                delete[] m_rgb565map[r][g];
+            }
+
+            delete[] m_rgb565map[r];
+        }
+
+        delete[] m_rgb565map;
+    }
+
+    if (m_virtualDisplay) {
+        free(m_virtualDisplay);
+    }
+}
+
+/*
+ *
+ */
+int VirtualDisplayBaseOutput::Init(Json::Value config) {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayBaseOutput::Init()\n");
+
+    m_width = config["width"].asInt();
+    if (m_width <= 0)
+        m_width = 1280;
+
+    m_height = config["height"].asInt();
+    if (m_height <= 0)
+        m_height = 1024;
+
+    if (config.isMember("pixelSize"))
+        m_pixelSize = config["pixelSize"].asInt();
+    else if (config.isMember("PixelSize"))
+        m_pixelSize = config["PixelSize"].asInt();
+
+    if (!m_pixelSize)
+        m_pixelSize = 2;
+
+    if (config.isMember("colorOrder"))
+        m_colorOrder = config["colorOrder"].asString();
+
+    if (config.isMember("backgroundFilename")) {
+        m_backgroundFilename = config["backgroundFilename"].asString();
+        // Backgrounds live flat in images/: reject separators and parent
+        // references so a crafted config cannot escape into FileExists/
+        // GraphicsMagick reads elsewhere. Falls back to no background, the
+        // same as a missing file below.
+        if (m_backgroundFilename.find_first_of("/\\") != std::string::npos ||
+            m_backgroundFilename.find("..") != std::string::npos) {
+            LogErr(VB_CHANNELOUT, "Invalid background filename '%s', ignoring\n",
+                   m_backgroundFilename.c_str());
+            m_backgroundFilename.clear();
+        }
+    }
+
+    if (config.isMember("backgroundBrightness"))
+        m_backgroundBrightness = 1.0 * config["backgroundBrightness"].asInt() / 100;
+
+    return ChannelOutput::Init(config);
+}
+
+/*
+ *
+ */
+size_t VirtualDisplayBaseOutput::virtualDisplayBufferBytes(int w, int h, int bpp) {
+    if (w <= 0 || h <= 0 || bpp <= 0) {
+        return 0;
+    }
+    uint64_t bytes = (uint64_t)w * (uint64_t)h * (uint64_t)bpp;
+    if (bytes > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    return (size_t)bytes;
+}
+
+int VirtualDisplayBaseOutput::InitializePixelMap(void) {
+    std::string virtualDisplayMapFilename = FPP_DIR_CONFIG("/virtualdisplaymap");
+
+    if (!FileExists(virtualDisplayMapFilename)) {
+        LogErr(VB_CHANNELOUT, "Error: %s does not exist\n",
+               virtualDisplayMapFilename.c_str());
+        AddOutputConfigWarning(41, "Virtual Display map file is missing: " + virtualDisplayMapFilename);
+        return 0;
+    }
+
+    FILE* file = fopen(virtualDisplayMapFilename.c_str(), "r");
+
+    if (file == NULL) {
+        LogErr(VB_CHANNELOUT, "Error: unable to open %s: %s\n",
+               virtualDisplayMapFilename.c_str(), FPPstrerror(errno));
+        AddOutputConfigWarning(41, "Virtual Display map file could not be opened: " + virtualDisplayMapFilename);
+        return 0;
+    }
+
+    char* line = NULL;
+    size_t len = 0;
+    ssize_t read;
+
+    std::string pixel;
+    std::vector<std::string> parts;
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    int xs = 0;
+    int ys = 0;
+    int zs = 0;
+    int ch = 0;
+    int s = 0;
+    int r = 0;
+    int g = 0;
+    int b = 0;
+    int rowOffset = 0;
+    int colOffset = 0;
+    int first = 1;
+    int i = 0;
+    int found = 0;
+    unsigned char customR;
+    unsigned char customG;
+    unsigned char customB;
+    VirtualPixelColor vpc = kVPC_RGB;
+    std::string colorPart;
+    int BPP = 3;
+    
+    // Use set for O(log n) duplicate checking instead of O(n) linear search
+    std::set<std::tuple<int, int, int>> seenPixels;
+    int offscreen = 0;
+    int badChannel = 0;
+
+    while ((read = getline(&line, &len, file)) != -1) {
+        if ((!line) || (!read) || (read == 1))
+            continue;
+
+        if (line[0] == '#')
+            continue;
+
+        // Strip the line feed
+        line[strlen(line) - 1] = '\0';
+
+        pixel = line;
+        parts = split(pixel, ',');
+
+        if (first) {
+            if (parts.size() == 2) {
+                m_previewWidth = atoi(parts[0].c_str());
+                m_previewHeight = atoi(parts[1].c_str());
+
+                // A corrupt header (e.g. "0,0" or non-numeric) would divide by
+                // zero below and convert NaN/Inf to int (UB). Fail cleanly
+                // instead; valid exporters always write positive dimensions.
+                if (m_previewWidth <= 0 || m_previewHeight <= 0) {
+                    LogErr(VB_CHANNELOUT, "Invalid virtual display preview dimensions %dx%d\n",
+                           m_previewWidth, m_previewHeight);
+                    free(line);
+                    fclose(file);
+                    return 0;
+                }
+
+                // Only HTTPVirtualDisplay uses this where buffer is based on preview size
+                if ((m_width == -1) || (m_height == -1)) {
+                    m_width = m_previewWidth;
+                    m_height = m_previewHeight;
+
+                    size_t bufBytes = virtualDisplayBufferBytes(m_width, m_height, m_bytesPerPixel);
+                    if (bufBytes == 0) {
+                        LogErr(VB_CHANNELOUT, "Invalid virtual display dimensions %dx%d\n",
+                               m_width, m_height);
+                        free(line);
+                        fclose(file);
+                        return 0;
+                    }
+                    m_virtualDisplay = (unsigned char*)malloc(bufBytes);
+                    if (!m_virtualDisplay) {
+                        LogErr(VB_CHANNELOUT, "Unable to malloc buffer\n");
+                        free(line);
+                        fclose(file);
+                        return 0;
+                    }
+                }
+
+                if ((1.0 * m_width / m_previewWidth) > (1.0 * m_height / m_previewHeight)) {
+                    // Virtual Display is wider than the preview aspect, so background
+                    // image height should equal virtual display height
+                    m_scale = 1.0 * m_height / m_previewHeight;
+                    rowOffset = 0;
+                    colOffset = ((m_width - (m_previewWidth * m_scale)) / 2);
+                } else {
+                    // Virtual Display is taller than the preview aspect, so background
+                    // image width should equal virtual display width
+                    m_scale = 1.0 * m_width / m_previewWidth;
+                    colOffset = 0;
+                    rowOffset = ((m_height - (m_previewHeight * m_scale)) / 2);
+                }
+            }
+
+            first = 0;
+            continue;
+        }
+
+        if (parts.size() >= 5) {
+            x = atoi(parts[0].c_str());
+            y = atoi(parts[1].c_str());
+
+            if (parts.size() >= 6) {
+                z = atoi(parts[2].c_str());
+                ch = atoi(parts[3].c_str());
+                BPP = atoi(parts[4].c_str());
+                colorPart = parts[5];
+            } else if (parts.size() >= 5) {
+                z = 0;
+                ch = atoi(parts[2].c_str());
+                BPP = atoi(parts[3].c_str());
+                colorPart = parts[4];
+            } else {
+                continue;
+            }
+
+            customR = customG = customB = 0;
+
+            // Every channel of the pixel is read straight out of the sequence
+            // buffer (GetPixelRGB), and GetRequiredChannelRanges() lost a pixel
+            // whose ch + 3 overflowed, so a channel outside the buffer read
+            // past it each frame.
+            if (ch < 0 || ch > (int)FPPD_MAX_CHANNELS - 4) {
+                badChannel++;
+                continue;
+            }
+
+            // The map is written by the exporter and not trusted: a model with
+            // no defined layout position arrives as INT_MIN, and pushing that
+            // through the scale into an int is undefined and lands the pixel
+            // gigabytes outside m_virtualDisplay.  Everything that later
+            // indexes the buffer through r/g/b (HTTPVirtualDisplay::PrepData,
+            // DrawPixel) relies on the offsets being in range, so enforce that
+            // here, in double, before converting.
+            double fys = m_height - (y * m_scale + rowOffset) - 1;
+            double fxs = x * m_scale + colOffset;
+            if (!(fxs > -1.0 && fxs < m_width && fys > -1.0 && fys < m_height)) {
+                offscreen++;
+                if (!m_allowDuplicatePixels) {
+                    continue;
+                }
+                // 3D mode addresses pixels by their index in the file, so the
+                // entry must stay; it never touches the 2D buffer.
+                fxs = fys = 0;
+            }
+            ys = (int)fys;
+            xs = (int)fxs;
+            s = (ys * m_width + xs) * m_bytesPerPixel;
+
+            if (m_colorOrder == "RGB") {
+                r = s + 0;
+                g = s + 1;
+                b = s + 2;
+            } else if (m_colorOrder == "RBG") {
+                r = s + 0;
+                g = s + 2;
+                b = s + 1;
+            } else if (m_colorOrder == "GRB") {
+                r = s + 1;
+                g = s + 0;
+                b = s + 2;
+            } else if (m_colorOrder == "GBR") {
+                r = s + 2;
+                g = s + 0;
+                b = s + 1;
+            } else if (m_colorOrder == "BRG") {
+                r = s + 1;
+                g = s + 2;
+                b = s + 0;
+            } else if (m_colorOrder == "BGR") {
+                r = s + 2;
+                g = s + 1;
+                b = s + 0;
+            }
+
+            if (colorPart == "RGB")
+                vpc = kVPC_RGB;
+            else if (colorPart == "RBG")
+                vpc = kVPC_RBG;
+            else if (colorPart == "GRB")
+                vpc = kVPC_GRB;
+            else if (colorPart == "GBR")
+                vpc = kVPC_GBR;
+            else if (colorPart == "BRG")
+                vpc = kVPC_BRG;
+            else if (colorPart == "BGR")
+                vpc = kVPC_BGR;
+            else if (colorPart == "RGBW")
+                vpc = kVPC_RGBW;
+            else if (colorPart == "Red")
+                vpc = kVPC_Red;
+            else if (colorPart == "Green")
+                vpc = kVPC_Green;
+            else if (colorPart == "Blue")
+                vpc = kVPC_Blue;
+            else if (colorPart == "White")
+                vpc = kVPC_White;
+            else if (startsWith(colorPart, "#")) {
+                // "#RRGGBB" exactly: substr/stoi below throw on anything
+                // shorter or non-hex, which would terminate fppd on a corrupt
+                // map line. Skip the pixel (logged) instead.
+                bool okColor = (colorPart.size() == 7);
+                for (size_t ci = 1; okColor && ci < colorPart.size(); ci++) {
+                    if (!isxdigit((unsigned char)colorPart[ci])) {
+                        okColor = false;
+                    }
+                }
+                if (!okColor) {
+                    LogErr(VB_CHANNELOUT, "Virtual Display: invalid color '%s', skipping pixel\n",
+                           colorPart.c_str());
+                    continue;
+                }
+                std::string tmpColor;
+
+                vpc = kVPC_Custom;
+
+                tmpColor = colorPart.substr(1, 2);
+                customR = std::stoi(tmpColor, NULL, 16);
+
+                tmpColor = colorPart.substr(3, 2);
+                customG = std::stoi(tmpColor, NULL, 16);
+
+                tmpColor = colorPart.substr(5, 2);
+                customB = std::stoi(tmpColor, NULL, 16);
+            }
+
+            // Use set for O(log n) duplicate check instead of O(n) linear search
+            // But skip duplicate checking in 3D mode where multiple pixels can exist at same coords
+            auto pixelKey = std::make_tuple(x, y, z);
+            if (m_allowDuplicatePixels || seenPixels.find(pixelKey) == seenPixels.end()) {
+                if (!m_allowDuplicatePixels) {
+                    seenPixels.insert(pixelKey);
+                }
+                m_pixels.push_back({ x, y, z, xs, ys, zs, ch, r, g, b, BPP, customR, customG, customB, vpc });
+            }
+        }
+    }
+
+    if (badChannel) {
+        LogWarn(VB_CHANNELOUT, "Virtual Display: %d pixel(s) in %s use channels outside 1-%d and were skipped\n",
+                badChannel, virtualDisplayMapFilename.c_str(), FPPD_MAX_CHANNELS);
+    }
+    if (offscreen) {
+        LogWarn(VB_CHANNELOUT, "Virtual Display: %d pixel(s) in %s lie outside the %dx%d preview and were skipped\n",
+                offscreen, virtualDisplayMapFilename.c_str(), m_width, m_height);
+    }
+
+    LoadBackgroundImage();
+
+    free(line);
+    fclose(file);
+
+    return 1;
+}
+
+/*
+ *
+ */
+void VirtualDisplayBaseOutput::LoadBackgroundImage(void) {
+    // Nothing to draw into (e.g. an empty map left no buffer): callers check
+    // too, but never write through a null display from here.
+    if (m_virtualDisplay == nullptr) {
+        return;
+    }
+
+    std::string bgFile = "/home/fpp/media/images/";
+    bgFile += m_backgroundFilename;
+
+    if (!FileExists(bgFile)) {
+        LogWarn(VB_CHANNELOUT, "Background image does not exist: %s\n",
+                bgFile.c_str());
+        return;
+    }
+
+    Magick::Image image;
+    Magick::Blob blob;
+
+    try {
+        image.quiet(true);
+        image.read(bgFile.c_str());
+        image.modifyImage();
+        image.scale(Magick::Geometry(m_width, m_height));
+        image.type(Magick::TrueColorType);
+        image.magick("RGBA");
+        image.write(&blob);
+    } catch (Magick::Exception& error_) {
+        // the image can come back partly decoded and unscaled, with no blob
+        LogErr(VB_CHANNELOUT, "GraphicsMagick exception reading %s: %s\n",
+               bgFile.c_str(), error_.what());
+        return;
+    }
+
+    unsigned char* imgData = (unsigned char*)blob.data();
+    unsigned int imgWidth = image.columns();
+    unsigned int imgHeight = image.rows();
+    unsigned int imgBytes = imgWidth * imgHeight * 4; // RGBA
+    // the copy below assumes a scaled RGBA image that fits the display
+    if (!imgData || blob.length() < imgBytes || imgWidth > (unsigned int)m_width || imgHeight > (unsigned int)m_height) {
+        LogErr(VB_CHANNELOUT, "Background image %s could not be converted for display\n", bgFile.c_str());
+        return;
+    }
+    unsigned long RGBx = 0;
+    bool letterboxed = false;
+    int offset = 0;
+    int colOffset = (m_width - imgWidth) / 2;
+    int r = 0;
+    int c = 0;
+
+    if ((1.0 * m_width / m_previewWidth) > (1.0 * m_height / m_previewHeight))
+        letterboxed = true;
+
+    offset = (m_height - imgHeight) / 2 * m_width * m_bytesPerPixel;
+
+    for (int i = 0; i < imgBytes;) {
+        if ((letterboxed) && (c == 0)) {
+            offset = ((r * m_width) + colOffset) * m_bytesPerPixel;
+        }
+
+        if ((m_bpp == 24) || (m_bpp == 32)) {
+            m_virtualDisplay[offset++] = imgData[i++] * m_backgroundBrightness;
+            m_virtualDisplay[offset++] = imgData[i++] * m_backgroundBrightness;
+            m_virtualDisplay[offset++] = imgData[i++] * m_backgroundBrightness;
+            i++;
+
+            if (m_bpp == 32)
+                offset++;
+        } else // 16bpp RGB565
+        {
+            RGBx = *(unsigned long*)(imgData + i);
+            *(uint16_t*)(m_virtualDisplay + offset) =
+                (((int)((RGBx & 0x000000FF) * m_backgroundBrightness) << 8) & 0b1111100000000000) |
+                (((int)((RGBx & 0x0000FF00) * m_backgroundBrightness) >> 5) & 0b0000011111100000) |
+                (((int)((RGBx & 0x00FF0000) * m_backgroundBrightness) >> 19)); // & 0b0000000000011111);
+
+            i += 4;
+            offset += 2;
+        }
+
+        if (letterboxed) {
+            c++;
+
+            if (c >= imgWidth) {
+                c = 0;
+                r++;
+            }
+        }
+    }
+}
+
+/*
+ *
+ */
+void VirtualDisplayBaseOutput::DrawPixel(int rOffset, int gOffset, int bOffset,
+                                         unsigned char r, unsigned char g, unsigned char b) {
+    if (m_bpp == 16) {
+        if ((rOffset < gOffset) && (gOffset < bOffset)) {
+            *((uint16_t*)(m_virtualDisplay + rOffset)) = m_rgb565map[r >> 3][g >> 2][b >> 3];
+        } else if ((rOffset < gOffset) && (bOffset < gOffset)) {
+            *((uint16_t*)(m_virtualDisplay + rOffset)) = m_rgb565map[r >> 3][b >> 2][g >> 3];
+        } else if ((gOffset < rOffset) && (rOffset < bOffset)) {
+            *((uint16_t*)(m_virtualDisplay + gOffset)) = m_rgb565map[g >> 3][r >> 2][b >> 3];
+        } else if ((gOffset < rOffset) && (bOffset < rOffset)) {
+            *((uint16_t*)(m_virtualDisplay + gOffset)) = m_rgb565map[g >> 3][b >> 2][r >> 3];
+        } else if ((bOffset < gOffset) && (rOffset < gOffset)) {
+            *((uint16_t*)(m_virtualDisplay + bOffset)) = m_rgb565map[b >> 3][r >> 2][g >> 3];
+        } else if ((bOffset < gOffset) && (gOffset < rOffset)) {
+            *((uint16_t*)(m_virtualDisplay + bOffset)) = m_rgb565map[b >> 3][g >> 2][r >> 3];
+        }
+    } else {
+        m_virtualDisplay[rOffset] = r;
+        m_virtualDisplay[gOffset] = g;
+        m_virtualDisplay[bOffset] = b;
+    }
+}
+
+void VirtualDisplayBaseOutput::GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) {
+    int min = FPPD_MAX_CHANNELS;
+    int max = 0;
+    for (auto& pixel : m_pixels) {
+        min = std::min(min, pixel.ch);
+        max = std::max(max, pixel.ch + (pixel.cpp == 4 ? 3 : 2));
+    }
+    addRange(min, max);
+}
+
+/*
+ *
+ */
+void VirtualDisplayBaseOutput::DrawPixels(unsigned char* channelData) {
+    unsigned char r = 0;
+    unsigned char g = 0;
+    unsigned char b = 0;
+    int stride = m_width * m_bytesPerPixel;
+    VirtualDisplayPixel pixel;
+
+    for (int i = 0; i < m_pixels.size(); i++) {
+        pixel = m_pixels[i];
+
+        GetPixelRGB(pixel, channelData, r, g, b);
+
+        DrawPixel(pixel.r, pixel.g, pixel.b, r, g, b);
+
+        if (m_pixelSize >= 2) {
+            if (m_pixelSize == 2) {
+                r /= 4;
+                g /= 4;
+                b /= 4;
+                r *= 3;
+                g *= 3;
+                b *= 3;
+            }
+
+            // Neighbours are bounded by the pixel's buffer position (xs/ys),
+            // not its layout coordinates: +/-m_bytesPerPixel moves along the
+            // row, +/-stride moves between rows.
+            if (pixel.xs < (m_width - 1))
+                DrawPixel(pixel.r + m_bytesPerPixel,
+                          pixel.g + m_bytesPerPixel,
+                          pixel.b + m_bytesPerPixel,
+                          r, g, b);
+
+            if (pixel.xs > 0)
+                DrawPixel(pixel.r - m_bytesPerPixel,
+                          pixel.g - m_bytesPerPixel,
+                          pixel.b - m_bytesPerPixel,
+                          r, g, b);
+
+            if (pixel.ys < (m_height - 1))
+                DrawPixel(pixel.r + stride,
+                          pixel.g + stride,
+                          pixel.b + stride,
+                          r, g, b);
+
+            if (pixel.ys > 0)
+                DrawPixel(pixel.r - stride,
+                          pixel.g - stride,
+                          pixel.b - stride,
+                          r, g, b);
+        }
+    }
+}
+
+/*
+ *
+ */
+void VirtualDisplayBaseOutput::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayBaseOutput::DumpConfig()\n");
+    LogDebug(VB_CHANNELOUT, "    width         : %d\n", m_width);
+    LogDebug(VB_CHANNELOUT, "    height        : %d\n", m_height);
+    LogDebug(VB_CHANNELOUT, "    scale         : %0.3f\n", m_scale);
+    LogDebug(VB_CHANNELOUT, "    preview width : %d\n", m_previewWidth);
+    LogDebug(VB_CHANNELOUT, "    preview height: %d\n", m_previewHeight);
+    LogDebug(VB_CHANNELOUT, "    color Order   : %s\n", m_colorOrder.c_str());
+    LogDebug(VB_CHANNELOUT, "    pixel count   : %d\n", m_pixels.size());
+    LogDebug(VB_CHANNELOUT, "    pixel size    : %d\n", m_pixelSize);
+    ChannelOutput::DumpConfig();
+}

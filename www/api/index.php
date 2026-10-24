@@ -5,37 +5,391 @@ $skipJSsettings = 1;
 require_once '../config.php';
 require_once '../common.php';
 
-send_header("Access-Control-Allow-Origin: *");
+dispatch_get('/', 'ServeApiDocs');
+dispatch_get('/api.html', 'ServeApiHtml');
+dispatch_get('/openapi.yaml', 'ServeOpenApiSpec');
+dispatch_get('/openapi.json', 'ServeOpenApiSpec');
 
-dispatch_get   ('/help', 'help_help');
+dispatch_get('/backups/list', 'GetAvailableBackups');
+dispatch_get('/backups/list/:DeviceName', 'GetAvailableBackupsOnDevice');
+dispatch_get('/backups/devices', 'RetrieveAvailableBackupsDevices');
+dispatch_post('/backups/devices/mount/:DeviceName/:MountLocation', 'MountDevice');
+dispatch_post('/backups/devices/unmount/:DeviceName/:MountLocation', 'UnmountDevice');
+dispatch_post('/backups/configuration', 'MakeJSONBackup');
+dispatch_get('/backups/configuration/list', 'GetAvailableJSONBackups');
+dispatch_get('/backups/configuration/list/:DeviceName', 'GetAvailableJSONBackupsOnDevice');
+dispatch_post('/backups/configuration/restore/:Directory/:BackupFilename', 'RestoreJsonBackup');
+dispatch_get('/backups/configuration/:Directory/:BackupFilename', 'DownloadJsonBackup');
+dispatch_delete('/backups/configuration/:Directory/:BackupFilename', 'DeleteJsonBackup');
 
-dispatch_get   ('/configfile', 'GetConfigFileList');
-dispatch_get   ('/configfile/**', 'DownloadConfigFile');
-dispatch_post  ('/configfile/**', 'UploadConfigFile');
+dispatch_get('/cape', 'GetCapeInfo');
+dispatch_post('/cape/eeprom/voucher', 'RedeemVoucher');
+dispatch_post('/cape/eeprom/sign/:key/:order', 'SignEEPROM');
+dispatch_get('/cape/eeprom/signingData/:key/:order', 'GetSigningData');
+dispatch_get('/cape/eeprom/signingFile/:key/:order', 'GetSigningFile');
+dispatch_post('/cape/eeprom/signingData', 'PostSigningData');
+dispatch_post('/cape/licenseCheck', 'RecordCapeLicenseCheck');
+dispatch_get('/cape/options', 'GetCapeOptions');
+dispatch_get('/cape/defaults', 'GetCapeDefaultSettings');
+dispatch_get('/cape/eeprom/vendors', 'GetEEPROMVendorLists');
+dispatch_get('/cape/strings', 'GetCapeStringOptions');
+dispatch_get('/cape/panel', 'GetCapePanelOptions');
+dispatch_get('/cape/strings/:key', 'GetCapeStringConfig');
+dispatch_get('/cape/panel/:key', 'GetCapePanelConfig');
+
+dispatch_get('/channel/input/stats', 'channel_input_get_stats');
+dispatch_delete('/channel/input/stats', 'channel_input_delete_stats');
+dispatch_get('/channel/output/processors', 'channel_get_output_processors');
+dispatch_post('/channel/output/processors', 'channel_save_output_processors');
+dispatch_get('/channel/output/serialDevices', 'channel_get_serial_devices');
+dispatch_get('/channel/output/:file', 'channel_get_output');
+dispatch_post('/channel/output/:file', 'channel_save_output');
+
+dispatch_get('/crashes/uploadTarget', 'GetCrashUploadTarget'); // keep above crashes/upload/:file
+dispatch_post('/crashes/upload/:file', 'PostCrashUpload');
+dispatch_post('/crashes/report', 'PostCrashReport');
+dispatch_get('/crashes/disclosures', 'GetCrashDisclosures');
+
+dispatch_get('/errorReport/preview', 'GetErrorReportPreview');
+
+dispatch_get('/configfile', 'GetConfigFileList');
+dispatch_get('/configfile/**', 'DownloadConfigFile');
+dispatch_post('/configfile/**', 'UploadConfigFile');
 dispatch_delete('/configfile/**', 'DeleteConfigFile');
 
-dispatch_get   ('/playlists', 'playlist_list');
-dispatch_post  ('/playlists', 'playlist_insert');
-dispatch_get   ('/playlist/:PlaylistName', 'playlist_get');
-dispatch_post  ('/playlist/:PlaylistName', 'playlist_update');
+dispatch_post('/dir/:DirName/:SubDir', 'CreateDir');
+dispatch_delete('/dir/:DirName/:SubDir', 'DeleteDir');
+
+dispatch_get('/effects', 'effects_list');
+dispatch_get('/effects/ALL', 'effects_list_ALL');
+
+dispatch_post('/email/configure', 'ConfigureEmail');
+dispatch_post('/email/test', 'SendTestEmail');
+
+dispatch_get('/events', 'events_list');
+dispatch_get('/events/:eventId', 'event_get');
+dispatch_get('/events/:eventId/trigger', 'event_trigger');
+dispatch_post('/events/:eventId/trigger', 'event_trigger');
+
+dispatch_get('/files/Sequences/fps', 'GetSequenceFPS'); // keep above files/:DirName
+dispatch_get('/files/:DirName', 'GetFiles');
+dispatch_get('/file/info/:plugin/:ext/**', 'GetPluginFileInfo'); // keep above file/:DirName
+dispatch_get('/file/onUpload/:ext/**', 'PluginFileOnUpload'); // keep above file/:DirName
+dispatch_get('/file/move/:fileName', 'MoveFile'); // keep above file/:DirName
+dispatch_post('/file/move/:fileName', 'MoveFile'); // keep above file/:DirName/:Name
+dispatch_get('/files/zip/:DirNames', 'GetZipDir');
+dispatch_post('/file/:DirName/copy/:source/:dest', 'files_copy');
+dispatch_post('/file/:DirName/rename/:source/:dest', 'files_rename');
+dispatch_get('/file/:DirName/tailfollow/**', 'TailFollowFile');
+dispatch_get('/file/:DirName/**', 'GetFile');
+dispatch_delete('/file/:DirName/**', 'DeleteFile');
+dispatch_post('/file/:DirName', 'PatchFile');
+dispatch_patch('/file/:DirName', 'PatchFile');
+dispatch_post('/file/:DirName/:Name', 'PostFile');
+
+dispatch_get('/git/originLog', 'GetGitOriginLog');
+dispatch_get('/git/releases/os/:All', 'GitOSReleases');
+dispatch_get('/git/releases/notes/:tag', 'GitOSReleaseNotes');
+dispatch_get('/git/releases/sizes', 'GitOSReleaseSizes');
+dispatch_get('/git/reset', 'GitReset');
+dispatch_post('/git/reset', 'GitReset');
+dispatch_get('/git/status', 'GitStatus');
+dispatch_get('/git/branches', 'GitBranches');
+dispatch_get('/git/forkBranches', 'GitForkBranches');
+dispatch_get('/git/pullRequests', 'GitPullRequests');
+
+dispatch_get('/media', 'GetMedia');
+dispatch_get('/media/:MediaName/duration', 'GetMediaDuration');
+dispatch_get('/media/:MediaName/meta', 'GetMediaMetaData');
+
+dispatch_get('/network/dns', 'network_get_dns');
+dispatch_post('/network/dns', 'network_save_dns');
+dispatch_get('/network/gateway', 'network_get_gateway');
+dispatch_post('/network/gateway', 'network_save_gateway');
+dispatch_get('/network/interface', 'network_list_interfaces');
+dispatch_get('/network/interface/:interface', 'network_get_interface');
+dispatch_get('/network/interface/add/:interface', 'network_add_interface');
+dispatch_post('/network/interface/:interface', 'network_set_interface');
+dispatch_post('/network/interface/:interface/apply', 'network_apply_interface');
+// Below the generic POST: limonade compiles ':param' to an optional group, so
+// above it this would also take POST /network/interface/add (an interface
+// named "add").  The GET forms are in the same order.
+dispatch_post('/network/interface/add/:interface', 'network_add_interface');
+dispatch_delete('/network/interface/:interface', 'network_delete_interface');
+
+dispatch_delete('/network/presisentNames', 'network_persistentNames_delete');
+dispatch_post('/network/presisentNames', 'network_persistentNames_create');
+dispatch_delete('/network/persistentNames', 'network_persistentNames_delete');
+dispatch_post('/network/persistentNames', 'network_persistentNames_create');
+dispatch_get('/network/wifi/scan/:interface', 'network_wifi_scan');
+dispatch_get('/network/wifi/status/:interface', 'network_wifi_status');
+dispatch_get('/network/wifi/strength', 'network_wifi_strength');
+
+dispatch_get('/options/:SettingName', 'GetOptions');
+
+dispatch_get('/audio/cardaliases', 'GetAudioCardAliases');
+dispatch_post('/audio/cardaliases', 'SaveAudioCardAliases');
+
+dispatch_get('/pipewire/audio/groups', 'GetPipeWireAudioGroups');
+dispatch_post('/pipewire/audio/groups', 'SavePipeWireAudioGroups');
+dispatch_post('/pipewire/audio/groups/apply', 'ApplyPipeWireAudioGroups');
+dispatch_get('/pipewire/audio/sinks', 'GetPipeWireSinks');
+dispatch_get('/pipewire/audio/cards', 'GetPipeWireAudioCards');
+dispatch_get('/pipewire/audio/usb-check', 'GetUsbAudioBandwidthCheck');
+dispatch_get('/pipewire/audio/sources', 'GetPipeWireAudioSources');
+dispatch_get('/pipewire/audio/plugin-sources', 'GetPipeWirePluginSources');
+dispatch_get('/pipewire/audio/input-groups', 'GetPipeWireInputGroups');
+dispatch_post('/pipewire/audio/input-groups', 'SavePipeWireInputGroups');
+dispatch_post('/pipewire/audio/input-groups/apply', 'ApplyPipeWireInputGroups');
+dispatch_post('/pipewire/audio/input-groups/volume', 'SetInputGroupMemberVolume');
+dispatch_post('/pipewire/audio/input-group/volume', 'SetInputGroupVolume');
+dispatch_post('/pipewire/audio/input-groups/effects', 'SaveInputGroupEffects');
+dispatch_post('/pipewire/audio/input-groups/eq/update', 'UpdateInputGroupEQRealtime');
+dispatch_get('/pipewire/audio/routing', 'GetRoutingMatrix');
+dispatch_post('/pipewire/audio/routing', 'SaveRoutingMatrix');
+dispatch_post('/pipewire/audio/routing/volume', 'SetRoutingPathVolume');
+dispatch_get('/pipewire/audio/routing/presets', 'GetRoutingPresets');
+dispatch_get('/pipewire/audio/routing/presets/names', 'GetRoutingPresetNames');
+dispatch_post('/pipewire/audio/routing/presets', 'SaveRoutingPreset');
+dispatch_post('/pipewire/audio/routing/presets/load', 'LoadRoutingPreset');
+dispatch_post('/pipewire/audio/routing/presets/live-apply', 'LiveApplyRoutingPreset');
+dispatch_delete('/pipewire/audio/routing/presets/:name', 'DeleteRoutingPreset');
+dispatch_post('/pipewire/audio/stream/volume', 'SetStreamSlotVolume');
+dispatch_get('/pipewire/audio/stream/status', 'GetStreamSlotStatus');
+dispatch_get('/pipewire/audio/stream/volumes', 'GetStreamSlotVolumes');
+dispatch_post('/pipewire/audio/group/volume', 'SetPipeWireGroupVolume');
+dispatch_get('/pipewire/audio/node-states', 'GetPipeWireNodeStates');
+dispatch_get('/pipewire/audio/targets', 'GetPipeWireVolumeTargets');
+dispatch_get('/pipewire/audio/preview', 'GetPipeWireAudioPreview');
+dispatch_post('/pipewire/audio/meters', 'SetPipeWireAudioMeters');
+dispatch_post('/pipewire/audio/eq/update', 'UpdatePipeWireEQRealtime');
+dispatch_post('/pipewire/audio/delay/update', 'UpdatePipeWireDelayRealtime');
+dispatch_post('/pipewire/audio/sync/start', 'StartSyncCalibration');
+dispatch_post('/pipewire/audio/sync/stop', 'StopSyncCalibration');
+dispatch_post('/pipewire/audio/services/restart', 'RestartPipeWireServices');
+dispatch_get('/pipewire/video/groups', 'GetPipeWireVideoGroups');
+dispatch_post('/pipewire/video/groups', 'SavePipeWireVideoGroups');
+dispatch_post('/pipewire/video/groups/apply', 'ApplyPipeWireVideoGroups');
+dispatch_post('/pipewire/simple/apply', 'ApplyPipeWireSimpleConfig');
+dispatch_get('/pipewire/video/connectors', 'GetVideoOutputTargets');
+dispatch_get('/pipewire/video/routing', 'GetVideoRoutingMatrix');
+dispatch_post('/pipewire/video/routing', 'SaveVideoRoutingMatrix');
+dispatch_get('/pipewire/video/input-sources', 'GetPipeWireVideoInputSources');
+dispatch_post('/pipewire/video/input-sources', 'SavePipeWireVideoInputSources');
+dispatch_post('/pipewire/video/input-sources/apply', 'ApplyPipeWireVideoInputSources');
+dispatch_get('/pipewire/video/input-sources/v4l2-devices', 'GetV4L2Devices');
+dispatch_get('/pipewire/video/input-sources/:id/preview', 'GetVideoInputPreview');
+
+dispatch_get('/pipewire/aes67/instances', 'GetAES67Instances');
+dispatch_post('/pipewire/aes67/instances', 'SaveAES67Instances');
+dispatch_post('/pipewire/aes67/apply', 'ApplyAES67Instances');
+dispatch_get('/pipewire/aes67/status', 'GetAES67Status');
+dispatch_get('/pipewire/aes67/interfaces', 'GetAES67NetworkInterfaces');
+dispatch_get('/pipewire/aes67/sdp', 'GetAES67SDP');
+dispatch_get('/pipewire/aes67/sdp/:InstanceId', 'GetAES67SDPFile');
+
+dispatch_get('/pipewire/rtspoutputs', 'GetRTSPOutputs');
+dispatch_get('/pipewire/rtspoutputs/status', 'GetRTSPOutputsStatus');
+dispatch_post('/pipewire/rtspoutputs/apply', 'ApplyRTSPOutputs');
+dispatch_post('/pipewire/rtspoutputs', 'SaveRTSPOutputs');
+dispatch_get('/pipewire/opusrtp/instances', 'GetOpusRTPInstances');
+dispatch_post('/pipewire/opusrtp/instances', 'SaveOpusRTPInstances');
+dispatch_post('/pipewire/opusrtp/apply', 'ApplyOpusRTPInstances');
+dispatch_get('/pipewire/opusrtp/status', 'GetOpusRTPStatus');
+dispatch_get('/pipewire/opusrtp/interfaces', 'GetOpusRTPNetworkInterfaces');
+
+dispatch_get('/pipewire/vban/instances', 'GetVBANInstances');
+dispatch_post('/pipewire/vban/instances', 'SaveVBANInstances');
+dispatch_post('/pipewire/vban/apply', 'ApplyVBANInstances');
+dispatch_get('/pipewire/vban/status', 'GetVBANStatus');
+dispatch_get('/pipewire/vban/interfaces', 'GetVBANNetworkInterfaces');
+dispatch_get('/pipewire/graph', 'GetPipeWireGraph');
+
+// PipeWire control facade — clean, ID-addressed, live-state 3rd-party API
+dispatch_get('/pipewire/control/status', 'PWCtl_GetStatus');
+dispatch_get('/pipewire/control/groups', 'PWCtl_GetGroups');
+dispatch_get('/pipewire/control/groups/:id', 'PWCtl_GetGroup');
+dispatch_post('/pipewire/control/groups/:id/volume', 'PWCtl_SetGroupVolume');
+dispatch_post('/pipewire/control/groups/:id/mute', 'PWCtl_SetGroupMute');
+dispatch_post('/pipewire/control/groups/:id/members/:cardId/volume', 'PWCtl_SetMemberVolume');
+dispatch_post('/pipewire/control/groups/:id/members/:cardId/mute', 'PWCtl_SetMemberMute');
+dispatch_get('/pipewire/control/input-groups', 'PWCtl_GetInputGroups');
+dispatch_get('/pipewire/control/input-groups/:id', 'PWCtl_GetInputGroup');
+dispatch_post('/pipewire/control/input-groups/:id/members/:memberIndex/volume', 'PWCtl_SetInputMemberVolume');
+dispatch_post('/pipewire/control/input-groups/:id/members/:memberIndex/mute', 'PWCtl_SetInputMemberMute');
+dispatch_get('/pipewire/control/streams', 'PWCtl_GetStreams');
+dispatch_post('/pipewire/control/streams/:slot/volume', 'PWCtl_SetStreamVolume');
+dispatch_get('/pipewire/control/routing', 'PWCtl_GetRouting');
+dispatch_post('/pipewire/control/routing/:inputGroupId/:outputGroupId/volume', 'PWCtl_SetRoutingVolume');
+dispatch_post('/pipewire/control/routing/:inputGroupId/:outputGroupId/mute', 'PWCtl_SetRoutingMute');
+
+dispatch_get('/playlists', 'playlist_list');
+dispatch_post('/playlists', 'playlist_insert');
+dispatch_get('/playlists/playable', 'playlist_playable');
+dispatch_get('/playlists/validate', 'playlist_list_validate');
+dispatch_post('/validate/commands', 'validate_commands');
+dispatch_get('/playlists/stop', 'playlist_stop');
+dispatch_get('/playlists/pause', 'playlist_pause');
+dispatch_get('/playlists/resume', 'playlist_resume');
+dispatch_get('/playlists/stopgracefully', 'playlist_stopgracefully');
+dispatch_get('/playlists/stopgracefullyafterloop', 'playlist_stopgracefullyafterloop');
+dispatch_post('/playlists/stop', 'playlist_stop');
+dispatch_post('/playlists/pause', 'playlist_pause');
+dispatch_post('/playlists/resume', 'playlist_resume');
+dispatch_post('/playlists/stopgracefully', 'playlist_stopgracefully');
+dispatch_post('/playlists/stopgracefullyafterloop', 'playlist_stopgracefullyafterloop');
+dispatch_get('/playlist/:PlaylistName', 'playlist_get');
+dispatch_get('/playlist/:PlaylistName/start', 'playlist_start');
+dispatch_get('/playlist/:PlaylistName/start/:Repeat', 'playlist_start_repeat');
+dispatch_get('/playlist/:PlaylistName/start/:Repeat/:ScheduleProtected', 'playlist_start_repeat_protected');
+dispatch_post('/playlist/:PlaylistName', 'playlist_update');
 dispatch_delete('/playlist/:PlaylistName', 'playlist_delete');
-dispatch_post  ('/playlist/:PlaylistName/:SectionName/item', 'PlaylistSectionInsertItem');
+dispatch_post('/playlist/:PlaylistName/:SectionName/item', 'PlaylistSectionInsertItem');
+// The POST starts go below the routes above, as their GETs do: limonade
+// compiles ':param' to an optional group, so registered first
+// '/playlist/:PlaylistName/start' also took POST /playlist/start (saving a
+// playlist named "start", in any case) and the item insert into one.
+dispatch_post('/playlist/:PlaylistName/start', 'playlist_start');
+dispatch_post('/playlist/:PlaylistName/start/:Repeat', 'playlist_start_repeat');
+dispatch_post('/playlist/:PlaylistName/start/:Repeat/:ScheduleProtected', 'playlist_start_repeat_protected');
+// Must stay BELOW the /playlist/:PlaylistName routes.  limonade compiles a
+// trailing ':param' to an OPTIONAL group, so this pattern also matches the
+// two-segment '/playlist/repeat' and '/playlist/repeat/start' - registered
+// first it would shadow both for anyone with a playlist actually named
+// "repeat".  Below them, only a genuine '/playlist/repeat/<value>' (which no
+// earlier route matches) reaches it.
+dispatch_get('/playlist/repeat/:Repeat', 'playlist_repeat');
+dispatch_post('/playlist/repeat/:Repeat', 'playlist_repeat');
 
-dispatch_get   ('/plugin', 'GetInstalledPlugins');
-dispatch_post  ('/plugin', 'InstallPlugin');
-dispatch_get   ('/plugin/:RepoName', 'GetPluginInfo');
+dispatch_get('/plugin/headerIndicators', 'GetPluginHeaderIndicators');
+dispatch_get('/plugin', 'GetInstalledPlugins');
+dispatch_post('/plugin', 'InstallPlugin');
+dispatch_post('/plugin/fetchInfo', 'FetchPluginInfoProxy');
+dispatch_get('/plugin/popularity', 'GetPluginPopularity'); // keep above /plugin/:RepoName
+dispatch_get('/plugin/githubStats', 'GetPluginGitHubStats'); // keep above /plugin/:RepoName
+dispatch_get('/plugin/source', 'GetPluginSource'); // keep above /plugin/:RepoName
+dispatch_get('/plugin/updateStatus', 'GetPluginUpdateStatus'); // keep above /plugin/:RepoName
+dispatch_post('/plugin/updateStatus/refresh', 'RefreshPluginUpdateStatus'); // keep above /plugin/:RepoName
+dispatch_get('/plugin/:RepoName', 'GetPluginInfo');
+dispatch_get('/plugin/:RepoName/icon', 'PluginServeIcon');
+dispatch_get('/plugin/:RepoName/page', 'GetPluginPageUrl');
+dispatch_get('/plugin/:RepoName/privacy', 'GetPluginPrivacyStatus');
+dispatch_get('/plugin/:RepoName/releaseNotes', 'GetPluginReleaseNotes');
 dispatch_delete('/plugin/:RepoName', 'UninstallPlugin');
-dispatch_post  ('/plugin/:RepoName/updates', 'CheckForPluginUpdates');
-dispatch_post  ('/plugin/:RepoName/upgrade', 'UpgradePlugin');
+dispatch_get('/plugin/:RepoName/settings/:SettingName', 'PluginGetSetting');
+dispatch_put('/plugin/:RepoName/settings/:SettingName', 'PluginSetSetting');
+dispatch_post('/plugin/:RepoName/settings/:SettingName', 'PluginSetSetting');
+dispatch_post('/plugin/:RepoName/updates', 'CheckForPluginUpdates');
+dispatch_get('/plugin/:RepoName/upgrade', 'UpgradePlugin');
+dispatch_post('/plugin/:RepoName/upgrade', 'UpgradePlugin');
+// NOTE: Plugins may also implement their own /plugin/:RepoName/* endpoints
+// which are added after the above endpoints via addPluginEndpoints() below.
 
-dispatch_get   ('/sequence', 'GetSequences');
-dispatch_get   ('/sequence/:SequenceName', 'GetSequence');
-dispatch_get   ('/sequence/:SequenceName/meta', 'GetSequenceMetaData');
-dispatch_post  ('/sequence/:SequenceName', 'PostSequence');
-dispatch_delete('/sequence/:SequenceName', 'DeleteSequence');
+dispatch_get('/proxies', 'GetProxies');
+dispatch_post('/proxies', 'PostProxies');
+dispatch_delete('/proxies', 'DeleteAllProxies');
+dispatch_post('/proxies/:ProxyIp', 'AddProxy');
+dispatch_delete('/proxies/:ProxyIp', 'DeleteProxy');
 
-dispatch_get   ('/cape', 'GetCapeInfo');
+dispatch_get(array('/proxy/*/**', array("Ip", "urlPart")), 'GetProxiedURL');
 
+dispatch_get('/remotes', 'GetRemotes');
+dispatch_get('/remoteAction', 'remoteAction');
+dispatch_post('/remoteAction', 'remoteAction');
+
+dispatch_get('/geoip', 'GetGeoIP');
+
+dispatch_get('/sequence', 'GetSequences');
+dispatch_get('/sequence/current/step', 'GetSequenceStep');
+dispatch_get('/sequence/current/stop', 'GetSequenceStop');
+dispatch_get('/sequence/current/togglePause', 'GetSequenceTogglePause');
+dispatch_post('/sequence/current/stop', 'GetSequenceStop');
+dispatch_post('/sequence/current/togglePause', 'GetSequenceTogglePause');
+dispatch_get('/sequence/:SequenceName', 'GetSequence');
+dispatch_get('/sequence/:SequenceName/meta', 'GetSequenceMetaData');
+dispatch_get('/sequence/:SequenceName/start/:startSecond', 'GetSequenceStart');
+dispatch_post('/sequence/:SequenceName', 'PostSequence');
+// below PostSequence, or it takes POST /sequence/start (see /playlist above)
+dispatch_post('/sequence/:SequenceName/start/:startSecond', 'GetSequenceStart');
+dispatch_delete('/sequence/:SequenceName', 'DeleteSequences');
+
+dispatch_post('/schedule/reload', 'ReloadSchedule');
+dispatch_get('/schedule', 'GetSchedule');
+dispatch_post('/schedule', 'SaveSchedule');
+
+dispatch_get('/settings', 'GetSettings');
+dispatch_post('/settings/fanThermal/reset', 'ResetFanThermalTrips');
+dispatch_get('/settings/:SettingName', 'GetSetting');
+dispatch_get('/settings/:SettingName/options', 'GetOptions');
+dispatch_put('/settings/:SettingName', 'PutSetting');
+dispatch_put('/settings/:SettingName/jsonValueUpdate', 'UpdateJSONValueSetting');
+
+dispatch_get('/scripts', 'scripts_list');
+dispatch_get('/scripts/:scriptName', 'script_get');
+dispatch_post('/scripts/:scriptName', 'script_save');
+dispatch_get('/scripts/:scriptName/run', 'script_run');
+dispatch_post('/scripts/:scriptName/run', 'script_run');
+
+dispatch_get('/statistics/usage', 'stats_get_last_file');
+dispatch_post('/statistics/usage', 'stats_publish_stats_file');
+dispatch_delete('/statistics/usage', 'stats_delete_last_file');
+
+dispatch_get('/system/fppd/restart', 'RestartFPPD');
+dispatch_get('/system/fppd/start', 'StartFPPD');
+dispatch_get('/system/fppd/stop', 'StopFPPD');
+dispatch_post('/system/fppd/restart', 'RestartFPPD');
+dispatch_post('/system/fppd/start', 'StartFPPD');
+dispatch_post('/system/fppd/stop', 'StopFPPD');
+dispatch_get('/system/fppd/restartStatus', 'GetFPPDRestartStatus');
+dispatch_post('/system/fppd/skipBootDelay', 'SkipBootDelay');
+dispatch_get('/system/reboot', 'RebootDevice');
+dispatch_post('/system/reboot', 'RebootDevice');
+dispatch_get('/system/releaseNotes/:version', 'ViewReleaseNotes');
+dispatch_get('/system/shutdown', 'SystemShutdownOS');
+dispatch_post('/system/shutdown', 'SystemShutdownOS');
+dispatch_get('/system/status', 'SystemGetStatus');
+dispatch_get('/system/updateStatus', 'GetUpdateStatus');
+dispatch_get('/system/updateActivity', 'GetUpdateActivity');
+dispatch_get('/system/info', 'SystemGetInfo');
+dispatch_get('/system/volume', 'SystemGetAudio');
+dispatch_post('/system/volume', 'SystemSetAudio');
+dispatch_post('/system/proxies', 'PostProxies');
+dispatch_get('/system/proxies', 'GetProxies');
+dispatch_get('/system/packages', 'GetOSpackages');
+dispatch_get('/system/packages/info/:packageName', 'GetOSpackageInfo');
+
+dispatch_get('/testmode', 'testMode_Get');
+dispatch_post('/testmode', 'testMode_Set');
+
+dispatch_get('/time', 'GetTime');
+
+dispatch_get('/privacy/consent', 'GetConsent');
+dispatch_post('/privacy/consent', 'RecordConsent');
+
+// Load FPP's own controllers BEFORE any plugin's api.php.
+//
+// limonade normally defers this to autoload_controller() inside run(), which
+// would put plugin code first: collectPluginEndpoints() require_once's every
+// installed plugin's api.php right here, at line 290, and run() only loads
+// www/api/controllers/ afterwards. That ordering is what makes a plugin able to
+// break or take over the API rather than merely fail on its own -- a plugin
+// declaring a name a controller also declares wins the race, and the
+// controller's later declaration is then the fatal one, killing every route
+// served by that file and every file loaded after it.
+//
+// Loading them first costs nothing (autoload_controller loads the whole
+// directory on any matched route anyway, and require_once makes the second call
+// a no-op) and means FPP's own definitions always exist first, so
+// PluginApiFunctionConflicts() (controllers/plugin.php) can see a conflict
+// coming.
+require_once_dir(__DIR__ . '/controllers');
+
+// Definition in controllers/plugin.php, alongside collectPluginEndpoints()
+// and the rest of the plugin-loading machinery -- called here, rather than
+// there, because ordering relative to the dispatch_* calls above and run()
+// below is what keeps plugins from ever registering ahead of FPP's own
+// routes (see the comment on require_once_dir() just above).
+addPluginEndpoints();
 
 run();
-?>
+

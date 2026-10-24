@@ -1,0 +1,158 @@
+name: Build and Publish Docker
+
+# Every ref that triggers a push here publishes a PERMANENT tag to Docker Hub
+# (the merge job below turns the per-arch digests into a named manifest), so the
+# trigger doubles as the registry's retention policy. It is deliberately narrow:
+#
+#   master          -> :latest
+#   vX.Y branches   -> :vX.Y   (a rolling image tracking a release branch)
+#   release tags    -> :X.Y.Z  (an immutable image for a release)
+#
+# Anything else -- feature branches, work-in-progress, one-off backup tags --
+# is built on demand via workflow_dispatch instead. Branch builds still work
+# exactly as before (the Dockerfile clones FPPBRANCH=github.ref_name and
+# docker/metadata-action still emits the branch-named tag); picking the branch
+# in "Use workflow from" is simply opt-in now. Before this, `branches: "**"`
+# plus `tags: "*"` meant every pushed ref of any shape earned a Docker Hub tag
+# forever, which is how a handful of merged feature branches and a stray local
+# backup tag ended up published there.
+on:
+  push:
+    branches:
+      - master
+      # Release branches carry a "v" prefix (v10.1); tags do not (10.1).
+      - "v[0-9]*"
+    # Same shape as the on.push.tags filter in build-images.yml: release tags
+    # start with a digit, which already excludes the lightweight 'nightly' tag
+    # the nightly job moves onto the master tip. `!*-master` drops the
+    # X.x-master branch-point markers (10.x-master), which are history
+    # bookmarks rather than something anyone would run.
+    tags:
+      - "[0-9]*"
+      - "!*-master"
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} image
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Prepare build variables
+        id: build
+        run: |
+          echo "image_repository=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_OUTPUT}"
+          echo "image_name=fpp" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push image by digest
+        id: docker-build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Docker/Dockerfile
+          build-args: |
+            FPPBRANCH=${{ github.ref_name }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.build.outputs.image_repository }}/${{ steps.build.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=fpp-build-docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=fpp-build-docker-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.docker-build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create multi-arch manifest and push
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Prepare build variables
+        id: build
+        run: |
+          echo "release_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "${GITHUB_OUTPUT}"
+          echo "image_repository=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_OUTPUT}"
+          echo "image_name=fpp" >> "${GITHUB_OUTPUT}"
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          flavor: |
+            latest=false
+          images: ${{ steps.build.outputs.image_repository }}/${{ steps.build.outputs.image_name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch,enable={{is_not_default_branch}}
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.created=${{ steps.build.outputs.release_date }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ steps.build.outputs.image_repository }}/${{ steps.build.outputs.image_name }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ steps.build.outputs.image_repository }}/${{ steps.build.outputs.image_name }}:${{ steps.meta.outputs.version }}

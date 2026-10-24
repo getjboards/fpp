@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 #############################################################################
 # FPP Install Script
 #
@@ -10,34 +12,36 @@
 # version of FPP, the system can then be switched to a new version number
 # or git branch for release.
 #
+# FPP installs created by this script are not supported.  Please do not log
+# bugs against these installs.  FPP is only supported when using FPP OS images
+# installed on Pi/Beagles.
+#
+# Make sure your system is connected to the internet via a wired connection
+# before running this script
+#
 #############################################################################
 # To use this script, download the latest copy from github and run it as
 # root on the system where you want to install FPP:
 #
-# wget -O ./FPP_Install.sh https://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
+# curl -o ./FPP_Install.sh https://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
 # chmod 700 ./FPP_Install.sh
 # su
 # ./FPP_Install.sh
 #
 #############################################################################
 # NOTE: This script is used to build the SD images for FPP releases.  Its
-#       main goal is to prep these release images.  It may be used for othe
+#       main goal is to prep these release images.  It may be used for other
 #       purposes, but it is not our main priority to keep FPP working on
 #       other Linux distributions or distribution versions other than those
 #       we base our FPP releases on.  Currently, FPP images are based on the
-#       following OS images for the Raspberry Pi and BeagleBone Black:
+#       latest OS images for the Raspberry Pi and BeagleBone Black.  See
+#       appropriate README for the exact image that is used.
 #
 #       Raspberry Pi
-#           - URL: https://www.raspberrypi.org/downloads/
-#           - Image
-#             - 2017-11-29-raspbian-stretch-lite.zip
 #           - Login/Password
 #             - pi/raspberry
 #
 #       BeagleBone Black
-#           - URL: http://beagleboard.org/latest-images
-#           - Images
-#             - bone-debian-9.3-iot-armhf-2018-03-05-4gb.img
 #           - Login/Password
 #             - debian/temppwd
 #
@@ -48,37 +52,119 @@
 #############################################################################
 # Other platforms which may be functioning:
 #
-# NOTE: FPP Development is based on the latest *bian Stretch images, so
-#       hardware which does not support Stretch may have issues.
-#
-#       ODROID C1
-#           http://oph.mdrjr.net/meveric/images/
-#           - Jessie/Debian-Jessie-1.1-20170526-C1.img.xz
-#           - Login/Password
-#             - root/odroid
-#           - When building a FPP image from this stock image, we will need
-#             to do something about the image size so we don't bloat the
-#             the FPP download.
-#
-#       Pine64
-#           http://wiki.pine64.org/index.php/Pine_A64_Software_Release
-#           - "Debian Base (3.10.102 BSP 2)" image
-#           - Login/Password
-#             - debian/debian
-#           - This image has very little free space after installing FPP,
-#             so you may want to expand the root partition by a few hundred MB.
+# NOTE: FPP Development targets Debian 13 (Trixie) and Ubuntu 24.04. Earlier
+#       distributions are not supported. Supported hosts:
+#         - Raspberry Pi OS (Trixie, armhf/arm64)
+#         - BeagleBone (Debian 13 armhf/arm64, rcn-ee base images)
+#         - Debian 13 / Ubuntu 24.04 on x86_64 or arm64 generic hardware
+#         - Armbian built on a Debian 13 or Ubuntu 24.04 base
+#         - Fedora 40+ (best-effort; primarily dev-host support)
 #
 #############################################################################
-SCRIPTVER="1.0"
 FPPBRANCH=${FPPBRANCH:-"master"}
-FPPIMAGEVER="2.6"
-FPPCFGVER="31"
+# FPPIMAGEVER is the OS image date stamp written into /etc/fpp/rfs_version
+# and shown in /etc/issue. Override via env (build-image-pi.sh passes the
+# user-supplied --os-version so the .img / .fppos filenames match what's
+# baked into the image itself).
+FPPIMAGEVER=${FPPIMAGEVER:-"2026-09"}
+FPPCFGVER="160"
 FPPPLATFORM="UNKNOWN"
 FPPDIR=/opt/fpp
 FPPUSER=fpp
 FPPHOME=/home/${FPPUSER}
 OSVER="UNKNOWN"
 
+# Make sure the sbin directories are on the path as we will
+# need the adduser/addgroup/ldconfig/a2enmod/etc... commands
+PATH=$PATH:/usr/sbin:/sbin
+
+# git refuses to run without HOME ("fatal: $HOME not set"), and systemd
+# does not set HOME for a system service, so launching the installer from a
+# unit (systemd-run, a provisioning service) rather than a login shell
+# aborts at the clone. Fall back to the invoking user's passwd home so the
+# clone and the "git config --global" below work there too.
+if [ -z "${HOME:-}" ]; then
+    HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+    export HOME=${HOME:-/root}
+fi
+
+# Under docker / chroot (systemd isn't PID 1), runtime systemctl commands
+# (start/stop/restart/reload/is-active/daemon-reload/...) fail because there
+# is no running systemd to talk to. But unit-symlink operations (enable,
+# disable, mask, unmask, preset, set-default) work perfectly well -- they
+# just manipulate /etc/systemd/system/*.wants/ symlinks, which is exactly
+# what we need during image builds.
+#
+# A blanket "neutralize all systemctl" override silently drops every
+# `systemctl enable fppd.service` in the script and produces an image where
+# none of FPP's services are registered with systemd. That's how broken Pi
+# images shipped before this fix.
+#
+# Selective wrapper: pass through unit-management commands (with --no-reload
+# so they don't try to talk to a running daemon); no-op everything else.
+#
+# disable / unmask are "remove from active state" -- idempotent by intent;
+# many of FPP's calls target units that may or may not exist depending on
+# platform (BB units don't exist on Pi, gdm/lightdm don't exist on Lite
+# images). Failures from these are noise we want to swallow so set -e
+# doesn't kill the install on the first absent unit.
+#
+# enable / mask / preset / etc. are "add to active state" -- failures from
+# these mean we got something we wanted wrong; surface them.
+if [ ! -d /run/systemd/system ]; then
+    _real_systemctl="$(command -v systemctl)"
+    systemctl() {
+        # Dispatch on the verb, not $1: options such as --global or --now
+        # can come first ("systemctl --global mask ...").
+        local _verb="" _arg
+        for _arg in "$@"; do
+            case "$_arg" in
+                -*) ;;
+                *) _verb="$_arg"; break ;;
+            esac
+        done
+        case "$_verb" in
+            disable|unmask)
+                "$_real_systemctl" --no-reload --no-warn "$@" 2>/dev/null || true
+                ;;
+            enable|mask|preset|preset-all|reenable|set-default|add-wants|add-requires)
+                "$_real_systemctl" --no-reload "$@"
+                ;;
+            *)
+                echo "skipping systemctl $*"
+                return 0
+                ;;
+        esac
+    }
+    export -f systemctl
+fi
+
+# CPU Count
+CPUS=$(grep "^processor" /proc/cpuinfo | wc -l)
+if [[ ${CPUS} -gt 1 ]]; then
+    MEMORY=$(grep MemTot /proc/meminfo | awk '{print $2}')
+    if [[ ${MEMORY} -lt 425000 ]]; then
+        # very limited memory, only use one core or we'll fail or
+        # will be very slow as we constantly swap in/out
+        CPUS=1
+    elif [[ ${MEMORY} -lt 512000 ]]; then
+        # Disk-backed swap only. SwapTotal also counts zram, which is compressed
+        # swap living in RAM: it cannot give a compile headroom the box does not
+        # physically have, so a zram-only board (e.g. a BeagleBone, ~240MB of
+        # zram and no disk swap) used to satisfy this test and pick -j2, then
+        # thrash. Mirrors DiskBackedSwapKB in scripts/functions, spelled out
+        # here because this file runs before the FPP source is available.
+        SWAPTOTAL=$(awk 'NR > 1 && $1 !~ /^\/dev\/zram/ { s += $3 } END { print s + 0 }' /proc/swaps 2>/dev/null)
+        # Limited memory, if we have some swap, we'll go ahead with -j 2
+        # otherwise we'll need to stick with -j 1 or we run out of memory
+        if [[ ${SWAPTOTAL} -gt 49000 ]]; then
+            CPUS=2
+        else
+            CPUS=1
+        fi
+    fi
+fi
+        
 #############################################################################
 # Some Helper Functions
 #############################################################################
@@ -86,16 +172,22 @@ OSVER="UNKNOWN"
 # This function was copied from /opt/fpp/scripts/functions in FPP source
 # since we don't have access to the source until we clone the repo.
 checkTimeAgainstUSNO () {
-	# www.usno.navy.mil is not pingable, so check github.com instead
-	ping -q -c 1 github.com > /dev/null 2>&1
-
-	if [ $? -eq 0 ]
+	# www.usno.navy.mil is not pingable, so check github.com instead.
+	# Inline the ping into the if so set -e doesn't abort on ping failure
+	# (ICMP often unavailable in chroots / qemu-user contexts).
+	if ping -q -c 1 github.com > /dev/null 2>&1
 	then
 		echo "FPP: Checking local time against U.S. Naval Observatory"
 
 		# allow clocks to differ by 24 hours to handle time zone differences
 		THRESHOLD=86400
-		USNOSECS=$(wget -q -O - http://www.usno.navy.mil/cgi-bin/time.pl | sed -e "s/.*\">//" -e "s/<\/t.*//" -e "s/...$//")
+        USNODATE=$(curl -I --connect-timeout 10 --max-time 10 --retry 2 --retry-max-time 10 -f -v --silent https://time.gov/ 2>&1 \ | grep '< Date' | sed -e 's/< Date: //')
+        if  [ "x${USNODATE}" != "x" ]
+        then
+        USNOSECS=$(date -d "${USNODATE}" +%s)
+        else 
+        USNOSECS=""
+        fi
 
         if [ "x${USNOSECS}" != "x" ]
         then
@@ -130,6 +222,7 @@ checkTimeAgainstUSNO () {
 	fi
 }
 
+
 #############################################################################
 # Gather some info about our system
 . /etc/os-release
@@ -149,67 +242,127 @@ then
 fi
 
 # Parse build options as arguments
-build_ola=false
-build_omxplayer=false
-while [ -n "$1" ]; do
-	case $1 in
-		--build-ola)
-			build_ola=true
-			shift
-			;;
-		--build-omxplayer)
-			build_omxplayer=true
-			shift
-			;;
-		*)
-			echo "Unknown option $1" >&2
-			exit 1
-			;;
-	esac
-done
+clone_fpp=true
+skip_apt_install=false
+desktop=true
+isimage=false;
 
+
+MODEL=""
+if [ -f /proc/device-tree/model ]; then
+    MODEL=$(tr -d '\0' < /proc/device-tree/model)
+fi
 # Attempt to detect the platform we are installing on
-if [ "x${OSID}" = "xraspbian" ]
+if [ "x${OSID}" = "xraspbian" ] || [ -f /etc/rpi-issue ]
 then
 	FPPPLATFORM="Raspberry Pi"
 	OSVER="debian_${VERSION_ID}"
-elif [ "x${VARIANT}" = "xDebian on C.H.I.P" ]; then
-	FPPPLATFORM="CHIP"
-elif [ -e "/sys/class/leds/beaglebone:green:usr0" ]
+    isimage=true
+    desktop=false
+elif [ -f /etc/bbb.io/templates/bb-boot ] \
+        || { [ -f /boot/firmware/ID.txt ] && grep -qi "beagleboard" /boot/firmware/ID.txt 2>/dev/null; } \
+        || [ -e "/sys/class/leds/beaglebone:green:usr1" ]
 then
-	FPPPLATFORM="BeagleBone Black"
-elif [ ! -z "$(grep ODROIDC /proc/cpuinfo)" ]
+    # BeagleBoard detection, in priority order:
+    #   1. /etc/bbb.io/templates/bb-boot -- present on all modern Beagle rootfs
+    #      builds; visible inside chroot (rootfs is mounted during image builds).
+    #   2. /boot/firmware/ID.txt -- stamped by the rcn-ee installer on BB64 and
+    #      recent BBB builds; contents begin with "BeagleBoard.org ...".
+    #   3. /sys/class/leds/beaglebone:green:usr1 -- only works on booted real
+    #      hardware; kept as legacy fallback.
+    if [ "$(uname -m)" = "aarch64" ]; then
+        FPPPLATFORM="BeagleBone 64"
+    else
+        FPPPLATFORM="BeagleBone Black"
+    fi
+    isimage=true
+    desktop=false
+elif [ -f "/etc/armbian-release" ]
 then
-	FPPPLATFORM="ODROID"
-elif [ ! -z "$(grep sun50iw1p1 /proc/cpuinfo)" ]
+    FPPPLATFORM="Armbian"
+    isimage=true
+    desktop=false
+elif [[ $PRETTY_NAME == *"Armbian"* ]]
 then
-	FPPPLATFORM="Pine64"
-elif [ ! -z "$(grep sun8i /proc/cpuinfo)" ]
-then
-	FPPPLATFORM="OrangePi"
+    FPPPLATFORM="Armbian"
+    isimage=true
+    desktop=false
 elif [ "x${OSID}" = "xdebian" ]
 then
 	FPPPLATFORM="Debian"
+elif [ "x${OSID}" = "xubuntu" ]
+then
+	FPPPLATFORM="Ubuntu"
+elif [ "x${OSID}" = "xfedora" ]
+then
+    FPPPLATFORM="Fedora"
 else
 	FPPPLATFORM="UNKNOWN"
 fi
+
+# Build-time override: BeagleBone autodetection relies on /sys/class/leds
+# entries that don't exist in a chroot, so image-build scripts can force
+# the platform string explicitly. Honored after autodetect so it always wins.
+if [ -n "${FPPPLATFORM_OVERRIDE:-}" ]; then
+    FPPPLATFORM="${FPPPLATFORM_OVERRIDE}"
+fi
+
+while [ -n "$1" ]; do
+    case $1 in
+        --skip-clone)
+            clone_fpp=false
+            shift
+            ;;
+        --skip-vlc)
+            # Deprecated: VLC removed in favor of GStreamer
+            shift
+            ;;
+        --build-vlc)
+            # Deprecated: VLC removed in favor of GStreamer
+            shift
+            ;;
+        --skip-apt-install)
+            skip_apt_install=true
+            shift
+            ;;
+        --img)
+            desktop=false
+            isimage=true
+            shift
+            ;;
+        --no-img)
+            desktop=true
+            isimage=false
+            shift
+            ;;
+        --branch)
+            FPPBRANCH=$2
+            shift
+            shift
+            ;;
+        --yes|-y)
+            FPP_INSTALL_YES=1
+            shift
+            ;;
+        *)
+            echo "Unknown option $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 checkTimeAgainstUSNO
 
 #############################################################################
 echo "============================================================"
-echo "$0 v${SCRIPTVER}"
-echo ""
 echo "FPP Image Version: v${FPPIMAGEVER}"
 echo "FPP Directory    : ${FPPDIR}"
 echo "FPP Branch       : ${FPPBRANCH}"
 echo "Operating System : ${PRETTY_NAME}"
 echo "Platform         : ${FPPPLATFORM}"
 echo "OS Version       : ${OSVER}"
-echo "Build OLA        : $build_ola"
-if [ "x${FPPPLATFORM}" = "xRaspberry Pi" ]; then
-echo "Build omxplayer  : $build_omxplayer"
-fi
+echo "OS ID            : ${OSID}"
+echo "Image            : ${isimage}"
 echo "============================================================"
 #############################################################################
 
@@ -220,19 +373,25 @@ echo ""
 echo "WARNINGS:"
 echo "- This install expects to be run on a clean freshly-installed system."
 echo "  The script is not currently designed to be re-run multiple times."
-echo "- This installer will take over your system.  It will disable any"
-echo "  existing 'pi' or 'debian' user and create a '${FPPUSER}' user.  If the system"
-echo "  has an empty root password, remote root login will be disabled."
+if $isimage; then
+    echo "- This installer will take over your system.  It will disable any"
+    echo "  existing 'pi' or 'debian' user and create a '${FPPUSER}' user.  If the system"
+    echo "  has an empty root password, remote root login will be disabled."
+fi
 echo ""
 
-echo -n "Do you wish to proceed? [N/y] "
-read ANSWER
-if [ "x${ANSWER}" != "xY" -a "x${ANSWER}" != "xy" ]
-then
-	echo
-	echo "Install cancelled."
-	echo
-	exit
+if [ "x${FPP_INSTALL_YES}" = "x1" ]; then
+    echo "Non-interactive mode (FPP_INSTALL_YES=1), proceeding."
+else
+    echo -n "Do you wish to proceed? [N/y] "
+    read ANSWER
+    if [ "x${ANSWER}" != "xY" -a "x${ANSWER}" != "xy" ]
+    then
+        echo
+        echo "Install cancelled."
+        echo
+        exit
+    fi
 fi
 
 STARTTIME=$(date)
@@ -251,6 +410,11 @@ echo "------------------------------------------------------------------------"
 if [ -e "/etc/fpp" ]
 then
 	echo "FPP - Removing old /etc/fpp"
+	rm -f /etc/fpp/config_version
+    rm -f /etc/fpp/platform
+    rm -f /etc/fpp/arch
+    rm -f /etc/fpp/rfs_version
+    rm -f /etc/fpp/desktop
 	rm -rf /etc/fpp
 fi
 
@@ -259,8 +423,17 @@ fi
 echo "FPP - Creating /etc/fpp and contents"
 mkdir /etc/fpp
 echo "${FPPPLATFORM}" > /etc/fpp/platform
+# Architecture marker (e.g. armhf / arm64 / x86_64). Used by upgradeOS to
+# refuse cross-arch .fppos applies — critical because FPPPLATFORM alone
+# cannot distinguish 32-bit vs 64-bit Pi (both write "Raspberry Pi").
+echo "$(dpkg --print-architecture 2>/dev/null || uname -m)" > /etc/fpp/arch
 echo "v${FPPIMAGEVER}" > /etc/fpp/rfs_version
 echo "${FPPCFGVER}" > /etc/fpp/config_version
+if $desktop; then
+    echo "1" > /etc/fpp/desktop
+else
+# Bunch of configuration we wont do if installing onto desktop
+# We shouldn't set the hostname or muck with the issue files, keyboard, etc...
 
 #######################################
 # Setting hostname
@@ -284,28 +457,41 @@ cat >> /etc/issue.new <<EOF
 Falcon Player OS Image v${FPPIMAGEVER}
 
 EOF
-cp /etc/issue.new /etc/issue
 cp /etc/issue.new /etc/issue.net
 rm /etc/issue.new
+
+head -1 /etc/issue > /etc/issue.new
+cat >> /etc/issue.new <<EOF
+
+Falcon Player OS Image v${FPPIMAGEVER}
+My IP address: \4
+
+FPP is configured from a web browser. Point your browser at:
+http://\4 , http://\n.local , or http://\n 
+
+EOF
+cp /etc/issue.new /etc/issue
+rm /etc/issue.new
+
 
 #######################################
 # Setup for U.S. users mainly
 echo "FPP - Setting US keyboard layout and locale"
-sed -i "s/XKBLAYOUT=".*"/XKBLAYOUT="us"/" /etc/default/keyboard
+# Minimal bases such as the Debian cloud images don't ship
+# keyboard-configuration, so there is no keymap to change.
+if [ -f /etc/default/keyboard ]; then
+    sed -i "s/XKBLAYOUT=".*"/XKBLAYOUT="us"/" /etc/default/keyboard
+fi
 echo "LANG=en_US.UTF-8" > /etc/default/locale
+
+# end of if desktop
+fi
+
 
 #######################################
 # Make sure /opt exists
 echo "FPP - Checking for existence of /opt"
 cd /opt 2> /dev/null || mkdir /opt
-
-#######################################
-# Remove old /opt/fpp if it exists
-if [ -e "/opt/fpp" ]
-then
-	echo "FPP - Removing old /opt/fpp"
-	rm -rf /opt/fpp
-fi
 
 
 #######################################
@@ -313,38 +499,129 @@ fi
 # Set noninteractive install to skip prompt about restarting services
 export DEBIAN_FRONTEND=noninteractive
 
-case "${OSVER}" in
-	debian_9)
-		case $FPPPLATFORM in
-			'CHIP'|'BeagleBone Black')
-				echo "FPP - Skipping non-free for $FPPPLATFORM"
-				;;
-			*)
-				echo "FPP - Enabling non-free repo"
-				sed -i -e "s/^deb \(.*\)/deb \1 non-free/" /etc/apt/sources.list
-				sed -i -e "s/non-free\(.*\)non-free/non-free\1/" /etc/apt/sources.list
-				;;
-		esac
 
-		echo "FPP - Marking unneeded packages for removal to save space"
-		case "${OSVER}" in
-			debian_9)
-				systemctl disable network-manager.service
+#############################################################################
+# install_base_packages
+# Top-level apt phase: remove unwanted stock packages, update apt, select PHP
+# version, install the full FPP dependency set, and do the one-off Pi USB-boot
+# fstab/cmdline plumbing that needs to run once-per-image.
+# Reads globals: FPPPLATFORM, OSVER, desktop, isimage, skip_apt_install
+# Sets globals:  ACTUAL_PHPVER, PHPVER, BOOTDIR (on Pi)
+#############################################################################
+install_base_packages() {
+    case "${OSVER}" in
+        debian_13 | ubuntu_24.*) ;;
+        *)
+            echo "ERROR: unsupported OS for install_base_packages: ${OSVER}" >&2
+            echo "Supported: Debian 13 (Trixie), Ubuntu 24.04+" >&2
+            exit 1
+            ;;
+    esac
 
-				# This list is based on the Stretch Lite SD image which we base our image on
-				for package in libxmuu1 xauth network-manager
-				do
-					echo "$package deinstall" | dpkg --set-selections
-				done
-				;;
-		esac
+        # Stop unattended-upgrades (if it exists) as it can hold a lock on the apt repository
+		if systemctl cat unattended-upgrades.service >/dev/null 2>&1; then
+	        systemctl stop unattended-upgrades
+		fi
 
-		echo "FPP - Make things cleaner by removing unneeded packages"
-		dpkg --get-selections | grep deinstall | while read package deinstall; do
-			apt-get -y purge $package
-		done
+        #remove a bunch of packages that aren't neeeded, free's up space
+        PACKAGE_REMOVE="nginx nginx-full nginx-common  triggerhappy pocketsphinx-en-us guile-2.2-libs \
+            gfortran glib-networking libxmuu1 xauth network-manager dhcpcd5 fake-hwclock ifupdown isc-dhcp-client isc-dhcp-common openresolv \
+            unattended-upgrades packagekit iwd apt-listchanges"
+        if [ "$FPPPLATFORM" == "BeagleBone 64" -o "$FPPPLATFORM" == "BeagleBone Black" ]; then
+            PACKAGE_REMOVE="$PACKAGE_REMOVE nodejs mender-client bb-code-server"
+        fi
+        if $desktop; then
+            #don't remove anything from a desktop
+            PACKAGE_REMOVE=""
+        fi
+        
+        if $skip_apt_install; then
+            PACKAGE_REMOVE=""
+        fi
+		
+		# Install base packages
+		echo "FPP - Installing SSH and Curl"
+		apt-get update
+		apt-get install openssh-server curl -y
+        
+        # Seamlessly migrate to systemd-networkd without dropping connectivity
+        if [ "x${PACKAGE_REMOVE}" != "x" ]; then
+            # Need to make sure there is configuration for eth0 or uninstalling dhcpclient will cause network to drop
+            echo "FPP - Detecting active network manager"
 
-		echo "FPP - Removing anything left that wasn't explicity removed"
+            USE_NM=0
+
+            if systemctl list-unit-files | grep -q '^NetworkManager.service'; then
+                if systemctl is-active --quiet NetworkManager; then
+                    USE_NM=1
+                fi
+            fi
+
+            # Ensure networkd config exists BEFORE switching anything
+            rm -f /etc/systemd/network/50-default.network
+
+            curl -fsSL -o /etc/systemd/network/50-default.network https://raw.githubusercontent.com/FalconChristmas/fpp/master/etc/systemd/network/50-default.network
+
+            # Install required packages first
+            apt-get update
+            apt-get install -y systemd-resolved
+
+            # Unmask + enable services
+            systemctl unmask systemd-networkd || true
+            systemctl unmask systemd-resolved || true
+
+            systemctl enable systemd-networkd
+            systemctl enable systemd-resolved
+
+            # If NetworkManager is active, migrate cleanly
+            if [ "$USE_NM" = "1" ]; then
+                echo "FPP - NetworkManager detected, migrating to systemd-networkd"
+
+                # Start networkd while NM still owns the interface
+                systemctl start systemd-networkd
+                systemctl start systemd-resolved
+
+                echo "FPP - Waiting for networkd startup"
+                sleep 5
+
+                # Gracefully release interfaces from NM
+                if command -v nmcli >/dev/null 2>&1; then
+                    nmcli networking off || true
+                fi
+
+                # Stop/disable NM
+                systemctl stop NetworkManager || true
+                systemctl disable NetworkManager || true
+
+                echo "FPP - Restarting networkd after migration"
+                systemctl restart systemd-networkd
+                systemctl restart systemd-resolved
+
+                echo "FPP - Waiting for network stabilization"
+                sleep 5
+
+            else
+                echo "FPP - NetworkManager not active, ensuring networkd is running"
+
+                systemctl restart systemd-networkd
+                systemctl restart systemd-resolved
+
+                sleep 3
+            fi
+
+            apt-get remove -y --purge --autoremove --allow-change-held-packages ${PACKAGE_REMOVE}
+
+            systemctl restart systemd-networkd
+            systemctl restart systemd-resolved
+
+            systemctl enable systemd-networkd
+            systemctl enable systemd-resolved
+
+            echo "FPP - Sleeping 5 seconds to make sure network is available"
+            sleep 5
+        fi
+        
+		echo "FPP - Removing anything left that wasn't explicitly removed"
 		apt-get -y --purge autoremove
 
 		echo "FPP - Updating package list"
@@ -353,11 +630,16 @@ case "${OSVER}" in
 		echo "FPP - Upgrading apt if necessary"
 		apt-get install --only-upgrade apt
 
-		echo "FPP - Sleeping 60 seconds to make sure any apt upgrade is quiesced"
-		sleep 60
+		echo "FPP - Sleeping 5 seconds to make sure any apt upgrade is quiesced"
+		sleep 5
 
 		echo "FPP - Upgrading other installed packages"
 		apt-get -y upgrade
+  
+        echo "FPP - Cleanup caches"
+        apt-get -y clean
+        apt-get -y --purge autoremove
+        apt-get -y clean
 
 		# remove gnome keyring module config which causes pkcs11 warnings
 		# when trying to do a git pull
@@ -365,374 +647,795 @@ case "${OSVER}" in
 
 		echo "FPP - Installing required packages"
 		# Install 10 packages, then clean to lower total disk space required
-		PACKAGE_LIST=""
-		case "${OSVER}" in
-			debian_9)
-				PACKAGE_LIST="alsa-base alsa-utils arping avahi-daemon \
-								apache2 apache2-bin apache2-data apache2-utils libapache2-mod-php7.0 \
-								zlib1g-dev libpcre3 libpcre3-dev libbz2-dev libssl-dev \
-								avahi-discover avahi-utils bash-completion bc btrfs-tools build-essential \
-								bzip2 ca-certificates ccache connman curl device-tree-compiler \
-								dh-autoreconf ethtool exfat-fuse fbi fbset file flite gdb \
-								gdebi-core git hdparm i2c-tools ifplugd imagemagick less \
-								libboost-dev libconvert-binary-c-perl \
-								libdbus-glib-1-dev libdevice-serialport-perl libjs-jquery \
-								libjs-jquery-ui libjson-perl libjsoncpp-dev liblo-dev libmicrohttpd-dev libnet-bonjour-perl \
-								libpam-smbpass libsdl2-dev libssh-4 libtagc0-dev libtest-nowarnings-perl locales lsof \
-								mp3info mailutils mpg123 mpg321 mplayer nano nginx node ntp perlmagick \
-								php-cli php-common php-curl php-dom php-fpm php-mcrypt \
-								php-sqlite3 php-zip python-daemon python-smbus rsync samba \
-								samba-common-bin shellinabox sudo sysstat tcpdump time usbmount vim \
-								vim-common vorbis-tools vsftpd firmware-realtek gcc g++\
-								dhcp-helper hostapd parprouted bridge-utils cpufrequtils \
-								firmware-atheros firmware-ralink firmware-brcm80211 \
-								dos2unix libmosquitto-dev mosquitto-clients librtmidi-dev \
-                                libavcodec-dev libavformat-dev libswresample-dev libsdl2-dev libswscale-dev libavdevice-dev libavfilter-dev \
-								wireless-tools libcurl4-openssl-dev resolvconf sqlite3 php7.0-zip"
-				;;
-		esac
+  
+        # PHP version selection. Each supported OS ships with a recent PHP
+        # in the stock repo -- no PPA, no backports.
+        if [ "${OSVER}" == "debian_13" ]; then
+            ACTUAL_PHPVER="8.4"
+            PHPVER="8.4"
+        elif [[ "${OSVER}" == ubuntu_24.* ]]; then
+            ACTUAL_PHPVER="8.3"
+            PHPVER="8.3"
+        else
+            echo "ERROR: unsupported OS for PHP selection: ${OSVER}" >&2
+            exit 1
+        fi
 
-		let packages=0
-		for package in ${PACKAGE_LIST}
-		do
-			apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ${package}
-			let packages=$((${packages}+1))
-			if [ $packages -gt 10 ]; then
-				let packages=0
-				apt-get -y clean
-			fi
-		done
+        #########################################
+        # WARNING
+        # ---------------------------------------
+        # If you modify this file, be sure to update Docker/Dockerfile
+        #########################################
 
-		echo "FPP - Configuring shellinabox to use /var/tmp"
-		echo "SHELLINABOX_DATADIR=/var/tmp/" >> /etc/default/shellinabox
-		sed -i -e "s/SHELLINABOX_ARGS.*/SHELLINABOX_ARGS=\"--no-beep -t\"/" /etc/default/shellinabox
+        PACKAGE_LIST="alsa-utils arping avahi-daemon avahi-utils locales nano net-tools distcc \
+                      apache2 apache2-bin apache2-data apache2-utils libavahi-client-dev util-linux-extra \
+                      bc bash-completion btrfs-progs exfat-fuse lsof ethtool curl zip unzip bzip2 wireless-tools dos2unix \
+                      fbi fbset file flite ca-certificates lshw gettext wget iproute2 fswatch \
+                      build-essential ffmpeg gcc g++ gdb mold vim vim-common bison flex device-tree-compiler dh-autoreconf \
+                      git hdparm i2c-tools jq less tcpdump time usbutils usb-modeswitch \
+                      samba rsync sudo shellinabox dnsmasq hostapd vsftpd sqlite3 at haveged samba samba-common-bin \
+                      mp3info exim4 mailutils dhcp-helper parprouted bridge-utils libiio-utils libhidapi-dev \
+                      php${PHPVER} php${PHPVER}-cli php${PHPVER}-fpm php${PHPVER}-common php${PHPVER}-curl php-pear \
+                      php${PHPVER}-bcmath php${PHPVER}-sqlite3 php${PHPVER}-zip php${PHPVER}-xml ccache \
+                      libtag1-dev \
+                      vorbis-tools libgraphicsmagick++1-dev graphicsmagick-libmagick-dev-compat libdrogon-dev \
+                      gettext apt-utils x265 libtheora-dev libvorbis-dev libx265-dev iputils-ping mp3gain clang-format \
+                      libmosquitto-dev mosquitto-clients mosquitto libzstd-dev lzma zstd gpiod libgpiod-dev libjsoncpp-dev libcurl4-openssl-dev libnl-3-dev libnl-genl-3-dev \
+                      fonts-freefont-ttf flex bison pkg-config libasound2-dev libsdl2-dev libsdl3-dev mesa-common-dev qrencode libusb-1.0-0-dev \
+                      pipewire pipewire-bin pipewire-alsa pipewire-pulse pipewire-jack pipewire-audio-client-libraries wireplumber \
+                      libpipewire-0.3-dev libspa-0.2-bluetooth pulseaudio-utils linuxptp libsamplerate0-dev \
+                      gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-alsa \
+                      gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
+                      gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-x \
+                      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-0 \
+                      libgstrtspserver-1.0-dev \
+                      flex bison pkg-config libasound2-dev python3-setuptools libssl-dev libtool bsdextrautils iw rsyslog tzdata libsystemd-dev \
+                      python3-pip yt-dlp"
 
-		echo "FPP - Cleaning up after installing packages"
-		apt-get -y clean
+        if [ "$FPPPLATFORM" == "Raspberry Pi" -o "$FPPPLATFORM" == "BeagleBone Black"  -o "$FPPPLATFORM" == "BeagleBone 64" ]; then
+            # firmware-misc-nonfree carries the rt2x00 / Mediatek (mt7601u, mt76xx) USB
+            # wifi blobs.
+            # No firmware-iwlwifi: every part it covers is Intel PCIe/M.2, which
+            # none of these boards can take, and it is the single largest firmware
+            # package in the archive (~170MB unpacked). The Pi image build already
+            # purged it back out after the fact; not installing it in the first
+            # place does the same for the BeagleBone images.
+            PACKAGE_LIST="$PACKAGE_LIST firmware-realtek firmware-atheros firmware-brcm80211 firmware-libertas firmware-zd1211 firmware-ti-connectivity firmware-misc-nonfree zram-tools"
+            if [ "$FPPPLATFORM" == "Raspberry Pi" ]; then
+                PACKAGE_LIST="$PACKAGE_LIST libva-dev smartmontools edid-decode kms++-utils"
+            fi
+            if [ "$FPPPLATFORM" == "BeagleBone Black"  -o "$FPPPLATFORM" == "BeagleBone 64" ]; then
+                # firmware-misc-nonfree lives in Debian's non-free-firmware component.
+                # Newer rcn-ee BeagleBone base images already enable non-free-firmware in
+                # /etc/apt/sources.list; older ones did not, leaving firmware-misc-nonfree
+                # with no install candidate. Only drop in our own source when it's actually
+                # missing -- otherwise apt warns about the component being "configured
+                # multiple times". Clean up any stale drop-in from a prior install.
+                FPP_NF_LIST=/etc/apt/sources.list.d/fpp-nonfree-firmware.list
+                if apt-cache policy firmware-misc-nonfree 2>/dev/null | grep -qE 'Candidate: [0-9]'; then
+                    rm -f "$FPP_NF_LIST"
+                else
+                    CODENAME="$(. /etc/os-release; echo "${VERSION_CODENAME:-trixie}")"
+                    cat > "$FPP_NF_LIST" <<EOF
+deb http://deb.debian.org/debian ${CODENAME} non-free-firmware
+deb http://deb.debian.org/debian ${CODENAME}-updates non-free-firmware
+deb http://security.debian.org/debian-security ${CODENAME}-security non-free-firmware
+EOF
+                    apt-get update
+                fi
+                PACKAGE_LIST="$PACKAGE_LIST ti-pru-cgt-v2.3"
+            fi
+        else
+            PACKAGE_LIST="$PACKAGE_LIST libva-dev smartmontools"
+        fi
+        if $isimage; then
+            PACKAGE_LIST="$PACKAGE_LIST networkd-dispatcher"
+        fi
 
-		echo "FPP - Installing libhttpserver SHA bd08772"
-		(cd /opt/ && git clone https://github.com/etr/libhttpserver && cd libhttpserver && git checkout bd08772 && ./bootstrap && mkdir build && cd build && CXXFLAGS=-std=c++98 ../configure --prefix=/usr && make && make install && cd /opt/ && rm -rf /opt/libhttpserver)
+        if [ "${OSVER}" == "debian_12" ]; then
+            PACKAGE_LIST="$PACKAGE_LIST python3-distutils"
+        fi
+        PACKAGE_LIST="$PACKAGE_LIST chrony pipewire"
+        
+        if $skip_apt_install; then
+            echo "skipping apt install because skip_apt_install == $skip_apt_install"
+            PACKAGE_LIST=""
+        else
+            echo "--------------------------"
+            echo "INSTALLING $PACKAGE_LIST"
+            echo "--------------------------"
+            apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install ${PACKAGE_LIST}
+        fi
+        
+        if $isimage; then
+            apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install systemd wpasupplicant
+        fi
+        echo "FPP - Cleaning up after installing packages"
+        apt-get -y clean
 
-		echo "FPP - Installing non-packaged Perl modules via App::cpanminus"
-		curl -L https://cpanmin.us | perl - --sudo App::cpanminus
-		echo "yes" | cpanm -fi Test::Tester File::Map Net::WebSocket::Server Net::PJLink
+        echo "FPP - Configuring shellinabox to use /var/tmp"
+        echo "SHELLINABOX_DATADIR=/var/tmp/" >> /etc/default/shellinabox
+        sed -i -e "s/SHELLINABOX_ARGS.*/SHELLINABOX_ARGS=\"--no-beep -t\"/" /etc/default/shellinabox
 
-		echo "FPP - Disabling any stock 'debian' user, use the '${FPPUSER}' user instead"
-		sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
 
 		if [ -f /bin/systemctl ]
 		then
 			echo "FPP - Disabling unneeded/unwanted services"
-			systemctl disable bonescript.socket
-			systemctl disable bonescript-autorun.service
-			systemctl disable console-kit-daemon.service
-			systemctl disable cloud9.socket
+			# beagle-flasher: present on current rcn-ee BB images and would
+			# otherwise re-flash the eMMC on shutdown. Disable it (if it
+			# exists) so FPP images don't surprise users by overwriting their
+			# installation.
+			if systemctl cat beagle-flasher-init-shutdown.service >/dev/null 2>&1; then
+				systemctl disable beagle-flasher-init-shutdown.service
+			fi
+
+			# Mask systemd-firstboot so it doesn't prompt for a username on
+			# first boot. We've already created the fpp user; the prompt is
+			# noise (and confuses non-headless users on Pi where the prompt
+			# appears on the HDMI console). Mask, not disable: -firstboot is
+			# gated by a marker file too, but masking guarantees no run.
+			systemctl mask systemd-firstboot.service || true
 		fi
 
-		echo "FPP - Disabling GUI"
-		update-rc.d -f gdm remove
-		update-rc.d -f gdm3 remove
-		update-rc.d -f lightdm remove
-		update-rc.d -f wdm remove
-		update-rc.d -f xdm remove
+        if $isimage; then
+            echo "FPP - Disabling GUI"
+            # gdm3 (current GNOME), lightdm (Pi OS Desktop / Mint), and the
+            # generic display-manager alias cover the desktop-DM cases we
+            # might encounter when --img is run on a desktop install. The
+            # legacy gdm/wdm/xdm names are gone from supported releases.
+			# Check if exists before disabling using cat
+			systemctl cat gdm3 >/dev/null 2>&1 && systemctl disable gdm3
+			systemctl cat lightdm >/dev/null 2>&1 && systemctl disable lightdm
+			systemctl cat display-manager.service >/dev/null 2>&1 && systemctl disable display-manager.service
+            
+            echo "FPP - Disabling dhcp-helper and hostapd from automatically starting"
+            systemctl disable dhcp-helper
+            systemctl disable hostapd
+            
+            systemctl disable distcc
+            
+            echo "FPP - Disabling the auto-upgrade services"
+            systemctl disable apt-daily.service || true
+            systemctl disable apt-daily.timer || true
+            systemctl disable apt-daily-upgrade.service || true
+            systemctl disable apt-daily-upgrade.timer || true
 
-		echo "FPP - Disabling dhcp-helper and hostapd from automatically starting"
-		update-rc.d -f dhcp-helper remove
-		update-rc.d -f hostapd remove
+            # Disable stock Debian housekeeping that serves no purpose on a
+            # fixed-image appliance and just adds disk writes / boot-time work:
+            #   man-db.timer        - rebuilds the man page index (no man use)
+            #   dpkg-db-backup.timer- daily /var/lib/dpkg backup (image is fixed)
+            #   e2scrub_*           - online ext4 scrub for LVM (we don't use LVM)
+            #   systemd-pstore      - archives kernel crash pstore at every boot
+            #   wtmpdb-update-boot  - writes boot records to the wtmp database
+            echo "FPP - Disabling unneeded housekeeping timers/services"
+            systemctl disable man-db.timer || true
+            systemctl disable dpkg-db-backup.timer || true
+            systemctl disable e2scrub_all.timer || true
+            systemctl disable e2scrub_reap.service || true
+            systemctl disable systemd-pstore.service || true
+            systemctl disable wtmpdb-update-boot.service || true
+            # gpio-manager: the libgpiod 2.x D-Bus GPIO daemon (Debian 13's gpiod
+            # package). FPP drives GPIO via the libgpiod *library* directly and
+            # never uses this daemon. It's idle by default, but since GPIO line
+            # requests are exclusive it's a latent EBUSY risk if anything ever
+            # makes it claim a line -- so disable it (also saves a boot service).
+            systemctl disable gpio-manager.service || true
 
-		if [ "x${OSVER}" == "xdebian_9" ]; then
-			systemctl disable display-manager.service
-		fi
+            echo "FPP - Enabling systemd-networkd"
+            # clean out the links to /dev/null so that we can enable systemd-networkd
+            rm -f /etc/systemd/network/99*
+            rm -f /etc/systemd/network/20*
+            rm -f /etc/systemd/network/73*
+            rm -f /etc/systemd/network/eth*
+            rm -f /etc/systemd/network/wlan*
+            rm -f /etc/systemd/network/SoftAp*
+            rm -rf /etc/wpa_supplicant/wpa_supplicant-wl*
+            if [ ! -f /etc/systemd/network/50-default.network ]; then
+                # Need to make sure there is configuration for eth0 or no connection will be
+                # setup after a reboot
+                curl -fsSL -o /etc/systemd/network/50-default.network https://raw.githubusercontent.com/FalconChristmas/fpp/master/etc/systemd/network/50-default.network
+            fi
+            # make sure we end up with eth0/wlan0 instead of enx#### wlx#### naming for now
+            ln -s /dev/null /etc/systemd/network/99-default.link
+            ln -s /dev/null /etc/systemd/network/73-usb-net-by-mac.link
+            systemctl enable systemd-networkd
+            systemctl disable systemd-networkd-wait-online.service
+            systemctl enable systemd-resolved
+            systemctl enable networkd-dispatcher
 
-		;;
-	ubuntu_14.04)
-		echo "FPP - Updating package list"
-		apt-get update
-		echo "FPP - FIXME, should be installing required Ubuntu packages"
-		;;
-	*)
-		echo "FPP - Unknown distro"
-		;;
-esac
+            # The wpasupplicant package enables BOTH the generic
+            # wpa_supplicant.service and the per-interface
+            # wpa_supplicant@<iface>.service, so every board boots two
+            # supplicant daemons. FPP only ever drives the per-interface one
+            # (see FPPINIT_Network.cpp), so the generic instance is a second
+            # daemon doing nothing on a board with 480MB and one core.
+            #
+            # Disabled WITHOUT --now on purpose: the generic unit declares
+            # RuntimeDirectory=wpa_supplicant, so stopping it makes systemd
+            # delete /run/wpa_supplicant -- including the control socket the
+            # RUNNING per-interface instance created there, which would break
+            # wpa_cli (and the network status page) until the next reboot.
+            # Leaving it running until then costs nothing and avoids that.
+            systemctl disable wpa_supplicant.service || true
+
+            # if systemd hasn't created a new resolv.conf, don't replace it yet
+            if [ -f /run/systemd/resolve/resolv.conf ]; then
+                rm -f /etc/resolv.conf
+                ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+            fi
+
+            #remove some things that were installed (not sure why)
+            apt-get remove -y --purge --autoremove --allow-change-held-packages pocketsphinx-en-us
+
+            if [ "$FPPPLATFORM" == "Raspberry Pi" ]; then
+                echo "FPP - Fixing haveged"
+                mkdir -p /etc/systemd/system/haveged.service.d
+                echo -e '[Service]\nSystemCallFilter=uname' > /etc/systemd/system/haveged.service.d/syscall.conf
+            
+                echo "FPP - Applying updates to allow optional boot from USB on Pi 4 (and up)"
+
+                # make sure the label on p1 is "boot" and p2 is rootfs.
+                # These device paths don't exist in a chroot image build, and
+                # even on real hardware the labels are typically already set;
+                # tolerate failure so the install doesn't abort under set -e.
+                fatlabel /dev/mmcblk0p1 boot 2>/dev/null || true
+                e2label /dev/mmcblk0p2 rootfs 2>/dev/null || true
+
+                # Debian 12+ Pi images always mount firmware at /boot/firmware.
+                BOOTDIR="/boot/firmware"
+
+                # Update /etc/fstab to use PARTUUID for / and /boot
+                BOOTLINE=$(grep "^[^#].* /boot[a-z/]* " /etc/fstab | sed -e "s;^[^#].* /boot[a-z/]* ;LABEL=boot ${BOOTDIR} ;")
+                ROOTLINE=$(grep "^[^#].* /  " /etc/fstab | sed -e "s;^[^#].* / ;LABEL=rootfs / ;")
+                echo "    - Updating /etc/fstab"
+                sed -i -e "s;^[^#].* /boot[a-z/]* .*;${BOOTLINE};" -e "s;^[^#].* / .*;${ROOTLINE};" /etc/fstab
+
+                # Create two different cmdline.txt files for USB and SD boot
+                echo "    - Creating ${BOOTDIR}/cmdline.* configs"
+                sed -i -e "s; root=PARTUUID=[0-9A-Za-z\-]* ; root=/dev/mmcblk0p2 ;g" ${BOOTDIR}/cmdline.txt
+                cat ${BOOTDIR}/cmdline.txt | sed -e "s/root=\/dev\/[a-zA-Z0-9]*\([0-9]\) /root=\/dev\/sda\1 /" > ${BOOTDIR}/cmdline.usb
+                cat ${BOOTDIR}/cmdline.txt | sed -e "s/root=\/dev\/[a-zA-Z0-9]*\([0-9]\) /root=\/dev\/mmcblk0p\1 /" > ${BOOTDIR}/cmdline.sd
+
+                # Create two batch files to switch back and forth between USB and SD boot
+                echo "    - Creating ${BOOTDIR}/boot_*.bat scripts"
+                cat > ${BOOTDIR}/boot_usb.bat <<EOF
+@echo off
+rem This script will switch ${BOOTDIR}/cmdline.txt to boot from a USB
+rem drive which will show up as /dev/sda inside the OS.
+
+@echo Copying USB boot config file into place.
+copy /y cmdline.usb cmdline.txt
+@echo.
+
+@echo Copy complete.
+@echo.
+
+set /p DUMMY=Hit ENTER to continue...
+EOF
+
+                cat > ${BOOTDIR}/boot_sd.bat <<EOF
+@echo off
+rem This script will switch ${BOOTDIR}/cmdline.txt to boot from a SD
+rem card which will show up as /dev/mmcblk0 inside the OS.
+
+@echo Copying (micro)SD boot config file into place.
+copy /y cmdline.sd cmdline.txt
+@echo.
+
+@echo Copy complete.
+@echo.
+
+set /p DUMMY=Hit ENTER to continue...
+EOF
+
+            fi
+        fi
+
+}
+
+install_base_packages
+
 
 #######################################
 # Platform-specific config
-case "${FPPPLATFORM}" in
-	'BeagleBone Black')
+#############################################################################
+# Platform-specific setup functions.
+# Each one is invoked from the case statement below based on FPPPLATFORM.
+# They rely on globals set earlier ($isimage, $FPPUSER, $OSVER, $skip_apt_install)
+# and may set $BOOTDIR as a side effect.
+#############################################################################
 
-		case "${OSVER}" in
-			debian_9)
-				echo "FPP - Disabling HDMI for Falcon and LEDscape cape support"
-				sed -i -e 's/#dtb=am335x-boneblack-emmc-overlay.dtb/dtb=am335x-boneblack-emmc-overlay.dtb/' /boot/uEnv.txt
+# apt_purge_installed <pkg> [<pkg>...]
+# Purge only packages that are actually installed. Needed under set -e since
+# apt-get purge on a missing package would otherwise abort the script.
+apt_purge_installed() {
+    local installed="" pkg
+    for pkg in "$@"; do
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            installed="$installed $pkg"
+        fi
+    done
+    if [ -n "$installed" ]; then
+        apt-get -y purge $installed
+    fi
+}
 
-				echo "FPP - Installing BeagleBone Overlays"
-				cd /opt/ && git clone https://github.com/beagleboard/bb.org-overlays && cd /opt/bb.org-overlays && make && make install && cd /opt/ && rm -rf bb.org-overlays
+# defer_bb_usb_gadgets
+# The stock BeagleBoard bb-usb-gadgets.service does a *blocking*
+# "systemctl start serial-getty@ttyGS0", which can sit ~35s waiting on the
+# getty/device and stalls the boot critical path -- delaying fppd. The USB
+# gadget (usb0 tether + serial console) is only a setup convenience, not used
+# in normal operation, so order it after fpp_postnetwork. fppd is also
+# After=fpp_postnetwork, so the gadget setup then runs in parallel with fppd
+# instead of holding it up.
+defer_bb_usb_gadgets() {
+    mkdir -p /etc/systemd/system/bb-usb-gadgets.service.d
+    cat > /etc/systemd/system/bb-usb-gadgets.service.d/fpp-defer.conf <<'EOF'
+[Unit]
+After=fpp_postnetwork.service
+EOF
+}
 
-				echo "FPP - Installing OLA"
-				apt-get -y install ola ola-python libola-dev libola1 libprotobuf-dev libprotobuf9
-				update-rc.d olad remove
+# Realtek USB WiFi adapters (rtw88_usb) default to switching the chip into USB 3
+# mode during probe.  The BeagleBone USB hosts are USB 2.0 high-speed only --
+# AM335x musb-hdrc and AM62x both enumerate at 480Mbps and expose no SuperSpeed
+# port -- so there is nothing to switch to and the attempt is pure risk.
+#
+# The switch is a register write (0xc4) that forces the device to re-enumerate,
+# and on AM335x it intermittently leaves the adapter wedged: every subsequent
+# register access returns -EPROTO/-ETIMEDOUT, the radio never associates, and the
+# board boots and runs normally but is unreachable. Seen twice in ~14 boots on one
+# board, with 65,956 driver errors logged on one of them against 1 on a good boot.
+#
+# Critically, re-probing does not recover it, because the re-probe re-attempts the
+# same switch. That is why physically unplugging and replugging the adapter -- or
+# unbinding and rebinding it in software -- does not reliably bring it back.
+#
+# Disabling this is cheap even on a Beagle that does have SuperSpeed: the kernel's
+# own help text offers N as the way to keep USB 3 signalling from interfering with
+# the 2.4GHz band, and a WiFi adapter does not need more than USB 2 high-speed for
+# FPP's traffic.
+#
+# Measured on a BBB: 0xc4 write failures 1 -> 0 per boot, USB re-enumerations
+# 2 -> 1, total rtw88 errors -> 0.
+setup_beaglebone_rtw88_usb() {
+    echo "FPP - Disabling the rtw88 USB 3 mode switch (no BeagleBone USB host is USB 3)"
+    mkdir -p /etc/modprobe.d
+    # The filename has to sort LAST. modprobe concatenates options from every
+    # file in /etc/modprobe.d in filename order and the final value wins, and the
+    # out-of-kernel lwfinger/rtw88 driver ships /etc/modprobe.d/rtw88.conf which
+    # sets the opposite (switch_usb_mode=y). BB64 uses that driver and keeps that
+    # file -- only the BBB image removes it (build-image-bbb.sh) -- so anything
+    # sorting before "rtw88.conf" is silently overridden. That is not a
+    # hypothetical: an earlier fpp-rtw88-usb.conf was installed correctly and the
+    # parameter still read Y on every BB64 boot.
+    rm -f /etc/modprobe.d/fpp-rtw88-usb.conf
+    cat > /etc/modprobe.d/zz-fpp-rtw88-usb.conf <<'EOF'
+# Auto-generated by FPP - see setup_beaglebone_rtw88_usb in SD/FPP_Install.sh
+# The BeagleBone USB host is USB 2.0 only, so switching a Realtek adapter into
+# USB 3 mode cannot succeed; the attempt forces a re-enumeration that sometimes
+# wedges the adapter until the board is power cycled. Re-probing re-attempts the
+# switch, so a wedged adapter will not recover from a replug either.
+#
+# BOTH module names are listed on purpose. The rtw88 USB core is rtw88_usb on
+# some kernels and rtw_usb on others -- 7.1.6 builds it as rtw88_usb, the
+# 6.18.x arm64-k3 builds as rtw_usb -- and modprobe silently ignores options for
+# a module that is not present. Naming only one leaves the option a no-op on the
+# other, which is exactly what happened on BB64: the file was installed and the
+# parameter still read Y.
+options rtw88_usb switch_usb_mode=N
+options rtw_usb switch_usb_mode=N
+EOF
+}
 
-				echo "FPP - Updating locale"
-				sed -i -e 's/# en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
-				dpkg-reconfigure --frontend=noninteractive locales
-				update-locale LANG=en_US.UTF-8
+setup_platform_beaglebone_black() {
+    setup_beaglebone_rtw88_usb
+    # Blacklist gyro/barometer on SanCloud enhanced (conflicts with cape pins).
+    cat > /etc/modprobe.d/blacklist-gyro.conf <<'EOF'
+blacklist st_pressure_spi
+blacklist st_pressure_i2c
+blacklist st_pressure
+blacklist inv_mpu6050_i2c
+blacklist st_sensors_spi
+blacklist st_sensors_i2c
+blacklist inv_mpu6050
+blacklist st_sensors
+EOF
+    echo "blacklist spidev" > /etc/modprobe.d/blacklist-spidev.conf
 
-				# Bind mount /tmp over /var/tmp because the default 10G /var/tmp is not
-				# big enough to rebuild the initrd when the kernel is updated
-				mount -o bind /tmp /var/tmp
+    # Blacklist bluetooth on BBG Gateway / BBGW / BBBW -- kernel instability,
+    # and we don't use it.
+    cat > /etc/modprobe.d/blacklist-bluetooth.conf <<'EOF'
+blacklist btusb
+blacklist bluetooth
+blacklist hci_uart
+blacklist bnep
+EOF
 
-				# We need the 'bone' kernel so LEDscape PRU code can work
-				BBB_KERNEL_VER=4.1.19-bone-rt-r20
-				echo "FPP - Switching to Bone kernel"
-				cd /opt/scripts/tools && ./update_kernel.sh --bone-rt-kernel --lts-4_1 --kernel=${BBB_KERNEL_VER}
+    rm -f /etc/modules-load.d/network.conf
 
-				echo "FPP - Installing updated 8192cu module"
-				# FIXME, get this in github once kernel version is finalized
-				wget -O /lib/modules/${BBB_KERNEL_VER}/kernel/drivers/net/wireless/8192cu.ko http://fpp.bc2va.org/modules/8192cu-${BBB_KERNEL_VER}.ko
-				sudo depmod ${BBB_KERNEL_VER}
-				#wget -O /lib/modules/${BBB_KERNEL_VER}/kernel/drivers/net/wireless/8192cu.ko https://github.com/FalconChristmas/fpp/releases/download/1.5/8192cu-${BBB_KERNEL_VER}.ko
-				;;
-		esac
+    systemctl disable keyboard-setup
+    systemctl disable unattended-upgrades
+    systemctl disable resize_filesystem
+    systemctl disable console-setup
+    # FPP uses smbd/nmbd for media file shares, never the AD domain controller.
+    systemctl disable samba-ad-dc || true
+    # No Bluetooth use on BeagleBone; kept enabled only on the Pi.
+    systemctl disable bluetooth || true
+    defer_bb_usb_gadgets
+}
 
+setup_platform_beaglebone_64() {
+    setup_beaglebone_rtw88_usb
+    systemctl disable keyboard-setup
+    systemctl disable unattended-upgrades
+    systemctl disable mender-client
+    systemctl disable resize_filesystem
+    systemctl disable console-setup
+    # FPP uses smbd/nmbd for media file shares, never the AD domain controller.
+    systemctl disable samba-ad-dc || true
+    # No Bluetooth use on BeagleBone; kept enabled only on the Pi.
+    systemctl disable bluetooth || true
+    defer_bb_usb_gadgets
 
-		echo "FPP - Fixing potential ping issue"
-		chmod u+s /bin/ping
+    echo "FPP - Adding required modules to modules-load to speed up boot"
+    cat >> /etc/modules-load.d/modules.conf <<'EOF'
+snd_pcm
+snd_timer
+snd
+soundcore
+irq_pruss_intc
+pru_rproc
+cpufreq_dt
+rti_wdt
+at24
+ad7291
+pruss
+omap_mailbox
+loop
+efi_pstore
+dm_mod
+ip_tables
+EOF
+}
 
-		;;
+setup_platform_raspberry_pi() {
+    echo "FPP - Updating firmware for Raspberry Pi install"
+    apt-get dist-upgrade -y
 
-	'Raspberry Pi')
-		echo "FPP - Updating firmware for Raspberry Pi install"
-        sudo apt-get dist-upgrade -y
+    echo "FPP - Installing Pi-specific packages"
+    apt-get -y install raspi-config
 
-		echo "FPP - Installing Pi-specific packages"
-		apt-get -y install raspi-config
+    if $isimage; then
+        # Debian 12+ Pi images always mount firmware at /boot/firmware.
+        BOOTDIR="/boot/firmware"
 
-        echo "FPP - Install kernel headers so modules can be compiled later"
-        apt-get -y install raspberrypi-kernel-headers
+        echo "FPP - Disabling stock users (pi, odroid, debian), use '${FPPUSER}' instead"
+        sed -i -e "s/^pi:.*/pi:*:16372:0:99999:7:::/"         /etc/shadow
+        sed -i -e "s/^odroid:.*/odroid:*:16372:0:99999:7:::/" /etc/shadow
+        sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
 
-		# TODO: Shouldn't this stuff go somewhere besides the Pi section?  I
-		# believe OLA is supported across most linux systems.  It can probably
-		# go in another location.
-		if $build_ola; then
-			echo "FPP - Installing OLA from source"
-			apt-get -y --force-yes install libcppunit-dev uuid-dev pkg-config libncurses5-dev libtool autoconf automake libmicrohttpd-dev protobuf-compiler python-protobuf libprotobuf-dev libprotoc-dev bison flex libftdi-dev libftdi1 libusb-1.0-0-dev liblo-dev
-			apt-get -y clean
-			git clone https://github.com/OpenLightingProject/ola.git /opt/ola
-			(cd /opt/ola && autoreconf -i && ./configure --enable-rdm-tests --enable-python-libs && make && make install && ldconfig)
-			rm -rf /opt/ola
-		else
-			echo "FPP - Installing OLA"
-			case "${OSVER}" in
-				debian_9)
-					apt-get -y install ola ola-python libola-dev libola1
-				;;
-			esac
-		fi
+        # FPP uses smbd/nmbd for media file shares, never the AD domain controller.
+        systemctl disable samba-ad-dc || true
 
-		echo "FPP - Installing wiringPi"
-		cd /opt/ && git clone git://git.drogon.net/wiringPi && cd /opt/wiringPi && ./build
+        echo "FPP - Tweaking ${BOOTDIR}/config.txt"
+        # Camera auto-detect off (we don't use it; saves a bit of boot time).
+        sed -i -e "s/camera_auto_detect/#camera_auto_detect/"  ${BOOTDIR}/config.txt
+        # Cap the vc4-KMS CMA pool at 256MB. The firmware default on a Pi4 is
+        # 512MB, which on a 1GB board leaves so little general RAM that a
+        # parallel compile gets OOM-killed mid-build (issue #2679). 256MB is far
+        # more than FPP ever needs for DMA/GPU buffers (DPI framebuffers, kmssink
+        # dumb buffers, virtual matrices all fit comfortably). We modify the
+        # existing overlay line in place rather than adding a second
+        # dtoverlay=vc4-kms-v3d line -- loading the overlay twice would fail to
+        # apply, silently dropping the cma setting. Matches both the generic
+        # overlay (Pi0-4) and the -pi5 variant; skips a line that already
+        # specifies a cma- size so a user override is preserved.
+        sed -i '/^[[:space:]]*dtoverlay=vc4-kms-v3d/{/cma-/!s/$/,cma-256/}' ${BOOTDIR}/config.txt
+        # NOTE: leave hdmi_force_hotplug alone. With the 6.18 vc4 KMS driver,
+        # disabling it lets the GPU drop the HDMI signal entirely when the
+        # kernel's hot-plug detection misses (which it does often enough on
+        # a fresh boot), leaving the monitor in powersave with no console
+        # visible. Old FPP images used to comment this out -- don't.
 
-		if $build_omxplayer; then
-			echo "FPP - Building omxplayer from source with our patch"
-			apt-get -y install git-core libssl1.0-dev libssh-dev libsmbclient-dev
-            cd /opt
-			git clone https://github.com/popcornmix/omxplayer.git
-			cd omxplayer
-			# get the latest and greatest to support ALSA
-			#git reset --hard 4d8ffd13153bfef2966671cb4fb484afeaf792a8
-			wget -O- https://raw.githubusercontent.com/FalconChristmas/fpp/master/external/omxplayer/FPP_omxplayer.diff | patch -p1
-			./prepare-native-raspbian.sh
-			make omxplayer.bin
-            cp omxplayer.bin /usr/bin/omxplayer.bin
-			cd ..
-			rm -rf /opt/omxplayer
-		else
-			# TODO: need to test this binary on jessie
-			echo "FPP - Installing patched omxplayer.bin for FPP MultiSync"
-			case "${OSVER}" in
-				debian_9)
-					wget -O- https://github.com/FalconChristmas/fpp-binaries/raw/master/Pi/omxplayer-dist-stretch.tgz | tar xzpv -C /
-					;;
-				*)
-					echo "WARNING: Unable to install patched omxplayer for this release"
-					;;
-			esac
-		fi
+        echo "FPP - Adding required modules to modules-load to speed up boot"
+        cat >> /etc/modules-load.d/modules.conf <<'EOF'
+i2c_dev
+spidev
+at24
+lm75
+snd_bcm2835
+bcm2835_codec
+snd_usb_audio
+EOF
 
-		echo "FPP - Disabling dhcpcd"
-		systemctl disable dhcpcd.service
+        # Append FPP-specific device-tree and hardware config to config.txt
+        cat >> ${BOOTDIR}/config.txt <<'EOF'
+[all]
 
-		echo "FPP - Configuring connman"
-		mv /etc/wpa_supplicant/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf.orig
-		cat <<-EOF > /var/lib/connman/settings
-		[global]
-		OfflineMode=false
+# Enable SPI in device tree, but keep the cs pins free
+dtparam=spi=on
+dtoverlay=spi0-0cs
+# SPI1 enabled with nothing muxed onto the header and no chip select taken --
+# see capes/drivers/pi/fpp-spi1-nopins.dts.  Its data pins are muxed only by
+# whoever calls configPin("spi") on P1-35/38/40, which also drives its own
+# chip select from userspace.
+dtoverlay=fpp-spi1-nopins
 
-		[WiFi]
-		Enable=true
-		Tethering=false
+# Enable PCIe for NVME storage (Gen2 is the Pi 5's certified speed; Gen3
+# is an overclock that some NVMe HATs/drives fail to train reliably at)
+dtparam=pciex1_gen=2
 
-		[Bluetooth]
-		Enable=false
-		Tethering=false
+# Enable Cape Specific Overlays
+dtoverlay=fpp-cape-overlay
 
-		[Wired]
-		Enable=true
-		Tethering=false
-		EOF
+# Enable I2C in device tree
+dtparam=i2c_arm=on,i2c_arm_baudrate=400000
 
-		mkdir /etc/connman
-		chmod 755 /etc/connman
-		cat <<-EOF >> /etc/connman/main.conf
-		[General]
-		PreferredTechnologies=wifi,ethernet
-		SingleConnectedTechnology=false
-		AllowHostnameUpdates=false
-		PersistentTetheringMode=true
-		EOF
+# Setting kernel scaling framebuffer method
+scaling_kernel=8
 
-		echo "FPP - Disabling stock users (pi, odroid, debian), use the '${FPPUSER}' user instead"
-		sed -i -e "s/^pi:.*/pi:*:16372:0:99999:7:::/" /etc/shadow
-		sed -i -e "s/^odroid:.*/odroid:*:16372:0:99999:7:::/" /etc/shadow
-		sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
+# Enable audio
+dtparam=audio=on
 
-		echo "FPP - Disabling getty on onboard serial ttyAMA0"
-		if [ "x${OSVER}" == "xdebian_9" ]; then
-			systemctl disable serial-getty@ttyAMA0.service
-			sed -i -e "s/console=serial0,115200 //" /boot/cmdline.txt
-			sed -i -e "s/autologin pi/autologin ${FPPUSER}/" /etc/systemd/system/autologin@.service
-		fi
+# Allow more current through USB
+max_usb_current=1
 
-		echo "FPP - Disabling auto mount of USB drives"
-		sed -i -e "s/ENABLED=1/ENABLED=0/" /etc/usbmount/usbmount.conf 2> /dev/null
+# Setup UART clock to allow DMX output
+init_uart_clock=16000000
 
-		echo "FPP - Disabling the hdmi force hotplug setting"
-		sed -i -e "s/hdmi_force_hotplug/#hdmi_force_hotplug/" /boot/config.txt
+# Swap Pi 3 and Zero W UARTs with BT
+dtoverlay=miniuart-bt
 
-		echo "FPP - Enabling SPI in device tree"
-		echo >> /boot/config.txt
+# Model Specific configuration
+#
+# No gpu_mem here, deliberately. The firmware GPU split is a legacy setting and
+# nothing in FPP draws on it any more: video goes through GStreamer (the old
+# omxplayer/MMAL path is long gone), and the display, DPI and virtual-matrix
+# buffers all come from the vc4-KMS CMA pool sized above. A Pi 5 ignores
+# gpu_mem outright; on a Pi 4 the 3D block has its own MMU and allocates from
+# Linux instead, where the documented ceiling is 76 -- so the 256 this used to
+# set just carved ~180MB out of usable RAM. Unset lets the firmware pick its
+# own default (64 below 1GB, 76 at 1GB and above), which is what we want.
+[pi5]
+# uart0 enabled with nothing muxed onto the header -- see
+# capes/drivers/pi/fpp-uart0-nopins.dts.  "dtparam=uart0=on" would claim
+# GPIO14 and GPIO15 at boot, and under strict pinmux FPP could never take
+# either back for a cape's own use.
+dtoverlay=fpp-uart0-nopins
+[pi02]
+dtparam=audio=off
+hdmi_force_hotplug=1
+hdmi_drive=2
 
-		echo "# Enable SPI in device tree" >> /boot/config.txt
-		echo "dtparam=spi=on" >> /boot/config.txt
-		echo >> /boot/config.txt
+[all]
 
-		echo "FPP - Updating SPI buffer size"
-		sed -i 's/$/ spidev.bufsiz=102400/' /boot/cmdline.txt
+EOF
 
-		echo "FPP - Disabling fancy network interface names"
-		sed -e 's/rootwait/rootwait net.ifnames=0 biosdevname=0/' /boot/cmdline.txt
+        # snd_bcm2835 is loaded by Pi firmware via dtparam=audio=on before
+        # userspace modprobe runs, so /etc/modprobe.d options don't apply.
+        # Kernel-command-line params do. enable_hdmi=0 drops the legacy
+        # HDMI audio device (vc4hdmi provides HDMI audio natively), so:
+        #   - "bcm2835 Headphones" becomes card 0 (restores FPP 9 layout)
+        #   - no duplicate HDMI ALSA entries
+        #   - aplay never hits the bcm2835 HDMI path, which on some
+        #     Pi4/Pi5 + monitor combinations re-trains the HDMI link and
+        #     briefly blanks the display.
+        echo "FPP - Updating SPI buffer size and audio device selection"
+        sed -i 's/$/ spidev.bufsiz=102400 snd_bcm2835.enable_headphones=1 snd_bcm2835.enable_hdmi=0/' ${BOOTDIR}/cmdline.txt
+        # Pi Zero 2 W uses vc4-hdmi for HDMI audio with dtparam=audio=off, so
+        # snd_bcm2835 is never loaded — its cmdline params must be absent or the
+        # module won't be present to honour them, and some kernel versions treat
+        # unknown module params as fatal.  Strip them for this model only.
+        if echo "${MODEL}" | grep -q "Zero 2"; then
+            echo "FPP - Pi Zero 2 W detected: removing snd_bcm2835 cmdline params (vc4-hdmi handles HDMI audio)"
+            sed -i 's/ snd_bcm2835\.enable_headphones=[0-9]*//g' ${BOOTDIR}/cmdline.txt
+            sed -i 's/ snd_bcm2835\.enable_hdmi=[0-9]*//g' ${BOOTDIR}/cmdline.txt
+        fi
 
-		echo "# Enable I2C in device tree" >> /boot/config.txt
-		echo "dtparam=i2c=on" >> /boot/config.txt
-		echo >> /boot/config.txt
+        echo "FPP - Updating root partition device"
+        sed -i 's/root=PARTUUID=[A-Fa-f0-9-]* /root=\/dev\/mmcblk0p2 /g' ${BOOTDIR}/cmdline.txt
+        sed -i 's/PARTUUID=[A-Fa-f0-9]*-01/\/dev\/mmcblk0p1/g' /etc/fstab
+        sed -i 's/PARTUUID=[A-Fa-f0-9]*-02/\/dev\/mmcblk0p2/g' /etc/fstab
 
-		echo "# Setting kernel scaling framebuffer method" >> /boot/config.txt
-		echo "scaling_kernel=8" >> /boot/config.txt
-		echo >> /boot/config.txt
+        echo "FPP - Disabling fancy network interface names"
+        sed -i -e 's/rootwait/rootwait net.ifnames=0 /' ${BOOTDIR}/cmdline.txt
 
-		echo "# Enable audio" >> /boot/config.txt
-		echo "dtparam=audio=on" >> /boot/config.txt
-		echo >> /boot/config.txt
+        echo "FPP - Freeing up more space by removing unnecessary packages"
+        apt_purge_installed \
+            wolfram-engine sonic-pi minecraft-pi firmware-iwlwifi \
+            libglusterfs0 mesa-va-drivers mesa-vdpau-drivers mesa-vulkan-drivers \
+            mkvtoolnix ncurses-term poppler-data va-driver-all librados2 libcephfs2
+        apt-get -y --purge autoremove
 
-		echo "# Allow more current through USB" >> /boot/config.txt
-		echo "max_usb_current=1" >> /boot/config.txt
-		echo >> /boot/config.txt
+        echo "FPP - Clearing config of packages marked for deinstall"
+        dpkg --get-selections | grep deinstall | while read package _; do
+            apt-get -y purge $package
+        done
 
-		echo "# Setup UART clock to allow DMX output" >> /boot/config.txt
-		echo "init_uart_clock=16000000" >> /boot/config.txt
-		echo >> /boot/config.txt
+        echo "FPP - Disabling Swap to save SD card"
+        systemctl disable dphys-swapfile
+        systemctl disable smartmontools
 
-		echo "# Swap Pi 3 and Zero W UARTs with BT" >> /boot/config.txt
-		echo "dtoverlay=pi3-miniuart-bt" >> /boot/config.txt
-		echo >> /boot/config.txt
+        echo "FPP - Kernel doesn't support cgroups so remove to silence warnings on boot"
+        update-rc.d -f cgroup-bin remove
 
-		echo "FPP - Freeing up more space by removing unnecessary packages"
-		apt-get -y purge wolfram-engine sonic-pi minecraft-pi
-		apt-get -y --purge autoremove
+        echo "FPP - Remove dhcpcd since we start DHCP interfaces on our own"
+        update-rc.d -f dhcpcd remove
 
-		echo "FPP - Make things cleaner by removing configuration from unnecessary packages"
-		dpkg --get-selections | grep deinstall | while read package deinstall; do
-			apt-get -y purge $package
-		done
+        echo "FPP - Setting locale"
+        sed -i 's/^\(en_GB.UTF-8\)/# \1/;s/..\(en_US.UTF-8\)/\1/' /etc/locale.gen
+        locale-gen en_US.UTF-8
+        dpkg-reconfigure --frontend=noninteractive locales
+        export LANG=en_US.UTF-8
 
-		echo "FPP - Disabling Swap to save SD card"
-		update-rc.d -f dphys-swapfile remove
+        echo "FPP - Fix ifup/ifdown scripts for manual dns"
+        # Only present when resolvconf is installed (pre-Trixie). Newer
+        # Raspbian uses systemd-resolved / NetworkManager and has no such hooks.
+        if [ -f /etc/network/if-up.d/000resolvconf ]; then
+            sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n/;p}' /etc/network/if-up.d/000resolvconf
+        fi
+        if [ -f /etc/network/if-down.d/resolvconf ]; then
+            sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n\n/;p}' /etc/network/if-down.d/resolvconf
+        fi
 
-		echo "FPP - Kernel doesn't support cgroups so remove to silence warnings on boot"
-		update-rc.d -f cgroup-bin remove
+        cat <<-EOF > /etc/dnsmasq.d/usb.conf
+interface=usb0
+interface=usb1
+port=53
+dhcp-authoritative
+domain-needed
+bogus-priv
+expand-hosts
+cache-size=2048
+dhcp-range=usb0,192.168.7.1,192.168.7.1,2m
+dhcp-range=usb1,192.168.6.1,192.168.6.1,2m
+listen-address=127.0.0.1
+listen-address=192.168.7.2
+listen-address=192.168.6.2
+dhcp-option=usb0,3
+dhcp-option=usb0,6
+dhcp-option=usb1,3
+dhcp-option=usb1,6
+dhcp-leasefile=/var/run/dnsmasq.leases
+EOF
 
-		echo "FPP - Remove dhcpcd since we start DHCP interfaces on our own"
-		update-rc.d -f dhcpcd remove
-
-		echo "FPP - Setting locale"
-		sed -i 's/^\(en_GB.UTF-8\)/# \1/;s/..\(en_US.UTF-8\)/\1/' /etc/locale.gen
-		locale-gen en_US.UTF-8
-		dpkg-reconfigure --frontend=noninteractive locales
-		export LANG=en_US.UTF-8
-
-		echo "FPP - Fix ifup/ifdown scripts for manual dns"
-		sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n/;p}' /etc/network/if-up.d/000resolvconf
-		sed -i -n 'H;${x;s/^\n//;s/esac\n/&\nif grep -qc "Generated by fpp" \/etc\/resolv.conf\; then\n\texit 0\nfi\n\n/;p}' /etc/network/if-down.d/resolvconf
+        sed -i -e "s/^IGNORE_RESOLVCONF.*/IGNORE_RESOLVCONF=yes/g" /etc/default/dnsmasq
+        sed -i -e "s/#IGNORE_RESOLVCONF.*/IGNORE_RESOLVCONF=yes/g" /etc/default/dnsmasq
+        echo "DNSMASQ_EXCEPT=lo" >> /etc/default/dnsmasq
 
         echo "FPP - Removing extraneous blacklisted modules"
-        rm -f /etc/modprobe.d/blacklist-rtl8192cu.conf
-        rm -f /etc/modprobe.d/blacklist-rtl8xxxu.conf
-		;;
-	#TODO
-	'CHIP')
-		echo "FPP - Reinstall chip packages that were probably removed earlier from dependencies"
-		for package in chip-exit chip-metapackage chip-configs chip-hwtest \
-						chip-input-reset chip-power chip-theme
-		do
-			apt-get -y install ${package}
-			let packages=$((${packages}+1))
-			if [ $packages -gt 10 ]; then
-				let packages=0
-				apt-get -y clean
-			fi
-		done
-		;;
-	'ODROID')
-		echo "FPP - Installing wiringPi"
-		cd /opt/ && git clone https://github.com/hardkernel/wiringPi && cd /opt/wiringPi && ./build
+        rm -f /etc/modprobe.d/blacklist-*8192cu.conf
+        rm -f /etc/modprobe.d/blacklist-*8xxxu.conf
+        # gpiochip4 symlink rule blocks gpio expanders that should sit at
+        # gpiochip4 from getting a dev entry.
+        rm -f /usr/lib/udev/rules.d/60-gpiochip4.rules
+    fi
 
-		echo "FPP - Installing patched omxplayer.bin for FPP MultiSync"
-		cp /usr/bin/omxplayer.bin /usr/bin/omxplayer.bin.orig
-		wget -O /usr/bin/omxplayer.bin https://github.com/FalconChristmas/fpp-binaries/raw/master/Pi/omxplayer.bin
-		;;
-	'Pine64')
-		echo "FPP - Pine64"
-		;;
-	'Orange Pi')
-		echo "FPP - Orange Pi"
+    echo "FPP - Disabling getty on onboard serial ttyAMA0"
+    systemctl disable serial-getty@ttyAMA0.service || true
+    sed -i -e "s/console=serial0,115200 //" ${BOOTDIR}/cmdline.txt
+    # autologin@.service only exists when the Pi image shipped with a
+    # pre-configured auto-login user; Trixie Lite doesn't.
+    if [ -f /etc/systemd/system/autologin@.service ]; then
+        sed -i -e "s/autologin pi/autologin ${FPPUSER}/" /etc/systemd/system/autologin@.service
+    fi
+    rm -f "/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+    # Trixie Lite doesn't enable getty@tty1 by default and
+    # systemd-getty-generator doesn't auto-fire it for the Pi's HDMI
+    # console, so a freshly-booted Pi plugged into a monitor shows nothing.
+    # Enable it explicitly so a login prompt appears.
+    systemctl enable getty@tty1.service
 
-		echo "FPP - Installing wiringOP (wiringPi port)"
-		cd /opt/ && git clone https://github.com/zhaolei/WiringOP && cd /opt/WiringOP && ./build
+    # Mask Raspberry Pi OS's userconfig.service (from the userconf-pi
+    # package -- yes the unit is "userconfig" with a g, while the package
+    # and on-disk script are "userconf-pi" / "userconf-service". Naming
+    # is a mess.) It runs unconditionally on first boot, and when
+    # /boot/firmware/userconf.txt is absent (which it is -- FPP creates
+    # the fpp user itself) it pops a whiptail "Please enter new username"
+    # dialog on tty8 and switches the active VT there. End result: a
+    # blank HDMI screen on first boot waiting for a username we already
+    # have. Mask so it never runs.
+    systemctl mask userconfig.service 2>/dev/null || true
+    rm -f /etc/systemd/system/getty@tty8.service.d/userconfsetup.conf
+    # SSH banner installed by userconf-pi telling the user "no valid user
+    # has been set up" -- they have, we did it. Raspberry Pi OS removes
+    # this file after first-boot user setup completes; since we mask the
+    # service, that cleanup never runs, so do it ourselves.
+    rm -f /etc/ssh/sshd_config.d/rename_user.conf
 
-		echo "FPP - Installing OLA from source"
-		apt-get -y --force-yes install libcppunit-dev uuid-dev pkg-config libncurses5-dev libtool autoconf automake libmicrohttpd-dev protobuf-compiler python-protobuf libprotobuf-dev libprotoc-dev bison flex libftdi-dev libftdi1 libusb-1.0-0-dev liblo-dev
-		apt-get -y clean
-		git clone https://github.com/OpenLightingProject/ola.git /opt/ola
-		(cd /opt/ola && autoreconf -i && ./configure --enable-rdm-tests --enable-python-libs && make && make install && ldconfig)
-		rm -rf /opt/ola
+    # /var/swap only exists when dphys-swapfile has been run; not on a fresh
+    # Trixie Lite base image.
+    if [ -f /var/swap ]; then
+        swapoff /var/swap || true
+        rm -f /var/swap
+    fi
+    rfkill unblock all || true
+}
 
-		echo "FPP - Disabling stock users, use the '${FPPUSER}' user instead"
-		sed -i -e "s/^orangepi:.*/orangepi:*:16372:0:99999:7:::/" /etc/shadow
+# Armbian-specific image-mode tweaks. Shared between FPPPLATFORM=Armbian and
+# FPPPLATFORM=Debian+ISARMBIAN=true (older Armbian releases mis-detected).
+apply_armbian_image_tweaks() {
+    apt-get remove -y network-manager
+    sed -i -e "s/overlays=/overlays=i2c0 spi-spidev /" /boot/armbianEnv.txt
+    echo "param_spidev_spi_bus=0"   >> /boot/armbianEnv.txt
+    echo "param_spidev_max_freq=25000000" >> /boot/armbianEnv.txt
+    sed -i -e "s/ENABLED=true/ENABLED=false/" /etc/default/armbian-ramlog
+}
 
-		;;
-	'Debian')
-		echo "FPP - Debian"
-		;;
-	*)
-		echo "FPP - Unknown platform"
-		;;
+setup_platform_armbian() {
+    if $isimage; then
+        apply_armbian_image_tweaks
+    fi
+}
+
+setup_platform_debian() {
+    if $isimage; then
+        apt-get remove -y network-manager
+        if [ "${ISARMBIAN:-false}" = "true" ]; then
+            apply_armbian_image_tweaks
+        fi
+    fi
+}
+
+case "${FPPPLATFORM}" in
+    'BeagleBone Black')  setup_platform_beaglebone_black ;;
+    'BeagleBone 64')     setup_platform_beaglebone_64 ;;
+    'Raspberry Pi')      setup_platform_raspberry_pi ;;
+    'Armbian')           setup_platform_armbian ;;
+    'Debian')            setup_platform_debian ;;
+    'Ubuntu'|'Fedora')   ;;  # no platform-specific image tweaks
+    *)                   echo "FPP - Unknown platform" ;;
 esac
-	
+
 #######################################
 # Clone git repository
-echo "FPP - Cloning git repository into /opt/fpp"
 cd /opt
-git clone https://github.com/FalconChristmas/fpp fpp
+if $clone_fpp; then
+
+    #######################################
+    # Remove old /opt/fpp if it exists
+    if [ -e "/opt/fpp" ]
+    then
+        echo "FPP - Removing old /opt/fpp"
+        rm -rf /opt/fpp
+    fi
+
+    echo "FPP - Cloning git repository into /opt/fpp"
+    git clone https://github.com/FalconChristmas/fpp fpp
+    cd fpp
+    git config pull.rebase true
+fi
+git config --global pull.rebase true
+# Use --system so /etc/gitconfig is updated -- the setting then applies to
+# every user regardless of HOME. Without this, `sudo git ...` (which keeps
+# HOME=/home/fpp) reads /home/fpp/.gitconfig where the safe.directory
+# was never set, and git aborts with "dubious ownership".
+git config --system --add safe.directory /opt/fpp
+git config --system --add safe.directory '*'
+
+# Add newfeatures remote for testing new features
+cd /opt/fpp
+if ! git remote get-url newfeatures > /dev/null 2>&1; then
+    echo "FPP - Adding newfeatures remote"
+    git remote add newfeatures https://github.com/FalconChristmas/fpp-new-feature-testing.git
+fi
+
+
+
+
+#######################################
+# Scrub any embedded credentials from the git config. GitHub's
+# actions/checkout writes a short-lived runner token into
+# [http "https://github.com/"] extraheader; if that tree is rsynced
+# into the image it ships a credential that (a) expires and breaks
+# the user's first Upgrade, and (b) should never have been published.
+# Safe to run even when no such header exists.
+if [ -d /opt/fpp/.git ]; then
+    git -C /opt/fpp config --local --remove-section http."https://github.com/" 2>/dev/null || true
+    git -C /opt/fpp submodule foreach --quiet --recursive \
+        'git config --local --remove-section http."https://github.com/" 2>/dev/null || true' || true
+fi
 
 #######################################
 # Switch to desired code branch
@@ -740,117 +1443,564 @@ echo "FPP - Switching git clone to ${FPPBRANCH} branch"
 cd /opt/fpp
 git checkout ${FPPBRANCH}
 
-#######################################
-echo "FPP - Installing PHP composer"
-cd /tmp/
-curl -sS https://getcomposer.org/installer | php
-mv ./composer.phar /usr/local/bin/composer
-chmod 755 /usr/local/bin/composer
+# Failsafe (image builds only): a shipped image MUST leave /opt/fpp on a real
+# tracking branch, never a detached HEAD. scripts/git_pull updates via
+# `git rebase @{u}`, which requires an upstream; a detached checkout -- what you
+# get from building a bare release TAG instead of its vX.Y branch -- breaks
+# every user's "Check for Updates" and makes www/common.php misreport the
+# version/branch. This is the last line of defense behind build-images.yml's
+# tag->branch resolver: fail the build loudly rather than publish an
+# un-updatable image (cf. CI run 30107796268, which shipped every 10.0-beta
+# image detached/on master). Normal (non-image) installs are unaffected.
+if [ "${isimage}" = "true" ]; then
+    CURBRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ "${CURBRANCH}" = "HEAD" ] || [ -z "${CURBRANCH}" ]; then
+        echo "FPP - FATAL: /opt/fpp is in detached HEAD after 'git checkout ${FPPBRANCH}'." >&2
+        echo "             A release image must track a branch (e.g. v10.0-beta), not a tag." >&2
+        exit 1
+    fi
+    if ! git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+        echo "FPP - FATAL: branch '${CURBRANCH}' in /opt/fpp has no upstream; self-update would fail." >&2
+        exit 1
+    fi
+    echo "FPP - Image /opt/fpp on branch '${CURBRANCH}' tracking $(git rev-parse --abbrev-ref '@{u}' 2>/dev/null)"
+fi
+
+if [ "$FPPPLATFORM" == "Raspberry Pi" ]; then
+    # force grabbing these upfront as the make -j4 may fail to fetch them due to locks
+    # while initializing
+    git submodule update --init external/RF24
+    git submodule update --init external/rpi-rgb-led-matrix
+    git submodule update --init external/spixels
+    cd /opt/fpp/src
+    make gitsubmodules
+    
+    echo "FPP - Creating FPP DPI Overlays"
+    cd /opt/fpp/capes/drivers/pi
+    make -j ${CPUS}
+    make install
+    make clean
+    cd ~
+fi
+
+
 
 #######################################
-PHPDIR="/etc/php/7.0"
+# Upgrade the config if needed
+# Non-fatal by design (this script runs under set -e): a failed migration
+# must not abort a fresh install. upgrade_config exits non-zero on failure
+# so the op log records it; the stale version file makes the next run retry.
+bash ${FPPDIR}/scripts/upgrade_config -notee || echo "WARNING: config upgrade reported failure, continuing install"
 
-echo "FPP - Setting up for UI"
-sed -i -e "s/^user =.*/user = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/^group =.*/group = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/.*listen.owner =.*/listen.owner = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/.*listen.group =.*/listen.group = ${FPPUSER}/" ${PHPDIR}/fpm/pool.d/www.conf
-sed -i -e "s/.*listen.mode =.*/listen.mode = 0660/" ${PHPDIR}/fpm/pool.d/www.conf
 
-echo "FPP - Allowing short tags in PHP"
-FILES="cli/php.ini fpm/php.ini"
+#######################################
+PHPDIR="/etc/php/${ACTUAL_PHPVER}"
+
+echo "FPP - Configuring PHP"
+FILES="cli/php.ini apache2/php.ini fpm/php.ini"
 for FILE in ${FILES}
 do
-	sed -i -e "s/^short_open_tag.*/short_open_tag = On/" ${PHPDIR}/${FILE}
-	sed -i -e "s/max_execution_time.*/max_execution_time = 300/" ${PHPDIR}/${FILE}
-	sed -i -e "s/max_input_time.*/max_input_time = 300/" ${PHPDIR}/${FILE}
-	sed -i -e "s/default_socket_timeout.*/default_socket_timeout = 300/" ${PHPDIR}/${FILE}
-	sed -i -e "s/post_max_size.*/post_max_size = 4G/" ${PHPDIR}/${FILE}
-	sed -i -e "s/upload_max_filesize.*/upload_max_filesize = 4G/" ${PHPDIR}/${FILE}
-	sed -i -e "s/;upload_tmp_dir =.*/upload_tmp_dir = \/home\/${FPPUSER}\/media\/upload/" ${PHPDIR}/${FILE}
-	sed -i -e "s/^; max_input_vars.*/max_input_vars = 5000/" ${PHPDIR}/${FILE}
+    if [ -f ${PHPDIR}/${FILE} ]; then
+        sed -i -e "s/^short_open_tag.*/short_open_tag = On/" ${PHPDIR}/${FILE}
+        sed -i -e "s/max_execution_time.*/max_execution_time = 1000/" ${PHPDIR}/${FILE}
+        sed -i -e "s/max_input_time.*/max_input_time = 900/" ${PHPDIR}/${FILE}
+        sed -i -e "s/default_socket_timeout.*/default_socket_timeout = 900/" ${PHPDIR}/${FILE}
+        sed -i -e "s/post_max_size.*/post_max_size = 1999M/" ${PHPDIR}/${FILE}
+        sed -i -e "s/upload_max_filesize.*/upload_max_filesize = 1999M/" ${PHPDIR}/${FILE}
+        sed -i -e "s/;upload_tmp_dir =.*/upload_tmp_dir = \/home\/${FPPUSER}\/media\/upload/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^;max_input_vars.*/max_input_vars = 5000/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^output_buffering.*/output_buffering = 1024/" ${PHPDIR}/${FILE}
+    fi
+done
+FILES="fpm/pool.d/www.conf"
+for FILE in ${FILES}
+do
+    if [ -f ${PHPDIR}/${FILE} ]; then
+        sed -i -e "s/^listen.owner .*/listen.owner = ${FPPUSER}/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^listen.group .*/listen.group = ${FPPUSER}/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^user\ .*/user = ${FPPUSER}/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^group\ .*/group = ${FPPUSER}/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^pm.max_children.*/pm.max_children = 25/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^pm.min_spare_servers.*/pm.min_spare_servers = 3/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^pm.max_spare_servers.*/pm.max_spare_servers = 6/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^pm.start_servers.*/pm.start_servers = 3/" ${PHPDIR}/${FILE}
+        sed -i -e "s/^;pm.max_requests.*/pm.max_requests = 300/" ${PHPDIR}/${FILE}
+        sed -i -e "s+^;clear_env.*+clear_env = no+g" ${PHPDIR}/${FILE}
+        # Never used by FPP; off, where nothing can turn it back on, as PHP's
+        # workaround for CVE-2026-109619. See upgrade/160.
+        if ! grep -q '^php_admin_value\[session\.upload_progress\.enabled\]' ${PHPDIR}/${FILE}; then
+            printf '\n; FPP: upload progress is never used; off as the CVE-2026-109619 workaround\nphp_admin_value[session.upload_progress.enabled] = 0\n' >> ${PHPDIR}/${FILE}
+        fi
+    fi
 done
 
-#######################################
-echo "FPP - Copying rsync daemon config files into place"
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsync > /etc/default/rsync
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsyncd.conf > /etc/rsyncd.conf
+# Turn off PHP extensions FPP does not use.  Every one of these was checked by
+# matching the functions and classes it actually provides (via ReflectionExtension)
+# against all of FPP's PHP sources -- none of them is referenced anywhere.
+#
+# This is a memory and attack-surface change, NOT a boot-time one: measured on a
+# single-core AM335x board it takes cold PHP startup from 1.08s to 0.84s, but
+# php-fpm loads extensions once in the master and forks its workers, so that is
+# ~0.24s of boot, once.  What it does buy is ~1.6MB per worker (9.7MB across the
+# six workers that board runs, and up to ~40MB at pm.max_children=25) on a device
+# with 480MB of RAM -- plus getting FFI out of a web-facing PHP.
+#
+# Deliberately conservative: sqlite3, pdo and pdo_sqlite are unused by FPP core
+# and were measured as safe to drop, but they are left ENABLED because a
+# third-party plugin under /media/plugins could reasonably keep its own data in
+# SQLite, and nothing here can see those plugins to check.
+echo "FPP - Disabling unused PHP extensions"
+phpdismod -v ${ACTUAL_PHPVER} calendar exif ffi ftp phar readline shmop \
+                              sysvmsg sysvsem sysvshm xmlwriter xsl 2>/dev/null || true
+
+# FPP serves very few web clients (usually one or two), so the stock
+# every-30-minutes PHP session garbage collection is overkill. Run it every
+# 2 hours instead, and turn off Persistent so a power-cycled appliance doesn't
+# fire a catch-up GC run on every boot -- that run was adding ~14s to the boot
+# critical path. The empty OnCalendar= first clears the inherited schedule.
+echo "FPP - Reducing phpsessionclean frequency"
+mkdir -p /etc/systemd/system/phpsessionclean.timer.d
+cat > /etc/systemd/system/phpsessionclean.timer.d/fpp.conf <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 00/2:09:00
+Persistent=false
+EOF
+
+# How far to push the services that are never needed while the box is booting.
+#
+# Everything below is already ordered after fpp_postnetwork so it stays out of the
+# fppinit/networkd window. On a single-core board that is not far enough: the
+# three services that decide when the box is actually usable -- fppd, apache2 and
+# php-fpm -- then have to share one core with all of it, and they lose. Measured
+# on a BBB, php-fpm starts in 2.3s cold on an idle box but took 20.9s at boot
+# (~18s of pure contention), and being the last of the three to come up it alone
+# sets the time-to-usable. Ordering the background services behind all three took
+# ~5s off that, and costs them nothing -- none is needed at boot by definition.
+#
+# Gate on $FPPPLATFORM, NOT on nproc: FPP_Install.sh runs inside a chroot during
+# image builds, where nproc reports the *build host's* core count, so an nproc
+# gate would silently never fire on a BBB image. FPPPLATFORM is derived from the
+# rootfs (bbb.io template + uname -m) and is correct in the chroot. AM335x is the
+# only single-core FPP target.
+#
+# Multi-core Pi and BeagleBone 64 deliberately keep the existing ordering: they
+# have spare cores, so the extra edges would buy nothing while making these units
+# hostage to a slow fppd start and delaying chrony's time sync for no gain.
+# php-fpm is referenced via $ACTUAL_PHPVER (8.4 on Debian 13, 8.3 on Ubuntu 24) --
+# hardcoding a version would name a unit that does not exist, and systemd ignores
+# an After= on an unknown unit silently, quietly dropping half the benefit.
+BG_DEFER_AFTER="fpp_postnetwork.service"
+SHELLINABOX_DEFER_AFTER="fppd.service"
+if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+    BG_DEFER_AFTER="fpp_postnetwork.service fppd.service apache2.service php${ACTUAL_PHPVER}-fpm.service"
+    SHELLINABOX_DEFER_AFTER="${BG_DEFER_AFTER}"
+fi
+
+# The exim4 MTA is only used for occasional outbound notification mail, never at
+# boot. Starting it early costs ~25s on a single-core SBC because it does DNS
+# lookups before the network/resolver is ready (so they time out), and it just
+# adds contention on the boot critical path. Order it after fpp_postnetwork:
+# fppd is also After=fpp_postnetwork, so exim starts in parallel with fppd
+# rather than ahead of it, and by then DNS actually resolves so it comes up fast.
+# (install_fpp_services disables the daemon outright; this only matters if an
+# admin turns it back on.)
+echo "FPP - Deferring exim4 startup until after the network is up"
+mkdir -p /etc/systemd/system/exim4.service.d
+cat > /etc/systemd/system/exim4.service.d/fpp-defer.conf <<EOF
+[Unit]
+After=${BG_DEFER_AFTER}
+EOF
+
+# exim4-base.service is the daily exim queue/db housekeeping oneshot, triggered
+# by exim4-base.timer. With Persistent=true it fires a catch-up run on every
+# boot of a power-cycled appliance -- and it's slow there (DNS not ready yet),
+# just like exim4 was. Turn Persistent off so it only runs at the next daily
+# tick (when DNS is up and the near-empty queue makes it trivial), and order the
+# service after fpp_postnetwork for the rare case the daily timer fires during a
+# boot window.
+echo "FPP - Keeping exim4-base housekeeping off the boot path"
+mkdir -p /etc/systemd/system/exim4-base.timer.d
+cat > /etc/systemd/system/exim4-base.timer.d/fpp.conf <<'EOF'
+[Timer]
+Persistent=false
+EOF
+mkdir -p /etc/systemd/system/exim4-base.service.d
+cat > /etc/systemd/system/exim4-base.service.d/fpp-defer.conf <<EOF
+[Unit]
+After=${BG_DEFER_AFTER}
+EOF
+
+# chrony: fppinit's postNetwork now does a fast one-shot SNTP clock set, so the
+# chrony daemon isn't needed during the boot critical path -- it only refines
+# the clock afterwards (and serves time to the rest of the fleet). Start it
+# after fpp_postnetwork so it's out of the fppinit/networkd contention window on
+# single-core SBCs.
+echo "FPP - Deferring chrony until after the clock is set in postNetwork"
+mkdir -p /etc/systemd/system/chrony.service.d
+cat > /etc/systemd/system/chrony.service.d/fpp-defer.conf <<EOF
+[Unit]
+After=${BG_DEFER_AFTER}
+EOF
+
+# apache2 + php-fpm back the web UI, which isn't needed before fppd. On a
+# single-core SBC they otherwise start alongside fpp_postnetwork and steal a
+# meaningful slice of CPU during it -- deferring them after fpp_postnetwork
+# measured ~2s off postNetwork and brought fppd up ~3s earlier on a BBB. They
+# then come up in parallel with fppd rather than contending with the network
+# setup. (Use $ACTUAL_PHPVER so this tracks the installed php-fpm version.)
+echo "FPP - Deferring apache2 and php-fpm until after the network setup"
+mkdir -p /etc/systemd/system/apache2.service.d
+cat > /etc/systemd/system/apache2.service.d/fpp-defer.conf <<'EOF'
+[Unit]
+After=fpp_postnetwork.service
+EOF
+mkdir -p /etc/systemd/system/php${ACTUAL_PHPVER}-fpm.service.d
+cat > /etc/systemd/system/php${ACTUAL_PHPVER}-fpm.service.d/fpp-defer.conf <<'EOF'
+[Unit]
+After=fpp_postnetwork.service
+EOF
+
+# shellinabox: the web terminal is a convenience that's never needed at boot,
+# and its SysV init script takes ~6s (Type=forking) right in the postNetwork
+# window. Defer it until after fppd so it's fully off the critical path.
+# (It's a systemd-sysv-generator unit, but a drop-in still applies.)
+echo "FPP - Deferring shellinabox until after fppd"
+mkdir -p /etc/systemd/system/shellinabox.service.d
+cat > /etc/systemd/system/shellinabox.service.d/fpp-defer.conf <<EOF
+[Unit]
+After=${SHELLINABOX_DEFER_AFTER}
+EOF
+
+# rsyslog duplicates the journal into /var/log/syslog, and on these boards that
+# write traffic competes for the SD/eMMC with the reads the boot itself needs --
+# the same storage contention that makes boot times on a BBB swing by ~10s
+# between otherwise identical boots.  Nothing needs it early: journald is the
+# primary, persistent log, and syslog.target has no dependents here.
+#
+# Deferring loses nothing.  syslog.socket is DefaultDependencies=no and
+# Before=sockets.target, so it exists from the very start of boot with an 8M
+# ReceiveBuffer, and rsyslog is TriggeredBy= it -- journald forwards into that
+# socket whether or not rsyslog is running, and rsyslog drains the backlog when
+# it starts.  A whole boot's journal on a BBB is ~95KB, about 1.2% of the buffer.
+echo "FPP - Deferring rsyslog so its writes don't compete with the boot's reads"
+mkdir -p /etc/systemd/system/rsyslog.service.d
+cat > /etc/systemd/system/rsyslog.service.d/fpp-defer.conf <<EOF
+[Unit]
+After=${BG_DEFER_AFTER}
+EOF
+
+if $isimage; then
+    #######################################
+    echo "FPP - Copying rsync daemon config files into place"
+    sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsync > /etc/default/rsync
+    sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" -e "s#FPPUSER#${FPPUSER}#g" < ${FPPDIR}/etc/rsyncd.conf > /etc/rsyncd.conf
+    systemctl disable rsync
+fi
 
 #######################################
-# Add the ${FPPUSER} user and group memberships
-echo "FPP - Adding ${FPPUSER} user"
-addgroup --gid 500 ${FPPUSER}
-adduser --uid 500 --home ${FPPHOME} --shell /bin/bash --ingroup ${FPPUSER} --gecos "Falcon Player" --disabled-password ${FPPUSER}
-adduser ${FPPUSER} adm
-adduser ${FPPUSER} sudo
-case "${FPPPLATFORM}" in
-	'Raspberry Pi'|'BeagleBone Black')
-		adduser ${FPPUSER} spi
-		;;
-esac
-adduser ${FPPUSER} video
-# FIXME, use ${FPPUSER} here instead of hardcoding
-sed -i -e 's/^fpp:\*:/fpp:\$6\$rA953Jvd\$oOoLypAK8pAnRYgQQhcwl0jQs8y0zdx1Mh77f7EgKPFNk\/jGPlOiNQOtE.ZQXTK79Gfg.8e3VwtcCuwz2BOTR.:/' /etc/shadow
+# Create the fpp user plus hardware group memberships.
+# Image installs pin fpp to UID/GID 1000 and evict any pre-existing user/group
+# there first (stock pi/debian users shipped in various base images) so the
+# fixed-UID adduser can't silently collide.
+# Side installs (no --img) must leave existing accounts alone, as
+# README.Debian promises: fpp still gets UID/GID 1000 when it is free,
+# otherwise adduser/addgroup pick the next free id. Nothing at runtime
+# depends on the number -- FPP looks the fpp user up by name.
+add_fpp_user() {
+    local existing_user_1000 existing_group_1000
+    local -a uid_opt=(--uid 1000) gid_opt=(--gid 1000)
+    existing_user_1000=$(getent passwd 1000 | cut -d: -f1 || true)
+    if [ -n "$existing_user_1000" ] && [ "$existing_user_1000" != "${FPPUSER}" ]; then
+        if $isimage; then
+            echo "FPP - Removing pre-existing UID 1000 user: ${existing_user_1000}"
+            userdel -r "${existing_user_1000}" 2>/dev/null || userdel "${existing_user_1000}" || true
+        else
+            echo "FPP - UID 1000 belongs to '${existing_user_1000}'; keeping it, ${FPPUSER} gets the next free UID"
+            uid_opt=()
+        fi
+    fi
+    existing_group_1000=$(getent group 1000 | cut -d: -f1 || true)
+    if [ -n "$existing_group_1000" ] && [ "$existing_group_1000" != "${FPPUSER}" ]; then
+        if $isimage; then
+            echo "FPP - Removing pre-existing GID 1000 group: ${existing_group_1000}"
+            groupdel "${existing_group_1000}" || true
+        else
+            echo "FPP - GID 1000 belongs to '${existing_group_1000}'; keeping it, ${FPPUSER} gets the next free GID"
+            gid_opt=()
+        fi
+    fi
 
+    echo "FPP - Adding ${FPPUSER} user"
+    addgroup "${gid_opt[@]}" ${FPPUSER}
+    adduser "${uid_opt[@]}" --home ${FPPHOME} --shell /bin/bash --ingroup ${FPPUSER} \
+            --gecos "Falcon Player" --disabled-password ${FPPUSER}
+    adduser ${FPPUSER} adm
+    adduser ${FPPUSER} sudo
+    # Hardware groups -- only present when the corresponding kernel drivers
+    # or packages have populated /etc/group.
+    for grp in gpio i2c spi; do
+        if getent group "$grp" > /dev/null; then
+            adduser ${FPPUSER} "$grp"
+        fi
+    done
+    adduser ${FPPUSER} video
+    adduser ${FPPUSER} audio
+    adduser ${FPPUSER} dialout
 
-#######################################
-echo "FPP - Fixing empty root passwd"
-sed -i -e 's/root::/root:*:/' /etc/shadow
+    # Pre-seed the fpp user's password ("falcon") directly in /etc/shadow so
+    # the install is self-contained; no interactive passwd prompt.
+    sed -i -e 's/^fpp:.*:/fpp:\$y\$j9T\$w6Yvb\/z1wtJh6TvI1zs8u\.\$ZEhs\/1W7JZlCrVCiVvsjarXzf\.3kY7GFHEpWIOQMPN6:20285:0:99999:7:::/' /etc/shadow
+}
+add_fpp_user
+
+if $isimage; then
+    echo "FPP - Disabling any stock 'debian' user, use the '${FPPUSER}' user instead"
+    sed -i -e "s/^debian:.*/debian:*:16372:0:99999:7:::/" /etc/shadow
+    
+    #######################################
+    echo "FPP - Fixing empty root passwd"
+    sed -i -e 's/root::/root:*:/' /etc/shadow
+
+    echo "FPP - Setting up ssh to disallow root login"
+    sed -i -e "s/#PermitRootLogin .*/PermitRootLogin prohibit-password/" /etc/ssh/sshd_config
+    sed -i -e "s/#\?Banner .*/Banner \/etc\/issue.net/g" /etc/ssh/sshd_config
+
+    echo "FPP - Cleaning up /root/.cpanm to save space on the SD image"
+    rm -rf /root/.cpanm
+fi
+
 
 #######################################
 echo "FPP - Populating ${FPPHOME}"
+# adduser only chowns the home directory when it CREATES it; if the base image
+# already shipped /home/fpp (or a stock UID-1000 user's home was reused) it is
+# left root-owned, which breaks anything fpp runs from its home (e.g. distcc's
+# ~/.distcc lock dir). Make sure the home dir itself belongs to fpp before we
+# start populating it; a recursive sweep at the end of image creation catches
+# everything the root-run install steps drop in afterward.
+chown ${FPPUSER}:${FPPUSER} ${FPPHOME}
+
+# adduser only copies /etc/skel into the home dir when it CREATES it. When
+# /home/fpp already exists (see above) the skel dotfiles are skipped, leaving
+# the user without ~/.profile -- and a bash *login* shell then never sources
+# ~/.bashrc (which loads /opt/fpp/scripts/common and, on a kiosk, fires startx).
+# Seed any skel dotfiles that are missing before we append to .bashrc below.
+for skelfile in /etc/skel/.profile /etc/skel/.bashrc /etc/skel/.bash_logout; do
+    if [ -f "${skelfile}" ] && [ ! -e "${FPPHOME}/$(basename "${skelfile}")" ]; then
+        cp "${skelfile}" "${FPPHOME}/"
+        chown ${FPPUSER}:${FPPUSER} "${FPPHOME}/$(basename "${skelfile}")"
+    fi
+done
 mkdir ${FPPHOME}/.ssh
-chown ${FPPUSER}.${FPPUSER} ${FPPHOME}/.ssh
+chown ${FPPUSER}:${FPPUSER} ${FPPHOME}/.ssh
 chmod 700 ${FPPHOME}/.ssh
 
-mkdir ${FPPHOME}/media
-chown ${FPPUSER}.${FPPUSER} ${FPPHOME}/media
-chmod 770 ${FPPHOME}/media
-chmod a+s ${FPPHOME}/media
-touch ${FPPHOME}/media/.auto_update_disabled
-chmod 644 ${FPPHOME}/media/.auto_update_disabled
+# -p, not a bare mkdir: an upgrade script run earlier in this same install (see
+# upgrade_config above) can legitimately have created a subdirectory of the
+# media dir already, and failing here aborts the entire install under set -e.
+# The chown/chmod below then puts an early-created dir back under fpp's
+# ownership either way.
+mkdir -p ${FPPHOME}/media
+chown ${FPPUSER}:${FPPUSER} ${FPPHOME}/media
+chmod 775 ${FPPHOME}/media
 
 cat > ${FPPHOME}/.vimrc <<-EOF
 set tabstop=4
 set shiftwidth=4
+set expandtab
 set autoindent
 set ignorecase
 set mouse=r
+syntax on
+colorscheme desert
 EOF
 
 chmod 644 ${FPPHOME}/.vimrc
-chown ${FPPUSER}.${FPPUSER} ${FPPHOME}/.vimrc
+chown ${FPPUSER}:${FPPUSER} ${FPPHOME}/.vimrc
 
 echo >> ${FPPHOME}/.bashrc
 echo ". /opt/fpp/scripts/common" >> ${FPPHOME}/.bashrc
 echo >> ${FPPHOME}/.bashrc
 
-#######################################
-# Configure log rotation
-echo "FPP - Configuring log rotation"
-cp /opt/fpp/etc/logrotate.d/* /etc/logrotate.d/
-sed -i -e "s/#compress/compress/" /etc/logrotate.conf
-sed -i -e "s/rotate .*/rotate 2/" /etc/logrotate.conf
+mkdir ${FPPHOME}/media/logs
+chown fpp:fpp ${FPPHOME}/media/logs
 
-#######################################
-# Configure ccache
-echo "FPP - Configuring ccache"
-ccache -M 50M
+configure_logging() {
+    echo "FPP - Configuring log rotation"
+    if [ -d /etc/logrotate.d ]; then
+        cp /opt/fpp/etc/logrotate.d/* /etc/logrotate.d/
+    fi
+    if [ -f /etc/logrotate.conf ]; then
+        sed -i -e "s/#compress/compress/" /etc/logrotate.conf
+        sed -i -e "s/rotate .*/rotate 2/" /etc/logrotate.conf
+    fi
+    if [ -f /etc/logrotate.d/rsyslog ]; then
+        sed -i -e "s/weekly/daily/" /etc/logrotate.d/rsyslog
+        # Size backstop: rotate syslog & friends once they cross 200M even
+        # between the daily cron runs, so a mid-day flood can't grow unbounded.
+        # (Belt-and-braces with the rsyslog rate limit below; logrotate only
+        # runs on cron, so the rate limit is the real-time guard.)
+        if ! grep -q "maxsize" /etc/logrotate.d/rsyslog; then
+            sed -i -e "0,/^\tdaily$/s//\tdaily\n\tmaxsize 200M/" /etc/logrotate.d/rsyslog
+        fi
+    fi
 
-#######################################
-echo "FPP - Configuring FTP server"
-sed -i -e "s/.*anonymous_enable.*/anonymous_enable=NO/" /etc/vsftpd.conf
-sed -i -e "s/.*local_enable.*/local_enable=YES/" /etc/vsftpd.conf
-sed -i -e "s/.*write_enable.*/write_enable=YES/" /etc/vsftpd.conf
-service vsftpd restart
+    # Rate-limit the local system log socket. Without this, a process that
+    # spams stderr in a tight loop -- e.g. PipeWire's ALSA layer retrying an
+    # unplugged USB sound card ("spa.alsa: ... No such device") -- writes
+    # unbounded lines into /var/log/syslog and can fill the whole disk between
+    # daily log rotations (observed: 400+ GB of syslog from one missing card).
+    # 1000 messages / 5s (~200 msg/s) is well above normal boot/runtime chatter
+    # but caps a runaway logger. Applied to the imuxsock module load line.
+    if [ -f /etc/rsyslog.conf ] && ! grep -q "SysSock.RateLimit" /etc/rsyslog.conf; then
+        sed -i -e 's|^module(load="imuxsock").*|module(load="imuxsock" SysSock.RateLimit.Interval="5" SysSock.RateLimit.Burst="1000") # FPP: throttle runaway loggers|' /etc/rsyslog.conf
+    fi
 
-#######################################
-echo "FPP - Configuring Samba"
-cat <<-EOF >> /etc/samba/smb.conf
+    # Disable duplicate logging to save on disk space
+    local facility
+    for facility in 'auth,authpriv\.\*' 'cron\.\*' 'kern\.\*' 'mail\.\*' 'user\.\*'; do
+        sed -i "/${facility}/s/^/# /" /etc/rsyslog.conf
+    done
+}
+
+configure_ccache() {
+    echo "FPP - Configuring ccache"
+    # ccache 4.12+ uses the XDG paths by default:
+    #   cache dir: /root/.cache/ccache
+    #   config:    /root/.config/ccache/ccache.conf
+    # Several settings (e.g. max_size) are only accepted in the config
+    # file when it's at the XDG user path, NOT at $CCACHE_DIR/ccache.conf.
+    # Clean up stale legacy-location configs so ccache doesn't trip over
+    # them when CCACHE_CONFIGPATH isn't set in the environment.
+    rm -f /root/.ccache/ccache.conf
+    rm -f /root/.cache/ccache/ccache.conf
+    mkdir -p /root/.cache/ccache /root/.config/ccache
+    # Pin both the cache dir and the config path explicitly. The image-build
+    # chroot can inherit a CCACHE_DIR pointing elsewhere; pinning it here keeps
+    # the populated cache at /root/.cache/ccache where build-image-*.sh tars it
+    # up for the release artifact, and keeps the config at the XDG path below.
+    export CCACHE_DIR=/root/.cache/ccache
+    export CCACHE_CONFIGPATH=/root/.config/ccache/ccache.conf
+    ccache -M 500M
+    ccache --set-config=temporary_dir=/tmp
+    # locale sloppiness keeps LANG/LC_ALL out of the cache key. Without it,
+    # manifest keys shipped from the image-build chroot (LANG typically "C")
+    # don't match Pi-runtime upgrades (LANG "en_US.UTF-8"), busting every hit.
+    ccache --set-config=sloppiness=pch_defines,time_macros,locale
+    ccache --set-config=hard_link=true
+    ccache --set-config=pch_external_checksum=true
+    # Fingerprint the compiler by its version + target triple rather than by
+    # hashing its binary contents. The chroot-built cache ships in the image,
+    # and the Pi's /usr/bin/g++ can end up with different bytes than what was
+    # hashed in the chroot (post-install triggers, qemu-user quirks, or any
+    # dpkg-reconfigure path can rewrite the file), invalidating the entire
+    # shipped cache on first upgrade. -dumpversion + -dumpmachine is stable
+    # across any such rewrite but still changes when the user actually upgrades
+    # the compiler.
+    ccache --set-config=compiler_check='%compiler% -dumpversion; %compiler% -dumpmachine'
+    # Mirror the config to the fpp user so non-root builds see the same
+    # settings. Use the XDG path, matching root's layout above.
+    mkdir -p /home/fpp/.config/ccache
+    cp /root/.config/ccache/ccache.conf /home/fpp/.config/ccache/ccache.conf
+    chown -R fpp:fpp /home/fpp/.config
+    # Deliberately leave CCACHE_CONFIGPATH exported for the rest of this
+    # installer run so the "make optimized" compile below reads THIS config.
+    # CCACHE_CONFIGPATH is the only config location with higher priority than
+    # everything else; without it, ccache picks its secondary config from
+    # $CCACHE_DIR/ccache.conf whenever CCACHE_DIR is set in the build
+    # environment (the image-build chroot inherits one) -- i.e.
+    # /root/.cache/ccache/ccache.conf, the file we just rm'd -- and NOT the
+    # XDG path we wrote the sloppiness settings to. With no sloppiness in
+    # effect, ccache refuses to cache any compile that pulls in the
+    # precompiled header ("Could not use precompiled header"), so the PCH and
+    # ~250 object files are all uncacheable and the cache shipped in the image
+    # is nearly empty/useless. This env var only lives in the build shell; it
+    # is not baked into the image, so on-device upgrade builds are unaffected
+    # (they read the XDG config by default).
+}
+
+configure_logging
+configure_ccache
+
+#############################################################################
+# configure_fpp_apt_repo
+#
+# nocc (FPP's distributed C++ compiler) is not in Debian, so FPP serves it from
+# its own signed apt repo. We trust the keyring BUNDLED in the FPP source tree
+# (reviewed-in-source, not fetched over the wire) and install nocc. Gated on
+# FPP_APT_REPO_URL so it is trivial to disable (set empty) or point elsewhere.
+# Best-effort: a transient repo outage must never fail the whole install.
+#############################################################################
+FPP_APT_REPO_URL="${FPP_APT_REPO_URL:-https://falconchristmas.github.io/fpp-apt}"
+# apt suites the FPP repo publishes, oldest -> newest. Add a Debian codename here
+# (and publish that suite) as each new release goes live -- e.g. append "forky".
+FPP_APT_REPO_SUITES="${FPP_APT_REPO_SUITES:-trixie}"
+# Use THIS device's OS codename when we publish a matching suite; otherwise fall
+# back to the newest published suite. Safe because nocc's binaries are portable
+# across Debian releases (static Go daemons + a wrapper built against older
+# glibc), so an as-yet-unserved codename (Ubuntu 'noble', or 'forky' before its
+# suite exists) still gets working packages instead of a 404.
+FPP_APT_REPO_SUITE="${FPP_APT_REPO_SUITE:-}"
+if [ -z "${FPP_APT_REPO_SUITE}" ]; then
+    _fpprepo_codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME}")"
+    for _fpprepo_s in ${FPP_APT_REPO_SUITES}; do
+        [ "${_fpprepo_s}" = "${_fpprepo_codename}" ] && FPP_APT_REPO_SUITE="${_fpprepo_s}"
+    done
+    [ -z "${FPP_APT_REPO_SUITE}" ] && FPP_APT_REPO_SUITE="${FPP_APT_REPO_SUITES##* }"
+fi
+configure_fpp_apt_repo() {
+    [ -n "${FPP_APT_REPO_URL}" ] || return 0
+    local keysrc=/opt/fpp/etc/apt/fpp-archive-keyring.gpg
+    if [ ! -f "${keysrc}" ]; then
+        echo "FPP - WARNING: ${keysrc} missing; skipping FPP apt repo / nocc"
+        return 0
+    fi
+    echo "FPP - Configuring FPP apt repository (${FPP_APT_REPO_URL})"
+    install -d -m 0755 /usr/share/keyrings
+    install -m 0644 "${keysrc}" /usr/share/keyrings/fpp-archive-keyring.gpg
+    cat > /etc/apt/sources.list.d/fpp.sources <<EOF
+Types: deb
+URIs: ${FPP_APT_REPO_URL}
+Suites: ${FPP_APT_REPO_SUITE}
+Components: main
+Signed-By: /usr/share/keyrings/fpp-archive-keyring.gpg
+EOF
+    # Docker passes --skip-apt-install and installs nocc from its Dockerfile so
+    # the package lands in a cached layer; there we just leave the repo set up.
+    if $skip_apt_install; then
+        echo "FPP - (skip-apt-install) FPP repo configured; 'nocc' left to caller"
+        return 0
+    fi
+    apt-get update || echo "FPP - WARNING: apt-get update failed for FPP repo"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y nocc \
+        || echo "FPP - WARNING: 'apt-get install nocc' failed (repo unreachable?)"
+}
+
+configure_fpp_apt_repo
+
+configure_samba_ftp() {
+    echo "FPP - Configuring FTP server"
+    sed -i -e "s/.*anonymous_enable.*/anonymous_enable=NO/" /etc/vsftpd.conf
+    sed -i -e "s/.*local_enable.*/local_enable=YES/" /etc/vsftpd.conf
+    sed -i -e "s/.*write_enable.*/write_enable=YES/" /etc/vsftpd.conf
+    systemctl disable vsftpd
+
+    #######################################
+    cp ${FPPHOME}/.vimrc /root/.vimrc
+
+    #######################################
+    echo "FPP - Configuring Samba"
+    cat <<-EOF >> /etc/samba/smb.conf
+
+[nobody]
+  browseable = no
 
 [FPP]
   comment = FPP Media Share
   path = ${FPPHOME}/media
+  veto files = /._*/.DS_Store/
+  delete veto files = yes
   writeable = Yes
   only guest = Yes
   create mask = 0777
@@ -860,17 +2010,21 @@ cat <<-EOF >> /etc/samba/smb.conf
   force user = ${FPPUSER}
 
 EOF
-case "${OSVER}" in
-	debian_9)
-		systemctl restart smbd.service
-		systemctl restart nmbd.service
-		;;
-esac
 
-#######################################
-# Setup mail
-echo "FPP - Updating exim4 config file"
-cat <<-EOF > /etc/exim4/update-exim4.conf.conf
+    systemctl disable smbd
+    systemctl disable nmbd
+}
+
+finalize_image_pre_build() {
+    echo "FPP - Adding missing exim4 & chrony log directory"
+    mkdir -p /var/log/chrony
+    chown _chrony:_chrony /var/log/chrony 2>/dev/null || true
+    mkdir -p /var/log/exim4
+    chown Debian-exim /var/log/exim4
+    chgrp Debian-exim /var/log/exim4
+
+    echo "FPP - Updating exim4 config file"
+    cat <<-EOF > /etc/exim4/update-exim4.conf.conf
 # /etc/exim4/update-exim4.conf.conf
 #
 # Edit this file and /etc/mailname by hand and execute update-exim4.conf
@@ -903,20 +2057,18 @@ dc_mailname_in_oh='true'
 dc_localdelivery='mail_spool'
 EOF
 
-# remove exim4 panic log so exim4 doesn't throw an alert about a non-zero log
-# file due to some odd error thrown during inital setup
-rm /var/log/exim4/paniclog
-#update config and restart exim
-update-exim4.conf
+    # remove exim4 panic log so exim4 doesn't throw an alert about a non-zero log
+    # file due to some odd error thrown during inital setup
+    rm -f /var/log/exim4/paniclog
+    # FPP manages implicit-TLS for port 465 via /etc/exim4/conf.d/main/99_fpp_smarthost.
+    # The default smarthost here is ::587 (STARTTLS), so ensure no stale smtps macro ships in the image.
+    rm -f /etc/exim4/conf.d/main/99_fpp_smarthost
+    #update config and restart exim
+    update-exim4.conf
 
-#######################################
-# Fix sudoers to not require password
-echo "FPP - Giving ${FPPUSER} user sudo"
-echo "${FPPUSER} ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
-
-#######################################
-# Print notice during login regarding console access
-cat <<-EOF >> /etc/motd
+    #######################################
+    # Print notice during login regarding console access
+    cat <<-EOF >> /etc/motd
 [0;31m
                    _______  ___
                   / __/ _ \\/ _ \\
@@ -927,138 +2079,714 @@ This FPP console is for advanced users, debugging, and developers.  If
 you aren't one of those, you're probably looking for the web-based GUI.
 
 You can access the UI by typing "http://fpp.local/" into a web browser.[0m
-	EOF
+EOF
 
-#######################################
-# Config fstab to mount some filesystems as tmpfs
-echo "FPP - Configuring tmpfs filesystems"
-echo "#####################################" >> /etc/fstab
-#echo "tmpfs         /var/log    tmpfs   nodev,nosuid,size=10M 0 0" >> /etc/fstab
-echo "tmpfs         /tmp        tmpfs   nodev,nosuid,size=10M 0 0" >> /etc/fstab
-echo "tmpfs         /var/tmp    tmpfs   nodev,nosuid,size=50M 0 0" >> /etc/fstab
-echo "#####################################" >> /etc/fstab
+    #######################################
+    # Config fstab to mount some filesystems as tmpfs.
+    # Skip on x86_64 (desktop installs typically have ample swap) and on
+    # Raspberry Pi (Raspbian ships its own /tmp / /var/tmp handling that we
+    # don't want to fight with).
+    ARCH=$(uname -m)
+    if [ "$ARCH" != "x86_64" ] && [ "$FPPPLATFORM" != "Raspberry Pi" ]; then
+        echo "FPP - Configuring tmpfs filesystems"
+        cp -f /opt/fpp/etc/systemd/tmp.mount /lib/systemd/system
+        systemctl unmask tmp.mount
+        systemctl enable tmp.mount
 
-COMMENTED=""
-SDA1=$(lsblk -l | grep sda1 | awk '{print $7}')
-if [ -n ${SDA1} ]
-then
-	COMMENTED="#"
+        sed -i 's|tmpfs\s*/tmp\s*tmpfs.*||g' /etc/fstab
+        sed -i 's|tmpfs\s*/var/tmp\s*tmpfs.*||g' /etc/fstab
+
+        # Defer the disk swap partition: mark it "noauto" so systemd does not
+        # activate it during boot. Otherwise swap.target waits for the swap
+        # device to be tagged by the slow single-core udev coldplug, and we wear
+        # the eMMC/SD by swapping to it during normal operation. zram remains the
+        # primary swap; fppinit's startDiskSwap() brings this partition up late
+        # (post-network), off the boot critical path, where it's still available
+        # for heavy jobs like compiling FPP. Idempotent: skips lines already
+        # carrying noauto.
+        sed -i -E '/noauto/!s;^([^#]\S+\s+\S+\s+swap\s+)(\S+)(\s+[0-9]+\s+[0-9]+\s*)$;\1\2,noauto\3;' /etc/fstab
+    fi
+
+    # /home/fpp/media lives on an external drive only when the user explicitly
+    # selects one in the Storage settings (uncommon). Ship the fstab entry
+    # COMMENTED: otherwise systemd's fstab generator creates home-fpp-media.mount
+    # for a /dev/sda1 that isn't present, and the dev-sda1.device job sits for the
+    # full 90s device timeout before failing. fppinit.service (After=/Wants= that
+    # mount) -- and everything ordered behind networking -- then waits out that
+    # 90s on every boot. The settings UI rewrites this line when external storage
+    # is chosen, so commenting it by default loses no functionality.
+    echo "#####################################" >> /etc/fstab
+    echo "#/dev/sda1     ${FPPHOME}/media  auto    defaults,nonempty,noatime,nodiratime,exec,nofail,flush,uid=1000,gid=1000  0  0" >> /etc/fstab
+    echo "#####################################" >> /etc/fstab
+
+    #######################################
+    #  Prefer IPv4
+    echo "FPP - Prefer IPv4"
+    echo "precedence ::ffff:0:0/96  100" >>  /etc/gai.conf
+
+    # need to keep extra memory to process network packets
+    echo "vm.min_free_kbytes=16384" >> /etc/sysctl.conf
+}
+
+if $isimage; then
+    configure_samba_ftp
 fi
-echo "${COMMENTED}/dev/sda1     ${FPPHOME}/media  auto    defaults,nonempty,noatime,nodiratime,exec,nofail,flush,uid=500,gid=500  0  0" >> /etc/fstab
-echo "#####################################" >> /etc/fstab
 
 #######################################
-# Disable IPv6
-echo "FPP - Disabling IPv6"
-cat <<-EOF >> /etc/sysctl.conf
+# Fix sudoers to not require password
+echo "FPP - Giving ${FPPUSER} user sudo"
+echo "${FPPUSER} ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-	# FPP - Disable IPv6
-	net.ipv6.conf.all.disable_ipv6 = 1
-	net.ipv6.conf.default.disable_ipv6 = 1
-	net.ipv6.conf.lo.disable_ipv6 = 1
-	net.ipv6.conf.eth0.disable_ipv6 = 1
-	EOF
+if $isimage; then
+    finalize_image_pre_build
+fi
 
 #######################################
-echo "FPP - Configuring Apache webserver"
+# Apache setup: envvars, FPP-supplied site/status configs, module enable set,
+# and a log-name tweak so our logrotate config picks up apache's error log.
+configure_apache() {
+    echo "FPP - Configuring Apache webserver"
 
-# Environment variables
-sed -i -e "s/APACHE_RUN_USER=.*/APACHE_RUN_USER=${FPPUSER}/" /etc/apache2/envvars
-sed -i -e "s/APACHE_RUN_GROUP=.*/APACHE_RUN_GROUP=${FPPUSER}/" /etc/apache2/envvars
-sed -i -e "s#APACHE_LOG_DIR=.*#APACHE_LOG_DIR=${FPPHOME}/media/logs#" /etc/apache2/envvars
+    sed -i -e "s/APACHE_RUN_USER=.*/APACHE_RUN_USER=${FPPUSER}/"   /etc/apache2/envvars
+    sed -i -e "s/APACHE_RUN_GROUP=.*/APACHE_RUN_GROUP=${FPPUSER}/" /etc/apache2/envvars
+    sed -i -e "s#APACHE_LOG_DIR=.*#APACHE_LOG_DIR=${FPPHOME}/media/logs#" /etc/apache2/envvars
+    # Port 80 listener. The IPv6 wildcard is preferred: with
+    # net.ipv6.bindv6only=0 (the Linux default) it dual-binds and serves
+    # both v4 and v6 clients from a single socket. But that bind is *fatal*
+    # to apache when the kernel has no IPv6 at all --
+    #   AH00078: alloc_listener: failed to get a socket for ::
+    #   AH00526: Syntax error on line 5 of /etc/apache2/ports.conf
+    # -- and apache then refuses to start, taking the entire web UI with it.
+    # That happens on any box booted with ipv6.disable=1, and on any box
+    # running a kernel whose ipv6 module is missing.
+    #
+    # <IfFile> is evaluated every time the config is parsed -- on start, on
+    # configtest, and on the SIGUSR1 re-read behind "systemctl reload" -- so
+    # the choice is never baked into how the master happened to be started,
+    # and a box that gains or loses IPv6 later corrects itself. (Contrast an
+    # <IfDefine> fed from envvars: the define lives on the master's argv, so a
+    # reload re-reads this file with whatever defines the *running* master
+    # started with and can silently pick the wrong branch.)
+    #
+    # <IfFile> needs apache 2.4.34+; the oldest release FPP installs on is
+    # well past that (Debian buster ships 2.4.38).
+    cat > /etc/apache2/ports.conf <<'PORTS_EOF'
+# Managed by FPP -- see configure_apache() in SD/FPP_Install.sh.
+# /proc/sys/net/ipv6 is absent both when the ipv6 module is missing and when
+# the kernel booted with ipv6.disable=1 -- exactly the cases where
+# "Listen [::]:80" aborts apache startup -- so such a box serves over IPv4
+# instead of failing to start apache at all.
+<IfFile /proc/sys/net/ipv6>
+Listen [::]:80
+</IfFile>
+<IfFile !/proc/sys/net/ipv6>
+Listen 80
+</IfFile>
 
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" < ${FPPDIR}/etc/apache2.site > /etc/apache2/sites-enabled/000-default.conf
+<IfModule ssl_module>
+	Listen 443
+</IfModule>
 
-sed -i \
-	-e "s/short_open_tag =.*/short_open_tag = On/" \
-	-e "s/max_execution_time =.*/max_execution_time = 300/" \
-	-e "s/max_input_time =.*/max_input_time = 300/" \
-	-e "s/max_input_vars =.*/max_input_vars = 5000/" \
-	-e "s/default_socket_timeout =.*/default_socket_timeout = 300/" \
-	-e "s/post_max_size =.*/post_max_size = 4G/" \
-	-e "s/upload_max_filesize =.*/upload_max_filesize = 4G/" \
-	-e "s#;upload_tmp_dir =.*#upload_tmp_dir = ${FPPHOME}/media/upload#" \
-	${PHPDIR}/apache2/php.ini
+<IfModule mod_gnutls.c>
+	Listen 443
+</IfModule>
+PORTS_EOF
 
-# Fix name of Apache default error log so it gets rotated by our logrotate config
-sed -i -e "s/error\.log/apache2-base-error.log/" /etc/apache2/apache2.conf
+    # Drop the APACHE_ARGUMENTS define an older FPP appended here; ports.conf
+    # probes for IPv6 itself now and nothing reads FPP_HAVE_IPV6 any more.
+    if grep -q FPP_HAVE_IPV6 /etc/apache2/envvars; then
+        sed -i '/^## FPP: only ask apache for the IPv6/,/^fi$/d' /etc/apache2/envvars
+    fi
 
-# Disable private /tmp directory
-sed -i -e "s/PrivateTmp=true/PrivateTmp=false/" /lib/systemd/system/apache2.service
+    cat /opt/fpp/etc/apache2.site   > /etc/apache2/sites-enabled/000-default.conf
+    cat /opt/fpp/etc/apache2.status > /etc/apache2/mods-enabled/status.conf
 
-# Disable default access logs
-rm /etc/apache2/conf-enabled/other-vhosts-access-log.conf
+    # libapache2-mod-php${ACTUAL_PHPVER} isn't in our install list (we use
+    # php-fpm), so the mod-php may not be present to disable. That's fine.
+    a2dismod php${ACTUAL_PHPVER} 2>/dev/null || true
+    a2dismod mpm_prefork 2>/dev/null || true
 
-case "${OSVER}" in
-	debian_9)
-		systemctl enable apache2.service
-		;;
+    local mod
+    for mod in mpm_event http2 cgi rewrite expires proxy proxy_http proxy_http2 \
+               proxy_html headers proxy_wstunnel; do
+        a2enmod "$mod"
+    done
+    a2enmod proxy_fcgi setenvif
+    a2enconf php${ACTUAL_PHPVER}-fpm
+
+    # Rename default error log so our logrotate rules apply.
+    sed -i -e "s/error\.log/apache2-base-error.log/" /etc/apache2/apache2.conf
+
+    rm /etc/apache2/conf-enabled/other-vhosts-access-log.conf
+
+    systemctl enable apache2.service
+}
+configure_apache
+
+
+configure_ntp() {
+    echo "FPP - Configuring chrony (NTP daemon)"
+
+    # An older FPP (or the base image) may have shipped ntpsec; it and chrony
+    # both bind UDP/123, so make sure ntpsec is gone before chrony takes over.
+    systemctl disable --now ntpsec.service > /dev/null 2>&1 || true
+    if dpkg -l ntpsec > /dev/null 2>&1; then
+        apt-get -y purge ntpsec > /dev/null 2>&1 || true
+    fi
+    # systemd-timesyncd would also fight chrony for the clock/port; keep it off.
+    systemctl disable --now systemd-timesyncd.service > /dev/null 2>&1 || true
+    systemctl mask systemd-timesyncd.service > /dev/null 2>&1 || true
+
+    # Write FPP's managed chrony.conf. The pool/server line is rewritten by the
+    # "Override default NTP Server" setting (see SetNTPServer in settings.php);
+    # everything else is FPP policy.
+    cat > /etc/chrony/chrony.conf <<'EOF'
+# FPP-managed chrony configuration.
+# The pool/server source line below is rewritten by the "Override default NTP
+# Server" web setting; the rest is regenerated on install.
+
+# Time source. FPP's public pool by default; replaced by the ntpServer setting.
+pool falconplayer.pool.ntp.org iburst minpoll 8 maxpoll 12
+
+# Record the clock's drift rate so time stays reasonable across reboots even
+# without an RTC or a reachable upstream.
+driftfile /var/lib/chrony/chrony.drift
+
+# ntpd "-g" equivalent: step (rather than slew) the clock for the first few
+# updates so an RTC-less board that boots with a wildly wrong time corrects fast.
+makestep 1.0 3
+
+# Read from / write back to the hardware RTC when one is present.
+rtcsync
+
+# DHCP-provided NTP servers are dropped into this dir by the networkd-dispatcher
+# chrony hook, but only when the UseNTPFromDHCP setting is enabled. Empty/absent
+# otherwise, which is harmless.
+sourcedir /run/chrony-dhcp
+
+# --- FPP as an NTP server for the rest of the fleet -------------------------
+# FPP has always run an NTP server that other controllers can point at (via the
+# "Override default NTP Server" setting). Users run on arbitrary IP ranges, so
+# the server is NOT restricted to a particular subnet. chrony (unlike classic
+# ntpd) does not answer mode 6/7 management queries over the network, so this
+# only exposes basic time service.
+allow all
+# Serve our own clock even with no synced upstream, so a controller acting as
+# the site time source keeps answering when the internet path is down/filtered.
+# Stratum 10 stays well above real servers, so a reachable upstream is always
+# preferred over the local clock.
+local stratum 10
+EOF
+
+    # chrony.conf references sourcedir /run/chrony-dhcp, and /run is tmpfs (empty
+    # at boot). Have systemd-tmpfiles create it early so chronyd never starts
+    # against a missing directory.
+    cat > /etc/tmpfiles.d/fpp-chrony.conf <<'EOF'
+d /run/chrony-dhcp 0755 root root -
+EOF
+    mkdir -p /run/chrony-dhcp
+}
+configure_ntp
+
+
+finalize_platform_beaglebone_64() {
+    sed -i -e "s/#force_color_prompt=yes/force_color_prompt=yes/" /home/fpp/.bashrc
+
+    # remove the udev rules that create the SoftAp interface on the bbbw and bbggw
+    rm -f /etc/udev/rules.d/*SoftAp*
+
+    echo 'GOVERNOR="schedutil"' > /etc/default/cpufrequtils
+    echo "USB_UMTPRD_DISABLED=yes" >> /etc/default/bb-boot
+
+    cd /opt/fpp/capes/drivers/pinctrl
+    make -j ${CPUS}
+    make install
+    make clean
+
+    cd /opt/fpp/capes/drivers/bb64
+    make -j ${CPUS}
+    make install
+    make clean
+
+    cp /boot/firmware/extlinux/extlinux.conf /boot/firmware/extlinux/extlinux.conf.orig
+    cp extlinux/extlinux.conf /boot/firmware/extlinux/extlinux.conf
+    cd ~
+
+    systemctl disable console-setup.service
+}
+finalize_platform_beaglebone_black() {
+    systemctl disable dev-hugepages.mount
+
+    # CPU frequency scaling is disabled in our kernel, no need for the service to run
+    systemctl disable cpufrequtils
+    systemctl disable loadcpufreq.service
+
+    # sysconf requires a vfat partition which the BBB images currently don't have
+    systemctl disable bbbio-set-sysconf
+    echo "USB_UMTPRD_DISABLED=yes" >> /etc/default/bb-boot
+
+    cd /opt/fpp/capes/drivers/bbb
+    make -j ${CPUS}
+    make install
+    make clean
+
+    cd /opt/fpp/capes/drivers/pinctrl
+    make -j ${CPUS}
+    make install
+    make clean
+
+    sed -i -e "s/#force_color_prompt=yes/force_color_prompt=yes/" /home/fpp/.bashrc
+
+    # adjust a bunch of settings in /boot/uEnv.txt
+    sed -i -e "s+^#enable_uboot_overlays=\(.*\)+enable_uboot_overlays=1+g"  /boot/uEnv.txt
+    sed -i -e "s+^#disable_uboot_overlay_video=\(.*\)+disable_uboot_overlay_video=1+g"  /boot/uEnv.txt
+    sed -i -e "s+#uboot_overlay_addr0=\(.*\)+uboot_overlay_addr0=/lib/firmware/fpp-base-overlay.dtb+g"  /boot/uEnv.txt
+    sed -i -e "s+#uboot_overlay_addr1=\(.*\)+uboot_overlay_addr1=/lib/firmware/fpp-cape-overlay.dtb+g"  /boot/uEnv.txt
+    sed -i -e "s+ quiet+ quiet rootwait+g"  /boot/uEnv.txt
+    sed -i -e "s+ net.ifnames=.+ +g"  /boot/uEnv.txt
+    sed -i -e "s+^uboot_overlay_pru=+#uboot_overlay_pru=+g"  /boot/uEnv.txt
+    echo "bootdelay=0" >> /boot/uEnv.txt
+    echo "#cmdline=init=/opt/fpp/SD/BBB-AutoFlash.sh" >> /boot/uEnv.txt
+
+    # remove the udev rules that create the SoftAp interface on the bbbw and bbggw
+    rm -f /etc/udev/rules.d/*SoftAp*
+
+    # clean out some DRI files that are not needed at all on Beagle hardware
+    local dri=/usr/lib/arm-linux-gnueabihf/dri
+    rm -rf ${dri}/r?00* ${dri}/rad* ${dri}/nouveau* ${dri}/rockchip* ${dri}/st* \
+           ${dri}/ili* ${dri}/imx* ${dri}/exy* ${dri}/etn* ${dri}/hx* \
+           ${dri}/kirin* ${dri}/rcar* ${dri}/mediatek* ${dri}/tegra* ${dri}/komeda* \
+           ${dri}/v3d* ${dri}/vc4* ${dri}/virtio* ${dri}/zink* ${dri}/lima* \
+           ${dri}/panfrost* ${dri}/armada* ${dri}/mi0283qt* ${dri}/pl111* ${dri}/msm* \
+           ${dri}/mcde* ${dri}/meson* ${dri}/ingenic* ${dri}/mali* ${dri}/mxs* \
+           ${dri}/rep* ${dri}/sun* ${dri}/vmw*
+}
+
+# Runs AFTER the main make, so the new u-boot overwrites whatever the build
+# may have touched. Stock u-boot on recent rcn-ee base images has been
+# unreliable on some Beagles; install a known-good version.
+finalize_platform_beaglebone_black_post_build() {
+    /opt/fpp/bin.bbb/bootloader/install.sh
+}
+case "${FPPPLATFORM}" in
+    "BeagleBone Black") finalize_platform_beaglebone_black ;;
+    "BeagleBone 64")    finalize_platform_beaglebone_64 ;;
 esac
+
+install_fpp_services() {
+    echo "FPP - Configuring FPP startup"
+    cp /opt/fpp/etc/systemd/*.service /lib/systemd/system/
+
+    mkdir -p /etc/pipewire /etc/pipewire/pipewire.conf.d
+    cp -a /opt/fpp/etc/pipewire/pipewire.conf.d/. /etc/pipewire/pipewire.conf.d/
+    mkdir -p /etc/wireplumber/wireplumber.conf.d
+    cp -a /opt/fpp/etc/wireplumber/wireplumber.conf.d/. /etc/wireplumber/wireplumber.conf.d/
+    # FPP WirePlumber Lua hooks (static, e.g. the combine-stream fallback blocker)
+    if [ -d /opt/fpp/etc/wireplumber/scripts ]; then
+        mkdir -p /usr/share/wireplumber/scripts
+        cp -a /opt/fpp/etc/wireplumber/scripts/. /usr/share/wireplumber/scripts/
+    fi
+    # Clean up old WirePlumber 0.4 Lua configs if present
+    rm -rf /etc/wireplumber/main.lua.d
+    if [ ! -f /etc/pipewire/pipewire.conf ] && [ -f /usr/share/pipewire/pipewire.conf ]; then
+        cp /usr/share/pipewire/pipewire.conf /etc/pipewire/pipewire.conf
+    fi
+    if [ ! -f /etc/pipewire/pipewire-pulse.conf ] && [ -f /usr/share/pipewire/pipewire-pulse.conf ]; then
+        cp /usr/share/pipewire/pipewire-pulse.conf /etc/pipewire/pipewire-pulse.conf
+    fi
+    if [ ! -f /etc/pipewire/client.conf ] && [ -f /usr/share/pipewire/client.conf ]; then
+        cp /usr/share/pipewire/client.conf /etc/pipewire/client.conf
+    fi
+
+    # NOTE: do not build/install upstream's GStreamer PipeWire plugin here.
+    # Replacing the distro plugin with a newer upstream one breaks audio
+    # outright unless it matches the libpipewire the process actually loads:
+    # a 1.6.0 plugin against the distro's 1.4.2 library leaves the pipewiresink
+    # stream node suspended, so playlists run silently with no error anywhere.
+    # scripts/build_pipewire_gst_plugin.sh is manual-only and version-guarded
+    # for that reason.  See upgrade/124 and upgrade/125.
+
+    if $isimage; then
+        mkdir -p /etc/networkd-dispatcher/initialized.d
+        cp -a /opt/fpp/etc/networkd-dispatcher/* /etc/networkd-dispatcher
+    fi
+
+    systemctl disable mosquitto
+    # haveged is only needed to seed entropy for first-boot SSH host-key
+    # generation on a board with no hardware RNG. fppinit no longer orders after
+    # it (it orders after local-fs.target) and checkSSHKeys starts it on demand
+    # in that no-RNG case, so it doesn't need to run on every boot -- disable it
+    # to keep its ~entropy-gathering startup off the boot path. Every FPP target
+    # has a hardware RNG (AM335x omap-rng, bcm2835-rng, ...), so it stays idle.
+    systemctl disable haveged.service 2>/dev/null || true
+
+    # atd runs one-shot jobs queued with at(1). FPP never queues any -- scheduling
+    # goes through fppd's own scheduler and cron -- so on a stock box the daemon
+    # starts, finds an empty spool and idles forever.
+    systemctl disable atd.service 2>/dev/null || true
+
+    # ufw ships enabled but unconfigured, so it starts, applies no rules (`ufw
+    # status` reports inactive) and exits.  FPP does not manage it and nothing in
+    # the tree references it; an admin who wants a firewall can enable it, which
+    # is what `ufw enable` does anyway.
+    systemctl disable ufw.service 2>/dev/null || true
+
+    # exim4: FPP and its plugins only hand mail to the sendmail binary, which
+    # delivers it from the submitting process, so the exim daemon has nothing to
+    # do. It isn't free, though: with no TLS certificate configured it generates
+    # a self-signed RSA cert at startup, and since that cert only lives an hour,
+    # again at the first queue-run wakeup after it expires (every 90 minutes in
+    # practice) -- 5-10s of CPU each time on a single-core board. Its SMTP
+    # listener on 127.0.0.1:25 is unused attack surface as well.
+    # fpp-exim-queue.timer takes over the one useful thing it did, retrying
+    # deferred mail. See also upgrade/148.
+    systemctl disable exim4.service 2>/dev/null || true
+    cp /opt/fpp/etc/systemd/fpp-exim-queue.timer /lib/systemd/system/
+    systemctl enable fpp-exim-queue.timer
+
+    # Built before the distribution published the fixed PHP (Raspbian, for
+    # 32-bit Pi's, lags Debian by days): retry after each boot and daily until
+    # it is installed; the timer turns itself off then. See upgrade/160.
+    if [ "${OSID}" = "debian" ] || [ "${OSID}" = "raspbian" ]; then
+        if ! /opt/fpp/scripts/php_security_update --check; then
+            cp /opt/fpp/etc/systemd/fpp-php-security-update.service \
+               /opt/fpp/etc/systemd/fpp-php-security-update.timer /lib/systemd/system/
+            systemctl enable fpp-php-security-update.timer
+        fi
+    fi
+    systemctl daemon-reload
+
+    local svc
+    for svc in fpp-early-block-trigger fppinit fpprtc fppoled fppd fpp_postnetwork \
+               fpp-install-kiosk fpp-reboot fpp-announce-ip; do
+        # fpp-install-kiosk sets up the local on-device browser UI shown over
+        # HDMI. BeagleBones run headless with HDMI disabled, so it would never
+        # be used there -- skip it (and disable, in case a prior run enabled it).
+        if [ "$svc" = "fpp-install-kiosk" ] && \
+           { [ "$FPPPLATFORM" = "BeagleBone Black" ] || [ "$FPPPLATFORM" = "BeagleBone 64" ]; }; then
+            systemctl disable ${svc}.service 2>/dev/null || true
+            continue
+        fi
+        systemctl enable ${svc}.service
+    done
+
+    # The PipeWire stack is intentionally NOT enabled. FPPINIT's setupAudio starts
+    # fpp-pipewire/fpp-wireplumber/fpp-pipewire-pulse on demand (from its audio
+    # thread) after it has written/validated the audio config, so PipeWire reads
+    # the correct graph on its first and only start rather than coming up empty at
+    # sound.target and needing a restart. Disable explicitly to undo any prior
+    # enablement.
+    systemctl disable fpp-pipewire.service fpp-wireplumber.service fpp-pipewire-pulse.service 2>/dev/null || true
+}
+
+# Image-only tweaks that happen after FPP services are installed/enabled.
+finalize_image_services() {
+    cp /opt/fpp/etc/update-RTC /etc/cron.daily
+
+    # Make sure the journal is large enough to store the full boot logs
+    # but not get too large which starts slowing down journalling (and thus boot)
+    if [ -f /etc/systemd/journald.conf ]; then
+        sed -i -e "s/^.*SystemMaxUse.*/SystemMaxUse=96M/g" /etc/systemd/journald.conf
+    fi
+
+    rm -f /etc/systemd/network/*eth*
+    rm -f /etc/systemd/network/*wlan*
+    cp /opt/fpp/etc/systemd/network/* /etc/systemd/network
+
+    # A configured WiFi adapter that is missing must not stall boot (upgrade 152)
+    mkdir -p "/etc/systemd/system/wpa_supplicant@.service.d"
+    cp "/opt/fpp/etc/systemd/wpa_supplicant@.service.d/fpp-missing-adapter.conf" "/etc/systemd/system/wpa_supplicant@.service.d/"
+    cp /opt/fpp/etc/udev/rules.d/80-fpp-wpa-supplicant.rules /etc/udev/rules.d/
+}
+
+if $isimage; then
+    rm -rf /usr/share/doc/*
+    apt-get clean
+
+    # The image-build CI checks out the source tree into /opt/fpp as a non-root
+    # build user, so every tracked file is owned by that uid (e.g. 1001). On a
+    # shipped image /opt/fpp is system software and must be root:root -- both for
+    # correctness and because anything copied out of the tree with "cp -a"
+    # (preserving ownership) would otherwise carry the build uid into /etc. A
+    # concrete failure: networkd-dispatcher refuses to run hooks in directories
+    # not owned by root, which broke the routable.d/chrony fast time-sync hook.
+    # Do this before install_fpp_services so its copies inherit root ownership.
+    echo "FPP - Setting root:root ownership on /opt/fpp"
+    chown -R root:root /opt/fpp
+fi
+
+install_fpp_services
+
 #######################################
-echo "FPP - Configuring (but disabling) nginx webserver"
+# FPP's Web/HTTP video inputs resolve YouTube URLs by shelling out to yt-dlp.
+# The packaged yt-dlp is frozen for the life of the Debian release while
+# YouTube reworks its player every few months, so an image built today ships a
+# yt-dlp that stops resolving anything within months -- the video input just
+# never produces a frame. Install upstream's standalone build (into
+# /usr/local/bin, which precedes /usr/bin in fppd's PATH, so it shadows the
+# package rather than replacing it) and leave the daily refresh behind.
+# Best-effort: no internet at install time just means the packaged yt-dlp
+# stands in until the first daily run that has some.
+echo "FPP - Installing upstream yt-dlp and its daily refresh"
+cp /opt/fpp/etc/update-ytdlp /etc/cron.daily/
+chmod 0755 /etc/cron.daily/update-ytdlp
+/opt/fpp/scripts/update_ytdlp.sh || true
 
-# Disable default site
-rm /etc/nginx/sites-enabled/default
-# Set user to ${FPPUSER}
-sed -i -e "s/^\s*\#\?\s*user\(\s*\)[^;]*/user\1${FPPUSER}/" /etc/nginx/nginx.conf
-# Install the fpp site
-sed -e "s#FPPDIR#${FPPDIR}#g" -e "s#FPPHOME#${FPPHOME}#g" < ${FPPDIR}/etc/nginx.conf > /etc/nginx/sites-enabled/fpp_nginx.conf
+if $isimage; then
+    finalize_image_services
+fi
 
-case "${OSVER}" in
-	debian_9)
-		systemctl disable php7.0-fpm.service
-		systemctl disable nginx.service
-		;;
-esac
-
-#######################################
-echo "FPP - Configuring FPP startup"
-cp /opt/fpp/etc/systemd/fppinit.service /lib/systemd/system/
-systemctl enable fppinit.service
-cp /opt/fpp/etc/systemd/fppd.service /lib/systemd/system/
-systemctl enable fppd.service
-
-systemctl enable rsync
-
-echo "FPP - Disabling services not needed/used"
-systemctl disable olad
-systemctl disable connman-wait-online
 
 echo "FPP - Compiling binaries"
 cd /opt/fpp/src/
-make clean ; make optimized
+make clean ; make -j ${CPUS} optimized
 
+
+configure_hostapd() {
+    # replace entry already there
+    sed -i 's/^DAEMON_CONF.*/DAEMON_CONF="\/etc\/hostapd\/hostapd.conf"/g' /etc/default/hostapd
+    if ! grep -q etc/hostapd/hostapd.conf "/etc/default/hostapd"; then
+        # not there, append after the commented out default line
+        sed -i 's/^#DAEMON_CONF\(.*\)/#DAEMON_CONF\1\nDAEMON_CONF="\/etc\/hostapd\/hostapd.conf"/g' /etc/default/hostapd
+    fi
+    if ! grep -q etc/hostapd/hostapd.conf "/etc/default/hostapd"; then
+        # default line not there, just append to end of file
+        echo "DAEMON_CONF=\"/etc/hostapd/hostapd.conf\"" >> /etc/default/hostapd
+    fi
+}
+
+# Swap configuration:
+#   - Raspberry Pi OS ships its own rpi-swap mechanism (/etc/rpi/swap.conf
+#     + systemd-zram-setup@zram0.service + dev-zram0.swap + rpi-zram-writeback)
+#     that handles zram setup automatically. Don't write zram-tools config
+#     on Pi -- it's read by a service we'd be disabling, and would just be
+#     dead clutter. We do pin its mechanism to plain zram, dropping the
+#     /var/swap loop device and the writeback timer that go with the stock
+#     "zram+file" default -- see configure_swap() below for why.
+#   - On BeagleBone (BBB / BB64) we drive zram via zram-tools, set up directly
+#     in fpp_postnetwork (FPPINIT startZRAMSwap) rather than at boot. zram isn't
+#     needed early and setting it up during the boot critical path just adds
+#     contention on the single core. NOTE: the rcn-ee Debian 13 image now ships
+#     systemd-zram-generator (the same systemd-zram-setup@zram0 mechanism Pi
+#     uses), which WOULD otherwise create /dev/zram0 in early boot, so we disable
+#     its vendor config below.
+configure_swap() {
+    if [ "$FPPPLATFORM" == "Raspberry Pi" ]; then
+        # Drop rpi-swap's default "zram+file" mechanism for plain "zram".
+        #
+        # In zram+file, /var/swap is attached to a loop device and handed to
+        # zram0 as a WRITEBACK target -- it is not swapped on, so it adds no
+        # usable swap (see DiskBackedSwapKB in scripts/functions). What it does
+        # add is rpi-setup-loop@var-swap.service on the boot critical path:
+        # swap.target -> dev-zram0.swap -> systemd-zram-setup@zram0 ->
+        # rpi-setup-loop@var-swap, and sysinit.target is ordered after
+        # swap.target, so that one unit gates the entire boot.
+        #
+        # Its ExecStartPost, rpi-wait-backingfile-symlink, waits for udev's
+        # /dev/disk/by-backingfile/var-swap symlink with an inotify loop that
+        # arms its watch AFTER testing for the symlink. Lose that race -- the
+        # symlink lands in the gap, or udev unlinks and recreates it while
+        # re-processing loop0 -- and the script blocks on an event that will
+        # never come again. The unit is Type=oneshot, whose TimeoutStartSec
+        # defaults to infinity, so the boot hangs forever on
+        # "A start job is running for rpi-setup-loop@var-swap.service", with
+        # no console and no ssh. Only a power cycle clears it, and since it is
+        # a race it clears on the next boot, which makes it look sporadic.
+        #
+        # zram itself is unchanged: same generator, same sizing, same
+        # dev-zram0.swap. We only drop the writeback file we were not using --
+        # the image already deletes /var/swap -- and with it the loop unit.
+        # rpi-swap cleans up a leftover /var/swap itself under this mechanism,
+        # via rpi-remove-swap-file@, pulled in by multi-user.target well off
+        # the boot path.
+        if [ -f /etc/rpi/swap.conf ]; then
+            mkdir -p /etc/rpi/swap.conf.d
+            cat > /etc/rpi/swap.conf.d/10-fpp-zram-only.conf <<'SWAP_EOF'
+# Installed by FPP. See configure_swap() in SD/FPP_Install.sh.
+[Main]
+Mechanism=zram
+SWAP_EOF
+        fi
+        # Just sysctl tuning; rpi-swap handles the actual zram device.
+        echo "vm.swappiness=1" >> /etc/sysctl.d/10-swap.conf
+        echo "vm.vfs_cache_pressure=90" >> /etc/sysctl.d/10-swap.conf
+        # RPi OS ships zram-tools enabled by default. Disable it so it
+        # doesn't race with rpi-swap's systemd-zram-setup@zram0 over
+        # /dev/zram0 at boot (both try to claim the device).
+        systemctl disable zramswap 2>/dev/null || true
+    else
+        # Disable the systemd-zram-generator vendor config so it does NOT create
+        # /dev/zram0 during early boot. zram-tools (driven by startZRAMSwap in
+        # fpp_postnetwork) sets it up later, off the boot critical path. Per
+        # zram-generator.conf(5), symlinking the vendor config's filename to
+        # /dev/null in /etc disables it.
+        ln -sf /dev/null /etc/systemd/zram-generator.conf
+        systemctl disable zramswap
+        # The stock zram-tools config ships PERCENT=50, which (per its own
+        # comment) takes precedence over SIZE -- so our SIZE= below would be
+        # ignored and zram would grab 50% of RAM. Disable PERCENT so our fixed
+        # SIZE actually applies.
+        sed -i 's/^PERCENT=/#PERCENT=/' /etc/default/zramswap
+        echo "ALGO=zstd" >> /etc/default/zramswap
+        echo "PRIORITY=100" >> /etc/default/zramswap
+        if [ "$FPPPLATFORM" == "BeagleBone 64" ]; then
+            echo "SIZE=125" >> /etc/default/zramswap
+            echo "vm.swappiness=10" >> /etc/sysctl.d/10-swap.conf
+        else
+            echo "SIZE=96" >> /etc/default/zramswap
+            echo "vm.swappiness=5" >> /etc/sysctl.d/10-swap.conf
+        fi
+        echo "vm.vfs_cache_pressure=90" >> /etc/sysctl.d/10-swap.conf
+        echo "vm.dirty_background_ratio=5" >> /etc/sysctl.d/10-swap.conf
+        echo "vm.dirty_ratio=10" >> /etc/sysctl.d/10-swap.conf
+    fi
+}
+
+# Strip payload that a shipped image has no use for.
+#
+# This is not only about download size. flash_storage.sh copies the running root
+# filesystem to eMMC with a file-level rsync, so on the "Copy to eMMC" path
+# every file costs a create + metadata write on top of its bytes -- and the
+# stock rootfs carries roughly ten thousand tiny man/locale files, which show up
+# as flash time out of all proportion to the megabytes they occupy.
+#
+# The dpkg drop-in is what makes this stick: without it, the next apt install on
+# the device (a plugin's dependency, a user package) unpacks a fresh set of man
+# pages and translations right back onto the image.
+slim_image() {
+    echo "FPP - Slimming image: docs, man pages, non-English locales"
+    mkdir -p /etc/dpkg/dpkg.cfg.d
+    cat > /etc/dpkg/dpkg.cfg.d/01_fpp_slim <<'DPKG_EOF'
+# FPP ships an appliance image: no changelogs, no man pages, English only.
+# path-include lines are evaluated after the excludes, so the en* catalogs,
+# locale.alias and the per-package copyright files survive the exclusions
+# above them. The copyright files stay because these images are redistributed
+# publicly and that is where each package's license text lives.
+path-exclude=/usr/share/doc/*
+path-include=/usr/share/doc/*/copyright
+path-exclude=/usr/share/man/*
+path-exclude=/usr/share/info/*
+path-exclude=/usr/share/groff/*
+path-exclude=/usr/share/locale/*
+path-include=/usr/share/locale/en*
+path-include=/usr/share/locale/locale.alias
+DPKG_EOF
+
+    rm -rf /usr/share/man/* /usr/share/info/* /usr/share/groff/*
+    rm -rf /var/cache/man/*
+    find /usr/share/doc -mindepth 1 ! -type d ! -name copyright -delete
+    find /usr/share/doc -mindepth 1 -type d -empty -delete
+    # Message catalogs only -- the generated locale-archive that programs
+    # actually run against lives in /usr/lib/locale and is untouched.
+    find /usr/share/locale -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} +
+
+    # Wifi firmware for buses these boards do not have: ath10k/ath11k/ath12k and
+    # rtw89 are PCIe/SDIO-only parts. An FPP controller's wifi is a USB dongle
+    # (ath9k_htc, rtl8xxx/rtw88, mt7601u et al), whose blobs live in other
+    # directories and are left alone. Deleted rather than dpkg path-excluded so
+    # "apt-get install --reinstall firmware-atheros" can put them back if some
+    # PCIe-equipped board ever does need them.
+    echo "FPP - Removing PCIe-only wifi firmware"
+    rm -rf /usr/lib/firmware/ath10k /usr/lib/firmware/ath11k \
+           /usr/lib/firmware/ath12k /usr/lib/firmware/rtw89
+
+    # apt's binary caches, rebuilt on demand by the next apt run. (The package
+    # lists in /var/lib/apt/lists are deliberately kept: third-party plugin
+    # installers run apt-get install without always running apt-get update
+    # first, and an empty list turns that into "unable to locate package".)
+    rm -f /var/cache/apt/*.bin
+}
+
+finalize_image_post_build() {
+    slim_image
+
+    systemctl disable dnsmasq
+    systemctl unmask hostapd
+    systemctl disable hostapd
+
+    rm -f /etc/resolv.conf
+    ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+
+    # Disable winbind as we don't use it and it causes long delays at login
+    pam-auth-update --disable winbind
+    systemctl disable winbind
+    systemctl mask winbind
+    sed -i -e "s/winbind//" /etc/nsswitch.conf
+
+    # Stop the distro's per-user PipeWire stack from starting when anyone logs
+    # in. FPP runs its own system instance (fpp-pipewire etc.); a user instance
+    # reads the same /etc/pipewire config, builds a second sink on the same
+    # sound card, and drags in rtkit and polkit. Mask globally, in
+    # /etc/systemd/user: an fppos upgrade syncs /etc but never /home, so masks
+    # in ~fpp/.config never reach a device upgraded that way.
+    systemctl --global mask pipewire.socket pipewire.service \
+        pipewire-pulse.socket pipewire-pulse.service \
+        wireplumber.service filter-chain.service
+
+    # Remove stock distro users; FPP has its own.
+    rm -rf /home/pi
+    rm -rf /home/debian
+}
 
 ######################################
-if [ "x${FPPPLATFORM}" = "xRaspberry Pi" ]; then
-    echo "FPP - Compiling WIFI drivers"
-    cd /opt/fpp/SD
-    ./FPP-Wifi-Drivers.sh
+case "${FPPPLATFORM}" in
+    "Raspberry Pi"|"BeagleBone Black"|"BeagleBone 64")
+        configure_hostapd
+        configure_swap
+        ;;
+esac
+
+if $isimage; then
+    finalize_image_post_build
+fi
+if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+    finalize_platform_beaglebone_black_post_build
 fi
 
-ENDTIME=$(date)
+generate_apache_csp() {
+    mkdir -p /home/fpp/media/config/
+    /opt/fpp/scripts/ManageApacheContentPolicy.sh regenerate
+}
 
-echo "========================================================="
-echo "FPP Install Complete."
-echo "Started : ${STARTTIME}"
-echo "Finished: ${ENDTIME}"
-echo "========================================================="
-echo "You can reboot the system by changing to the '${FPPUSER} user with the"
-echo "password 'falcon' and running the shutdown command."
-echo ""
-echo "su - ${FPPUSER}
-echo "sudo shutdown -r now"
-echo ""
-echo "NOTE: If you are prepping this as an image for release,"
-echo "remove the SSH keys before shutting down so they will be"
-echo "rebuilt during the next boot."
-echo ""
-echo "su - ${FPPUSER}
-echo "sudo rm -rf /etc/ssh/ssh_host*key*"
-echo "sudo shutdown -r now"
-echo "========================================================="
-echo ""
+print_install_complete() {
+    local endtime
+    endtime=$(date)
+    cat <<-EOF
+=========================================================
+FPP Install Complete.
+Started : ${STARTTIME}
+Finished: ${endtime}
+=========================================================
+You can reboot the system by changing to the '${FPPUSER} user with the
+password 'falcon' and running the shutdown command.
 
-cp /home/pi/FPP_Install.* ${FPPHOME}/
-chown fpp.fpp ${FPPHOME}/FPP_Install.*
+su - ${FPPUSER}
+sudo shutdown -r now
 
+NOTE: If you are prepping this as an image for release,
+remove the SSH keys before shutting down so they will be
+rebuilt during the next boot.
+
+su - ${FPPUSER}
+sudo rm -rf /etc/ssh/ssh_host*key*
+sudo shutdown -r now
+=========================================================
+
+EOF
+}
+
+generate_apache_csp
+print_install_complete
+
+cp /root/FPP_Install.* ${FPPHOME}/
+chown fpp:fpp ${FPPHOME}/FPP_Install.*
+
+if $isimage; then
+    # Final safety net: many install steps above run as root and create files or
+    # directories under ${FPPHOME} (the apache CSP config, .config, the copied
+    # FPP_Install.*, etc.), and adduser leaves /home/fpp itself root-owned if the
+    # base image pre-created it. Guarantee the whole home tree is fpp-owned so
+    # the shipped image never hands the fpp user a directory it can't write.
+    echo "FPP - Ensuring ${FPPHOME} is owned by ${FPPUSER}"
+    chown -R ${FPPUSER}:${FPPUSER} ${FPPHOME}
+fi

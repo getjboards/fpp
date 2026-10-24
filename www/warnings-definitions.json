@@ -1,0 +1,531 @@
+{
+    "WarningGroups": {
+        "Network_Warnings": {
+            "fa-icon": "network-wired"
+        },
+        "Disk_Warnings": {
+            "fa-icon": "floppy-disk"
+        },
+        "Output_Warnings": {
+            "fa-icon": "up-right-from-square"
+        },
+        "Device_Warnings": {
+            "fa-icon": "microchip"
+        },
+        "Log_Warnings": {
+            "fa-icon": "pencil"
+        },
+        "FPPD_Warnings": {
+            "fa-icon": "feather-alt"
+        },
+        "Plugin_Warnings": {
+            "fa-icon": "puzzle-piece"
+        }
+    },
+    "Warnings": [
+        {
+            "id": 1,
+            "Title": "FPPD Has Crashed.",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 2,
+            "Title": "Log Level Set to Excessive.",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Log_Warnings"
+        },
+        {
+            "id": 3,
+            "Title": "Log Level Set to Debug.",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Log_Warnings"
+        },
+        {
+            "id": 4,
+            "Title": "MQTT Disconnected.",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 5,
+            "Title": "Could not load plugin.",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Plugin_Warnings"
+        },
+        {
+            "id": 6,
+            "Title": "Sending data to myself",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 7,
+            "Title": "Colorlight Link",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 8,
+            "Title": "Colorlight Speed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 9,
+            "Title": "Colorlight Version",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 10,
+            "Title": "Dummy Audio",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 11,
+            "Title": "Received bridging data while sequence is running",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 12,
+            "Title": "Boot Delay Active",
+            "HelpTxt": "Boot delay is in progress. FPPD will start automatically when the configured delay completes or valid system time is received.",
+            "HelpPageType": "",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 13,
+            "Title": "Pixel String Cape Configuration References Missing Hardware",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 14,
+            "Title": "Could Not Resolve Host Name",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 15,
+            "Title": "Raspberry Pi Voltage Too Low",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 16,
+            "Title": "Pixel Output Port Problem",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 17,
+            "Title": "Frame Skips - Likely Slow Network",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 18,
+            "Title": "FSEQ Data Block Not Available - Slow Storage",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Disk_Warnings"
+        },
+        {
+            "id": 19,
+            "Title": "FPP Scheduler Is Disabled",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 20,
+            "Title": "Unable To Start PRU - Reboot Required",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 21,
+            "Title": "ColorLight Output Too Slow",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 22,
+            "Title": "Invalid Interface For UDP Broadcast/Multicast",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 23,
+            "Title": "Scheduled Playlist Or Sequence Does Not Exist",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 24,
+            "Title": "Playlist Could Not Be Loaded",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 25,
+            "Title": "Sequence File Does Not Exist",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 26,
+            "Title": "Channel Output Configuration Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 27,
+            "Title": "Cannot Reach Output Controller",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 28,
+            "Title": "USB DMX Adapter Problem",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 29,
+            "Title": "Schedule Will Not Run In Remote Mode",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 30,
+            "Title": "Media File Could Not Be Played",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 31,
+            "Title": "Video Output Pipeline Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 32,
+            "Title": "Playlist URL Request Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 33,
+            "Title": "Dynamic Playlist Data Invalid",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 34,
+            "Title": "Playlist Image Could Not Be Displayed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 35,
+            "Title": "Invalid Pixel Overlay Model",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 36,
+            "Title": "Display Output Failed To Start",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 37,
+            "Title": "Virtual Display Preview Unavailable",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 38,
+            "Title": "Serial Output Port Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 39,
+            "Title": "LOR Output Configuration Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 40,
+            "Title": "nRF24 Radio Output Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 41,
+            "Title": "Virtual Display Map Missing",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 42,
+            "Title": "MultiSync Network Socket Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 43,
+            "Title": "Network Discovery (mDNS) Unavailable",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 44,
+            "Title": "Network Audio Stream Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 45,
+            "Title": "AES67 PTP Clock Sync Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 46,
+            "Title": "WLED Audio Sync Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 47,
+            "Title": "Invalid Schedule Entry",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 48,
+            "Title": "Schedule Location Not Set",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 49,
+            "Title": "Effect Could Not Be Started",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 50,
+            "Title": "LED Panel Output Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 51,
+            "Title": "GPIO Pin Configuration Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 52,
+            "Title": "WLED Sound Reactive Input Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 53,
+            "Title": "Sensor Initialization Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 54,
+            "Title": "Network/DMX Input Error",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 55,
+            "Title": "System Clock Not Set",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 56,
+            "Title": "Video Input Source Failed",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 57,
+            "Title": "Plugins must be reinstalled",
+            "HelpTxt": "",
+            "HelpPageType": "",
+            "WarningGroup": "Plugin_Warnings"
+        },
+        {
+            "id": 58,
+            "Title": "Audio Output Card Not Present",
+            "HelpTxt": "The configured audio output sound card is no longer present - it may have been unplugged or dropped off the USB bus. Audio will fall back to the default output device until the card is reconnected.",
+            "HelpPageType": "",
+            "WarningGroup": "Device_Warnings"
+        },
+        {
+            "id": 61,
+            "Title": "Command Not Found",
+            "HelpTxt": "A command was referenced that does not exist, most likely because a plugin that used to provide it was removed or updated. Check your Playlists (Command entries), Command Presets, and GPIO Input bindings for a reference to the command name shown, and check the Plugin Manager to see if a plugin providing it needs reinstalling. This warning clears itself automatically 15 minutes after the last time it was triggered.",
+            "HelpPageType": "",
+            "WarningGroup": "Plugin_Warnings"
+        },
+        {
+            "id": 66,
+            "Title": "Command Preset Triggers Itself",
+            "HelpTxt": "A Command Preset ran a command that fired the same event again before the preset had finished - for example a MEDIA_STARTED preset that runs Play Media, which starts more media and fires MEDIA_STARTED again. That loops forever, so FPP ran the preset once and skipped the nested run. Edit the preset named in the warning (Status/Control - Command Presets) so its commands don't re-trigger it. This warning clears itself automatically 15 minutes after the last time it was triggered.",
+            "HelpPageType": "",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 67,
+            "Title": "Display Output Cropped",
+            "HelpTxt": "A framebuffer output (for example a Virtual Display) is configured larger than the display device it is drawing on, so only the top-left part of the image that fits is shown. Make the output's width and height match the display's resolution, or set the display to a resolution at least as large as the output. This warning clears when the output is reconfigured or FPPD restarts.",
+            "HelpPageType": "",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 68,
+            "Title": "Controller Needs More Than Its Pacing Rate",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 69,
+            "Title": "Network Interface Dropping Packets",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 65,
+            "Title": "FPPD restart limit reached.",
+            "HelpTxt": "",
+            "HelpPageType": "md",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 59,
+            "Title": "FPPD Main Loop Stalled",
+            "HelpTxt": "fppd's main loop has stopped running, so the status shown may be out of date and MultiSync packets are not being processed. The fppd log names where it stalled. The warning clears on its own if the loop resumes; otherwise restart FPPD.",
+            "HelpPageType": "",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 62,
+            "Title": "Invalid Playlist Branch",
+            "HelpTxt": "A Branch entry in a playlist has an invalid start time, end time or iteration count, so it cannot decide which way to branch. Edit the playlist and correct the Branch entry.",
+            "HelpPageType": "",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 63,
+            "Title": "Frame Rate Too High For Pixel Strings",
+            "HelpTxt": "The sequence's frame rate is higher than the configured pixel strings can output, so frames will be dropped. Lower the sequence's frame rate, or put fewer pixels on the longest strings.",
+            "HelpPageType": "",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 64,
+            "Title": "Pixel Overlay Model Out Of Memory",
+            "HelpTxt": "FPP ran out of memory allocating pixel overlay model buffers, so some models will not display. Reduce the number or size of the overlay models.",
+            "HelpPageType": "",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 70,
+            "Title": "Script Outside Scripts Directory Refused",
+            "HelpTxt": "A playlist, command or event asked FPP to run a script by a path outside the scripts directory, which FPP refuses. Put the script in the scripts directory and refer to it by name.",
+            "HelpPageType": "",
+            "WarningGroup": "FPPD_Warnings"
+        },
+        {
+            "id": 71,
+            "Title": "Video Output Has No Display",
+            "HelpTxt": "A video output has no monitor or projector detected: it is unplugged or switched off. Expected while a projector is turned off; the warning clears as soon as a display is detected.",
+            "HelpPageType": "",
+            "WarningGroup": "Output_Warnings"
+        },
+        {
+            "id": 72,
+            "Title": "Network Input Port Unavailable",
+            "HelpTxt": "FPP could not open the UDP port for a network input, usually because another program is already using it, so that input is off. Stop the other program, then save the input configuration again or restart FPPD.",
+            "HelpPageType": "",
+            "WarningGroup": "Network_Warnings"
+        },
+        {
+            "id": 73,
+            "Title": "Configuration Entry Could Not Be Read",
+            "HelpTxt": "An entry in a configuration file has a value of the wrong type and was skipped; the message names the file. Correct or re-save that entry. The warning clears after an hour unless the entry is still found to be bad.",
+            "HelpPageType": "",
+            "WarningGroup": "FPPD_Warnings"
+        }
+    ]
+}

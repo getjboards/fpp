@@ -1,0 +1,483 @@
+#!/bin/bash
+
+COMMON_PATH=$(dirname "$0")            # relative
+COMMON_PATH=$(cd "$COMMON_PATH" && pwd)
+
+. ${COMMON_PATH}/common
+
+PHPOUT="n"
+
+HTML_HEAD="<div class='row'>";
+HTML_FOOT="</div>"
+HTML_LABEL="<div class='col-sm-4'><div class='description'>%s</div></div>"
+HTML_STATUS="<div class='col-sm' id='checkNumber%d'>%s</div>"
+HTML_GOOD="<i class='fas fa-check-circle text-success' title='%s'></i>"
+HTML_BAD="<i class='fas fa-times-circle text-danger'></i>&nbsp;%s"
+HTML_WARN="<i class='fas fa-check-circle text-warning'></i>&nbsp;%s"
+HTML_RUNNING="Running..."
+
+if [ "x$1" = "x-p" -o "x$1" = "x--php" ]
+then
+    PHPOUT="y"
+fi
+
+
+if [ ${#2} -gt 1 ]
+then
+    BROWSER_TIME="$2"
+fi
+
+ID=0
+
+#############################################################################
+# Each Health Check function needs to do 3 things:
+# 1) Call PrintItemHead with the description of the test being run
+# 2) Set the numeric STATUS and string STATUSSTR variables
+#    - STATUS=0 - Fail
+#    - STATUS=1 - Pass
+#    - STATUS=2 - Warning
+# 3) Call PrintItemFoot to display the result of the test
+
+#############################################################################
+# Helpers
+
+# Usage: PrintItemHead DESCRIPTION
+PrintItemHead() {
+    DESC="$1"
+
+    ID=$(expr ${ID} + 1)
+
+    if [ "${PHPOUT}" = "y" ]
+    then
+        /bin/echo -n "${HTML_HEAD}"
+        printf "${HTML_LABEL}" "${DESC}"
+        printf "${HTML_STATUS}" "${ID}" "${HTML_RUNNING}"
+        echo "${HTML_FOOT}"
+    else
+        printf "%-40.40s: " "${DESC}.................................................................."
+    fi
+}
+
+# Escape a status string for $('#checkNumberN').html("...") inside a
+# streamScript block. STATUSSTR carries host-influenced text (warnings,
+# hostnames, plugin names). HTML-escaping covers </script>, the title='...'
+# attribute and every quote, so only backslashes remain to JS-escape.
+EscapeStatusStr() {
+    printf '%s' "$1" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&#39;/g" \
+            -e 's/\\/\\\\/g' \
+        | tr -d '\r\n'
+}
+
+# Usage: PrintItemFoot NUMERICAL_STATUS STRING_STATUS TOOLTIP_TEXT
+PrintItemFoot() {
+    if [ "${PHPOUT}" = "y" ]
+    then
+        STATUSHTML="${HTML_GOOD}"
+        if [ ${STATUS} -eq 0 ]
+        then
+            STATUSHTML="${HTML_BAD}"
+        else
+            if [ ${STATUS} -eq 2 ]
+            then
+                STATUSHTML="${HTML_WARN}"
+            fi
+        fi
+
+        ESCAPED_STATUSSTR=$(EscapeStatusStr "${STATUSSTR}")
+        STATUSHTML=$(printf "${STATUSHTML}" "${ESCAPED_STATUSSTR}")
+        printf "<script class='streamScript'>\$('#checkNumber%d').html(\"%s\");</script>\n" ${ID} "${STATUSHTML}"
+    else
+        STATUSTEXT="Pass"
+        if [ ${STATUS} -eq 0 ]
+        then
+            STATUSTEXT="Fail"
+            if [ ${STATUS} -eq 2 ]
+            then
+                STATUSTEXT="Warning"
+            fi
+        fi
+
+        printf "%s - %s\n" "${STATUSTEXT}" "${STATUSSTR}"
+    fi
+}
+
+#############################################################################
+# Health Check Functions
+
+HC_FPPD() {
+    PrintItemHead "FPPD is running"
+
+    PID=$(pgrep fppd)
+    if [ ! -f "${FPPDIR}/src/fppd" ]
+    then
+        STATUS=0
+        STATUSSTR="FPPD executable is missing. Rebuild required."
+
+    elif ! fppdBinaryValid
+    then
+        # Checked even while fppd runs: a damaged file only fails at the next start.
+        STATUS=0
+        STATUSSTR="FPPD executable is damaged. Rebuild required."
+
+    elif [ "x${PID}" != "x" ]
+    then
+        STATUS=1
+        STATUSSTR="FPPD is running at PID ${PID}"
+    else
+        STATUS=0
+        STATUSSTR="FPPD is not running"
+    fi
+
+    PrintItemFoot
+}
+
+HC_Scheduler() {
+    PrintItemHead "Scheduler is enabled"
+
+    DISABLED=$(getSetting DisableScheduler)
+
+    if [ "x${DISABLED}" != "x1" ]
+    then
+        STATUS=1
+        STATUSSTR="Scheduler is enabled"
+    else
+        STATUS=2
+        STATUSSTR="Scheduler is disabled"
+    fi
+
+    PrintItemFoot
+}
+
+HC_HostName() {
+    PrintItemHead "HostName is unique"
+
+    FPPHOSTNAMES=$(curl -s http://127.0.0.1/api/fppd/multiSyncSystems | sed -e "s/},/}\n/g" | grep fppMode | sed -e 's/\(.*\)"hostname":"\([^"]*\)"\(.*\)/\2/' | grep -i "^fpp$" | wc -l)
+    HOSTNAME=$(getSetting HostName)
+
+    if [ ${FPPHOSTNAMES} -gt 1 ]
+    then
+        STATUS=2
+        STATUSSTR="There may be more than one host on the network with the 'FPP' hostname.  Consider changing the hostname of this system"
+    else
+        if [ "x${HOSTNAME}" = "x" ]
+        then
+            STATUS=2
+            STATUSSTR="Hostname is not set, consider setting the hostname of this system if you intend to have more than one FPP instance on the same network"
+        elif [ "x${HOSTNAME}" != "xFPP" -a "x${HOSTNAME}" != "xfpp" ] ; then
+            STATUS=1
+            STATUSSTR="Hostname is set to other than the default of FPP"
+        else
+            STATUS=2
+            STATUSSTR="Hostname is set to the default of 'FPP'.  Consider setting the hostname of this system if you intend to have more than one FPP instance on the same network"
+        fi
+    fi
+
+    PrintItemFoot
+}
+
+HC_CheckGateways() {
+    GW=$(netstat -rn | grep "^0\.0\.0\.0" | uniq | wc -l)
+
+    PrintItemHead "Gateway Check"
+
+    if [ "${GW}" == "1" ]; then
+        STATUS=1
+        STATUSSTR="A single gateway was found."
+    else
+        STATUS=0
+        STATUSSTR="Multiple default gateways were found!"
+    fi
+
+    PrintItemFoot
+}
+
+
+HC_PingGateway() {
+    GW=$(netstat -rn | grep "^0\.0\.0\.0" | head -1 | awk '{print $2}')
+
+    PrintItemHead "Default Gateway (${GW})"
+
+    if [ "x${GW}" != "x" ]
+    then
+        ping -c 1 -q -W 2 ${GW} > /dev/null 2>&1
+        if [ $? -eq 0 ]
+        then
+            STATUS=1
+            STATUSSTR="Ping default gateway (${GW}) was successful"
+        else
+            STATUS=0
+            STATUSSTR="Unable to ping default gateway ${GW}"
+        fi
+    else
+        STATUS=0
+        STATUSSTR="No default gateway found"
+    fi
+
+    PrintItemFoot
+}
+
+HC_Internet() {
+    PrintItemHead "Internet Access"
+    # If one of these IP addresses are pingable then we have internet connectivity.
+    ips=("1.1.1.1" "8.8.8.8" "9.9.9.9")
+    # Initialize return code
+    rc=1
+
+    # Loop through the IPs and try to ping
+    for ip in "${ips[@]}"; do
+        if ping -c 1 -q -W 2 "$ip" > /dev/null 2>&1; then
+            rc=0
+            break
+        fi
+    done
+
+    if [ $rc -eq 0 ]
+    then
+        STATUS=1
+        STATUSSTR="Internet connectivity confirmed."
+    else
+        STATUS=0
+        STATUSSTR="Internet connectivity check unsuccessful."
+    fi
+
+    PrintItemFoot
+}
+
+HC_DNS() {
+    PrintItemHead "External DNS"
+
+    OUT=$(getent hosts github.com 2>&1)
+    if [ "x${OUT}" = "x" ]
+    then
+        STATUS=0
+        STATUSSTR="Unable to query github.com via DNS"
+    else
+        STATUS=1
+        STATUSSTR="DNS lookup of github.com was successful"
+    fi
+
+    PrintItemFoot
+}
+
+HC_NTPOffset() {
+    PrintItemHead "Network Time Protocol Offset"
+
+    STATUS=1
+    STATUSSTR="Your time is accurate"
+
+    ntp_synced=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)
+
+    if [ "$ntp_synced" != "yes" ]; then
+        if pgrep -x chronyd >/dev/null 2>&1; then
+            STATUS=2
+            STATUSSTR="NTP daemon not synchronized"
+        else
+            STATUS=0
+            STATUSSTR="NTP daemon not running"
+        fi
+    else
+        # chrony reports the last correction via "chronyc tracking".
+        offset=$(chronyc -n tracking 2>/dev/null | awk -F': *' '/Last offset/ {print $2; exit}' | awk '{print $1}')
+        offms=$(awk -v o="${offset:-0}" 'BEGIN { o = (o < 0) ? -o : o; printf "%d", o * 1000 }')
+        if [ "${offms:-0}" -ge "${limit:-100}" ]; then
+            STATUS=0
+            STATUSSTR="Your time may be incorrect, please verify"
+        fi
+    fi
+
+    PrintItemFoot
+}
+
+HC_DateTime() {
+    PrintItemHead "FPP Date/Time Alignment to Browser"
+
+    # Compare FPP system time against the browser setting (passed as 2nd arg to script)
+    fppsystem_timestamp=$(date +%s)
+    WARN_THRESHOLD=600 #10 minutes (in seconds)
+    FAIL_THRESHOLD=14400 #4 hours (in seconds)
+    WARN_MIN=$(($BROWSER_TIME - $WARN_THRESHOLD))
+    WARN_MAX=$(($BROWSER_TIME + $WARN_THRESHOLD))
+    FAIL_MIN=$(($BROWSER_TIME - $FAIL_THRESHOLD))
+    FAIL_MAX=$(($BROWSER_TIME + $FAIL_THRESHOLD))
+    #echo "FPP TIME: "$fppsystem_timestamp
+    #echo "BROWSER TIME: "$BROWSER_TIME
+    #echo "WARN_MIN: $WARN_MIN"
+    #echo "WARN_MAX: $WARN_MAX"
+    STATUS=1
+    STATUSSTR="Your FPP system date/time is aligned to the browser"
+
+    if [ "$fppsystem_timestamp" -ge "$WARN_MAX" ] || [ "$fppsystem_timestamp" -le "$WARN_MIN" ]; then
+        STATUS=2
+        STATUSSTR="Your FPP system date/time is more than 10 mins different to the browser, please verify"
+    fi
+
+    if [ "$fppsystem_timestamp" -ge "$FAIL_MAX" ] || [ "$fppsystem_timestamp" -le "$FAIL_MIN" ]; then
+        STATUS=0
+        STATUSSTR="Your FPP system date/time is significantly different to the browser, please verify"
+    fi
+
+    PrintItemFoot
+}
+
+HC_RootDisk() {
+    PrintItemHead "Root filesystem free space"
+
+    USED=$(df -k / | grep -v Filesystem | awk '{print $5}' | sed -e "s/%//")
+    if [ ${USED} -lt 95 ]
+    then
+        STATUS=1
+        STATUSSTR="Root filesystem is only ${USED}% used"
+    else
+        STATUS=0
+        STATUSSTR="Root filesystem is ${USED}% used"
+    fi
+
+    PrintItemFoot
+}
+
+HC_MediaDisk() {
+    FSTAB=$(mount | grep "/home/fpp/media")
+    if [ "x${FSTAB}" = "x" ]
+    then
+        return
+    fi
+
+    PrintItemHead "/home/fpp/media free space"
+
+    USED=$(df -k /home/fpp/media | grep -v Filesystem | awk '{print $5}' | sed -e "s/%//")
+    if [ ${USED} -lt 95 ]
+    then
+        STATUS=1
+        STATUSSTR="/home/fpp/media filesystem is only ${USED}% used"
+    else
+        STATUS=0
+        STATUSSTR="/home/fpp/media filesystem is ${USED}% used"
+    fi
+
+    PrintItemFoot
+}
+
+HC_Warnings() {
+    PrintItemHead "FPPD Warnings"
+
+    WARNING_FILE="${FPPDIR}/www/warnings.json"
+    JQ=$(which jq)
+
+    if [ "$?" == "1" ]
+    then
+        STATUS=0
+        STATUSSTR="jq not installed. Perform FPP Upgrade"
+
+    elif [ ! -r "$WARNING_FILE" ]
+    then
+        STATUS=1
+        STATUSSTR="No Warning File found"
+    else    
+        CNT=$(jq '.[]' $WARNING_FILE | wc -l)
+        if [ "$CNT" == "0" ]
+        then
+            STATUS=1
+            STATUSSTR="No Warnings Found"
+        else
+            STATUS=2
+            STATUSSTR=$(jq '.[]' $WARNING_FILE  | paste -sd "," | sed  's/"//g')
+            STATUSSTR="$CNT FPPD WARNINGS: $STATUSSTR"
+        fi
+    fi
+
+    PrintItemFoot
+
+}
+
+# Emits at most one item, "Unknown Plugins", and only when this system has a
+# record of installing something from outside the curated plugin list --
+# unlike the other checks here, absence of the item is the normal case, not a
+# loading state. See the plugin-source block in www/api/controllers/plugin.php for
+# what the levels mean.
+#
+# This page has no "caution" color between pass and fail, so the uncertain
+# level ("something was installed while the plugin list was unreachable") renders
+# as a plain pass with explanatory text rather than as a failure.
+HC_PluginSource() {
+    PLUGINSOURCE=$(curl -s --max-time 3 http://127.0.0.1/api/plugin/source)
+    if [ "x${PLUGINSOURCE}" = "x" ]; then
+        return
+    fi
+
+    JQ=$(which jq)
+    if [ "$?" == "1" ]; then
+        return
+    fi
+
+    LEVEL=$(echo "${PLUGINSOURCE}" | jq -r '.level')
+
+    case "${LEVEL}" in
+        unknown)
+            STATUS=0
+            # Sticky across uninstalls: name the plugins, marking any since
+            # removed, when FPP recorded them.
+            NAMES=$(echo "${PLUGINSOURCE}" | jq -r '[.plugins[]? | .repoName + (if .installed then "" else " (since removed)" end)] | join(", ")')
+            if [ -n "${NAMES}" ]; then
+                STATUSSTR="Installed: ${NAMES}"
+            else
+                STATUSSTR="Installed at some point (may since have been removed)"
+            fi
+            ;;
+        unverified)
+            STATUS=1
+            STATUSSTR="Possibly Installed - plugin list was unreachable at install time"
+            ;;
+        *)
+            return
+            ;;
+    esac
+
+    PrintItemHead "Unknown Plugins"
+    PrintItemFoot
+}
+
+#############################################################################
+# Main Health Check routines here.  Some call others due to dependencies but
+# some stand alone on their own.
+
+#############################
+# FPP
+HC_FPPD
+HC_Warnings
+HC_PluginSource
+
+MODE=$(getSetting fppMode)
+if [ "x${MODE}" = "xplayer" -o "x${MODE}" = "xmaster" ]
+then
+    HC_Scheduler
+fi
+
+HC_HostName
+
+#############################
+# Network
+HC_CheckGateways
+HC_PingGateway
+if [ ${STATUS} -eq 1 ]
+then
+    HC_Internet
+    if [ ${STATUS} -eq 1 ]
+    then
+        HC_DNS
+        if [ ${STATUS} -eq 1 ]; then
+            HC_NTPOffset
+        fi
+    fi
+fi
+############################
+# Date / Time
+# Nothing to compare against without a browser time (crash reports)
+if [ -n "$BROWSER_TIME" ]; then
+    HC_DateTime
+fi
+
+#############################
+# System Resources
+HC_RootDisk
+HC_MediaDisk

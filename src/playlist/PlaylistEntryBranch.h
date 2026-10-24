@@ -1,81 +1,80 @@
+#pragma once
 /*
- *   Playlist Entry Branch Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _PLAYLISTENTRYBRANCH_H
-#define _PLAYLISTENTRYBRANCH_H
-
 #include <string>
+#include "fpp-json-fwd.h"
 
 #include "Playlist.h"
 #include "PlaylistEntryBase.h"
 
-#define PE_BRANCH_TYPE_UNDEFINED      0
-#define PE_BRANCH_TYPE_CLOCK_TIME     1
-#define PE_BRANCH_TYPE_PLAYLIST_TIME  2
-#define PE_BRANCH_TYPE_LOOP_COUNT     3
-
-#define PE_BRANCH_COMP_MODE_UNDEFINED 0
-#define PE_BRANCH_COMP_MODE_LTEQ      1
-#define PE_BRANCH_COMP_MODE_EQ        2
-#define PE_BRANCH_COMP_MODE_GTEQ      3
-
 class PlaylistEntryBranch : public PlaylistEntryBase {
-  public:
-	PlaylistEntryBranch(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryBranch();
+public:
+    PlaylistEntryBranch(Playlist* playlist, PlaylistEntryBase* parent = NULL);
+    virtual ~PlaylistEntryBranch();
 
-	int  Init(Json::Value &config);
+    virtual int Init(Json::Value& config) override;
 
-	int  StartPlaying(void);
+    virtual int StartPlaying(void) override;
+    virtual int Process(void) override;
 
-	void SetNext(int isTrue);
+    void SetNext(int isTrue);
 
-	void Dump(void);
+    virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+    virtual Json::Value GetConfig(void) override;
 
-  private:
-	int  m_branchType;
-	int  m_comparisonMode;
+    virtual PlaylistBranchType GetNextBranchType() override { return m_nextBranchType; }
+    virtual std::string GetNextSection(void) override { return m_nextSection; }
+    virtual int GetNextItem(void) override { return m_nextItem; }
+    virtual std::string GetNextData(void) override { return m_nextBranchPlaylist; }
 
-	// Time comparison
-	int  m_sHour;
-	int  m_sMinute;
-	int  m_sSecond;
-	int  m_sDaySecond;
-	int  m_sHourSecond;
-	int  m_eHour;
-	int  m_eMinute;
-	int  m_eSecond;
-	int  m_eDaySecond;
-	int  m_eHourSecond;
+private:
+    std::string m_branchTest;
 
-	std::string m_trueNextSection;
-	int         m_trueNextItem;
-	std::string m_falseNextSection;
-	int         m_falseNextItem;
+    // Time comparison
+    std::string m_startTime;
+    std::string m_endTime;
+    int m_sHour;
+    int m_sMinute;
+    int m_sSecond;
+    int m_sDaySecond;
+    int m_sHourSecond;
+    int m_eHour;
+    int m_eMinute;
+    int m_eSecond;
+    int m_eDaySecond;
+    int m_eHourSecond;
+
+    // Loop Number
+    int m_iterationStart;
+    int m_iterationCount;
+
+    // MQTT Topic Message
+    std::string m_mqttTopic;
+    std::string m_mqttMessage;
+
+    PlaylistBranchType m_trueNextBranchType;
+    std::string m_trueNextSection;
+    int m_trueNextItem;
+    std::string m_trueBranchPlaylist;
+
+    PlaylistBranchType m_falseNextBranchType;
+    std::string m_falseNextSection;
+    int m_falseNextItem;
+    std::string m_falseBranchPlaylist;
+
+    PlaylistBranchType m_nextBranchType;
+    std::string m_nextSection;
+    int m_nextItem;
+    std::string m_nextBranchPlaylist;
 };
-
-#endif

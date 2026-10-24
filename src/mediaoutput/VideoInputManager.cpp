@@ -1,0 +1,2131 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2026 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "Warnings.h" // WarningHolder -- needed directly for NOPCH builds
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <map>
+#include <mutex>
+#include <set>
+#include <vector>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define FPP_ENVIRON (*_NSGetEnviron())
+#else
+extern char** environ;
+#define FPP_ENVIRON environ
+#endif
+
+#include "GStreamerOut.h"
+#include "V4L2Device.h"
+#include "VideoInputManager.h"
+#include "VideoOutputManager.h"
+#include "common.h"
+#include "settings.h"
+#include "log.h"
+
+#include <fstream>
+#include <sstream>
+
+#include "fpp-json.h"
+
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+#include <gst/app/gstappsink.h>
+#endif
+
+// pipewiresink mode=provide enum value (GST_PIPEWIRE_SINK_MODE_PROVIDE)
+static constexpr int PIPEWIRE_SINK_MODE_PROVIDE = 2;
+
+// Quote a config-derived value for a gst_parse_launch() description.
+//
+// That description is a grammar, not a format string: space, '!', ',' and '='
+// are all syntax. Splicing a raw config value in lets it reshape the pipeline -
+// an RTSP URI containing a space or a comma turns the rest of the description
+// into something else entirely, and the failure does not surface as the GError
+// the callers already check. It has been observed faulting inside libgstreamer's
+// own parser (gst_value_deserialize <- gst_caps_from_string <-
+// gst_parse_launch_full), which takes fppd down with it and, since the source is
+// re-started on the next reload, crash-loops the daemon.
+//
+// Quoting fixes it: inside quotes the parser takes the value literally, having
+// first un-escaped backslash sequences - so backslashes and quotes in the value
+// must themselves be escaped. Quoting a value that needed no escaping parses to
+// exactly the same string, so this is safe to apply unconditionally.
+static std::string GstQuote(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out += '"';
+    for (char c : value) {
+        if (c == '\\' || c == '"') {
+            out += '\\';
+        }
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
+// Sanitise a URI down to URL-safe characters before it is spliced into a
+// single-quoted shell argument, so nothing in it can close the quote.
+static std::string ShellSafeUri(const std::string& uri) {
+    std::string out;
+    out.reserve(uri.size());
+    for (char c : uri) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == ':' || c == '/'
+            || c == '.' || c == '-' || c == '_' || c == '~' || c == '?'
+            || c == '&' || c == '=' || c == '%' || c == '+' || c == '@') {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// What a yt-dlp resolution produced.
+struct YtDlpResult {
+    std::string url;         // empty when resolution failed
+    double fps = 0.0;        // 0 when fps wasn't requested, or didn't parse
+    std::string diagnostics; // yt-dlp's own error text, for the log
+};
+
+// Resolve a page URL to a directly playable stream URL via yt-dlp.
+//
+// stderr used to be sent to /dev/null, which made every failure look identical
+// in the log - "returned no valid URL" - while the reason for it was thrown
+// away. The packaged yt-dlp goes stale against YouTube every few months and
+// then fails with a specific, actionable message ("The page needs to be
+// reloaded", "Sign in to confirm you're not a bot"), so that is the failure
+// operators actually hit and the one the log could least afford to swallow.
+// stderr is folded into the capture and reported instead: yt-dlp's own
+// diagnostics are line-oriented and never begin with "http", so the URL line
+// stays unambiguous among them.
+//
+// Bounded, and killable: it talks to YouTube, and a stalled connection would
+// otherwise hold the caller for as long as the network stays silent.  It runs
+// in its own process group, so the deadline and Shutdown() (which has only a
+// few seconds before fppd_stop kills fppd) can take down yt-dlp and anything
+// it started.  Spawned directly rather than through a shell, so the URI is an
+// argument, not shell text.
+static constexpr int YTDLP_TIMEOUT_SEC = 45;
+static std::atomic<pid_t> s_ytDlpPgid{ 0 };
+
+static void KillRunningYtDlp() {
+    pid_t pgid = s_ytDlpPgid.load();
+    if (pgid > 0) {
+        kill(-pgid, SIGKILL);
+    }
+}
+
+static YtDlpResult RunYtDlp(const std::string& format, const std::string& uri, bool wantFps) {
+    YtDlpResult res;
+    std::vector<std::string> args = { "yt-dlp", "-f", format, "--print", "url" };
+    if (wantFps) {
+        args.push_back("--print");
+        args.push_back("fps");
+    }
+    // Only a web URL, and after "--" so it can never be read as an option:
+    // ShellSafeUri() keeps '-' and '=', and IsYouTubeUri() only looks for
+    // "youtube.com/" anywhere in it, so "--config-locations=.../youtube.com/x"
+    // had yt-dlp load an uploaded config, which can carry --exec.
+    std::string safeUri = ShellSafeUri(uri);
+    std::string scheme = safeUri.substr(0, 8);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+    if (!startsWith(scheme, "http://") && !startsWith(scheme, "https://")) {
+        res.diagnostics = "not an http(s) URL";
+        return res;
+    }
+    args.push_back("--");
+    args.push_back(safeUri);
+    std::vector<char*> argv;
+    for (auto& a : args) {
+        argv.push_back(a.data());
+    }
+    argv.push_back(nullptr);
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        res.diagnostics = "could not run yt-dlp";
+        return res;
+    }
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, fds[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, fds[1]);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attr, 0);
+    pid_t pid = -1;
+    int rc = posix_spawnp(&pid, "yt-dlp", &actions, &attr, argv.data(), FPP_ENVIRON);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+    close(fds[1]);
+    if (rc != 0) {
+        close(fds[0]);
+        res.diagnostics = "could not run yt-dlp";
+        return res;
+    }
+    s_ytDlpPgid = pid;
+
+    // stderr is folded into the capture (see above); read until yt-dlp exits
+    // and closes the pipe, or the deadline passes.
+    std::string output;
+    char buf[4096];
+    uint64_t deadline = GetMonotonicTimeMS() + (uint64_t)YTDLP_TIMEOUT_SEC * 1000;
+    bool timedOut = false;
+    for (;;) {
+        uint64_t now = GetMonotonicTimeMS();
+        if (now >= deadline) {
+            timedOut = true;
+            break;
+        }
+        struct pollfd pfd = { fds[0], POLLIN, 0 };
+        int pr = poll(&pfd, 1, (int)std::min<uint64_t>(deadline - now, 1000));
+        if (pr < 0 && errno != EINTR) {
+            break;
+        }
+        if (pr <= 0) {
+            continue;
+        }
+        ssize_t n = read(fds[0], buf, sizeof(buf));
+        if (n > 0) {
+            output.append(buf, (size_t)n);
+        } else if (n == 0 || errno != EINTR) {
+            break;
+        }
+    }
+    if (timedOut) {
+        kill(-pid, SIGKILL);
+        res.diagnostics = "yt-dlp did not answer within " + std::to_string(YTDLP_TIMEOUT_SEC) + "s";
+    }
+    s_ytDlpPgid = 0;
+    close(fds[0]);
+    // fppd sets SA_NOCLDWAIT, so the kernel reaps yt-dlp itself and this
+    // usually fails with ECHILD; it only matters where that isn't set.  The
+    // exit status can't be relied on either way - validate the output instead.
+    waitpid(pid, nullptr, WNOHANG);
+    if (timedOut) {
+        return res;
+    }
+
+    std::istringstream iss(output);
+    std::string line;
+    bool fpsLineNext = false;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+        if (fpsLineNext) {
+            // --print fps emits the framerate on the line right after the URL.
+            fpsLineNext = false;
+            try {
+                res.fps = std::stod(line);
+            } catch (...) {
+                res.fps = 0.0;
+            }
+        } else if (res.url.empty() && line.rfind("http", 0) == 0) {
+            res.url = line;
+            fpsLineNext = wantFps;
+        } else if (res.url.empty() && res.diagnostics.size() < 400) {
+            if (!res.diagnostics.empty()) {
+                res.diagnostics += " | ";
+            }
+            res.diagnostics += line;
+        }
+    }
+    return res;
+}
+
+// The formats StartSource() and StartSourceWithAudio() ask yt-dlp for.
+static std::string YtVideoFormat(int height) {
+    // Select the best H.264 video-only stream that fits the configured
+    // output height.  This avoids fetching 240p when the user wants
+    // 720p/1080p, while still capping bandwidth to what the Pi can
+    // actually decode and display.
+    return "bestvideo[height<=" + std::to_string(height) + "][vcodec^=avc1]/worst[vcodec^=avc1]";
+}
+// 234 = high quality HLS audio, 233 = low quality HLS audio
+// 140 = AAC 128k from DASH (non-live fallback), 139 = HE-AAC 48k
+static const char* const YT_AUDIO_FORMAT = "234/233/140/139/bestaudio";
+
+static bool IsYouTubeUri(const std::string& uri) {
+    return uri.find("youtube.com/") != std::string::npos ||
+           uri.find("youtu.be/") != std::string::npos;
+}
+
+// yt-dlp results fetched before StartSource() runs (see StartLoadedSources()),
+// keyed by format and URI.  Only touched under VideoInputManager::m_mutex.
+static std::map<std::string, YtDlpResult> s_ytPrefetched;
+
+static std::string YtKey(const std::string& format, const std::string& uri) {
+    return format + "\n" + uri;
+}
+
+// What StartSource() calls: the prefetched answer when there is one, else a
+// live lookup (a source started outside StartLoadedSources()).
+static YtDlpResult ResolveYtDlp(const std::string& format, const std::string& uri, bool wantFps) {
+    auto it = s_ytPrefetched.find(YtKey(format, uri));
+    if (it != s_ytPrefetched.end()) {
+        return it->second;
+    }
+    return RunYtDlp(format, uri, wantFps);
+}
+
+// Adopt the stream's native framerate, but never above the configured one -
+// don't push a source to 60fps just because the stream is 60fps natively when
+// the user asked for 30. videorate handles the downsampling.
+static void ApplyDetectedFps(double detectedFps, int& framerate, const char* name) {
+    if (detectedFps < 1.0 || detectedFps > 120.0) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp fps not available for '%s', using config %dfps\n",
+                name, framerate);
+        return;
+    }
+    int detected = (int)std::lround(detectedFps);
+    int configFps = framerate;
+    framerate = std::min(detected, configFps);
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp detected %dfps for '%s', "
+            "capped to configured %dfps -> using %dfps\n",
+            detected, name, configFps, framerate);
+}
+
+// Warnings about a source's config or its stream (an invalid value, no URI,
+// an RTSP stream with no video).  Each is recorded as it is raised and all
+// come down at the next reload -- which raises again whichever is still true
+// -- and at shutdown; nothing else retracts them.  "Failed to start" also
+// comes down once the source reaches PLAYING.
+static std::mutex s_sourceWarningsLock;
+static std::set<std::string> s_sourceWarnings;
+
+static void AddSourceWarning(const std::string& msg) {
+    {
+        std::lock_guard<std::mutex> lock(s_sourceWarningsLock);
+        s_sourceWarnings.insert(msg);
+    }
+    WarningHolder::AddWarning(56, msg);
+}
+
+static void RemoveSourceWarning(const std::string& msg) {
+    {
+        std::lock_guard<std::mutex> lock(s_sourceWarningsLock);
+        s_sourceWarnings.erase(msg);
+    }
+    WarningHolder::RemoveWarning(56, msg);
+}
+
+static void ClearSourceWarnings() {
+    std::set<std::string> warnings;
+    {
+        std::lock_guard<std::mutex> lock(s_sourceWarningsLock);
+        warnings.swap(s_sourceWarnings);
+    }
+    for (const auto& msg : warnings) {
+        WarningHolder::RemoveWarning(56, msg);
+    }
+}
+
+// Control characters have no representation in the description grammar and
+// never belong in a URI, device path or element name, so reject them up front
+// rather than trying to encode them. Checked once per source in StartSource()
+// instead of at each of the seven splice sites.
+static bool GstValueUsable(const std::string& value, const char* what,
+                           const std::string& sourceName) {
+    for (unsigned char c : value) {
+        if (c < 0x20 || c == 0x7f) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: %s for '%s' contains a control character\n",
+                    what, sourceName.c_str());
+            AddSourceWarning("Video input '" + sourceName + "' has an invalid " + what);
+            return false;
+        }
+    }
+    return true;
+}
+
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+// Per-pipeline state behind the rtspsrc stream decisions below.
+//
+// Heap-allocated and owned by the rtspsrc element as object data -- freed
+// when rtspsrc is finalised along with the pipeline -- rather than living in
+// the SourceInfo.  The pipeline outlives StartSource() and a
+// Reload can reallocate m_sources while it is still running, which is the
+// same hazard the run thread's copied-by-value locals guard against.
+struct RtspStreamFilter {
+    std::string sourceName;
+    bool wantAudio = false;    // mirrors SourceInfo::audioEnabled
+    bool videoSelected = false;
+    bool audioSelected = false;
+    int offered = 0;           // SDP media select-stream has been asked about
+};
+
+static const char* RTSP_FILTER_KEY = "fpp-rtsp-stream-filter";
+
+static std::string NoVideoTrackWarning(const std::string& sourceName) {
+    return "Video input '" + sourceName + "': the RTSP stream contains no video track";
+}
+
+// The camera's SDP offered media, none of it video.  Retried on the backoff
+// like any failed source, since the camera's own configuration can add the
+// video track back; the warning comes down when a video media is selected
+// again (RtspSelectStream), or at the next reload.
+static void ReportNoVideoTrack(const RtspStreamFilter* filter) {
+    LogErr(VB_MEDIAOUT, "VideoInputManager: '%s' RTSP stream offers no video track\n",
+           filter->sourceName.c_str());
+    AddSourceWarning(NoVideoTrackWarning(filter->sourceName));
+}
+
+// rtspsrc's "select-stream" signal: return FALSE to keep it from ever
+// SETUPing a given SDP media.
+//
+// Every media rtspsrc sets up becomes one src pad, and every pad has to
+// reach a sink: an unlinked one makes rtspsrc's delivery loop tear the whole
+// pipeline down with "Internal data stream error ... reason not-linked",
+// which is fatal under protocols=tcp where all media share one connection.
+// The pipelines built below offer exactly one video branch, plus one audio
+// branch when audio extraction is enabled, so accept at most one media for
+// each and refuse the rest before they are ever requested.  Refusing here
+// rather than sinking the extra pads also means the camera never sends
+// them, so nothing is decoded or carried that we would only discard.
+//
+// Taking only the *first* video matters for cameras that advertise two video
+// media in a single SDP -- some offer H.264 and MJPEG as alternatives.  Main
+// and sub substreams are normally separate RTSP URLs and never reach here.
+static gboolean RtspSelectStream(GstElement*, guint idx, GstCaps* caps, gpointer userData) {
+    auto* filter = static_cast<RtspStreamFilter*>(userData);
+    if (!filter || !caps || gst_caps_get_size(caps) == 0) {
+        return TRUE;
+    }
+
+    GstStructure* s = gst_caps_get_structure(caps, 0);
+    const gchar* media = s ? gst_structure_get_string(s, "media") : nullptr;
+
+    // "media" carries the SDP m= line type and is always present in practice.
+    // An unlabelled media is treated as the video track rather than dropped,
+    // so a server we cannot classify still gets its one stream through -- the
+    // same benefit-of-the-doubt the original video-only filter gave it.
+    const bool isVideo = !media || g_strcmp0(media, "video") == 0;
+    const bool isAudio = media && g_strcmp0(media, "audio") == 0;
+    filter->offered++;
+
+    if (isVideo) {
+        if (filter->videoSelected) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: '%s' SDP offers more than one video "
+                    "stream; keeping the first and ignoring media %u\n",
+                    filter->sourceName.c_str(), idx);
+            return FALSE;
+        }
+        filter->videoSelected = true;
+        RemoveSourceWarning(NoVideoTrackWarning(filter->sourceName));
+        return TRUE;
+    }
+
+    if (isAudio && filter->wantAudio && !filter->audioSelected) {
+        filter->audioSelected = true;
+        return TRUE;
+    }
+
+    LogDebug(VB_MEDIAOUT, "VideoInputManager: '%s' ignoring SDP media %u (%s)\n",
+             filter->sourceName.c_str(), idx, media ? media : "unlabelled");
+    return FALSE;
+}
+
+// rtspsrc has finished creating pads for everything select-stream accepted.
+// A stream with no video media at all leaves the video branch empty, which
+// otherwise surfaces only as "No frames" in the preview with nothing in the
+// log to explain it -- so name the actual cause here.
+static void RtspNoMorePads(GstElement*, gpointer userData) {
+    auto* filter = static_cast<RtspStreamFilter*>(userData);
+    if (!filter || filter->videoSelected) {
+        return;
+    }
+    ReportNoVideoTrack(filter);
+}
+
+// When select-stream refused every media -- an audio-only camera on a source
+// with audio off -- rtspsrc creates no pads, so "no-more-pads" never fires:
+// it fails instead with "No supported stream was found", which reads as a
+// transport problem.  Called for a pipeline error; reports the real cause and
+// returns true if that is what happened.
+static bool RtspFailedForNoVideo(GstElement* pipeline) {
+    GstElement* rtspEl = gst_bin_get_by_name(GST_BIN(pipeline), "rtspvsrc");
+    if (!rtspEl) {
+        return false;
+    }
+    // Written on rtspsrc's thread before it posted the error this is called for.
+    auto* filter = static_cast<RtspStreamFilter*>(g_object_get_data(G_OBJECT(rtspEl), RTSP_FILTER_KEY));
+    bool noVideo = filter && filter->offered > 0 && !filter->videoSelected;
+    if (noVideo) {
+        ReportNoVideoTrack(filter);
+    }
+    gst_object_unref(rtspEl);
+    return noVideo;
+}
+
+// Route each rtspsrc pad to the branch matching its media type.
+//
+// Only needed for the audio+video pipeline.  gst_parse_launch's own delayed
+// linking drops its pad-added handler after the first pad it manages to link,
+// so it can satisfy exactly one branch and the second would be left dangling
+// -- the very failure this whole filter exists to prevent.
+static void RtspLinkPadToBranch(GstElement* src, GstPad* pad, gpointer userData) {
+    auto* filter = static_cast<RtspStreamFilter*>(userData);
+    if (!filter) {
+        return;
+    }
+    const std::string& name = filter->sourceName;
+
+    GstCaps* caps = gst_pad_get_current_caps(pad);
+    if (!caps) {
+        caps = gst_pad_query_caps(pad, nullptr);
+    }
+    const gchar* media = nullptr;
+    if (caps && gst_caps_get_size(caps) > 0) {
+        media = gst_structure_get_string(gst_caps_get_structure(caps, 0), "media");
+    }
+    const char* branch = (media && g_strcmp0(media, "audio") == 0) ? "adec" : "vdec";
+
+    GstObject* parent = gst_element_get_parent(src);
+    GstElement* dec = parent ? gst_bin_get_by_name(GST_BIN(parent), branch) : nullptr;
+    if (!dec) {
+        LogErr(VB_MEDIAOUT, "VideoInputManager: '%s' has no '%s' branch for RTSP media '%s'\n",
+               name.c_str(), branch, media ? media : "unlabelled");
+    } else {
+        GstPad* sinkPad = gst_element_get_static_pad(dec, "sink");
+        if (!sinkPad) {
+            LogErr(VB_MEDIAOUT, "VideoInputManager: '%s' branch '%s' has no sink pad\n",
+                   name.c_str(), branch);
+        } else if (gst_pad_is_linked(sinkPad)) {
+            // select-stream should have kept this from happening; if a server
+            // produces a second pad for a branch anyway, leaving it unlinked
+            // would kill the pipeline, so say so rather than fail silently.
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: '%s' branch '%s' is already linked, "
+                    "ignoring extra RTSP media '%s'\n",
+                    name.c_str(), branch, media ? media : "unlabelled");
+        } else {
+            GstPadLinkReturn ret = gst_pad_link(pad, sinkPad);
+            if (ret != GST_PAD_LINK_OK) {
+                LogErr(VB_MEDIAOUT, "VideoInputManager: '%s' could not link RTSP media '%s' "
+                       "to '%s' (%d)\n", name.c_str(), media ? media : "unlabelled", branch, ret);
+            } else {
+                LogInfo(VB_MEDIAOUT, "VideoInputManager: '%s' linked RTSP media '%s' to '%s'\n",
+                        name.c_str(), media ? media : "unlabelled", branch);
+            }
+        }
+        if (sinkPad) {
+            gst_object_unref(sinkPad);
+        }
+        gst_object_unref(dec);
+    }
+    if (parent) {
+        gst_object_unref(parent);
+    }
+    if (caps) {
+        gst_caps_unref(caps);
+    }
+}
+#endif
+
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+// Publish a pipeline's "apwsink" pipewiresink as a PipeWire Audio/Source node
+// so the mix bus can route it, and attach the throughput probe used to spot
+// audio arriving faster or slower than real time.
+//
+// Shared by the YouTube (StartSourceWithAudio) and RTSP audio paths: both end
+// in the same named sink and want it configured identically apart from
+// branchMayStayEmpty, which is set when the source may carry no audio track.
+static void ConfigureAudioSourceSink(GstElement* pipeline, const std::string& audioNodeName,
+                                     const std::string& sourceName, bool branchMayStayEmpty) {
+    GstElement* apwsink = gst_bin_get_by_name(GST_BIN(pipeline), "apwsink");
+    if (apwsink) {
+        std::string audioNodeDesc = "FPP Audio Input: " + sourceName;
+
+        GstStructure* aprops = gst_structure_new("props",
+            "media.class", G_TYPE_STRING, "Audio/Source",
+            "node.name", G_TYPE_STRING, audioNodeName.c_str(),
+            "node.description", G_TYPE_STRING, audioNodeDesc.c_str(),
+            "node.autoconnect", G_TYPE_BOOLEAN, FALSE,
+            "node.always-process", G_TYPE_BOOLEAN, TRUE,
+            "node.latency", G_TYPE_STRING, "2048/48000",
+            "object.register", G_TYPE_STRING, "true",
+            NULL);
+        g_object_set(apwsink, "stream-properties", aprops, NULL);
+        gst_structure_free(aprops);
+
+        g_object_set(apwsink, "mode", PIPEWIRE_SINK_MODE_PROVIDE, NULL);
+        // sync=FALSE: provide mode crashes with sync=TRUE.
+        // The clocksync element upstream paces the audio at real-time instead.
+        g_object_set(apwsink, "sync", FALSE, NULL);
+
+        // An RTSP camera may turn out to advertise no audio at all, leaving this
+        // branch with nothing flowing through it.  async=FALSE keeps the sink out
+        // of the pipeline's preroll so an empty audio branch cannot stall the
+        // video branch's path to PLAYING.  The YouTube path already resolved a
+        // real audio URL before building the pipeline, so it keeps the default.
+        if (branchMayStayEmpty) {
+            g_object_set(apwsink, "async", FALSE, NULL);
+        }
+
+        // Add a throughput probe on pipewiresink's sink pad to measure
+        // how fast audio actually flows (vs expected real-time pace).
+        GstPad* sinkPad = gst_element_get_static_pad(apwsink, "sink");
+        if (sinkPad) {
+            struct ProbeData {
+                int64_t totalBytes;
+                int64_t startUs;
+                int64_t lastLogUs;
+                int64_t lastPtsNs;
+                int sampleRate;
+                int bytesPerFrame;
+            };
+            auto* pd = new ProbeData{0, 0, 0, 0, 48000, 8}; // default 2ch*F32LE=8 bpf
+            gst_pad_add_probe(sinkPad, GST_PAD_PROBE_TYPE_BUFFER,
+                [](GstPad* pad, GstPadProbeInfo* info, gpointer udata) -> GstPadProbeReturn {
+                    auto* d = static_cast<ProbeData*>(udata);
+                    GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+                    if (d->startUs == 0) {
+                        d->startUs = g_get_monotonic_time();
+                        // Log actual negotiated caps
+                        GstCaps* caps = gst_pad_get_current_caps(pad);
+                        if (caps) {
+                            gchar* cs = gst_caps_to_string(caps);
+                            LogInfo(VB_MEDIAOUT, "Audio probe caps: %s\n", cs);
+                            // Extract bytes-per-frame from caps to fix calculation
+                            GstStructure* s = gst_caps_get_structure(caps, 0);
+                            const gchar* fmt = gst_structure_get_string(s, "format");
+                            int ch = 0; gst_structure_get_int(s, "channels", &ch);
+                            int bps = 2; // default S16LE
+                            if (fmt && (strcmp(fmt, "F32LE") == 0 || strcmp(fmt, "F32BE") == 0 ||
+                                        strcmp(fmt, "S32LE") == 0 || strcmp(fmt, "S32BE") == 0))
+                                bps = 4;
+                            else if (fmt && (strcmp(fmt, "F64LE") == 0 || strcmp(fmt, "F64BE") == 0))
+                                bps = 8;
+                            if (ch > 0) d->bytesPerFrame = ch * bps;
+                            g_free(cs);
+                            gst_caps_unref(caps);
+                        }
+                    }
+                    d->totalBytes += gst_buffer_get_size(buf);
+                    // Also track by PTS
+                    GstClockTime pts = GST_BUFFER_PTS(buf);
+                    if (GST_CLOCK_TIME_IS_VALID(pts)) d->lastPtsNs = pts;
+                    int64_t now = g_get_monotonic_time();
+                    if (now - d->lastLogUs >= 5000000) { // every 5s
+                        d->lastLogUs = now;
+                        double audioSecs = (double)d->totalBytes / (d->sampleRate * d->bytesPerFrame);
+                        double wallSecs = (double)(now - d->startUs) / 1000000.0;
+                        double ratio = wallSecs > 0 ? audioSecs / wallSecs : 0;
+                        double ptsSecs = (double)d->lastPtsNs / 1000000000.0;
+                        LogInfo(VB_MEDIAOUT, "Audio throughput: %.1fs audio in %.1fs wall (ratio=%.3f) bpf=%d pts=%.1fs\n",
+                                audioSecs, wallSecs, ratio, d->bytesPerFrame, ptsSecs);
+                    }
+                    return GST_PAD_PROBE_OK;
+                }, pd,
+                [](gpointer udata) { delete static_cast<ProbeData*>(udata); });
+            gst_object_unref(sinkPad);
+        }
+
+        gst_object_unref(apwsink);
+    }
+}
+#endif
+
+VideoInputManager& VideoInputManager::Instance() {
+    static VideoInputManager instance;
+    return instance;
+}
+
+VideoInputManager::~VideoInputManager() {
+    Shutdown();
+}
+
+void VideoInputManager::Init() {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    if (m_initialized)
+        return;
+
+    // Only init if PipeWire backend is active (Simple or Advanced).
+    // Simple PipeWire mode does not configure video input sources by itself,
+    // but the manager is still safe to leave initialised.
+    if (!isPipeWireBackend()) {
+        std::string backend = getSetting("MediaBackend");
+        LogDebug(VB_MEDIAOUT, "VideoInputManager: Skipping init (MediaBackend=%s, not pipewire)\n", backend.c_str());
+        return;
+    }
+
+    m_initialized = true;
+    // A prior Shutdown() may have latched m_shutdownDone; since we're
+    // (re)starting sources here, a future Shutdown() must be allowed to
+    // run its teardown again.
+    m_shutdownDone = false;
+    lock.unlock();
+    {
+        std::lock_guard<std::mutex> rl(m_reloadMutex);
+        m_stopReloads = false;
+    }
+
+    // Load and start the sources on the worker: a YouTube source can take
+    // yt-dlp's whole timeout to resolve, and fppd's startup shouldn't wait.
+    RequestReload();
+}
+
+void VideoInputManager::RequestReload() {
+    std::lock_guard<std::mutex> rl(m_reloadMutex);
+    if (m_stopReloads) {
+        return;
+    }
+    m_reloadPending = true;
+    EnsureReloadWorkerLocked();
+    m_reloadCv.notify_all();
+}
+
+void VideoInputManager::ScheduleSourceRestart(int sourceId) {
+    std::lock_guard<std::mutex> rl(m_reloadMutex);
+    if (m_stopReloads) {
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    RestartState& r = m_restarts[sourceId];
+    if (r.delayMs == 0 || now - r.lastFailure > std::chrono::milliseconds(RESTART_QUIET_RESET_MS)) {
+        r.delayMs = RESTART_MIN_DELAY_MS;
+    } else {
+        r.delayMs = std::min(r.delayMs * 2, RESTART_MAX_DELAY_MS);
+    }
+    r.lastFailure = now;
+    r.due = now + std::chrono::milliseconds(r.delayMs);
+    r.pending = true;
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Restarting source %d in %d ms\n", sourceId, r.delayMs);
+    EnsureReloadWorkerLocked();
+    m_reloadCv.notify_all();
+}
+
+void VideoInputManager::EnsureReloadWorkerLocked() {
+    if (m_reloadRunning) {
+        return;  // the running worker sees the new request and acts on it
+    }
+    if (m_reloadThread.joinable()) {
+        m_reloadThread.join();  // a finished worker; it no longer needs the lock
+    }
+    m_reloadRunning = true;
+    m_reloadThread = std::thread([this]() {
+        SetThreadName("FPP-VideoInReload");
+        std::unique_lock<std::mutex> l(m_reloadMutex);
+        while (!m_stopReloads) {
+            if (m_reloadPending) {
+                // A reload restarts every source from the new config, so
+                // queued restarts and their backoff go with the old one.
+                m_reloadPending = false;
+                m_restarts.clear();
+                l.unlock();
+                Reload();
+                l.lock();
+                continue;
+            }
+            int id = -1;
+            std::chrono::steady_clock::time_point due;
+            for (const auto& [sid, r] : m_restarts) {
+                if (r.pending && (id < 0 || r.due < due)) {
+                    id = sid;
+                    due = r.due;
+                }
+            }
+            if (id < 0) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() < due) {
+                m_reloadCv.wait_until(l, due);
+                continue;
+            }
+            m_restarts[id].pending = false;
+            l.unlock();
+            RestartSource(id);
+            l.lock();
+        }
+        m_reloadRunning = false;
+    });
+}
+
+void VideoInputManager::RestartSource(int sourceId) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    auto find = [this, sourceId]() -> SourceInfo* {
+        for (auto& s : m_sources) {
+            if (s.id == sourceId) {
+                return &s;
+            }
+        }
+        return nullptr;
+    };
+    SourceInfo* source = find();
+    if (!m_initialized || !source || !source->enabled || source->running) {
+        return;
+    }
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Restarting source '%s'\n", source->name.c_str());
+    // The run thread cleared `running` on its way out and takes no lock after
+    // that, so this join is immediate.
+    StopSource(*source);
+
+    bool youTube = source->type == "urisrc" && IsYouTubeUri(source->uri);
+    std::string uri = source->uri;
+    int height = source->height;
+    bool audio = source->audioEnabled;
+    lock.unlock();
+
+    // As in Reload(): the old pipeline must let go of the device or socket
+    // before the new one opens it, and a wedged teardown or a yt-dlp lookup
+    // must not hold m_mutex.
+    JoinTeardownThreads();
+    std::map<std::string, YtDlpResult> results;
+    if (youTube) {
+        results[YtKey(YtVideoFormat(height), uri)] = RunYtDlp(YtVideoFormat(height), uri, true);
+        if (audio) {
+            results[YtKey(YT_AUDIO_FORMAT, uri)] = RunYtDlp(YT_AUDIO_FORMAT, uri, false);
+        }
+    }
+
+    lock.lock();
+    {
+        std::lock_guard<std::mutex> rl(m_reloadMutex);
+        if (m_stopReloads) {
+            return;
+        }
+    }
+    source = find();
+    if (!m_initialized || !source || !source->enabled || source->running) {
+        return;
+    }
+    s_ytPrefetched = std::move(results);
+    bool started = StartSource(*source);
+    s_ytPrefetched.clear();
+    if (!started) {
+        // A lookup or a resource that isn't back yet (a YouTube URL that
+        // won't resolve): keep trying, on the backoff.
+        ScheduleSourceRestart(sourceId);
+    }
+}
+
+void VideoInputManager::StartLoadedSources(std::unique_lock<std::mutex>& lock) {
+    // Resolving a YouTube source runs yt-dlp, which can take as long as its
+    // timeout.  Holding m_mutex across that stalled everything that asks this
+    // manager about its sources -- the video output manager starting media
+    // playback among them, under its own lock.  Collect what needs resolving,
+    // resolve it unlocked, and start the sources from the results.
+    struct YtJob {
+        std::string format;
+        std::string uri;
+        bool wantFps;
+    };
+    std::vector<YtJob> jobs;
+    for (const auto& source : m_sources) {
+        if (source.enabled && source.type == "urisrc" && IsYouTubeUri(source.uri)) {
+            jobs.push_back({ YtVideoFormat(source.height), source.uri, true });
+            if (source.audioEnabled) {
+                jobs.push_back({ YT_AUDIO_FORMAT, source.uri, false });
+            }
+        }
+    }
+    if (!jobs.empty()) {
+        lock.unlock();
+        std::map<std::string, YtDlpResult> results;
+        for (const auto& job : jobs) {
+            {
+                // Shutdown() waits for this; don't make it wait for every
+                // source when one lookup would do.
+                std::lock_guard<std::mutex> rl(m_reloadMutex);
+                if (m_stopReloads) {
+                    break;
+                }
+            }
+            results[YtKey(job.format, job.uri)] = RunYtDlp(job.format, job.uri, job.wantFps);
+        }
+        lock.lock();
+        s_ytPrefetched = std::move(results);
+        std::lock_guard<std::mutex> rl(m_reloadMutex);
+        if (m_stopReloads) {
+            // Shutting down: don't start what it is about to tear down.
+            s_ytPrefetched.clear();
+            return;
+        }
+    }
+    for (auto& source : m_sources) {
+        // A source that can't start yet (yt-dlp with no network at boot, a
+        // camera still coming up) is retried on the backoff, like one whose
+        // pipeline dies later; nothing else would try it again before Apply.
+        if (source.enabled && !StartSource(source)) {
+            ScheduleSourceRestart(source.id);
+        }
+    }
+    s_ytPrefetched.clear();
+}
+
+void VideoInputManager::Reload() {
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Reloading configuration\n");
+    StopAllSources();
+
+    // Join the teardown threads spawned by the StopAllSources() above (plus
+    // any still outstanding from an earlier cycle) before touching the
+    // devices/URIs again — otherwise StartSource() below can race the old
+    // pipeline's gst_element_set_state(..., NULL) and fail to reopen a
+    // v4l2/rtsp resource that's still held (EBUSY).
+    JoinTeardownThreads();
+
+    // The sources are rebuilt from the new config, and raise again what
+    // still applies.  Cleared only now: until the old run threads were
+    // joined and their pipelines set to NULL (which stops rtspsrc's
+    // streaming thread), they could still raise "failed to start" or "no
+    // video track" for a source the new config may not have.
+    ClearSourceWarnings();
+
+    std::unique_lock<std::mutex> lock(m_mutex);
+    m_initialized = true;
+    // See Init(): allow a subsequent Shutdown() to run its teardown again.
+    m_shutdownDone = false;
+
+    if (LoadConfig()) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Reloaded with %d source(s)\n", (int)m_sources.size());
+        StartLoadedSources(lock);
+    }
+}
+
+void VideoInputManager::Shutdown() {
+    // Idempotent: main() calls this at shutdown and ~VideoInputManager() calls
+    // it again at static-destruction time. Run the teardown only once.
+    if (m_shutdownDone.exchange(true)) {
+        return;
+    }
+    // No reloads from here on, and wait out one in progress: it is about to
+    // start sources this is tearing down.
+    std::thread reloadWorker;
+    {
+        std::lock_guard<std::mutex> rl(m_reloadMutex);
+        m_stopReloads = true;
+        m_reloadPending = false;
+        m_restarts.clear();
+        reloadWorker = std::move(m_reloadThread);
+    }
+    m_reloadCv.notify_all();
+    // A YouTube lookup can run for its full timeout, far longer than
+    // fppd_stop waits before it kills fppd.
+    KillRunningYtDlp();
+    if (reloadWorker.joinable()) {
+        reloadWorker.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_initialized = false;
+    }
+    StopAllSources();
+    // Make sure every teardown thread spawned above (and any left over from
+    // a prior Reload) has actually finished before we consider Shutdown()
+    // complete, so nothing outlives the process.
+    JoinTeardownThreads();
+    ClearSourceWarnings();
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Shutdown complete\n");
+}
+
+bool VideoInputManager::HasSources() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return !m_sources.empty();
+}
+
+bool VideoInputManager::HasActiveSources() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& s : m_sources) {
+        if (s.running)
+            return true;
+    }
+    return false;
+}
+
+int VideoInputManager::ActiveSourceCount() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    int count = 0;
+    for (const auto& s : m_sources) {
+        if (s.running)
+            count++;
+    }
+    return count;
+}
+
+std::string VideoInputManager::GetSourceNodeName(int sourceId) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& s : m_sources) {
+        if (s.id == sourceId && s.running)
+            return s.pipeWireNodeName;
+    }
+    return "";
+}
+
+std::vector<std::pair<int, std::string>> VideoInputManager::GetSourceList() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<std::pair<int, std::string>> result;
+    for (const auto& s : m_sources) {
+        result.emplace_back(s.id, s.pipeWireNodeName);
+    }
+    return result;
+}
+
+int VideoInputManager::GetSourceFramerate(const std::string& channelName) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& s : m_sources) {
+        if (s.pipeWireNodeName == channelName)
+            return s.framerate;
+    }
+    return 0;
+}
+
+bool VideoInputManager::IsSourceRunning(const std::string& channelName) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& s : m_sources) {
+        if (s.pipeWireNodeName == channelName)
+            return s.running.load();
+    }
+    return false;
+}
+
+bool VideoInputManager::LoadConfig() {
+    std::string configPath = FPP_DIR_MEDIA("/config/pipewire-video-input-sources-gen.json");
+
+    if (!FileExists(configPath)) {
+        LogDebug(VB_MEDIAOUT, "VideoInputManager: No config at %s\n", configPath.c_str());
+        return false;
+    }
+
+    std::ifstream ifs(configPath);
+    if (!ifs.is_open()) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Cannot open %s\n", configPath.c_str());
+        return false;
+    }
+
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    if (!Json::parseFromStream(builder, ifs, &root, &errors)) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: JSON parse error: %s\n", errors.c_str());
+        return false;
+    }
+
+    if (!root.isArray()) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Config is not an array\n");
+        return false;
+    }
+
+    for (const auto& entry : root) {
+        SourceInfo si;
+        // asInt()/asBool()/asString() throw on a value of the wrong type, and
+        // this runs on the reload worker thread, where an escaping exception
+        // terminates fppd (at every start, since Init() asks for a reload);
+        // skip that source.
+        try {
+            if (!entry.isObject()) {
+                continue;
+            }
+            si.id = entry.get("id", 0).asInt();
+            si.name = entry.get("name", "").asString();
+            si.type = entry.get("type", "").asString();
+            si.pipeWireNodeName = entry.get("pipeWireNodeName", "").asString();
+            si.enabled = entry.get("enabled", true).asBool();
+
+            si.width = entry.get("width", 320).asInt();
+            si.height = entry.get("height", 240).asInt();
+            si.framerate = entry.get("framerate", 10).asInt();
+
+            if (si.type == "videotestsrc") {
+                si.pattern = entry.get("pattern", "smpte").asString();
+            } else if (si.type == "v4l2src") {
+                si.device = entry.get("device", "/dev/video0").asString();
+                si.powerLineFrequency = entry.get("powerLineFrequency", -1).asInt();
+                si.exposureMode = entry.get("exposureMode", "camera").asString();
+                si.exposureTime100us = entry.get("exposureTime100us", -1).asInt();
+                si.dynamicFramerate = entry.get("dynamicFramerate", -1).asInt();
+                if (si.powerLineFrequency < 0 || si.powerLineFrequency > 2)
+                    si.powerLineFrequency = -1;
+                if (si.exposureMode != "auto" && si.exposureMode != "manual")
+                    si.exposureMode = "camera";
+                if (si.dynamicFramerate < 0 || si.dynamicFramerate > 1)
+                    si.dynamicFramerate = -1;
+                // 100us units: 1 .. 1s.  The device's own range is applied on
+                // top of this in V4L2Device::ApplyControls.
+                if (si.exposureTime100us < 1 || si.exposureTime100us > 10000)
+                    si.exposureTime100us = -1;
+            } else if (si.type == "rtspsrc") {
+                si.uri = entry.get("uri", "").asString();
+                si.latency = entry.get("latency", 200).asInt();
+                if (si.latency < 0) si.latency = 0;
+                if (si.latency > 10000) si.latency = 10000;
+            } else if (si.type == "urisrc") {
+                si.uri = entry.get("uri", "").asString();
+                si.bufferSec = entry.get("bufferSec", 3.0).asDouble();
+                if (si.bufferSec < 0) si.bufferSec = 0;
+                if (si.bufferSec > 30) si.bufferSec = 30;
+            } else if (si.type == "rtpsrc") {
+                si.port = entry.get("port", 5004).asInt();
+                si.encoding = entry.get("encoding", "H264").asString();
+                si.multicastGroup = entry.get("multicastGroup", "").asString();
+                if (si.port < 1024) si.port = 1024;
+                if (si.port > 65535) si.port = 65535;
+            }
+
+            // Audio extraction settings
+            si.audioEnabled = entry.get("audioEnabled", false).asBool();
+            si.audioPipeWireNodeName = entry.get("audioPipeWireNodeName", "").asString();
+        } catch (const std::exception& ex) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: skipping a source in %s, a value has the wrong type: %s\n",
+                    configPath.c_str(), ex.what());
+            continue;
+        }
+
+        if (si.type.empty() || si.pipeWireNodeName.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: Skipping source with missing type or node name\n");
+            continue;
+        }
+
+        // Clamp to reasonable bounds
+        if (si.width < 16) si.width = 16;
+        if (si.width > 3840) si.width = 3840;
+        if (si.height < 16) si.height = 16;
+        if (si.height > 2160) si.height = 2160;
+        if (si.framerate < 1) si.framerate = 1;
+        if (si.framerate > 60) si.framerate = 60;
+
+        m_sources.push_back(std::move(si));
+    }
+
+    return !m_sources.empty();
+}
+
+std::string VideoInputManager::BuildDeviceCaps(const SourceInfo& source) {
+    std::vector<V4L2Device::Mode> modes = V4L2Device::EnumerateModes(source.device);
+    if (modes.empty()) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s enumerated no capture modes, "
+                             "letting the device pick its own\n", source.device.c_str());
+        return "";
+    }
+
+    V4L2Device::Mode chosen;
+    if (!V4L2Device::SelectMode(modes, source.width, source.height, source.framerate, chosen))
+        return "";
+
+    std::string caps = V4L2Device::ModeToCaps(chosen);
+    if (caps.empty()) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s best mode is %s (no caps mapping), "
+                             "letting the device pick its own\n",
+                source.device.c_str(), chosen.fourcc.c_str());
+        return "";
+    }
+
+    if (chosen.width != source.width || chosen.height != source.height ||
+        chosen.fps() < source.framerate - 0.01) {
+        // Worth saying out loud: this is the difference between what the
+        // operator typed and what the camera can actually deliver, and the
+        // scaler silently papering over it is what made the old behaviour
+        // hard to spot.
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s has no %dx%d@%d mode; capturing %s %dx%d@%.3g "
+                             "and converting\n",
+                source.device.c_str(), source.width, source.height, source.framerate,
+                chosen.fourcc.c_str(), chosen.width, chosen.height, chosen.fps());
+    } else {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s capturing %s %dx%d@%.3g\n",
+                source.device.c_str(), chosen.fourcc.c_str(), chosen.width, chosen.height, chosen.fps());
+    }
+
+    return caps;
+}
+
+bool VideoInputManager::StartSource(SourceInfo& source) {
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+    if (source.running) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' already running\n", source.name.c_str());
+        return true;
+    }
+
+    // Sources start from Init()/Reload(), which a config change can trigger
+    // before any media has played -- and media playback is what used to be the
+    // only thing that called gst_init().  Without this, gst_parse_launch()
+    // below segfaults inside GStreamer's own parser on a perfectly well-formed
+    // pipeline description.
+    GStreamerOutput::EnsureGStreamerInit();
+
+    setenv("PIPEWIRE_RUNTIME_DIR", "/run/pipewire-fpp", 0);
+
+    if (!GstValueUsable(source.uri, "URI", source.name) ||
+        !GstValueUsable(source.device, "capture device path", source.name) ||
+        !GstValueUsable(source.pattern, "test pattern", source.name) ||
+        !GstValueUsable(source.multicastGroup, "multicast group", source.name) ||
+        !GstValueUsable(source.pipeWireNodeName, "node name", source.name)) {
+        return false;
+    }
+
+    // Build the source element portion of the pipeline
+    std::string srcElement;
+    bool useDecodebin = false;
+    bool useUridecodebin = false;
+    bool useRtspAudio = false;
+    if (source.type == "videotestsrc") {
+        srcElement = "videotestsrc is-live=true";
+        if (!source.pattern.empty()) {
+            srcElement += " pattern=" + GstQuote(source.pattern);
+        }
+    } else if (source.type == "v4l2src") {
+        if (source.device.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: v4l2src '%s' has no device path\n", source.name.c_str());
+            AddSourceWarning("Video input '" + source.name + "' has no capture device path configured");
+            return false;
+        }
+        srcElement = "v4l2src device=" + GstQuote(source.device);
+    } else if (source.type == "rtspsrc") {
+        if (source.uri.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: rtspsrc '%s' has no URI\n", source.name.c_str());
+            AddSourceWarning("Video input '" + source.name + "' (RTSP) has no URI configured");
+            return false;
+        }
+        // rtspsrc → decodebin handles codec negotiation (H.264, H.265, MJPEG, etc.)
+        // name=rtspvsrc lets us fetch the element below to filter which SDP
+        // media are set up at all (see the select-stream connection further
+        // down), and to route the resulting pads when audio is wanted too.
+        srcElement = "rtspsrc name=rtspvsrc location=" + GstQuote(source.uri)
+                   + " latency=" + std::to_string(source.latency)
+                   + " protocols=tcp";
+        // With audio enabled the camera's audio track is kept and published as
+        // its own PipeWire source, which needs a second branch and so a
+        // different pipeline shape -- built below rather than by useDecodebin.
+        useRtspAudio = source.audioEnabled;
+        useDecodebin = !useRtspAudio;
+    } else if (source.type == "urisrc") {
+        if (source.uri.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: urisrc '%s' has no URI\n", source.name.c_str());
+            AddSourceWarning("Video input '" + source.name + "' has no URI configured");
+            return false;
+        }
+        std::string resolvedUri = source.uri;
+
+        // Detect YouTube URLs and resolve to a direct stream URL via yt-dlp.
+        // YouTube page URLs can't be played by GStreamer directly, and the
+        // resolved URLs expire after ~1 hour, so we resolve at start time.
+        // When audioEnabled is true for YouTube sources, skip resolution here —
+        // StartSourceWithAudio resolves separate video + audio URLs.
+        if (!source.audioEnabled &&
+            (resolvedUri.find("youtube.com/") != std::string::npos ||
+             resolvedUri.find("youtu.be/") != std::string::npos)) {
+            LogInfo(VB_MEDIAOUT, "VideoInputManager: Resolving YouTube URL for '%s' via yt-dlp\n",
+                    source.name.c_str());
+            YtDlpResult yt = ResolveYtDlp(YtVideoFormat(source.height), resolvedUri, true);
+            if (yt.url.empty()) {
+                // Do not fall back to the original page URL. uridecodebin will
+                // happily fetch it, get text/html back, and fail with "Your
+                // GStreamer installation is missing a plug-in ... Missing
+                // decoder: text/html" - which reads like a broken GStreamer
+                // install and sends you looking in entirely the wrong place.
+                // The source cannot start until yt-dlp resolves it, so fail
+                // here and say why.
+                LogErr(VB_MEDIAOUT, "VideoInputManager: yt-dlp could not resolve the URL for '%s': %s\n",
+                       source.name.c_str(),
+                       yt.diagnostics.empty() ? "no output" : yt.diagnostics.c_str());
+                AddSourceWarning("Video input '" + source.name
+                    + "': yt-dlp could not resolve the YouTube URL - it may need updating");
+                return false;
+            }
+            LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp resolved '%s' -> %zu-char stream URL\n",
+                    source.name.c_str(), yt.url.size());
+            resolvedUri = yt.url;
+            ApplyDetectedFps(yt.fps, source.framerate, source.name.c_str());
+        }
+
+        // uridecodebin handles full URI negotiation: HTTP, HLS (.m3u8),
+        // MPEG-DASH, direct files, etc.  It selects the right source
+        // element (souphttpsrc, hlsdemux, …) and decoder automatically.
+        // caps="video/x-raw" restricts output to decoded video only —
+        // without it, streams containing audio+video (e.g. HLS) will
+        // expose an audio pad with no consumer, blocking preroll.
+        srcElement = "uridecodebin uri=" + GstQuote(resolvedUri)
+                   + " caps=\"video/x-raw\"";
+        // uridecodebin already includes decoding — do NOT add another
+        // decodebin after it.  Just need videoconvert + videoscale + caps.
+        useDecodebin = false;
+        useUridecodebin = true;
+    } else if (source.type == "rtpsrc") {
+        // UDP RTP receiver with appropriate depayloader
+        std::string caps;
+        std::string depay;
+        if (source.encoding == "H264") {
+            caps = "application/x-rtp,media=video,encoding-name=H264,clock-rate=90000";
+            depay = "rtph264depay";
+        } else if (source.encoding == "H265") {
+            caps = "application/x-rtp,media=video,encoding-name=H265,clock-rate=90000";
+            depay = "rtph265depay";
+        } else if (source.encoding == "JPEG") {
+            caps = "application/x-rtp,media=video,encoding-name=JPEG,clock-rate=90000";
+            depay = "rtpjpegdepay";
+        } else if (source.encoding == "MP2T") {
+            caps = "application/x-rtp,media=video,encoding-name=MP2T,clock-rate=90000";
+            depay = "rtpmp2tdepay";
+        } else {
+            // RAW or unknown — use decodebin to auto-detect
+            caps = "application/x-rtp";
+            depay = "";
+        }
+        srcElement = "udpsrc port=" + std::to_string(source.port);
+        if (!source.multicastGroup.empty()) {
+            srcElement += " multicast-group=" + GstQuote(source.multicastGroup)
+                        + " auto-multicast=true";
+        }
+        srcElement += " caps=\"" + caps + "\"";
+        if (!depay.empty()) {
+            srcElement += " ! " + depay;
+        }
+        useDecodebin = true;
+    } else {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Unknown source type '%s'\n", source.type.c_str());
+        AddSourceWarning("Video input '" + source.name + "' has unknown source type '" + source.type + "'");
+        return false;
+    }
+
+    // Build full pipeline:
+    //   <source> ! capsfilter ! videoconvert ! queue ! pipewiresink(mode=provide)
+    // For rtspsrc: rtspsrc ! decodebin ! videoconvert ! videoscale ! caps ! queue ! pipewiresink
+
+    // When audio is enabled for YouTube urisrc sources, delegate to
+    // StartSourceWithAudio which resolves separate video + audio URLs.
+    // YouTube muxed HLS formats return 403 for segment downloads, so
+    // we use two separate uridecodebin elements.
+    if (source.audioEnabled && useUridecodebin) {
+        bool isYouTube = source.uri.find("youtube.com/") != std::string::npos ||
+                         source.uri.find("youtu.be/") != std::string::npos;
+        if (isYouTube) {
+            if (StartSourceWithAudio(source)) {
+                return true;
+            }
+            // StartSourceWithAudio() couldn't resolve the video and/or audio
+            // URL (e.g. yt-dlp found no separate audio stream) and returned
+            // false without starting anything. Don't leave the source
+            // unstarted — retry as video-only. Clearing audioEnabled makes
+            // this re-entrant call take the plain yt-dlp video-URL
+            // resolution path above (it's skipped above while audioEnabled
+            // is set, since that path is StartSourceWithAudio's job).
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: '%s' failed to start with audio, "
+                    "retrying as video-only\n", source.name.c_str());
+            source.audioEnabled = false;
+            return StartSource(source);
+        }
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: audioEnabled not supported for non-YouTube urisrc '%s', ignoring audio\n",
+                source.name.c_str());
+    }
+
+    // pixel-aspect-ratio=1/1 is load-bearing.  Forcing width and height
+    // alone lets videoscale hit the requested size by changing the PAR
+    // instead of actually rescaling: a 4:3 camera configured as 1280x720
+    // produced caps of 1280x720 with pixel-aspect-ratio=3/4, i.e. a frame
+    // that still displays 4:3.  Pinning square pixels makes videoscale do
+    // the real work, and its add-borders default letterboxes rather than
+    // distorting when the source and target aspects differ.
+    std::string capsStr = "video/x-raw,width=" + std::to_string(source.width)
+                        + ",height=" + std::to_string(source.height)
+                        + ",pixel-aspect-ratio=1/1"
+                        + ",framerate=" + std::to_string(source.framerate) + "/1";
+
+    std::string pipelineDesc;
+    if (useRtspAudio) {
+        // Two branches in ONE GstPipeline so both share a clock and base_time.
+        // Separate pipelines pace independently and drift apart, which is why
+        // StartSourceWithAudio() combines its branches the same way.
+        //
+        // rtspsrc's pads are deliberately left unlinked in this description:
+        // gst_parse_launch can only ever satisfy one of them, so
+        // RtspLinkPadToBranch() connects each pad to vdec or adec by media
+        // type once rtspsrc creates it.  Each decodebin therefore handles a
+        // single stream and its own dynamic src pad links normally.
+        pipelineDesc = srcElement
+            + " decodebin name=vdec"
+            + " ! videoconvert"
+            + " ! videoscale"
+            + " ! videorate"
+            + " ! " + capsStr
+            + " ! queue max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0"
+            + " ! clocksync"
+            + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName)
+            + " decodebin name=adec"
+            + " ! audioconvert"
+            + " ! audioresample"
+            + " ! audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved"
+            + " ! queue max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0"
+            + " ! clocksync"
+            + " ! pipewiresink name=apwsink";
+    } else if (useUridecodebin) {
+        // uridecodebin already decodes — just convert/scale/queue to intervideosink.
+        // videorate converts the stream's native framerate to the configured one.
+        // clocksync paces bursty HLS delivery at real-time.
+        pipelineDesc = srcElement
+            + " ! videoconvert"
+            + " ! videoscale"
+            + " ! videorate"
+            + " ! " + capsStr
+            + " ! queue max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0"
+            + " ! clocksync"
+            + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName);
+    } else if (useDecodebin) {
+        // RTSP: decodebin handles codec negotiation, videoscale + caps enforce resolution.
+        // videorate needed when stream framerate differs from configured value.
+        // clocksync paces delivery at real-time.
+        pipelineDesc = srcElement
+            + " ! decodebin"
+            + " ! videoconvert"
+            + " ! videoscale"
+            + " ! videorate"
+            + " ! " + capsStr
+            + " ! queue max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0"
+            + " ! clocksync"
+            + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName);
+    } else if (source.type == "v4l2src") {
+        // Cameras only negotiate their own native modes.  Asking v4l2src
+        // directly for video/x-raw at an arbitrary width/height/framerate
+        // fails to negotiate and the pipeline never leaves READY, which
+        // surfaced only as "failed to start" in the log.  decodebin covers
+        // MJPEG-only and H.264 webcams (very common above VGA), and passes
+        // already-raw formats straight through; videoscale/videorate then
+        // convert whatever the camera gave us to the configured size/rate.
+        //
+        // Leaving the device *entirely* unconstrained, though, meant the
+        // configured resolution and framerate never reached it at all:
+        // v4l2src picked the device's own preferred mode (a 1920x1080@30
+        // source was observed capturing 640x480@60) and videoscale/videorate
+        // resampled that to the configured numbers, so the settings looked
+        // applied while the capture ignored them.  BuildDeviceCaps asks the
+        // device what it actually supports and pins the closest real mode,
+        // returning "" -- and so restoring exactly the unconstrained
+        // behaviour above -- whenever it can't be sure.
+        std::string deviceCaps = BuildDeviceCaps(source);
+
+        pipelineDesc = srcElement
+            + (deviceCaps.empty() ? "" : " ! " + deviceCaps)
+            + " ! decodebin"
+            + " ! videoconvert"
+            + " ! videoscale"
+            + " ! videorate"
+            + " ! " + capsStr
+            + " ! queue max-size-buffers=2 leaky=downstream"
+            + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName);
+    } else {
+        pipelineDesc = srcElement
+            + " ! " + capsStr
+            + " ! videoconvert"
+            + " ! queue max-size-buffers=2"
+            + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName);
+    }
+
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Starting source '%s' (%s): %s\n",
+            source.name.c_str(), source.type.c_str(), pipelineDesc.c_str());
+
+    GError* error = nullptr;
+    source.pipeline = gst_parse_launch(pipelineDesc.c_str(), &error);
+    if (!source.pipeline) {
+        LogErr(VB_MEDIAOUT, "VideoInputManager: Failed to create pipeline for '%s': %s\n",
+               source.name.c_str(), error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        return false;
+    }
+    GStreamerOutput::GuardVideoConvertInputs(source.pipeline);
+    if (error) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Pipeline warning for '%s': %s\n",
+                source.name.c_str(), error->message);
+        g_error_free(error);
+    }
+
+    if (source.type == "rtspsrc") {
+        GstElement* rtspEl = gst_bin_get_by_name(GST_BIN(source.pipeline), "rtspvsrc");
+        if (rtspEl) {
+            // Owned by the element: freed when rtspsrc is finalised with the
+            // pipeline, so it outlives every handler below and the run
+            // thread's error check (RtspFailedForNoVideo).  The three handlers
+            // run on rtspsrc's own thread, one media at a time, so the shared
+            // state needs no locking.
+            auto* filter = new RtspStreamFilter{ source.name, useRtspAudio, false, false };
+            g_object_set_data_full(G_OBJECT(rtspEl), RTSP_FILTER_KEY, filter,
+                                   [](gpointer d) { delete static_cast<RtspStreamFilter*>(d); });
+            g_signal_connect(rtspEl, "select-stream", G_CALLBACK(RtspSelectStream), filter);
+            if (useRtspAudio) {
+                g_signal_connect(rtspEl, "pad-added", G_CALLBACK(RtspLinkPadToBranch), filter);
+            }
+            g_signal_connect(rtspEl, "no-more-pads", G_CALLBACK(RtspNoMorePads), filter);
+            gst_object_unref(rtspEl);
+        }
+    }
+
+    if (useRtspAudio) {
+        // Publish the camera's audio as its own PipeWire Audio/Source node.
+        // branchMayStayEmpty: unlike the YouTube path, nothing has confirmed
+        // the camera actually offers audio, and it may advertise none.
+        std::string audioNodeName = source.audioPipeWireNodeName;
+        if (audioNodeName.empty())
+            audioNodeName = source.pipeWireNodeName + "_audio";
+        ConfigureAudioSourceSink(source.pipeline, audioNodeName, source.name, true);
+
+        // Both branches pace against one clock rather than letting
+        // pipewiresink provide its own, matching StartSourceWithAudio().
+        GstClock* sysClock = gst_system_clock_obtain();
+        gst_pipeline_use_clock(GST_PIPELINE(source.pipeline), sysClock);
+        gst_object_unref(sysClock);
+    }
+
+    // Video sink is intervideosink — no PipeWire configuration needed.
+    // The channel name (set in the pipeline description) matches the
+    // consumer's intervideosrc channel for in-process video routing.
+    // PipeWire's video driver scheduling (rate=0) cannot drive video
+    // graph cycles, so we bypass PipeWire for video entirely.
+
+    // Start in a background thread — set_state(PLAYING) can block
+    source.shutdownRequested = false;
+    source.running = true;
+
+    std::string sourceName = source.name;
+    std::string nodeNameCopy = source.pipeWireNodeName;
+    const int sourceId = source.id;
+    GstElement* pipeline = source.pipeline;
+    std::atomic<bool>* shutdownFlag = &source.shutdownRequested;
+    std::atomic<bool>* runningFlag = &source.running;
+
+    // Copied by value into the thread rather than reached through `source`:
+    // the run thread outlives this call and m_sources can be reallocated by
+    // a Reload while it is still going.
+    std::string deviceCopy = source.device;
+    V4L2Device::ControlSettings controls;
+    if (source.type == "v4l2src") {
+        controls.powerLineFrequency = source.powerLineFrequency;
+        controls.exposureMode = source.exposureMode;
+        controls.exposureTime100us = source.exposureTime100us;
+        controls.dynamicFramerate = source.dynamicFramerate;
+    }
+
+    source.runThread = std::thread([pipeline, sourceName, nodeNameCopy, shutdownFlag, runningFlag,
+                                    deviceCopy, controls, sourceId]() {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' thread starting pipeline (node=%s)\n",
+                sourceName.c_str(), nodeNameCopy.c_str());
+
+        // Device controls (anti-flicker / exposure) are applied twice on
+        // purpose: once here so v4l2src inherits them when it opens the
+        // node, and again once the pipeline is actually PLAYING so a driver
+        // that resets on open doesn't undo them.  The writes are idempotent
+        // and cost one ioctl each.
+        auto applyControls = [deviceCopy, controls, sourceName]() {
+            if (!controls.AnyRequested())
+                return;
+            std::string summary;
+            if (V4L2Device::ApplyControls(deviceCopy, controls, summary) && !summary.empty()) {
+                LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' device controls: %s\n",
+                        sourceName.c_str(), summary.c_str());
+            }
+        };
+        applyControls();
+
+        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            if (!shutdownFlag->load()) {
+                LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' failed to start\n", sourceName.c_str());
+                AddSourceWarning("Video input '" + sourceName + "' failed to start");
+            }
+            *runningFlag = false;
+            if (!shutdownFlag->load()) {
+                VideoInputManager::Instance().ScheduleSourceRestart(sourceId);
+            }
+            return;
+        }
+
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' pipeline state=%s (waiting for data)\n",
+                sourceName.c_str(),
+                ret == GST_STATE_CHANGE_SUCCESS ? "PLAYING" :
+                ret == GST_STATE_CHANGE_ASYNC   ? "ASYNC"   : "OTHER");
+
+        // If pipeline went straight to PLAYING (no async), notify consumers now.
+        if (ret == GST_STATE_CHANGE_SUCCESS) {
+            applyControls();
+            VideoOutputManager::Instance().NotifyProducerReady(nodeNameCopy);
+            // Up again after a restart: retract the banner its failure raised.
+            WarningHolder::RemoveWarning(56, "Video input '" + sourceName + "' failed to start");
+        }
+
+        // Monitor the pipeline bus for errors / EOS
+        GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
+        while (!shutdownFlag->load()) {
+            GstMessage* msg = gst_bus_timed_pop(bus, 500 * GST_MSECOND);
+            if (!msg) continue;
+
+            switch (GST_MESSAGE_TYPE(msg)) {
+                case GST_MESSAGE_ERROR: {
+                    GError* err = nullptr;
+                    gchar* debug = nullptr;
+                    gst_message_parse_error(msg, &err, &debug);
+                    if (!shutdownFlag->load() && !RtspFailedForNoVideo(pipeline)) {
+                        LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' error: %s (%s)\n",
+                                sourceName.c_str(), err ? err->message : "?", debug ? debug : "");
+                    }
+                    if (err) g_error_free(err);
+                    g_free(debug);
+                    gst_message_unref(msg);
+                    gst_object_unref(bus);
+                    // Drop the dead pipeline out of PLAYING so it releases
+                    // its device fd / socket / decoder buffers now instead
+                    // of holding them until the next Reload/Shutdown (this
+                    // pipeline is per-daemon-lifetime, so that could be
+                    // days). StopSource() still owns unref'ing source.pipeline.
+                    gst_element_set_state(pipeline, GST_STATE_NULL);
+                    *runningFlag = false;
+                    if (!shutdownFlag->load()) {
+                        VideoInputManager::Instance().ScheduleSourceRestart(sourceId);
+                    }
+                    return;
+                }
+                case GST_MESSAGE_BUFFERING: {
+                    // HLS / adaptive streams send buffering messages from
+                    // internal queue2 elements.  For live streams, pausing
+                    // on low buffer levels starves downstream (pipewiresink)
+                    // and prevents PipeWire consumers from connecting.
+                    // Just log without pausing — the internal queues handle
+                    // buffering on their own.
+                    gint percent = 0;
+                    gst_message_parse_buffering(msg, &percent);
+                    if (percent == 0 || percent == 100) {
+                        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' buffering %d%%\n",
+                                sourceName.c_str(), percent);
+                    }
+                    break;
+                }
+                case GST_MESSAGE_STATE_CHANGED: {
+                    if (GST_MESSAGE_SRC(msg) == GST_OBJECT(pipeline)) {
+                        GstState oldState, newState, pending;
+                        gst_message_parse_state_changed(msg, &oldState, &newState, &pending);
+                        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' state %s -> %s (pending=%s)\n",
+                                sourceName.c_str(),
+                                gst_element_state_get_name(oldState),
+                                gst_element_state_get_name(newState),
+                                gst_element_state_get_name(pending));
+                        if (newState == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING) {
+                            applyControls();
+                            VideoOutputManager::Instance().NotifyProducerReady(nodeNameCopy);
+                            // Up again after a restart: retract the banner its failure raised.
+                            WarningHolder::RemoveWarning(56, "Video input '" + sourceName + "' failed to start");
+                        }
+                    }
+                    break;
+                }
+                case GST_MESSAGE_EOS:
+                    if (!shutdownFlag->load()) {
+                        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' received EOS\n", sourceName.c_str());
+                    }
+                    gst_message_unref(msg);
+                    gst_object_unref(bus);
+                    // Same reasoning as the ERROR case above — EOS also
+                    // means the pipeline is done producing and must not be
+                    // left in PLAYING.
+                    gst_element_set_state(pipeline, GST_STATE_NULL);
+                    *runningFlag = false;
+                    if (!shutdownFlag->load()) {
+                        VideoInputManager::Instance().ScheduleSourceRestart(sourceId);
+                    }
+                    return;
+                default:
+                    break;
+            }
+            gst_message_unref(msg);
+        }
+        gst_object_unref(bus);
+        *runningFlag = false;
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' thread exiting\n", sourceName.c_str());
+    });
+
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' launched (node=%s)\n",
+            source.name.c_str(), source.pipeWireNodeName.c_str());
+    return true;
+#else
+    LogWarn(VB_MEDIAOUT, "VideoInputManager: GStreamer not available\n");
+    // Permanent: a build without GStreamer stays one until it is replaced.
+    WarningHolder::AddWarning(56, "Video input requires GStreamer, which is not available on this device");
+    return false;
+#endif
+}
+
+// ─── Start source with separate video + audio streams (YouTube HLS) ───────
+bool VideoInputManager::StartSourceWithAudio(SourceInfo& source) {
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+    GStreamerOutput::EnsureGStreamerInit();
+    if (source.running) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' already running\n", source.name.c_str());
+        return true;
+    }
+
+    setenv("PIPEWIRE_RUNTIME_DIR", "/run/pipewire-fpp", 0);
+
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Starting source '%s' with audio extraction\n",
+            source.name.c_str());
+
+    // YouTube muxed HLS formats (91/92) return HTTP 403 for segment
+    // downloads, so we resolve separate video-only and audio-only URLs
+    // and use two independent uridecodebin elements.
+
+    // Resolve video-only URL and detect native framerate
+    std::string videoUrl;
+    {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Resolving YouTube video URL for '%s'\n",
+                source.name.c_str());
+        YtDlpResult yt = ResolveYtDlp(YtVideoFormat(source.height), source.uri, true);
+        if (yt.url.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to resolve video URL for '%s': %s\n",
+                    source.name.c_str(),
+                    yt.diagnostics.empty() ? "no output" : yt.diagnostics.c_str());
+            AddSourceWarning("Video input '" + source.name + "': could not resolve the video URL");
+            return false;
+        }
+        videoUrl = yt.url;
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Video URL resolved (%zu chars)\n", videoUrl.size());
+        ApplyDetectedFps(yt.fps, source.framerate, source.name.c_str());
+    }
+
+    // Resolve audio-only URL
+    std::string audioUrl;
+    {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Resolving YouTube audio URL for '%s'\n",
+                source.name.c_str());
+        YtDlpResult yt = ResolveYtDlp(YT_AUDIO_FORMAT, source.uri, false);
+        if (yt.url.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to resolve audio URL for '%s' (%s), "
+                    "falling back to video-only\n", source.name.c_str(),
+                    yt.diagnostics.empty() ? "no output" : yt.diagnostics.c_str());
+            // Returning false here is not a no-op: our caller (StartSource())
+            // retries with audioEnabled cleared and builds the regular
+            // video-only pipeline instead of leaving the source unstarted.
+            return false;
+        }
+        audioUrl = yt.url;
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Audio URL resolved (%zu chars)\n", audioUrl.size());
+    }
+
+    // Build a SINGLE combined pipeline for video and audio.
+    // Both paths share one pipeline clock and base_time, preventing
+    // A/V drift that occurs when separate pipelines pace independently.
+    // (intervideosink + pipewiresink in one pipeline works fine;
+    // the original deadlock was two pipewiresinks in provide mode.)
+    // pixel-aspect-ratio=1/1 is load-bearing.  Forcing width and height
+    // alone lets videoscale hit the requested size by changing the PAR
+    // instead of actually rescaling: a 4:3 camera configured as 1280x720
+    // produced caps of 1280x720 with pixel-aspect-ratio=3/4, i.e. a frame
+    // that still displays 4:3.  Pinning square pixels makes videoscale do
+    // the real work, and its add-borders default letterboxes rather than
+    // distorting when the source and target aspects differ.
+    std::string capsStr = "video/x-raw,width=" + std::to_string(source.width)
+                        + ",height=" + std::to_string(source.height)
+                        + ",pixel-aspect-ratio=1/1"
+                        + ",framerate=" + std::to_string(source.framerate) + "/1";
+
+    // Convert bufferSec to nanoseconds for GStreamer properties.
+    // This buffers decoded HLS content so clocksync can pace it smoothly.
+    long long bufferNs = (long long)(source.bufferSec * 1000000000.0);
+    if (bufferNs < 1000000000LL) bufferNs = 1000000000LL; // minimum 1s
+
+    // Two independent branches in one GstPipeline: they share the
+    // pipeline clock, so both clocksync elements pace identically.
+    std::string combinedPipelineDesc =
+        "uridecodebin uri=" + GstQuote(videoUrl) + " caps=\"video/x-raw\""
+        " buffer-duration=" + std::to_string(bufferNs) +
+        " ! videoconvert"
+        " ! videoscale"
+        " ! videorate"
+        " ! " + capsStr +
+        " ! queue max-size-time=" + std::to_string(bufferNs) +
+        " max-size-buffers=0 max-size-bytes=0"
+        " ! clocksync"
+        " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName) +
+        " uridecodebin uri=" + GstQuote(audioUrl) + " caps=\"audio/x-raw\""
+        " ! audioconvert"
+        " ! audioresample"
+        " ! audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved"
+        " ! queue max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0"
+        " ! clocksync"
+        " ! pipewiresink name=apwsink";
+
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: '%s' combined A/V pipeline: %s\n",
+            source.name.c_str(), combinedPipelineDesc.c_str());
+
+    // --- Create combined A/V pipeline ---
+    GError* error = nullptr;
+    source.pipeline = gst_parse_launch(combinedPipelineDesc.c_str(), &error);
+    if (!source.pipeline) {
+        LogErr(VB_MEDIAOUT, "VideoInputManager: Failed to create pipeline for '%s': %s\n",
+               source.name.c_str(), error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        return false;
+    }
+    GStreamerOutput::GuardVideoConvertInputs(source.pipeline);
+    if (error) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: Pipeline warning for '%s': %s\n",
+                source.name.c_str(), error->message);
+        g_error_free(error);
+    }
+
+    // No separate audio pipeline — audio is in the combined pipeline.
+    source.audioPipeline = nullptr;
+
+    // Configure audio pipewiresink as an Audio/Source in provide mode.
+    std::string audioNodeName = source.audioPipeWireNodeName;
+    if (audioNodeName.empty())
+        audioNodeName = source.pipeWireNodeName + "_audio";
+    ConfigureAudioSourceSink(source.pipeline, audioNodeName, source.name, false);
+
+    // Force the combined pipeline to use the system clock instead of
+    // letting pipewiresink provide its own.  Both clocksync elements
+    // then pace against the same monotonic clock.
+    GstClock* sysClock = gst_system_clock_obtain();
+    gst_pipeline_use_clock(GST_PIPELINE(source.pipeline), sysClock);
+    gst_object_unref(sysClock);
+
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: '%s' combined pipeline built (video=%s, audio=%s)\n",
+            source.name.c_str(), source.pipeWireNodeName.c_str(),
+            source.audioPipeWireNodeName.c_str());
+
+    // Start combined pipeline in its own thread
+    source.shutdownRequested = false;
+    source.running = true;
+
+    std::string sourceName = source.name;
+    std::string nodeNameCopy = source.pipeWireNodeName;
+    const int sourceId = source.id;
+    GstElement* combinedPipeline = source.pipeline;
+    std::atomic<bool>* shutdownFlag = &source.shutdownRequested;
+    std::atomic<bool>* runningFlag = &source.running;
+
+    source.runThread = std::thread([combinedPipeline, sourceName, nodeNameCopy, shutdownFlag, runningFlag, sourceId]() {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' A/V thread starting (node=%s)\n",
+                sourceName.c_str(), nodeNameCopy.c_str());
+
+        GstStateChangeReturn ret = gst_element_set_state(combinedPipeline, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            if (!shutdownFlag->load()) {
+                LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' failed to start\n",
+                        sourceName.c_str());
+                AddSourceWarning("Video input '" + sourceName + "' failed to start");
+            }
+            *runningFlag = false;
+            if (!shutdownFlag->load()) {
+                VideoInputManager::Instance().ScheduleSourceRestart(sourceId);
+            }
+            return;
+        }
+
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' pipeline state=%s\n",
+                sourceName.c_str(),
+                ret == GST_STATE_CHANGE_SUCCESS ? "PLAYING" :
+                ret == GST_STATE_CHANGE_ASYNC   ? "ASYNC"   : "OTHER");
+
+        if (ret == GST_STATE_CHANGE_SUCCESS) {
+            VideoOutputManager::Instance().NotifyProducerReady(nodeNameCopy);
+            // Up again after a restart: retract the banner its failure raised.
+            WarningHolder::RemoveWarning(56, "Video input '" + sourceName + "' failed to start");
+        }
+
+        GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(combinedPipeline));
+        while (!shutdownFlag->load()) {
+            GstMessage* msg = gst_bus_timed_pop(bus, 500 * GST_MSECOND);
+            if (!msg) continue;
+
+            switch (GST_MESSAGE_TYPE(msg)) {
+                case GST_MESSAGE_ERROR: {
+                    GError* err = nullptr;
+                    gchar* debug = nullptr;
+                    gst_message_parse_error(msg, &err, &debug);
+                    if (!shutdownFlag->load()) {
+                        const gchar* srcName = GST_MESSAGE_SRC(msg) ?
+                            GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) : "?";
+                        LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' error [%s]: %s (%s)\n",
+                                sourceName.c_str(), srcName,
+                                err ? err->message : "?", debug ? debug : "");
+                    }
+                    if (err) g_error_free(err);
+                    g_free(debug);
+                    gst_message_unref(msg);
+                    gst_object_unref(bus);
+                    // Drop the dead combined A/V pipeline out of PLAYING so
+                    // it releases its device fd / socket / decoder buffers
+                    // now instead of holding them until the next
+                    // Reload/Shutdown. StopSource() still owns unref'ing
+                    // source.pipeline.
+                    gst_element_set_state(combinedPipeline, GST_STATE_NULL);
+                    *runningFlag = false;
+                    if (!shutdownFlag->load()) {
+                        VideoInputManager::Instance().ScheduleSourceRestart(sourceId);
+                    }
+                    return;
+                }
+                case GST_MESSAGE_BUFFERING: {
+                    gint percent = 0;
+                    gst_message_parse_buffering(msg, &percent);
+                    if (percent == 0 || percent == 100) {
+                        const gchar* srcName = GST_MESSAGE_SRC(msg) ?
+                            GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) : "?";
+                        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' [%s] buffering %d%%\n",
+                                sourceName.c_str(), srcName, percent);
+                    }
+                    break;
+                }
+                case GST_MESSAGE_STATE_CHANGED: {
+                    if (GST_MESSAGE_SRC(msg) == GST_OBJECT(combinedPipeline)) {
+                        GstState oldState, newState, pending;
+                        gst_message_parse_state_changed(msg, &oldState, &newState, &pending);
+                        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' state %s -> %s (pending=%s)\n",
+                                sourceName.c_str(),
+                                gst_element_state_get_name(oldState),
+                                gst_element_state_get_name(newState),
+                                gst_element_state_get_name(pending));
+                        if (newState == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING) {
+                            VideoOutputManager::Instance().NotifyProducerReady(nodeNameCopy);
+                            // Up again after a restart: retract the banner its failure raised.
+                            WarningHolder::RemoveWarning(56, "Video input '" + sourceName + "' failed to start");
+                        }
+                    }
+                    break;
+                }
+                case GST_MESSAGE_EOS:
+                    if (!shutdownFlag->load()) {
+                        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' received EOS\n",
+                                sourceName.c_str());
+                    }
+                    gst_message_unref(msg);
+                    gst_object_unref(bus);
+                    // Same reasoning as the ERROR case above.
+                    gst_element_set_state(combinedPipeline, GST_STATE_NULL);
+                    *runningFlag = false;
+                    if (!shutdownFlag->load()) {
+                        VideoInputManager::Instance().ScheduleSourceRestart(sourceId);
+                    }
+                    return;
+                default:
+                    break;
+            }
+            gst_message_unref(msg);
+        }
+        gst_object_unref(bus);
+        *runningFlag = false;
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' A/V thread exiting\n", sourceName.c_str());
+    });
+
+    // No separate audio thread — audio runs in the combined pipeline.
+
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' launched with audio (node=%s)\n",
+            source.name.c_str(), source.pipeWireNodeName.c_str());
+    return true;
+#else
+    LogWarn(VB_MEDIAOUT, "VideoInputManager: GStreamer not available\n");
+    // Permanent: a build without GStreamer stays one until it is replaced.
+    WarningHolder::AddWarning(56, "Video input requires GStreamer, which is not available on this device");
+    return false;
+#endif
+}
+
+void VideoInputManager::StopSource(SourceInfo& source) {
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+    source.shutdownRequested = true;
+    source.audioShutdownRequested = true;
+
+    // Join the bus monitor threads first — they check shutdown flags
+    // every 500ms (gst_bus_timed_pop timeout) and exit promptly.
+    if (source.runThread.joinable()) {
+        source.runThread.join();
+    }
+    if (source.audioRunThread.joinable()) {
+        source.audioRunThread.join();
+    }
+
+    if (source.pipeline) {
+        GstElement* p = source.pipeline;
+        source.pipeline = nullptr;
+        std::string name = source.name;
+        // Tracked (not detached) so Shutdown()/Reload() can join it before
+        // the process exits or the same device/URI is reopened — see
+        // JoinTeardownThreads().
+        std::lock_guard<std::mutex> tlock(m_teardownMutex);
+        m_teardownThreads.emplace_back([p, name]() {
+            gst_element_set_state(p, GST_STATE_NULL);
+            gst_object_unref(p);
+            LogInfo(VB_MEDIAOUT, "VideoInputManager: Video pipeline for '%s' released\n", name.c_str());
+        });
+    }
+
+    if (source.audioPipeline) {
+        GstElement* ap = source.audioPipeline;
+        source.audioPipeline = nullptr;
+        std::string name = source.name;
+        std::lock_guard<std::mutex> tlock(m_teardownMutex);
+        m_teardownThreads.emplace_back([ap, name]() {
+            gst_element_set_state(ap, GST_STATE_NULL);
+            gst_object_unref(ap);
+            LogInfo(VB_MEDIAOUT, "VideoInputManager: Audio pipeline for '%s' released\n", name.c_str());
+        });
+    }
+
+    source.running = false;
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' stopped\n", source.name.c_str());
+#endif
+}
+
+void VideoInputManager::StopAllSources() {
+    // The swap moves the vector's buffer, so the run threads' pointers to
+    // each source's flags stay valid until the sources are destroyed below,
+    // after StopSource() has joined those threads.
+    std::vector<SourceInfo> sources;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        sources.swap(m_sources);
+    }
+    for (auto& source : sources) {
+        StopSource(source);
+    }
+}
+
+void VideoInputManager::JoinTeardownThreads() {
+    // Swap the list out under the lock, then join outside it — joining can
+    // block for a while if a pipeline is wedged in gst_element_set_state(),
+    // and StopSource() (called from other sources' teardown, or a
+    // concurrent caller) shouldn't have to wait on m_teardownMutex for that.
+    std::vector<std::thread> threads;
+    {
+        std::lock_guard<std::mutex> tlock(m_teardownMutex);
+        threads.swap(m_teardownThreads);
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+}
+
+
+bool VideoInputManager::GrabSnapshotJPEG(int sourceId, int maxWidth, int timeoutMs,
+                                         std::vector<uint8_t>& jpegOut) {
+    jpegOut.clear();
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+    if (maxWidth < 32) maxWidth = 32;
+    if (maxWidth > 1280) maxWidth = 1280;
+    if (timeoutMs < 100) timeoutMs = 100;
+    if (timeoutMs > 10000) timeoutMs = 10000;
+
+    GStreamerOutput::EnsureGStreamerInit();
+
+    std::string channel;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& src : m_sources) {
+            if (src.id == sourceId) {
+                if (!src.running.load()) {
+                    return false;
+                }
+                channel = src.pipeWireNodeName;
+                break;
+            }
+        }
+    }
+    if (channel.empty() || !GstValueUsable(channel, "node name", "snapshot")) {
+        return false;
+    }
+
+    // pixel-aspect-ratio=1/1 is load-bearing.  With a width-only capsfilter
+    // videoscale satisfies the request by changing the PAR rather than the
+    // height -- a 240x135 source came out as a 320x135 JPEG, and since JPEG
+    // carries no PAR the preview showed a squashed picture.  Pinning PAR to
+    // square forces videoscale to pick the height instead, so the preview
+    // has the same shape as the real output.
+    std::string desc = "intervideosrc name=isrc timeout=" + std::to_string((long long)timeoutMs * 1000000LL)
+                     + " channel=" + GstQuote(channel)
+                     + " ! videoconvert"
+                     + " ! videoscale"
+                     + " ! video/x-raw,width=" + std::to_string(maxWidth)
+                     + ",pixel-aspect-ratio=1/1"
+                     + " ! jpegenc quality=70"
+                     + " ! appsink name=snap max-buffers=1 drop=true sync=false";
+
+    GError* error = nullptr;
+    GstElement* pipeline = gst_parse_launch(desc.c_str(), &error);
+    if (!pipeline) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: snapshot pipeline failed for source %d: %s\n",
+                sourceId, error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        return false;
+    }
+    GStreamerOutput::GuardVideoConvertInputs(pipeline);
+    if (error) {
+        g_error_free(error);
+        error = nullptr;
+    }
+
+    GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "snap");
+    if (!sink) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        return false;
+    }
+
+    bool ok = false;
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE) {
+        GstSample* sample = gst_app_sink_try_pull_sample(
+            GST_APP_SINK(sink), (GstClockTime)timeoutMs * GST_MSECOND);
+        if (sample) {
+            GstBuffer* buf = gst_sample_get_buffer(sample);
+            GstMapInfo map;
+            if (buf && gst_buffer_map(buf, &map, GST_MAP_READ)) {
+                jpegOut.assign(map.data, map.data + map.size);
+                gst_buffer_unmap(buf, &map);
+                ok = !jpegOut.empty();
+            }
+            gst_sample_unref(sample);
+
+            // Log what intervideosrc actually negotiated off the shared
+            // surface, now that a frame has arrived and caps are fixed.
+            // This is the only in-process view of the channel's real caps:
+            // an out-of-process gst-launch probe can never see it, because
+            // the inter elements share a surface registry private to one
+            // process and would report the element default (320x240) and
+            // emit black frames instead.
+            GstElement* isrc = gst_bin_get_by_name(GST_BIN(pipeline), "isrc");
+            if (isrc) {
+                GstPad* pad = gst_element_get_static_pad(isrc, "src");
+                if (pad) {
+                    GstCaps* c = gst_pad_get_current_caps(pad);
+                    if (c) {
+                        gchar* cs = gst_caps_to_string(c);
+                        LogDebug(VB_MEDIAOUT, "VideoInputManager: channel '%s' negotiated caps: %s\n",
+                                 channel.c_str(), cs ? cs : "?");
+                        g_free(cs);
+                        gst_caps_unref(c);
+                    }
+                    gst_object_unref(pad);
+                }
+                gst_object_unref(isrc);
+            }
+        } else {
+            LogDebug(VB_MEDIAOUT, "VideoInputManager: snapshot timed out for source %d (no frames on channel %s)\n",
+                     sourceId, channel.c_str());
+        }
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(sink);
+    gst_object_unref(pipeline);
+    return ok;
+#else
+    return false;
+#endif
+}

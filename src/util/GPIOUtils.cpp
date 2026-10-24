@@ -1,0 +1,773 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+#include "common.h"
+
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <array>
+#include <fcntl.h>
+#include <limits>
+#include <set>
+#include <thread>
+#include <unistd.h> // ftruncate -- needed directly for NOPCH builds
+
+#include "GPIOUtils.h"
+#include "../Warnings.h"
+#include "../log.h"
+#include "commands/Commands.h"
+
+// No platform information on how to control pins
+static NoPinCapabilities NULL_PIN_INSTANCE("-none-", 0);
+
+const NoPinCapabilities& NoPinCapabilitiesProvider::getPinByName(const std::string& name) { return NULL_PIN_INSTANCE; }
+const NoPinCapabilities& NoPinCapabilitiesProvider::getPinByGPIO(int chip, int gpio) { return NULL_PIN_INSTANCE; }
+const NoPinCapabilities& NoPinCapabilitiesProvider::getPinByUART(const std::string& n) { return NULL_PIN_INSTANCE; }
+
+Json::Value PinCapabilities::toJSON() const {
+    Json::Value ret;
+    if (name != "" && name != "-none-") {
+        ret["pin"] = name;
+        ret["gpioChip"] = gpioIdx;
+        ret["gpioLine"] = gpio;
+        if (gpioIdx == 0) {
+            // somewhat for compatibility with the old kernel GPIO numbers on the Pi's
+            ret["gpio"] = gpio;
+        }
+        if (pwm != -1) {
+            ret["pwm"] = pwm;
+            ret["subPwm"] = subPwm;
+        }
+        if (i2cBus != -1) {
+            ret["i2c"] = i2cBus;
+        }
+        if (uart != "") {
+            ret["uart"] = uart;
+        }
+        ret["supportsPullUp"] = supportsPullUp();
+        ret["supportsPullDown"] = supportsPullDown();
+    }
+    return ret;
+}
+
+void PinCapabilities::enableOledScreen(int i2cBus, bool enable) {
+    // this pin is i2c, we may need to tell fppoled to turn off the display
+    // before we shutdown this pin because once we re-configure, i2c will
+    // be unavailable and the display won't update
+    int smfd = shm_open("fppoled", O_CREAT | O_RDWR, 0644);
+    if (smfd < 0) {
+        return;
+    }
+    ftruncate(smfd, 1024);
+    unsigned int* status = (unsigned int*)mmap(0, 1024, PROT_WRITE | PROT_READ, MAP_SHARED, smfd, 0);
+    if (status == MAP_FAILED) {
+        close(smfd);
+        return;
+    }
+    if (i2cBus == (int)status[0]) {
+        if (!enable) {
+            // force the display off
+            status[2] = 1;
+            int count = 0;
+            while (status[1] != 0 && count < 150) {
+                count++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        } else {
+            // allow the display to come back on
+            status[2] = 0;
+        }
+    }
+    munmap(status, 1024);
+    close(smfd);
+}
+
+// the built in GPIO chips that are handled by the more optimized
+// platform specific GPIO drivers
+static const std::set<std::string> PLATFORM_IGNORES{
+    "pinctrl-bcm2835", // raspberry pi's
+    "pinctrl-bcm2711", // Pi4
+    "raspberrypi-exp-gpio",
+    "brcmvirt-gpio",
+    "gpio-0-31", // beagles
+    "gpio-32-63",
+    "gpio-64-95",
+    "gpio-96-127",
+    "gpio-brcmstb@107d508500", // Pi5's internal GPIO chips
+    "gpio-brcmstb@107d508520",
+    "gpio-brcmstb@107d517c00",
+    "gpio-brcmstb@107d517c20",
+    "pinctrl-rp1",   // Pi5's external GPIO chip
+    "tps65219-gpio", // AM62x
+    "4201000.gpio",
+    "600000.gpio",
+    "601000.gpio"
+};
+// No platform information on how to control pins
+static std::string PROCESS_NAME = "FPPD";
+
+bool GPIODCapabilities::supportsPullUp() const {
+    return true;
+}
+bool GPIODCapabilities::supportsPullDown() const {
+    return true;
+}
+
+#ifdef HASGPIOD
+// Indexed by PinCapabilities::gpioIdx unchecked, so the cache covers every
+// value that field can hold. It used to be 32 entries, and a pin on
+// gpiochip32 or above (an I2C expander on a board with many chips) indexed
+// past the end.
+constexpr int MAX_GPIOD_CHIPS = std::numeric_limits<decltype(PinCapabilities::gpioIdx)>::max() + 1;
+class GPIOChipHolder {
+public:
+    static GPIOChipHolder INSTANCE;
+
+#ifdef IS_GPIOD_CXX_V2
+    std::array<std::shared_ptr<gpiod::chip>, MAX_GPIOD_CHIPS> chips;
+#else
+    std::array<gpiod::chip, MAX_GPIOD_CHIPS> chips;
+#endif
+};
+GPIOChipHolder GPIOChipHolder::INSTANCE;
+#endif
+
+void GPIODCapabilities::releasePin() const {
+    releaseGPIOD();
+#ifdef HASGPIOD
+#ifdef IS_GPIOD_CXX_V2
+    request = nullptr;
+#else
+    if (line.is_requested()) {
+        line.release();
+    }
+#endif
+#endif
+}
+
+int GPIODCapabilities::configPin(const std::string& mode,
+                                 bool directionOut,
+                                 const std::string& desc) const {
+#ifdef HASGPIOD
+    // printf("Configuring %s %d %d %s\n", name.c_str(), gpioIdx, gpio, mode.c_str());
+#ifdef IS_GPIOD_CXX_V2
+    if (chip == nullptr) {
+        if (!GPIOChipHolder::INSTANCE.chips[gpioIdx]) {
+            try {
+                std::string gn = gpioName;
+                if (gn.empty()) {
+                    gn = "gpiochip" + std::to_string(gpioIdx);
+                }
+                GPIOChipHolder::INSTANCE.chips[gpioIdx] = std::make_shared<gpiod::chip>("/dev/" + gn);
+            } catch (const std::exception& ex) {
+                std::string w = "Could not open GPIO chip " + (gpioName.empty() ? std::to_string(gpioIdx) : gpioName) +
+                                " (" + ex.what() + ")";
+                WarningHolder::AddWarning(51, w);
+                LogWarn(VB_GPIO, "%s\n", w.c_str());
+                return -1;
+            }
+        }
+        chip = GPIOChipHolder::INSTANCE.chips[gpioIdx];
+    }
+
+    std::string consumer = PROCESS_NAME;
+    if (!desc.empty()) {
+        consumer += "-" + desc;
+    }
+
+    // Already configured exactly this way: keep the request.  Callers
+    // configure on every action (each GPIO command, each LED pulse tick), and
+    // releasing and re-requesting an output drives it low until the caller's
+    // setValue() -- a glitch on a relay that was already on.
+    {
+        bool wantOpenDrain = (mode == "gpio_od");
+        bool wantOut = directionOut || wantOpenDrain;
+        bool sameBias = true;
+        if (!wantOut) {
+            auto want = mode == "gpio_pu" ? gpiod::line::bias::PULL_UP
+                                          : (mode == "gpio_pd" ? gpiod::line::bias::PULL_DOWN : gpiod::line::bias::DISABLED);
+            sameBias = (lastBias == want);
+        }
+        if (request && lastRequestType == (wantOut ? 1 : 0) && openDrain == wantOpenDrain && sameBias &&
+            lastDesc == consumer) {
+            return 0;
+        }
+    }
+
+    openDrain = (mode == "gpio_od");
+    lastDesc = consumer;
+
+    // Build line settings for the requested mode. For open-drain, withBias
+    // controls whether we request an internal pull-up.
+    auto makeSettings = [&](bool withBias) {
+        gpiod::line_settings settings;
+        if (openDrain) {
+            // Open-drain output for bit-banged I2C: setValue(0) drives low,
+            // setValue(1) releases (high-Z, pulled up). The released line stays
+            // readable, so ACK/read bits work with no direction flipping.
+            settings.set_direction(gpiod::line::direction::OUTPUT);
+            settings.set_drive(gpiod::line::drive::OPEN_DRAIN);
+            if (withBias) {
+                settings.set_bias(gpiod::line::bias::PULL_UP);
+                lastBias = gpiod::line::bias::PULL_UP;
+            } else {
+                lastBias = gpiod::line::bias::AS_IS;
+            }
+        } else if (directionOut) {
+            settings.set_direction(gpiod::line::direction::OUTPUT);
+        } else {
+            settings.set_direction(gpiod::line::direction::INPUT);
+            if (mode == "gpio_pu") {
+                settings.set_bias(gpiod::line::bias::PULL_UP);
+                lastBias = gpiod::line::bias::PULL_UP;
+            } else if (mode == "gpio_pd") {
+                settings.set_bias(gpiod::line::bias::PULL_DOWN);
+                lastBias = gpiod::line::bias::PULL_DOWN;
+            } else {
+                settings.set_bias(gpiod::line::bias::DISABLED);
+                lastBias = gpiod::line::bias::DISABLED;
+            }
+        }
+        return settings;
+    };
+
+    // Open-drain: try with an internal pull-up, then without -- some
+    // controllers (e.g. an i2c GPIO expander exposed as a kernel gpiochip)
+    // don't support bias config and reject the request; an external pull-up
+    // is then required. Other modes are a single attempt.
+    int attempts = openDrain ? 2 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        try {
+            gpiod::line_settings settings = makeSettings(attempt == 0);
+            gpiod::request_builder builder = chip->prepare_request();
+            builder.add_line_settings(gpio, settings);
+            builder.set_consumer(consumer);
+            if (request) {
+                request->release();
+                request = nullptr;
+            }
+            request = std::make_shared<gpiod::line_request>(builder.do_request());
+            lastRequestType = (directionOut || openDrain) ? 1 : 0;
+            if (openDrain && attempt == 1) {
+                LogInfo(VB_GPIO, "Pin %s: open-drain configured without an internal pull-up; an external pull-up is required\n", name.c_str());
+            }
+            break;
+        } catch (const std::exception& ex) {
+            if (openDrain && attempt == 0) {
+                continue;  // retry without the (unsupported) pull-up bias
+            }
+            std::string w = "Could not configure pin " + name + "(" + desc + ") as " + mode + " (" + ex.what() + ")";
+            WarningHolder::AddWarning(51, w);
+            LogWarn(VB_GPIO, "%s\n", w.c_str());
+            lastRequestType = 0;
+        }
+    }
+#else
+    // printf("Configuring %s %d %d %s\n", name.c_str(), gpioIdx, gpio, mode.c_str());
+    if (chip == nullptr) {
+        if (!GPIOChipHolder::INSTANCE.chips[gpioIdx]) {
+            if (gpioName.empty()) {
+                std::string n = std::to_string(gpioIdx);
+                GPIOChipHolder::INSTANCE.chips[gpioIdx].open(n, gpiod::chip::OPEN_BY_NUMBER);
+            } else {
+                GPIOChipHolder::INSTANCE.chips[gpioIdx].open(gpioName, gpiod::chip::OPEN_BY_NAME);
+            }
+        }
+        chip = &GPIOChipHolder::INSTANCE.chips[gpioIdx];
+        line = chip->get_line(gpio);
+    }
+    gpiod::line_request req;
+    req.consumer = PROCESS_NAME;
+    if (!desc.empty()) {
+        req.consumer += "-" + desc;
+    }
+    lastDesc = req.consumer;
+    openDrain = (mode == "gpio_od");
+    if (openDrain) {
+        req.request_type = gpiod::line_request::DIRECTION_OUTPUT;
+        req.flags |= gpiod::line_request::FLAG_OPEN_DRAIN | gpiod::line_request::FLAG_BIAS_PULL_UP;
+    } else if (directionOut) {
+        req.request_type = gpiod::line_request::DIRECTION_OUTPUT;
+    } else {
+        req.request_type = gpiod::line_request::DIRECTION_INPUT;
+        if (mode == "gpio_pu") {
+            req.flags |= gpiod::line_request::FLAG_BIAS_PULL_UP;
+        } else if (mode == "gpio_pd") {
+            req.flags |= gpiod::line_request::FLAG_BIAS_PULL_DOWN;
+        } else {
+            req.flags |= gpiod::line_request::FLAG_BIAS_DISABLE;
+        }
+    }
+    if (req.request_type != lastRequestType || req.flags != lastRequestFlags) {
+        if (line.is_requested()) {
+            line.release();
+        }
+        try {
+            line.request(req, 1);
+            lastRequestType = req.request_type;
+            lastRequestFlags = req.flags;
+        } catch (const std::exception& ex) {
+            std::string w = "Could not configure pin " + name + "(" + desc + ") as " + mode + " (" + ex.what() + ")";
+            WarningHolder::AddWarning(51, w);
+            LogWarn(VB_GPIO, "%s\n", w.c_str());
+            lastRequestType = 0;
+            lastRequestFlags = 0;
+        }
+    }
+#endif
+    // -1 when the line could not be requested (the chip open above already
+    // says so): a failed request used to report success, warning and all.
+    return isAcquired() ? 0 : -1;
+#else
+    return 0;
+#endif
+}
+void GPIODCapabilities::releaseGPIOD() const {
+#ifdef HASGPIOD
+#ifdef IS_GPIOD_CXX_V2
+    if (request) {
+        request->release();
+        request = nullptr;
+        lastRequestType = 0;
+        lastDesc.clear();
+    }
+#else
+    if (line.is_requested()) {
+        line.release();
+        lastRequestType = 0;
+        lastRequestFlags = 0;
+        lastDesc.clear();
+    }
+#endif
+#endif
+}
+
+int GPIODCapabilities::readEventFromFile() const {
+#ifdef HASGPIOD
+#ifdef IS_GPIOD_CXX_V2
+    if (request) {
+        try {
+            gpiod::edge_event_buffer buffer(1);
+            int count = request->read_edge_events(buffer);
+            if (count == 1) {
+                auto& event = buffer.get_event(0);
+                return event.type() == gpiod::edge_event::event_type::RISING_EDGE ? 1 : 0;
+            }
+        } catch (const std::exception& ex) {
+            LogWarn(VB_GPIO, "Error reading event for pin %s: %s\n", name.c_str(), ex.what());
+        }
+    }
+#else
+    struct gpiod_line_event event;
+    if (gpiod_line_event_read_fd(line.event_get_fd(), &event) >= 0) {
+        return event.event_type == GPIOD_LINE_EVENT_RISING_EDGE;
+    }
+#endif
+#endif
+    return -1;
+}
+
+int GPIODCapabilities::requestEventFile(bool risingEdge, bool fallingEdge) const {
+    int fd = -1;
+#ifdef HASGPIOD
+#ifdef IS_GPIOD_CXX_V2
+    LogDebug(VB_GPIO, "requestEventFile V2 for pin %s (chip:%d line:%d device:%s)\n",
+             name.c_str(), gpioIdx, gpio, gpioName.c_str());
+    // Ensure chip is initialized
+    if (chip == nullptr) {
+        if (!GPIOChipHolder::INSTANCE.chips[gpioIdx]) {
+            try {
+                std::string gn = gpioName;
+                if (gn.empty()) {
+                    gn = "gpiochip" + std::to_string(gpioIdx);
+                }
+                GPIOChipHolder::INSTANCE.chips[gpioIdx] = std::make_shared<gpiod::chip>("/dev/" + gn);
+            } catch (const std::exception& ex) {
+                std::string w = "Could not open GPIO chip " + (gpioName.empty() ? std::to_string(gpioIdx) : gpioName) +
+                                " for event request (" + ex.what() + ")";
+                WarningHolder::AddWarning(51, w);
+                LogWarn(VB_GPIO, "%s\n", w.c_str());
+                return -1;
+            }
+        }
+        chip = GPIOChipHolder::INSTANCE.chips[gpioIdx];
+    }
+
+    try {
+        std::string desc = lastDesc;
+        releaseGPIOD();
+        lastDesc = desc;
+
+        if (!chip) {
+            WarningHolder::AddWarning(51, "Could not configure pin " + name + " for events: chip pointer is null");
+            return -1;
+        }
+
+        gpiod::line_settings settings;
+        settings.set_direction(gpiod::line::direction::INPUT);
+
+        if (risingEdge && fallingEdge) {
+            settings.set_edge_detection(gpiod::line::edge::BOTH);
+        } else if (risingEdge) {
+            settings.set_edge_detection(gpiod::line::edge::RISING);
+        } else if (fallingEdge) {
+            settings.set_edge_detection(gpiod::line::edge::FALLING);
+        }
+        if (lastBias != gpiod::line::bias::UNKNOWN) {
+            settings.set_bias(lastBias);
+        }
+        std::string consumer = lastDesc.empty() ? PROCESS_NAME : lastDesc;
+
+        LogDebug(VB_GPIO, "Building request for pin %s: chip device=%s, line=%d\n",
+                 name.c_str(), gpioName.c_str(), gpio);
+
+        gpiod::request_builder builder = chip->prepare_request();
+        builder.add_line_settings(gpio, settings);
+        builder.set_consumer(consumer);
+
+        LogDebug(VB_GPIO, "Executing do_request() for pin %s\n", name.c_str());
+        request = std::make_shared<gpiod::line_request>(builder.do_request());
+
+        fd = request->fd();
+        if (fd < 0) {
+            WarningHolder::AddWarning(51, "Could not get event file descriptor for pin " + name);
+            request = nullptr;
+        }
+    } catch (const std::exception& ex) {
+        LogDebug(VB_GPIO, "Pin %s (chip:%d line:%d device:%s) does not support edge detection - will use polling instead. (%s)\n",
+                 name.c_str(), gpioIdx, gpio, gpioName.c_str(), ex.what());
+        // Re-configure the pin for plain input so getValue() works for polling
+        try {
+            gpiod::line_settings settings;
+            settings.set_direction(gpiod::line::direction::INPUT);
+            if (lastBias != gpiod::line::bias::UNKNOWN) {
+                settings.set_bias(lastBias);
+            }
+            std::string consumer = lastDesc.empty() ? PROCESS_NAME : lastDesc;
+            gpiod::request_builder builder = chip->prepare_request();
+            builder.add_line_settings(gpio, settings);
+            builder.set_consumer(consumer);
+            request = std::make_shared<gpiod::line_request>(builder.do_request());
+            lastRequestType = 2; // Use 2 to indicate input-for-polling (not 0 which means unconfigured)
+            LogInfo(VB_GPIO, "Pin %s re-configured for polling input\n", name.c_str());
+        } catch (const std::exception& ex2) {
+            LogWarn(VB_GPIO, "Could not re-configure pin %s for polling: %s\n", name.c_str(), ex2.what());
+        }
+        return -1; // Return -1 to trigger polling fallback
+    }
+#else
+    gpiod::line_request req;
+    req.consumer = lastDesc.empty() ? PROCESS_NAME : lastDesc;
+    req.request_type = lastRequestType;
+    req.flags = lastRequestFlags;
+    if (risingEdge && fallingEdge) {
+        req.request_type |= gpiod::line_request::EVENT_BOTH_EDGES;
+    } else if (risingEdge) {
+        req.request_type |= gpiod::line_request::EVENT_RISING_EDGE;
+    } else if (fallingEdge) {
+        req.request_type |= gpiod::line_request::EVENT_FALLING_EDGE;
+    }
+    bool wasRequested = line.is_requested();
+    if (wasRequested) {
+        line.release();
+    }
+    try {
+        line.request(req, 0);
+    } catch (const std::exception& ex) {
+        if (!wasRequested) {
+            WarningHolder::AddWarning(51, "Could not configure pin " + name + " for events (" + ex.what() + ") for edges Rising:" +
+                                      std::to_string(risingEdge) + "   Falling:" + std::to_string(fallingEdge));
+        }
+    }
+    if (line.is_requested()) {
+        fd = line.event_get_fd();
+        if (fd < 0) {
+            WarningHolder::AddWarning(51, "Could not get event file descriptor for pin " + name);
+        }
+    } else if (wasRequested) {
+        req.request_type = lastRequestType;
+        line.request(req, 0);
+        if (!line.is_requested()) {
+            WarningHolder::AddWarning(51, "Could not re-request pin " + name + " after failing to request events");
+        }
+    } else {
+        WarningHolder::AddWarning(51, "Could not request event for pin " + name);
+    }
+#endif
+#endif
+    return fd;
+}
+
+// A line the kernel handed to a peripheral cannot be requested at all, and under
+// the strict pinmux of kernel 6.18 that is now permanent for some pins.  Say so
+// plainly, rather than leaving callers to infer it from a value that is really
+// just the "could not read" default.
+bool GPIODCapabilities::isAcquired() const {
+#ifdef HASGPIOD
+#ifdef IS_GPIOD_CXX_V2
+    return request != nullptr;
+#else
+    return line.is_requested();
+#endif
+#else
+    return false;
+#endif
+}
+
+bool GPIODCapabilities::getValue() const {
+#ifdef HASGPIOD
+    if (lastRequestType == 1 && !openDrain) { // push-pull OUTPUT: value is what we drove
+        return lastValue;
+    }
+    // open-drain (or input): read the actual line level so a released open-drain
+    // line reflects what the slave is driving (needed for I2C ACK/read bits).
+#ifdef IS_GPIOD_CXX_V2
+    if (!request) {
+        return 0;
+    }
+    try {
+        auto v = request->get_value(gpio);
+        return v == gpiod::line::value::ACTIVE;
+    } catch (const std::exception& ex) {
+        LogWarn(VB_GPIO, "Error getting value for pin %s: %s\n", name.c_str(), ex.what());
+        return 0;
+    }
+#else
+    if (lastRequestType == 0 && !line.is_requested()) {
+        return 0;
+    }
+    // Same contract as the v2 branch above: libgpiod v1's line::get_value()
+    // throws (std::system_error on a failed ioctl, std::logic_error on an empty
+    // or unrequested line handle) and callers of PinCapabilities::getValue()
+    // are not exception-safe, so a GPIO read failure must degrade to a warning.
+    try {
+        return line.get_value();
+    } catch (const std::exception& ex) {
+        LogWarn(VB_GPIO, "Error getting value for pin %s: %s\n", name.c_str(), ex.what());
+        return 0;
+    }
+#endif
+#else
+    return 0;
+#endif
+}
+void GPIODCapabilities::setValue(bool i) const {
+#ifdef HASGPIOD
+    lastValue = i;
+#ifdef IS_GPIOD_CXX_V2
+    if (request) {
+        try {
+            request->set_value(gpio, i ? gpiod::line::value::ACTIVE : gpiod::line::value::INACTIVE);
+        } catch (const std::exception& ex) {
+            LogWarn(VB_GPIO, "Error setting value for pin %s: %s\n", name.c_str(), ex.what());
+        }
+    }
+#else
+    // Same contract as the v2 branch above: libgpiod v1's line::set_value()
+    // routes through line_bulk::set_values() and throws (std::system_error on a
+    // failed ioctl, std::logic_error on an empty or unrequested line handle).
+    // configPin()/requestEventFile() only warn when a request fails, leaving the
+    // line unrequested, so the first setValue() on such a pin would otherwise
+    // escape as an uncaught exception and std::terminate fppd.
+    try {
+        line.set_value(i ? 1 : 0);
+    } catch (const std::exception& ex) {
+        LogWarn(VB_GPIO, "Error setting value for pin %s: %s\n", name.c_str(), ex.what());
+    }
+#endif
+#endif
+}
+static std::vector<GPIODCapabilities> GPIOD_PINS;
+static PinCapabilitiesProvider* PIN_PROVIDER = nullptr;
+
+#ifdef HASGPIOD
+// Scan the kernel gpiochips and register any lines for chips not already known.
+// Split out of InitGPIO() so it can run again later: an I2C GPIO expander that a
+// cape device-tree overlay instantiates can probe a bit after boot, so its chip
+// (and its named lines) may be missing during the first scan. Re-running picks up
+// the late chip without disturbing the pins already registered.
+static void registerGPIODChips() {
+    try {
+#ifdef IS_GPIOD_CXX_V2
+        // Chip devices (e.g. "gpiochip5") we've already registered lines for.
+        std::set<std::string> registeredDevices;
+        for (const auto& p : GPIOD_PINS) {
+            registeredDevices.insert(p.gpioName);
+        }
+        // Rebuild the label-uniqueness set from the already-registered chips so a
+        // duplicate chip label keeps getting the same disambiguating suffix.
+        std::set<std::string> found;
+        for (const auto& dev : registeredDevices) {
+            try {
+                auto chip = gpiod::chip("/dev/" + dev);
+                std::string label = chip.get_info().label();
+                char ci = 'b';
+                std::string ulabel = label;
+                while (found.find(ulabel) != found.end()) {
+                    ulabel = label + ci;
+                    ci++;
+                }
+                found.insert(ulabel);
+            } catch (...) {
+                // chip went away; ignore
+            }
+        }
+        std::set<std::string> foundChips;
+        for (const auto& entry : std::filesystem::directory_iterator("/dev/")) {
+            if (startsWith(entry.path().filename().string(), "gpiochip")) {
+                foundChips.insert(entry.path().filename().string());
+            }
+        }
+        for (auto& chipName : foundChips) {
+            if (registeredDevices.find(chipName) != registeredDevices.end()) {
+                continue; // already registered this chip
+            }
+            auto chip = gpiod::chip("/dev/" + chipName);
+            auto info = chip.get_info();
+            std::string chipDevice = chipName;
+            std::string label = info.label();
+            int chipNum = std::stoi(chipDevice.substr(8));
+
+            if (PLATFORM_IGNORES.find(label) == PLATFORM_IGNORES.end()) {
+                char ci = 'b';
+                while (found.find(label) != found.end()) {
+                    label = chip.get_info().label() + ci;
+                    ci++;
+                }
+                found.insert(label);
+                int num_lines = chip.get_info().num_lines();
+                LogDebug(VB_GPIO, "Registering chip %s (/dev/%s) as chipIdx=%d with %d lines\n",
+                            label.c_str(), chipDevice.c_str(), chipNum, num_lines);
+                for (int x = 0; x < num_lines; x++) {
+                    std::string n = label + "-" + std::to_string(x);
+                    auto line = chip.get_line_info(x);
+                    std::string plabel = line.name();
+                    if (plabel.empty()) {
+                        plabel = n;
+                    }
+                    GPIOD_PINS.push_back(GPIODCapabilities(plabel, x, chipDevice).setGPIO(chipNum, x));
+                }
+            }
+        }
+#else
+        // libgpiod v1 (legacy): scan once, as before.
+        if (GPIOD_PINS.empty()) {
+            std::set<std::string> found;
+            LogDebug(VB_GPIO, "Using libgpiod C++ API v1\n");
+            ::gpiod_chip* chip = gpiod_chip_open_by_number(0);
+            if (chip != nullptr) {
+                int chipCount = 0;
+                ::gpiod_chip_close(chip);
+                for (auto& a : gpiod::make_chip_iter()) {
+                    std::string name = a.name();
+                    std::string label = a.label();
+
+                    if (PLATFORM_IGNORES.find(label) == PLATFORM_IGNORES.end()) {
+                        char i = 'b';
+                        while (found.find(label) != found.end()) {
+                            label = a.label() + i;
+                            i++;
+                        }
+                        found.insert(label);
+                        for (int x = 0; x < a.num_lines(); x++) {
+                            std::string n = label + "-" + std::to_string(x);
+                            std::string plabel = a.get_line(x).name();
+                            if (plabel.empty()) {
+                                plabel = n;
+                            }
+                            GPIOD_PINS.push_back(GPIODCapabilities(plabel, x, name).setGPIO(chipCount, x));
+                        }
+                    }
+                    chipCount++;
+                }
+            }
+        }
+#endif
+    } catch (const std::exception& ex) {
+        LogWarn(VB_GPIO, "Error initializing GPIO: %s\n", ex.what());
+    }
+}
+#endif
+
+void PinCapabilities::InitGPIO(const std::string& process, PinCapabilitiesProvider* p) {
+    PROCESS_NAME = process;
+    if (p == nullptr) {
+        p = new NoPinCapabilitiesProvider();
+    }
+    if (PIN_PROVIDER != nullptr) {
+        delete PIN_PROVIDER;
+    }
+    PIN_PROVIDER = p;
+#ifdef HASGPIOD
+    registerGPIODChips();
+#endif
+    PIN_PROVIDER->Init();
+}
+
+void PinCapabilities::RescanGPIO() {
+#ifdef HASGPIOD
+    registerGPIODChips();
+#endif
+}
+std::vector<std::string> PinCapabilities::getPinNames() {
+    std::vector<std::string> pn = PIN_PROVIDER->getPinNames();
+    for (auto& a : GPIOD_PINS) {
+        pn.push_back(a.name);
+    }
+    return pn;
+}
+
+const PinCapabilities& PinCapabilities::getPinByName(const std::string& n) {
+    for (auto& a : GPIOD_PINS) {
+        if (n == a.name) {
+            return a;
+        }
+    }
+    // PIN_PROVIDER is only set once InitGPIO() runs, which must wait until after
+    // cape detection so cape GPIO expanders are registered. Anything that looks
+    // up a pin before then (e.g. fppoled's early display init probing the i2c1
+    // fallback) gets the null pin rather than dereferencing a null provider --
+    // configPin() etc. on it are no-ops, so the lookup is safely skipped.
+    if (PIN_PROVIDER == nullptr) {
+        return NULL_PIN_INSTANCE;
+    }
+    return PIN_PROVIDER->getPinByName(n);
+}
+const PinCapabilities& PinCapabilities::getPinByGPIO(int chip, int gpio) {
+    for (auto& a : GPIOD_PINS) {
+        if (a.gpioIdx == chip && a.gpio == gpio) {
+            return a;
+        }
+    }
+    if (PIN_PROVIDER == nullptr) {
+        return NULL_PIN_INSTANCE;
+    }
+    return PIN_PROVIDER->getPinByGPIO(chip, gpio);
+}
+const PinCapabilities& PinCapabilities::getPinByUART(const std::string& n) {
+    if (PIN_PROVIDER == nullptr) {
+        return NULL_PIN_INSTANCE;
+    }
+    return PIN_PROVIDER->getPinByUART(n);
+}
+
+void PinCapabilities::SetMultiPinValue(const std::list<const PinCapabilities*>& pins, int v) {
+    if (pins.empty()) {
+        return;
+    }
+    for (auto p : pins) {
+        p->setValue(v);
+    }
+}

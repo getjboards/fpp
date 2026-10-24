@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <?php
+    include 'common/htmlMeta.inc';
+    require_once "config.php";
+    require_once 'common.php';
+    include 'common/menuHead.inc';
+    ?>
+    <title><? echo $pageTitle; ?></title>
+    <style>
+        /* Three independent <table>s below need their Name/Topic and Value
+           columns to land at identical pixel x-offsets so the eye can track
+           straight down the page. They have different trailing column
+           counts (the User table has an extra Storage/Actions column the
+           other two don't), so every fixed column gets an explicit width
+           that sums to the same 296px in all three tables, and Name/Value
+           are left auto: under table-layout:fixed the auto columns split
+           what's left equally, and since every table is width:100% of the
+           same container that's the same pixel width everywhere. (WebKit
+           treats calc() on a <col> as auto anyway, so auto is the portable
+           spelling of "(100% - 296px) / 2".)
+           Widths are relative on purpose: the previous fixed px widths let
+           the table outgrow the page on tablets, and iOS Safari then sizes
+           its layout viewport to the overflowing document, so the navbar
+           collapse and other viewport media queries stopped applying on
+           this page only (#2956). */
+        .variables-aligned-table { table-layout: fixed; width: 100%; }
+        .variables-aligned-table .varcol-copy { width: 40px; }
+        .variables-aligned-table .varcol-eye { width: 46px; }
+        .variables-aligned-table .varcol-updated { width: 110px; }
+        .variables-aligned-table .varcol-storage { width: 100px; }
+        /* Tables without a Storage/Actions column: Last Updated absorbs
+           its 100px so the fixed columns sum to 296px in every table. */
+        .variables-aligned-table .varcol-updated-wide { width: 210px; }
+        /* The cells clip their own content with an ellipsis (flex +
+           .text-truncate) so the row stays one line at any width;
+           min-width:0 lets a flex item shrink below its content width,
+           which is what makes text-overflow kick in. */
+        .variables-aligned-table .varcell { display: flex; align-items: center; min-width: 0; }
+        .variables-aligned-table .varcell > .text-truncate { flex: 1 1 auto; min-width: 0; }
+        .variables-aligned-table .varcell > .varnote { flex: 0 0 auto; }
+        /* Names/topics truncate from the START, not the end - for MQTT
+           topics the distinguishing part is the tail (.../state,
+           .../temperature) while the prefix repeats across dozens of
+           sibling rows. direction:rtl puts the ellipsis on the left; the
+           left-to-right marks (U+200E) flanking the text stop the bidi
+           algorithm from moving leading/trailing punctuation (a trailing
+           "/" or ":") to the wrong end. They're pseudo-content so they
+           never end up in a copy/paste of the name. */
+        .variables-aligned-table .varname { direction: rtl; text-align: left; }
+        .variables-aligned-table .varname::before,
+        .variables-aligned-table .varname::after { content: "\200E"; }
+        /* The View (eye) button is rendered on every row and toggled by
+           UpdateVariableEyeButtons() to only show where the value on screen
+           is actually clipped. visibility (not display) so the column
+           keeps its width and nothing shifts as rows gain/lose the eye. */
+        .variables-aligned-table .variableEyeHidden { visibility: hidden; }
+
+        /* Mobile: the row can't fit both a readable Name and a Value. Fall
+           back to natural sizing and hide the Value column outright (its
+           cells, not visibility:collapse on the <col> - Safari doesn't
+           support collapse on columns), so the row reflows to just
+           Name/Topic + the eye icon (forced on for every row here, since
+           it's the only way left to see a value at all) + Last Updated
+           (+ Storage/Actions on the User table). */
+        @media (max-width: 767.98px) {
+            .variables-aligned-table { table-layout: auto; }
+            .variables-aligned-table .varcol-name,
+            .variables-aligned-table .varcol-copy,
+            .variables-aligned-table .varcol-eye,
+            .variables-aligned-table .varcol-updated,
+            .variables-aligned-table .varcol-updated-wide,
+            .variables-aligned-table .varcol-storage { width: auto; }
+            .variables-aligned-table th:nth-child(3),
+            .variables-aligned-table td:nth-child(3) { display: none; }
+            .variables-aligned-table .variableEyeHidden { visibility: visible; }
+            .variables-aligned-table .varcell > .text-truncate { max-width: 40vw; }
+        }
+    </style>
+    <script>
+
+        // Value cells stay one line regardless of how long the (already-short,
+        // backend-capped) value is - CSS clips to the column with an ellipsis
+        // (see .varcell). A value large enough to be server-truncated shows
+        // its capped preview plus a byte count; hover a clipped cell for the
+        // preview text, or click View (its own column, see RenderEyeCell)
+        // for the exact current full value.
+        function RenderValueCell(value, truncatedOnServer, size) {
+            var esc = $('<div>').text(value).html();
+            var escAttr = esc.replace(/'/g, '&#39;');
+            var titleSuffix = truncatedOnServer ? '&hellip;' : '';
+            var sizeNote = truncatedOnServer ? "<span class='varnote text-muted ms-1'>(" + size + " bytes)</span>" : '';
+            return "<div class='varcell'><code class='text-truncate varvalue' data-full='" + escAttr + titleSuffix + "'>" + esc + "</code>" + sizeNote + "</div>";
+        }
+
+        // The eye/View button gets its own unlabeled column (rather than
+        // being appended inline after the value text) so it always lands at
+        // the same x-offset down the page. It's rendered on every row and
+        // starts hidden unless the value is server-truncated (never fully
+        // visible inline); UpdateVariableEyeButtons() then reveals it on
+        // rows whose value is clipped at the current column width, and the
+        // mobile CSS forces it visible everywhere (the Value column itself
+        // is hidden there).
+        function RenderEyeCell(name, truncatedOnServer) {
+            var hidden = truncatedOnServer ? '' : ' variableEyeHidden';
+            return "<button type='button' class='buttons btn-sm variableEyeBtn" + hidden + "' data-name=\"" + EscapeVariableAttr(name) + "\" " +
+                "data-server-truncated='" + (truncatedOnServer ? 1 : 0) + "' title='View'><i class='fas fa-eye'></i></button>";
+        }
+
+        // Row action buttons are delegated (not inline onclick="") so the
+        // name comes from a data-* attribute the browser decodes for us -
+        // safe for any name containing quotes or JS syntax, which an
+        // inline onclick string is not (an attribute-escaped quote is
+        // decoded back before the JS parser sees it). MQTT topics are
+        // externally supplied, so this isn't hypothetical.
+        function EscapeVariableAttr(name) {
+            return $('<div>').text(name).html().replace(/"/g, '&quot;');
+        }
+        $(document).on('click', '.variableEyeBtn', function () {
+            ViewVariable($(this).attr('data-name'));
+        });
+        $(document).on('click', '.variableClearBtn', function () {
+            ClearVariable($(this).attr('data-name'));
+        });
+        $(document).on('click', '.variableDeleteBtn', function () {
+            DeleteVariable($(this).attr('data-name'));
+        });
+
+        // Measures each row's rendered name and value against their columns:
+        // shows the View button only where the value is actually clipped,
+        // and gives a clipped cell a hover title with the full text. Runs
+        // after every table (re)render and, debounced, on resize - the
+        // columns are relative widths so what fits changes continuously.
+        // The full text is kept in data-full rather than rendered as a
+        // title= up front: SetupToolTips() (re-run every 3s by the FPP
+        // table refresh) turns every [title] on the page into a Bootstrap
+        // tooltip, so titling every cell would mean hundreds of tooltip
+        // instances rebuilt on each refresh.
+        function UpdateVariableEyeButtons() {
+            $('.variables-aligned-table tbody tr[data-name]:not(.d-none)').each(function () {
+                var $row = $(this);
+                var valueClipped = false;
+                $row.find('.varname, .varvalue').each(function () {
+                    // Integer scrollWidth vs. fractional layout width: a 1px
+                    // tolerance keeps sub-pixel overflow from counting.
+                    var clipped = this.scrollWidth > this.getBoundingClientRect().width + 1;
+                    if (this.classList.contains('varvalue')) {
+                        valueClipped = clipped;
+                    }
+                    if (clipped && !this.title && !this.getAttribute('data-bs-toggle')) {
+                        this.title = this.getAttribute('data-full');
+                    } else if (!clipped) {
+                        // Un-clipped (wider window): drop the title, and the
+                        // Bootstrap tooltip if SetupToolTips() already made one.
+                        var inst = bootstrap.Tooltip.getInstance(this);
+                        if (inst) {
+                            inst.dispose();
+                            this.removeAttribute('data-bs-toggle');
+                            this.removeAttribute('data-bs-tooltip-title');
+                            this.removeAttribute('data-bs-original-title');
+                            this.removeAttribute('aria-label');
+                        }
+                        this.removeAttribute('title');
+                    }
+                });
+                var $btn = $row.find('.variableEyeBtn');
+                if ($btn.length && $btn.attr('data-server-truncated') !== '1') {
+                    $btn.toggleClass('variableEyeHidden', !valueClipped);
+                }
+            });
+        }
+
+        // Brief inline feedback (swap the icon to a checkmark for a moment)
+        // rather than a toast/alert - keeps it lightweight for a button that
+        // can appear on many rows at once. Delegated (not inline onclick=""),
+        // so the copied text comes from a data-* attribute the browser
+        // decodes for us - safe for any name containing a quote/apostrophe,
+        // unlike hand-escaping text into an inline onclick string.
+        $(document).on('click', '.variableCopyBtn', function () {
+            var $icon = $(this).find('i');
+            CopyTextToClipboard($(this).attr('data-copy')).then(function () {
+                $icon.removeClass('fa-copy').addClass('fa-check text-success');
+                setTimeout(function () {
+                    $icon.removeClass('fa-check text-success').addClass('fa-copy');
+                }, 1000);
+            }, function () {
+                $.jGrowl('Could not copy to the clipboard', { themeState: 'danger' });
+            });
+        });
+
+        // Truncates from the START, not the end, when the name doesn't fit
+        // (CSS - see .varname) - for MQTT topics the meaningful/
+        // distinguishing part is usually the tail (.../state,
+        // .../temperature), while the prefix repeats across dozens of
+        // sibling rows and just adds noise when scanning. Full name is in
+        // the title tooltip, still searchable/sortable underneath. Optional
+        // leading markup (the FPP table's description icon) sits in the
+        // same flex row so it isn't pushed around by the truncation.
+        function RenderNameCell(name, prefixHtml) {
+            var esc = $('<div>').text(name).html();
+            var escAttr = esc.replace(/'/g, '&#39;');
+            return "<div class='varcell'>" + (prefixHtml || '') +
+                "<code class='text-truncate varname' data-full='" + escAttr + "'>" + esc + "</code></div>";
+        }
+
+        // Every row gets a copy button, regardless of table - names get
+        // pasted into %VAR:name%/%%name%%/If-condition fields elsewhere in
+        // the app often enough that retyping-by-hand isn't a safe
+        // assumption even for short names.
+        function RenderCopyButton(name) {
+            var escForAttr = $('<div>').text(name).html().replace(/"/g, '&quot;');
+            return "<button type='button' class='buttons btn-sm variableCopyBtn' data-copy=\"" + escForAttr + "\" " +
+                "title='Copy full name'><i class='fas fa-copy'></i></button>";
+        }
+
+        // Rows are tagged with data-name (the variable/topic name, lowercased)
+        // as they're rendered; filtering just toggles .d-none rather than
+        // re-fetching, so it stays instant and survives the 3s auto-refresh
+        // (each Load*Table() re-applies it after rebuilding its rows).
+        var VARIABLE_SEARCH_TABLES = [
+            { tbody: '#variablesTableBody', colspan: 6 },
+            { tbody: '#fppVariablesTableBody', colspan: 5 },
+            { tbody: '#mqttVariablesTableBody', colspan: 5 }
+        ];
+        function ApplyVariableSearchFilter() {
+            var term = $('#variableSearchBox').val().trim().toLowerCase();
+            $.each(VARIABLE_SEARCH_TABLES, function (i, t) {
+                var $tbody = $(t.tbody);
+                var $rows = $tbody.find('tr[data-name]');
+                var visibleCount = 0;
+                $rows.each(function () {
+                    var name = $(this).attr('data-name');
+                    var match = term === '' || name.indexOf(term) !== -1;
+                    $(this).toggleClass('d-none', !match);
+                    if (match) {
+                        visibleCount++;
+                    }
+                });
+                $tbody.find('tr.variableSearchNoMatch').remove();
+                if (term !== '' && $rows.length && !visibleCount) {
+                    $("<tr class='variableSearchNoMatch'><td colspan='" + t.colspan + "' class='text-muted'>" +
+                        "No matches for \"" + $('<div>').text(term).html() + "\".</td></tr>").appendTo($tbody);
+                }
+            });
+            // Rows hidden by the filter measure as 0 wide, so re-check the
+            // eye buttons only after visibility is settled.
+            UpdateVariableEyeButtons();
+        }
+
+        // Per-table sort state, applied client-side to the already-fetched
+        // data (no re-fetch needed) - clicking a sortable header re-renders
+        // that table's rows in the new order and toggles asc/desc on a
+        // second click of the same column.
+        var VariableSortState = {
+            user: { field: 'name', dir: 1 },
+            fpp: { field: 'name', dir: 1 },
+            mqtt: { field: 'name', dir: 1 }
+        };
+
+        function SetVariableSort(table, field) {
+            var s = VariableSortState[table];
+            if (s.field === field) {
+                s.dir = -s.dir;
+            } else {
+                s.field = field;
+                s.dir = 1;
+            }
+            RenderSortIndicators();
+            if (table === 'user') {
+                LoadVariablesTable();
+            } else if (table === 'fpp') {
+                LoadFppVariablesTable();
+            } else if (table === 'mqtt') {
+                LoadMqttVariablesTable();
+            }
+        }
+
+        function RenderSortIndicators() {
+            $('.sortableHeader').each(function () {
+                var s = VariableSortState[$(this).data('table')];
+                var isActive = s.field === $(this).data('field');
+                $(this).find('.sortIndicator').text(isActive ? (s.dir === 1 ? ' ▲' : ' ▼') : '');
+            });
+        }
+
+        // Numeric-aware: "2" sorts before "10" instead of after, but falls
+        // back to a plain string compare for anything that isn't a bare number
+        // (most Values/timestamps-as-text won't be).
+        function CompareForSort(va, vb) {
+            var na = parseFloat(va), nb = parseFloat(vb);
+            var bothNumeric = va !== '' && vb !== '' && !isNaN(na) && !isNaN(nb) &&
+                String(na) === va.trim() && String(nb) === vb.trim();
+            if (bothNumeric) {
+                return na - nb;
+            }
+            return va < vb ? -1 : (va > vb ? 1 : 0);
+        }
+
+        function SortNames(names, data, table) {
+            var s = VariableSortState[table];
+            var field = s.field, dir = s.dir;
+            return names.slice().sort(function (a, b) {
+                var va, vb;
+                if (field === 'value') {
+                    va = data[a].value || '';
+                    vb = data[b].value || '';
+                } else if (field === 'lastUpdated') {
+                    va = data[a].lastUpdated || 0;
+                    vb = data[b].lastUpdated || 0;
+                    return dir * (va - vb);
+                } else {
+                    va = a.toLowerCase();
+                    vb = b.toLowerCase();
+                }
+                return dir * CompareForSort(va, vb);
+            });
+        }
+
+        // Single coarsest-fitting unit (not a combined breakdown), compact
+        // form - "8s", "5m", "3h", "2d", never "5 minutes 12 seconds ago".
+        // Recomputed for free every 3s since these tables already fully
+        // re-render on that timer.
+        function FormatVariableTimestamp(unixSeconds) {
+            if (!unixSeconds) {
+                return '<span class="text-muted">never</span>';
+            }
+            var diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
+            var units = [
+                ['d', 86400],
+                ['h', 3600],
+                ['m', 60],
+                ['s', 1]
+            ];
+            for (var i = 0; i < units.length; i++) {
+                var count = Math.floor(diff / units[i][1]);
+                if (count >= 1 || units[i][0] === 's') {
+                    return count + units[i][0];
+                }
+            }
+        }
+
+        // The tables refresh every 3s (LoadAllVariableTables' setInterval
+        // below) and SetupToolTips() converts every title= on the page -
+        // the row buttons, the FPP info icons, clipped cells - into a
+        // Bootstrap tooltip whose floating bubble lives outside the
+        // trigger element. If a refresh empties a tbody while one is
+        // showing, its trigger is gone but the bubble is never told to
+        // hide - it's orphaned on screen until the page reloads - and
+        // Bootstrap's instance map keeps the detached rows alive. Dispose
+        // the old rows' instances before every rebuild.
+        function DisposeVariableTooltips($tbody) {
+            $tbody.find('[data-bs-toggle="tooltip"]').each(function () {
+                var inst = bootstrap.Tooltip.getInstance(this);
+                if (inst) {
+                    inst.dispose();
+                }
+            });
+        }
+
+        function LoadVariablesTable() {
+            $.ajax({
+                dataType: 'json',
+                url: 'api/variables',
+                success: function (data) {
+                    var $tbody = $('#variablesTableBody');
+                    DisposeVariableTooltips($tbody);
+                    $tbody.empty();
+                    var names = SortNames(Object.keys(data || {}), data, 'user');
+                    if (!names.length) {
+                        $tbody.append(
+                            "<tr><td colspan='6' class='text-muted'>No variables defined yet.</td></tr>"
+                        );
+                        return;
+                    }
+                    $.each(names, function (i, name) {
+                        var v = data[name];
+                        var persistIcon = v.persist
+                            ? "<i class='fas fa-save text-info' title='Persisted - survives an fppd restart'></i>"
+                            : "<i class='fas fa-memory text-muted' title='In-memory only - lost on an fppd restart'></i>";
+                        var attrName = EscapeVariableAttr(name);
+                        var valueCell = RenderValueCell(v.value, v.truncated, v.size);
+                        var eyeCell = RenderEyeCell(name, v.truncated);
+                        var row =
+                            "<tr>" +
+                            "<td>" + RenderNameCell(name) + "</td>" +
+                            "<td class='text-center'>" + RenderCopyButton(name) + "</td>" +
+                            "<td class='ps-4'>" + valueCell + "</td>" +
+                            "<td class='text-center'>" + eyeCell + "</td>" +
+                            "<td>" + FormatVariableTimestamp(v.lastUpdated) + "</td>" +
+                            "<td class='text-center text-nowrap'>" + persistIcon + " " +
+                            "<button type='button' class='buttons btn-sm variableClearBtn' data-name=\"" + attrName + "\" title='Clear (reset value)'><i class='fas fa-eraser'></i></button> " +
+                            "<button type='button' class='buttons btn-sm variableDeleteBtn' data-name=\"" + attrName + "\" title='Delete (remove entirely)'><i class='fas fa-trash text-danger'></i></button>" +
+                            "</td>" +
+                            "</tr>";
+                        $(row).attr('data-name', name.toLowerCase()).appendTo($tbody);
+                    });
+                    ApplyVariableSearchFilter();
+                },
+                error: function () {
+                    $('#variablesTableBody').html("<tr><td colspan='6' class='text-danger'>Error loading variables.</td></tr>");
+                }
+            });
+        }
+
+        function ClearVariable(name) {
+            if (!confirm('Clear variable "' + name + '"? This resets its value (removing any persisted copy on ' +
+                'disk) but keeps the row - use Delete instead to remove it entirely.')) {
+                return;
+            }
+            $.ajax({
+                type: 'POST',
+                url: 'api/variables/' + encodeURIComponent(name) + '?persist=false',
+                data: '',
+                contentType: 'text/plain',
+                complete: function () {
+                    LoadVariablesTable();
+                }
+            });
+        }
+
+        function DeleteVariable(name) {
+            if (!confirm('Delete variable "' + name + '"? This removes it entirely from the list (not just its ' +
+                'value) - it can be recreated later via Set Variable if needed.')) {
+                return;
+            }
+            $.ajax({
+                type: 'DELETE',
+                url: 'api/variables/' + encodeURIComponent(name),
+                complete: function () {
+                    LoadVariablesTable();
+                }
+            });
+        }
+
+        var viewVariableSeq = 0;
+        function ViewVariable(name) {
+            // Fetch fresh rather than reusing the table's cached value - the
+            // table row can be stale by the time the user clicks (another
+            // periodic task/GPIO/MQTT write may have landed since the last
+            // LoadVariablesTable()).
+            $.ajax({
+                dataType: 'text',
+                url: 'api/variables/' + encodeURIComponent(name),
+                success: function (value) {
+                    ShowVariableValuePopup(name, value);
+                },
+                error: function () {
+                    ShowVariableValuePopup(name, '');
+                }
+            });
+        }
+
+        function ShowVariableValuePopup(name, value) {
+            var domId = 'viewVariablePopup_' + (++viewVariableSeq);
+            var $popup = $(
+                "<div id='" + domId + "'><pre class='text-break m-0' style='white-space:pre-wrap;'></pre></div>"
+            ).appendTo('body');
+            $popup.find('pre').text(value);
+            $popup.fppDialog({
+                height: 'auto',
+                maxHeight: 500,
+                width: 500,
+                title: name,
+                modal: true,
+                open: function () {
+                    $popup.parent().find('.ui-dialog-titlebar-close').hide();
+                },
+                close: function () {
+                    $popup.remove();
+                },
+                buttons: {
+                    'Copy to Clipboard': function () {
+                        CopyTextToClipboard(value).catch(function () {
+                            $.jGrowl('Could not copy to the clipboard', { themeState: 'danger' });
+                        });
+                    },
+                    'Close': function () {
+                        $popup.fppDialog('close');
+                    }
+                }
+            });
+        }
+
+        // Fixed meanings for the read-only "fpp_" status variables - unlike
+        // user/MQTT variables (arbitrary, no canonical description), these
+        // are a known, stable set computed by ComputeFppStatusVariables()
+        // (Variables.cpp). Keep in sync with that function.
+        var FPP_VARIABLE_DESCRIPTIONS = {
+            fpp_status: 'Numeric player status code (0=idle, 1=playing, 2-4=stopping variants, 5=paused).',
+            fpp_status_name: 'Player status as text: idle, playing, playing media, playing background, stopping gracefully, stopping gracefully after loop, stopping now, or paused.  "playing media" and "playing background" mean a stream slot is active outside a playlist (Play Media, a PSA, background music); the numeric status stays idle in that case because the player itself is idle.',
+            fpp_mode_name: 'Current FPP mode, e.g. "player", "bridge", "master", "remote".',
+            fpp_volume: 'Current audio output volume (0-100).',
+            fpp_multisync: '1 if MultiSync is enabled, 0 otherwise.',
+            fpp_uptime_seconds: 'Seconds since fppd started.',
+            fpp_is_playing: '1 if a playlist is currently playing, 0 otherwise.',
+            fpp_was_scheduled: '1 if the current/most recent playlist was started by the Scheduler rather than manually or via the API, 0 otherwise.',
+            fpp_scheduler_enabled: '1 if the Scheduler is enabled, 0 if it has been disabled.',
+            fpp_current_time: 'Current local time as HH:MM (24-hour) - same format as the "Time" If-condition Source, so they compare directly.',
+            fpp_current_date: 'Current local date as YYYY-MM-DD.',
+            fpp_day_of_week: 'Current local day name, e.g. "Monday".',
+            fpp_current_month: 'Current local month name, e.g. "July".',
+            fpp_warning_count: 'Number of active system warnings.',
+            fpp_next_playlist: 'Name of the next Scheduler-triggered playlist, or empty if none is scheduled.',
+            fpp_next_playlist_start: 'Start time of the next scheduled playlist.',
+            fpp_current_playlist: 'Name of the currently loaded playlist.',
+            fpp_current_playlist_count: 'Number of entries in the current playlist.',
+            fpp_current_playlist_index: 'Index of the currently playing entry within the current playlist.',
+            fpp_current_sequence: 'Filename of the currently playing sequence.',
+            fpp_current_song: 'Filename of the currently playing media/song.',
+            fpp_seconds_played: 'Seconds played so far in the current playlist entry.',
+            fpp_seconds_remaining: 'Seconds remaining in the current playlist entry.',
+            fpp_time_elapsed: 'Elapsed time of the current playlist entry, formatted as text.',
+            fpp_time_remaining: 'Remaining time of the current playlist entry, formatted as text.',
+            fpp_repeat_mode: 'Current playlist repeat mode.',
+            fpp_random: 'Current playlist shuffle/random mode.'
+        };
+
+        function LoadFppVariablesTable() {
+            $.ajax({
+                dataType: 'json',
+                url: 'api/variables?fpp=true',
+                success: function (data) {
+                    var $tbody = $('#fppVariablesTableBody');
+                    DisposeVariableTooltips($tbody);
+                    $tbody.empty();
+                    var names = SortNames(Object.keys(data || {}), data, 'fpp');
+                    if (!names.length) {
+                        $tbody.append("<tr><td colspan='5' class='text-muted'>None available.</td></tr>");
+                        return;
+                    }
+                    $.each(names, function (i, name) {
+                        var v = data[name];
+                        var valueCell = RenderValueCell(v.value, v.truncated, v.size);
+                        var eyeCell = RenderEyeCell(name, v.truncated);
+                        var desc = FPP_VARIABLE_DESCRIPTIONS[name];
+                        var descIcon = desc
+                            ? "<i class='fas fa-info-circle text-muted me-1 flex-shrink-0' title='" + $('<div>').text(desc).html().replace(/'/g, '&#39;') + "'></i>"
+                            : '';
+                        var row =
+                            "<tr>" +
+                            "<td>" + RenderNameCell(name, descIcon) + "</td>" +
+                            "<td class='text-center'>" + RenderCopyButton(name) + "</td>" +
+                            "<td class='ps-4'>" + valueCell + "</td>" +
+                            "<td class='text-center'>" + eyeCell + "</td>" +
+                            "<td>" + FormatVariableTimestamp(v.lastUpdated) + "</td>" +
+                            "</tr>";
+                        $(row).attr('data-name', name.toLowerCase()).appendTo($tbody);
+                    });
+                    ApplyVariableSearchFilter();
+                    // These rows (and their info-icon title attributes) are
+                    // added after the page's one-time SetupToolTips() pass
+                    // (fpp.js, called on initial load only) already ran, so
+                    // without re-running it here the icons' titles never get
+                    // converted into (or shown as) Bootstrap tooltips - same
+                    // reason co-ledPanels.php/schedulePreview.php/
+                    // multisync.php/settings.php all re-call it after their
+                    // own dynamic re-renders.
+                    SetupToolTips();
+                },
+                error: function () {
+                    $('#fppVariablesTableBody').html("<tr><td colspan='5' class='text-danger'>Error loading FPP variables.</td></tr>");
+                }
+            });
+        }
+
+        function LoadMqttVariablesTable() {
+            $.ajax({
+                dataType: 'json',
+                url: 'api/variables?mqtt=true',
+                success: function (data) {
+                    var $tbody = $('#mqttVariablesTableBody');
+                    DisposeVariableTooltips($tbody);
+                    $tbody.empty();
+                    var names = SortNames(Object.keys(data || {}), data, 'mqtt');
+                    if (!names.length) {
+                        $tbody.append(
+                            "<tr><td colspan='5' class='text-muted'>No MQTT messages cached yet. Go to " +
+                            "<a href='settings-mqtt.php'>MQTT Settings</a> to connect to a broker and " +
+                            "subscribe to a topic (or <code>#</code> for everything) - any topic this " +
+                            "device receives a message on will appear here.</td></tr>"
+                        );
+                        return;
+                    }
+                    $.each(names, function (i, name) {
+                        var v = data[name];
+                        var valueCell = RenderValueCell(v.value, v.truncated, v.size);
+                        var eyeCell = RenderEyeCell(name, v.truncated);
+                        var row =
+                            "<tr>" +
+                            "<td class='align-top'>" + RenderNameCell(name) + "</td>" +
+                            "<td class='align-top text-center'>" + RenderCopyButton(name) + "</td>" +
+                            "<td class='ps-4 align-top'>" + valueCell + "</td>" +
+                            "<td class='align-top text-center'>" + eyeCell + "</td>" +
+                            "<td class='align-top'>" + FormatVariableTimestamp(v.lastUpdated) + "</td>" +
+                            "</tr>";
+                        $(row).attr('data-name', name.toLowerCase()).appendTo($tbody);
+                    });
+                    ApplyVariableSearchFilter();
+                },
+                error: function () {
+                    $('#mqttVariablesTableBody').html("<tr><td colspan='5' class='text-danger'>Error loading MQTT variables.</td></tr>");
+                }
+            });
+        }
+
+        function LoadAllVariableTables() {
+            LoadVariablesTable();
+            LoadFppVariablesTable();
+            LoadMqttVariablesTable();
+        }
+
+        function pageSpecific_PageLoad_PostDOMLoad_ActionsSetup() {
+            $('#variableSearchBox').on('input', ApplyVariableSearchFilter);
+            $(document).on('click', '.sortableHeader', function () {
+                SetVariableSort($(this).data('table'), $(this).data('field'));
+            });
+            RenderSortIndicators();
+            LoadAllVariableTables();
+            // The listing endpoints only ever return short values (or a
+            // capped preview + a View button for large ones - see
+            // kInlineValueMaxBytes in Variables.cpp), so it's safe to keep
+            // these fresh automatically without a manual Refresh.
+            setInterval(LoadAllVariableTables, 3000);
+
+            // Columns are relative widths, so which values fit changes
+            // continuously with the window - re-measure (no re-fetch) after
+            // the resize settles.
+            var variableResizeTimer = null;
+            $(window).on('resize', function () {
+                clearTimeout(variableResizeTimer);
+                variableResizeTimer = setTimeout(UpdateVariableEyeButtons, 250);
+            });
+        }
+
+    </script>
+</head>
+
+<body>
+    <div id="bodyWrapper">
+        <?php
+        $activeParentMenuItem = 'content';
+        include 'menu.inc'; ?>
+        <div class="mainContainer">
+            <h1 class="title">Variables</h1>
+            <div class="pageContent">
+                <div class="text-muted mb-3">
+                    <p class="mb-0">
+                        Variables are named values that stick around so different parts of FPP can share
+                        data. Read one back two ways: drop <code>%VAR:name%</code> into any command's
+                        text field and it's swapped for the current value when that command runs - e.g. a
+                        <code>URL</code> command's address containing <code>%VAR:apiKey%</code>, or a
+                        <code>Run Script</code> command passing <code>%VAR:outsideTempF%</code> as an
+                        argument. Or, inside an <code>If</code> command's Check, pick the Variable
+                        directly from the condition editor - no <code>%VAR:</code> needed there.
+                    </p>
+                </div>
+                <div class="input-group mb-3">
+                    <span class="input-group-text"><i class="fas fa-search"></i></span>
+                    <input type="text" id="variableSearchBox" class="form-control" placeholder="Search variables">
+                </div>
+                <h5 class="fw-semibold mb-1 mt-2" id="userVariablesHead">User Variables</h5>
+                <div class="text-muted mb-2">
+                    Values you set yourself with the <b>Set Variable</b> command, triggered directly,
+                    from a GPIO input, a scheduler entry, the API, or (for data fetched
+                    from outside FPP, like a weather API) a
+                    <a href="recurringtasks.php">Recurring Task</a>.
+                </div>
+                <div class="fppTableContents" role="region" aria-labelledby="userVariablesHead" tabindex="0">
+                <table class="table table-striped variables-aligned-table">
+                    <colgroup>
+                        <col class="varcol-name"><col class="varcol-copy"><col class="varcol-value"><col class="varcol-eye"><col class="varcol-updated"><col class="varcol-storage">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="user" data-field="name">Name<span class="sortIndicator"></span></a></th>
+                            <th></th>
+                            <th class="ps-4"><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="user" data-field="value">Value<span class="sortIndicator"></span></a></th>
+                            <th></th>
+                            <th><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="user" data-field="lastUpdated">Last Updated<span class="sortIndicator"></span></a></th>
+                            <th class="text-center"></th>
+                        </tr>
+                    </thead>
+                    <tbody id="variablesTableBody">
+                        <tr>
+                            <td colspan="6" class="text-muted">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+                </div>
+
+                <h5 class="fw-semibold mb-1 mt-2" id="fppVariablesHead">FPP Read-only Variables</h5>
+                <div class="fppTableContents" role="region" aria-labelledby="fppVariablesHead" tabindex="0">
+                <table class="table table-striped variables-aligned-table">
+                    <colgroup>
+                        <col class="varcol-name"><col class="varcol-copy"><col class="varcol-value"><col class="varcol-eye"><col class="varcol-updated-wide">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="fpp" data-field="name">Name<span class="sortIndicator"></span></a></th>
+                            <th></th>
+                            <th class="ps-4"><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="fpp" data-field="value">Value<span class="sortIndicator"></span></a></th>
+                            <th></th>
+                            <th><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="fpp" data-field="lastUpdated">Last Updated<span class="sortIndicator"></span></a></th>
+                        </tr>
+                    </thead>
+                    <tbody id="fppVariablesTableBody">
+                        <tr>
+                            <td colspan="5" class="text-muted">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+                </div>
+
+                <h5 class="fw-semibold mb-1 mt-2" id="mqttVariablesHead">MQTT Read-only Variables</h5>
+                <div class="fppTableContents" role="region" aria-labelledby="mqttVariablesHead" tabindex="0">
+                    <table class="table table-striped variables-aligned-table">
+                        <colgroup>
+                            <col class="varcol-name"><col class="varcol-copy"><col class="varcol-value"><col class="varcol-eye"><col class="varcol-updated-wide">
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="mqtt" data-field="name">Name<span class="sortIndicator"></span></a></th>
+                                <th></th>
+                                <th class="ps-4"><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="mqtt" data-field="value">Value<span class="sortIndicator"></span></a></th>
+                                <th></th>
+                                <th><a href="javascript:void(0)" class="text-decoration-none text-reset sortableHeader" data-table="mqtt" data-field="lastUpdated">Last Updated<span class="sortIndicator"></span></a></th>
+                            </tr>
+                        </thead>
+                        <tbody id="mqttVariablesTableBody">
+                            <tr>
+                                <td colspan="5" class="text-muted">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <?php include 'common/footer.inc'; ?>
+    </div>
+</body>
+
+</html>

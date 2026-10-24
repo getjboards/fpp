@@ -1,88 +1,178 @@
 <?php
-$skipJSsettings = 1;
+$skipHTMLCodeOutput = false;
+//Check if this script is being called directly for is being included on another script
+//If included we'll skip printing the HTML code for the page as it's likely we just want to access functions to generate a backup
+function checkDirectScriptExecution()
+{
+    global $skipJSsettings, $skipHTMLCodeOutput;
+    $incl_files = get_included_files();
+
+    //Try to detect if the API scripts are have been included, meaning that this being included in a function of one of the API script
+    $api_index_script = 'www/api/index.php';
+    $api_index_script_found = false;
+    $api_library_script = 'www/api/lib/limonade.php';
+    $api_library_script_found = false;
+
+    //Search over the array and try find either
+    foreach ($incl_files as $incl_idx => $included_file) {
+        if (strpos($included_file, $api_index_script) !== false) {
+            $api_index_script_found = true;
+        } else if (strpos($included_file, $api_library_script) !== false) {
+            $api_library_script_found = true;
+        }
+    }
+
+    //script in the first index should be the script were executing
+    if (($incl_files[0] != __FILE__) || ($api_index_script_found === true || $api_library_script_found === true)) {
+        $skipJSsettings = 1;
+        $skipHTMLCodeOutput = true;
+    }
+}
+checkDirectScriptExecution();
+
+//Stop config.php spitting out any JS used in the UI, not needed on the backup page, if left as is the JSON download will have the <script> tag in it due to
+//that data already being in the buffer
+//so change the flag so it doesn't get output when the request is a post request (which is the user submitting the backup form)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' || $skipHTMLCodeOutput === true) {
+    $skipJSsettings = 1;
+}
 //error_reporting(E_ALL);
 //ini_set('display_errors', 1);
 
 //Include other scripts
-require_once('common.php');
-//Includes for API access
-//require_once('fppjson.php');
-require_once('fppxml.php');
+require_once 'common.php';
+require_once 'common/settings.php';
+require_once 'commandsocket.php';
 
 //Define a map of backup/restore areas and setting locations, this is also used to populate the area select lists
 $system_config_areas = array(
     'all' => array('friendly_name' => 'All', 'file' => false),
-    'channelInputs' => array('friendly_name' => 'Channel Inputs (E1.31 Bridge)', 'file' => $settings['universeInputs']),
-    'channelOutputs' =>
-        array(
-            'friendly_name' => 'Channel Outputs (Universe, Falcon, LED Panels, etc.)',
-            'file' => array(
-                'universes' => array('type' => 'file', 'location' => $settings['universeOutputs']),
-                'falcon_pixelnet_DMX' => array('type' => 'function', 'location' => array('backup' => 'LoadPixelnetDMXFile_FPDv1', 'restore' => 'SavePixelnetDMXFile_FPDv1')),
-                'pixel_strings' => array('type' => 'file', 'location' => $settings['co-pixelStrings']),
-                'bbb_strings' => array('type' => 'file', 'location' => $settings['co-bbbStrings']),
-                'led_panels' => array('type' => 'file', 'location' => $settings['channelOutputsJSON']),
-                'other' => array('type' => 'file', 'location' => $settings['co-other']),
-            ),
-            'special' => true
+    'channelInputs' => array(
+        'friendly_name' => 'Channel Inputs (E1.31 Bridge)',
+        'file' => array(
+            'universe_inputs' => array('type' => 'file', 'location' => $settings['universeInputs']),
+            'dmx_inputs' => array('type' => 'file', 'location' => $settings['dmxInputs']),
         ),
+        'special' => true,
+    ),
+    'channelOutputs' => array(
+        'friendly_name' => 'Channel Outputs (Universe, Falcon, LED Panels, etc.)',
+        'file' => array(
+            'universes' => array('type' => 'file', 'location' => $settings['universeOutputs']),
+            'pixel_strings' => array('type' => 'file', 'location' => $settings['co-pixelStrings']),
+            'bbb_strings' => array('type' => 'file', 'location' => $settings['co-bbbStrings']),
+            'pwm' => array('type' => 'file', 'location' => $settings['co-pwm']),
+            'led_panels' => array('type' => 'file', 'location' => $settings['channelOutputsJSON']),
+            'other' => array('type' => 'file', 'location' => $settings['co-other']),
+        ),
+        'special' => true,
+    ),
     'channelmemorymaps' => array('friendly_name' => 'Pixel Overlay Models Old(Channel Memory Maps)', 'file' => $settings['mediaDirectory'] . "/channelmemorymaps"),
+    'gpio-input' => array('friendly_name' => 'GPIO Input Triggers ', 'file' => $settings['configDirectory'] . "/gpio.json"),
     'model-overlays' => array('friendly_name' => 'Pixel Overlay Models', 'file' => $settings['model-overlays']),
+    'virtualdisplaymap' => array('friendly_name' => 'Virtual Display Map (2D Preview Layout)', 'file' => $settings['configDirectory'] . "/virtualdisplaymap"),
+    'misc_configs' => array(
+        'friendly_name' => 'Miscellaneous Settings (Additional Plugins Configs, System Settings, etc.)',
+        'file' => array(
+            'configs' => array('type' => 'function', 'location' => array('backup' => 'BackupConfigFolderConfigs', 'restore' => 'RestoreConfigFolderConfigs')),
+        ),
+        'special' => true,
+    ),
     'outputProcessors' => array('friendly_name' => 'Output Processors', 'file' => $settings['outputProcessorsFile']),
-    'show_setup' =>
-        array(
-            'friendly_name' => 'Show Setup (Events, Playlists, Schedule, Scripts)',
-            'file' => array(
-                'events' => array('type' => 'dir', 'location' => $eventDirectory),
-                'playlist' => array('type' => 'dir', 'location' => $playlistDirectory),
-                'schedule' => array('type' => 'file', 'location' => $scheduleFile),
-                'scripts' => array('type' => 'dir', 'location' => $scriptDirectory),
-            ),
-            'special' => true
+    'show_setup' => array(
+        'friendly_name' => 'Show Setup (Playlists, Schedule, Scripts)',
+        'file' => array(
+            'playlist' => array('type' => 'dir', 'location' => $playlistDirectory),
+            'schedule' => array('type' => 'file', 'location' => $settings['scheduleJsonFile']),
+            'scripts' => array('type' => 'dir', 'location' => $scriptDirectory),
         ),
-    'settings' =>
-        array(
-            'friendly_name' => 'System Settings (incl. GPIO Input, Email, Timezone)',
-            'file' => array(
-                'system_settings' => array('type' => 'file', 'location' => $settingsFile),
-                'email' => array('type' => 'file', 'location' => false),
-                'timezone' => array('type' => 'file', 'location' => $timezoneFile)
-            ),
-            'special' => true
+        'special' => true,
+    ),
+    'settings' => array(
+        'friendly_name' => 'System Settings (incl. Command Presets, Email, Proxies, Timezone)',
+        'file' => array(
+            'system_settings' => array('type' => 'file', 'location' => $settingsFile),
+            'commandPresets' => array('type' => 'file', 'location' => $settings['configDirectory'] . "/commandPresets.json"),
+            'pluginPrivacyAccepted' => array('type' => 'file', 'location' => $settings['configDirectory'] . "/pluginPrivacyAccepted.json"),
+            'proxies' => array('type' => 'file', 'location' => $settings['configDirectory'] . "/proxies"),
+            'email' => array('type' => 'file', 'location' => false),
+            'timezone' => array('type' => 'function', 'location' => array('backup' => 'ReadTimeZone', 'restore' => '')), //We'll handle restore ourselves
         ),
+        'special' => true,
+    ),
     'plugins' => array(
         'friendly_name' => 'Plugin Settings',
         'file' => array(),
-        'special' => true
+        'special' => true,
     ),
     'network' => array(
-		'friendly_name' => 'Network Settings (Wired & WiFi)',
-		'file' => array(
-			'wired_network' => array('type' => 'file', 'location' =>  $settings['configDirectory']. "/interface.eth0"),
-			'wifi_network' => array('type' => 'file', 'location' =>  $settings['configDirectory']. "/interface.wlan0"),
-		),
-		'special' => true
-	)
+        'friendly_name' => 'Network Settings (Wired & WiFi, DNS)',
+        'file' => array(
+            //Std. Network Interfaces
+            'wired_network' => array('type' => 'file', 'location' => $settings['configDirectory'] . "/interface.eth0"),
+            'wifi_network' => array('type' => 'file', 'location' => $settings['configDirectory'] . "/interface.wlan0"),
+            //Manual/Custom DNS Settings stored here
+            'dns' => array('type' => 'file', 'location' => $settings['configDirectory'] . "/dns"),
+        ),
+        'special' => true,
+    ),
+    'virtualEEPROM' => array(
+        'friendly_name' => 'Virtual EEPROM',
+        'file' => array(
+            'cape-eeprom.bin' => array('type' => 'file', 'location' => $settings['configDirectory'] . '/cape-eeprom.bin')
+        ),
+        'binary' => true
+    ),
 );
 
-//FPP Backup version
-$fpp_backup_version = "2";
-//FPP Backup files directory
-$fpp_backup_location = $settings['configDirectory'] . "/backups";
+//FPP Backup version - This is used for tracking the CURRENT backup file format or "backup" version as we may move things around and need backwards compatibility when restoring older version
+//When restoring, this value is read from the uploaded file and in processRestoreData() used to decide on what extra massaging old data needs to work with the current script
+$fpp_backup_format_version = "8.0";
 
-//Array of plugins
+//The v4, v5, vX that appears in backup filename was originally using $fpp_backup_version but to save user confusion will now match the FPP major version
+//it was originally intended as a visual aid to help discern between different backup versions.
+$fpp_major_version = collectFppMajorVersion();
+
+//Directory where backups will be saved
+$fpp_backup_location = $settings['configDirectory'] . "/backups";
+//Flag whether the users browser will download the JSON file - default to always download, this is forced off when calling via API for example
+$fpp_backup_prompt_download = true;
+
+/////////////////////
+/// HOUSE KEEPING ///
+//NOT USED - Max age for stored settings backup files, Default: 90 days
+$fpp_backup_max_age = 90;
+//Max number of backup files we want to keep Default: 45
+$fpp_backup_min_number_kept = 60;
+//Max number of backup per plugin or by trigger source (eg. /api/config_file/someconfig all backup generated via this endpoint will have a trigger source of  config_file/someconfig we'll limit those backups to the below, default: 5
+$fpp_backup_max_plugin_backups_key = 5;
+
+////////////////////
+/// DEBUGGING
+$backups_verbose_logging = false;
+
+//Hold any backup error messages here
+$backup_errors = array();
+
+//Array of known plugins - initially empty, populated dynamically
 $system_active_plugins = array();
 
-//Populate plugins
+//NOTE: - ONLY FOR PLUGINS AT CURRENT
+//Extra backup locations act as a map between any extra files and a plugin it's related to.
+//there no way to programmatically know or discover what configurations files a plugin is using outside the normal "plugin.<plugin-name>.json" configuration file
+//$extra_backup_locations = json_decode(file_get_contents($settings['fppDir'] . '/www/backup_locations.json'), true);
+
+//Populate plugins by looking for their config files (which is what we want to backup anyway, if a config file exists therefore configuration is set for that plugin)
 $system_config_areas['plugins']['file'] = retrievePluginList();
+
+//Populate extra network interfaces, this will help bring in extra configured interfaces like USB eth or extra USB Wifi
+retrieveNetworkInterfaces();
 
 //Preserve some existing settings by default
 $keepMasterSlaveSettings = true;
 $keepNetworkSettings = true;
-//Encrypt/obfuscate passwords and other sensitive data
-$protectSensitiveData = true;
 //The final value is read from the uploaded file on restore, used to skip some parts of the restore operation
-$uploadDataProtected = true;
+$uploadData_IsProtected = true;
 
 //list of settings restored
 $settings_restored = array();
@@ -93,17 +183,22 @@ $network_settings_restored = false;
 $network_settings_restored_post_apply = array('wired_network' => "", 'wifi_network' => "");
 $network_settings_restored_applied_ips = array('wired_network' => array(), 'wifi_network' => array());
 
-//Array of settings by name/key name, that are considered sensitive/taboo
-$sensitive_data = array('emailgpass', 'password', 'secret');
-
-//Lookup arrays for whats json and a ini file
-$known_json_config_files = array('channelInputs', 'channelOutputs', 'outputProcessors', 'universes', 'pixel_strings', 'bbb_strings', 'led_panels', 'other', 'model-overlays');
+//Lookup arrays for what is a json and a ini file
+$known_json_config_files = array('channelInputs', 'universe_inputs', 'dmx_inputs', 'gpio-input', 'channelOutputs', 'commandPresets', 'pluginPrivacyAccepted', 'outputProcessors', 'universes', 'pixel_strings', 'bbb_strings', 'pwm', 'led_panels', 'other', 'model-overlays');
 $known_ini_config_files = array('settings', 'system_settings', 'network', 'wired', 'wifi');
 
 //Remove BBB Strings from the system areas if we're on a Pi or any other platform that isn't a BBB
-if ($settings['Platform'] != "BeagleBone Black") {
+if (!$settings['BeaglePlatform']) {
     unset($system_config_areas['channelOutputs']['file']['bbb_strings']);
 }
+
+// NOTE: The backup page used to call CSP_AllowRemoteSystems() here, which added
+// every known remote's IP to the Apache Content-Security-Policy connect-src so
+// the browser could make cross-origin requests to those remotes. That bloated the
+// CSP header without bound on larger sites (and couldn't even express IPv6
+// remotes). The backup page now reaches remotes through the local backups API
+// using ?ip=<address> (see ProxyBackupToRemote() in api/controllers/backups.php),
+// keeping the browser same-origin, so no per-remote CSP entries are needed.
 
 /**
  * Handle POST for download or restore
@@ -114,188 +209,20 @@ if (isset($_POST['btnDownloadConfig'])) {
     /// BACKUP
     /////
     if (isset($_POST['backuparea']) && !empty($_POST['backuparea'])) {
-        if (isset($_POST['protectSensitive'])) {
-            $protectSensitiveData = true;
-        } else {
-            $protectSensitiveData = false;
-        }
-
+        //A stale protectSensitive here is ignored rather than refused.  The only
+        //thing that can still send it is a copy of this page loaded before the
+        //option was removed -- nothing else in the tree posts this form, and the
+        //remote-backup proxy forwards an empty body to four listing routes
+        //(ProxyBackupToRemote in api/controllers/backups.php).  So it is leftover
+        //markup from FPP's own UI, not a considered request, and the user who
+        //pressed Download wants a backup.  The API path refuses instead, because
+        //there a caller really did ask and would not otherwise know it got the
+        //opposite.
         //this value *SHOULD* directly match a key in $system_config_areas
         $area = $_POST['backuparea'];
 
-        //temporary collection area for settings
-        $tmp_settings_data = array();
-
-        $file_data = null;
-        $special = false;
-
-        if (array_key_exists($area, $system_config_areas)) {
-            //Create a copy of the areas array to manipulate
-            $tmp_config_areas = $system_config_areas;
-
-            //Generate backup for selected area
-            //AREA - ALL
-            if (strtolower($area) == "all") {
-                //combine all backup areas into a single file
-
-                //remove the 'all' key and do some processing of areas array
-                unset($tmp_config_areas['all']);
-                //remove email as its in the general settings file and not a separate section
-                unset($tmp_config_areas['settings']['file']['email']);
-
-                //loop over the areas and process them
-                foreach ($tmp_config_areas as $config_key => $config_data) {
-                    $setting_file_to_backup = $config_data['file'];
-                    $file_data = array();
-                    //if setting file value is an array then there are one or more setting files related to this backup
-                    if (is_array($setting_file_to_backup)) {
-//                    if (array_key_exists('special', $setting_file)) {
-//                        $special = $tmp_config_areas[$config_key]['file']['special'];
-//                    }
-
-                        //loop over the array
-                        foreach ($setting_file_to_backup as $sfi => $sfd) {
-                            $file_data = array();
-                            //           'events' => array('type' => 'dir', 'location' => $eventDirectory),
-
-                            //File or directory, read data accordingly
-                            if ($sfd['type'] == "dir") {
-                                //read all files in directory and read data
-                                $file_data = read_directory_files($sfd['location']);
-                            } else if ($sfd['type'] == "file") {
-                                //read setting file as normal
-
-                                if (in_array($sfi, $known_ini_config_files)) {
-                                    //INI
-                                    //parse ini properly
-                                    $backup_file_data = parse_ini_string(file_get_contents($sfd['location']));
-                                } else if (in_array($sfi, $known_json_config_files)) {
-                                    //JSON
-                                    //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
-                                    $backup_file_data = json_decode(file_get_contents($sfd['location']), true);
-                                } else {
-                                    //all other files are std flat files, process them into an array by splitting at line breaks
-                                    $backup_file_data = explode("\n", file_get_contents($sfd['location']));
-                                }
-
-                                $file_data = array($backup_file_data);
-                            } else if ($sfd['type'] == "function") {
-                                $backup_function = $sfd['location']['backup'];
-                                if (function_exists($backup_function)) {
-                                    $backup_file_data = $backup_function();
-                                }
-                                $file_data = array($backup_file_data);
-                            }
-                            //Remove sensitive data
-                            $tmp_settings_data[$config_key][$sfi] = remove_sensitive_data($file_data);
-                        }
-                    } else {
-                        if ($setting_file_to_backup !== false && file_exists($setting_file_to_backup)) {
-                            //what type of file are we dealing with? json, ini, csv, flatfile?
-                            //ultimately the data should be returned as an array
-                            //it will later be json_encoded
-
-                            if (in_array($config_key, $known_ini_config_files)) {
-                                //INI
-                                //parse ini properly
-                                $file_data = parse_ini_string(file_get_contents($setting_file_to_backup));
-                            } else if (in_array($config_key, $known_json_config_files)) {
-                                //JSON
-                                //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
-                                $file_data = json_decode(file_get_contents($setting_file_to_backup), true);
-                            } else {
-                                //all other files are std flat files, process them into an array by splitting at line breaks
-                                $file_data = explode("\n", file_get_contents($setting_file_to_backup));
-                            }
-                            //Remove sensitive data
-                            $tmp_settings_data[$config_key] = remove_sensitive_data($file_data);
-                        }
-                    }
-                }
-//            } else if (strtolower($area) == "email") {
-//                //AREA - EMAIL BACKUP
-//                $emailgpass = '';
-//                //Do a quick work around to obtain the emailgpass
-//                if ($tmp_config_areas['settings']['file'] !== false && file_exists($tmp_config_areas['settings']['file'])) {
-//                    $setting_file_data = parse_ini_string(file_get_contents($tmp_config_areas['settings']['file']));
-//                    if (array_key_exists('emailgpass', $setting_file_data)) {
-//                        //get pass
-//                        $emailgpass = $setting_file_data['emailgpass'];
-//                    }
-//                }
-//
-//                //special treatment for email settings as they are inside the general settings file
-//                //collect them together here
-//                $email_settings = array(
-//                    'emailenable' => $settings['emailenable'],
-//                    'emailguser' => $settings['emailguser'],
-//                    'emailgpass' => $emailgpass,
-//                    'emailfromtext' => $settings['emailfromtext'],
-//                    'emailtoemail' => $settings['emailtoemail']
-//                );
-//
-//                $tmp_settings_data['email'] = $email_settings;
-            } else {
-                //AREA - Individual Backup section selections will arrive here
-                //All other backup areas for individual selections
-                $setting_file_to_backup = $tmp_config_areas[$area]['file'];
-
-                //if setting file value is an array then there are one or more setting files related to this backup
-                if (is_array($setting_file_to_backup)) {
-//                    if (array_key_exists('special', $tmp_config_areas[$area]['file'])) {
-//                        $special = $tmp_config_areas[$area]['file']['special'];
-//                    }
-                    //loop over the array
-                    foreach ($setting_file_to_backup as $sfi => $sfd) {
-                        $file_data = array();
-                        if ($sfd['type'] == "dir") {
-                            $file_data = read_directory_files($sfd['location']);
-                        } else if ($sfd['type'] == "file") {
-                            //Get the data out of the file
-                            if (in_array($sfi, $known_ini_config_files)) {
-                                //INI
-                                //parse ini properly
-                                $backup_file_data = parse_ini_string(file_get_contents($sfd['location']));
-                            } else if (in_array($sfi, $known_json_config_files)) {
-                                //JSON
-                                //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
-                                $backup_file_data = json_decode(file_get_contents($sfd['location']), true);
-                            } else {
-                                //all other files are std flat files, process them into an array by splitting at line breaks
-                                $backup_file_data = explode("\n", file_get_contents($sfd['location']));
-                            }
-                            $file_data = array($backup_file_data);
-                        } else if ($sfd['type'] == "function") {
-                            $backup_function = $sfd['location']['backup'];
-                            $backup_file_data = array();
-                            if (function_exists($backup_function)) {
-                                $backup_file_data = $backup_function();
-                            }
-                            $file_data = array($backup_file_data);
-                        }
-                        //Remove Sensitive data
-                        $tmp_settings_data[$area][$sfi] = remove_sensitive_data($file_data);
-                    }
-                } else {
-                    if ($setting_file_to_backup !== false && file_exists($setting_file_to_backup)) {
-                        if (in_array($area, $known_ini_config_files)) {
-                            $file_data = parse_ini_string(file_get_contents($setting_file_to_backup));
-                        } else if (in_array($area, $known_json_config_files)) {
-                            $file_data = json_decode(file_get_contents($setting_file_to_backup), true);
-                        } else {
-                            $file_data = explode("\n", file_get_contents($setting_file_to_backup));
-                        }
-                        //Remove sensitive data
-                        $tmp_settings_data[$area] = remove_sensitive_data($file_data);
-                    }
-                }
-            }
-
-            //DO IT!
-            if (!empty($tmp_settings_data)) {
-                doBackupDownload($tmp_settings_data, $area);
-            }
-        }
+        //Do the work to backup settings
+        performBackup($area, true);
     }
 
 } else if (isset($_POST['btnRestoreConfig'])) {
@@ -322,7 +249,7 @@ if (isset($_POST['btnDownloadConfig'])) {
         //split string to get the main area and sub-area
         if (stripos($restore_area, "/") !== false) {
             $restore_area_arr = explode("/", $restore_area);
-            $restore_area_main = $restore_area_arr[0];//main area is first
+            $restore_area_main = $restore_area_arr[0]; //main area is first
         } else {
             $restore_area_main = $restore_area;
         }
@@ -339,76 +266,24 @@ if (isset($_POST['btnDownloadConfig'])) {
                 $rstftmp_name = $_FILES['conffile']['tmp_name'];
                 //file contents
                 $file_contents = file_get_contents($rstftmp_name);
-                //decode back into an array
-                $file_contents_decoded = json_decode($file_contents, true);
 
-                //successful decode
-                if ($file_contents_decoded !== FALSE && is_array($file_contents_decoded)) {
-                    //Get value of protected state and remove it from the array
-                    if (array_key_exists('protected', $file_contents_decoded)) {
-                        $uploadDataProtected = $file_contents_decoded['protected'];
-                        unset($file_contents_decoded['protected']);
-                    }
+                //An uploaded backup is normally already whole - downloads are
+                //written out that way.  One copied off the box by hand is not, so
+                //resolve against this box's own blob store; anything still
+                //unresolved is reported rather than restored with a hole in it.
+                $blob_error = '';
+                $file_contents = InlineBackupBlobs($file_contents, GetBackupBlobDir(GetDirSetting('JsonBackups')), $blob_error);
 
-                    //work out of backup file is version 2 or not
-                    //if it's not a version 2 file, then we can only really restore settings
-                    //email can be restored because it's contained in the settings
-                    $is_version_2_backup = false;
-                    if (array_key_exists('fpp_backup_version', $file_contents_decoded) && ($file_contents_decoded['fpp_backup_version'] == $fpp_backup_version)) {
-                        $is_version_2_backup = true;
-                    }
-
-                    //Remove the platform key as it's not used for anything yet
-                    unset($file_contents_decoded['platform']);
-                    unset($file_contents_decoded['fpp_backup_version']);
-
-                    //Restore all areas
-                    if (strtolower($restore_area) == "all" && $is_version_2_backup) {
-                        // ALL SETTING RESTORE
-                        //read each area and process it
-                        foreach ($file_contents_decoded as $restore_area_key => $area_data) {
-                            //Pass the restore area and data to the restore function
-                            $restore_done = process_restore_data($restore_area_key, $area_data);
-                        }
-
-//                    } else if (strtolower($restore_area) == "email" && $is_version_2_backup) {
-//                        //get email settings, from the actual system settings
-//                        $area_data = $file_contents_decoded['settings']['system_settings'];
-//                        //Pass the restore area and data to the restore function
-//                        $restore_done = process_restore_data("email", $area_data);
-//                    }
-                        //Restore all other areas, settings can be restored regardless of version
-                        //if the area is not settings or it's not a v2 backup then nothing will be done
-                    } else {
-                        // ALL OTHER SETTING RESTORE
-                        //Process specific restore areas, this work almost like the 'all' area
-                        //general settings, but only a matching area is cherry picked
-
-                        //If the key exists in the decoded data then we can process
-                        if (array_key_exists($restore_area_main, $file_contents_decoded)) {
-                            $restore_area_key = $restore_area_main;
-                            $area_data = $file_contents_decoded[$restore_area_main];
-
-                            //If we're restoring channelOutputs, we might need the system settings.. eg when restoring the LED panel data we need to set the layout in settings
-                            if ($restore_area_key == "channelOutputs" && array_key_exists('settings', $file_contents_decoded)) {
-                                $system_settings = array();
-                                if (array_key_exists('system_settings', $file_contents_decoded['settings'])) {
-                                    $system_settings = $file_contents_decoded['settings']['system_settings'];
-                                    //modify the area data
-                                    $area_data_new = array('area_data' => $area_data, 'system_settings' => $system_settings);
-                                    $area_data = $area_data_new;
-                                }
-                            }
-
-                            //Pass the restore area and data to the restore function
-                            $restore_done = process_restore_data($restore_area, $area_data);
-                        }
-                    }
-
-                    //All processed
-//                    $restore_done = true;
+                if ($file_contents === false) {
+                    $backup_error_string = "Restore: the uploaded backup " . $rstfname . " is incomplete - " . $blob_error;
+                    $backup_errors[] = $backup_error_string;
+                    error_log($backup_error_string);
                 } else {
-                    error_log("The backup " . $rstfname . " data could not be decoded properly. Is it a valid backup file?");
+                    //decode back into an array
+                    $file_contents_decoded = json_decode($file_contents, true);
+
+                    //successful decode
+                    doRestore($restore_area, $file_contents_decoded, $rstfname, $keepNetworkSettings, $keepMasterSlaveSettings, 'page');
                 }
             }
         }
@@ -416,80 +291,418 @@ if (isset($_POST['btnDownloadConfig'])) {
 }
 
 /**
- * Removes any sensitive data from the input array
+ * Does some initial processing before calling processRestoreData(), to do the heavy lifting to restore the backup.
  *
- * @param $input_array
- * @return mixed
+ * @param $restore_Area String The area which we want to restore content for
+ * @param $restore_Data Array Contents of the JSON backup file as associative array
+ * @param $restore_Filepath String File path to the backup file that was used
+ * @param $restore_keepNetworkSettings Bool Whether or not we keep the system's current network settings, DEFAULT TRUE
+ * @param $restore_keepMasterSlaveSettings Bool Whether or not we keep the system's current Master/Slave settings, DEFAULT TRUE
+ * @param $restore_Source String The source of the call to restore backups, either page or api, this helps changing some logic when restoring via API
+ * @return array
  */
-function remove_sensitive_data($input_array)
+function doRestore($restore_Area, $restore_Data, $restore_Filepath, $restore_keepNetworkSettings = true, $restore_keepMasterSlaveSettings = true, $restore_Source = 'page')
 {
-    global $sensitive_data, $protectSensitiveData;
+    global $system_config_areas, $keepNetworkSettings, $keepMasterSlaveSettings, $fpp_backup_format_version, $backup_errors, $restore_done, $uploadData_IsProtected;
 
-    //Remove any sensitive data
-    if ($protectSensitiveData == true) {
-        //loop over the areas
+    $keepNetworkSettings = $restore_keepNetworkSettings;
+    $keepMasterSlaveSettings = $restore_keepMasterSlaveSettings;
+    //
+    $file_contents_decoded = $restore_Data;
+    $_fpp_backup_version = null;
 
-        foreach ($input_array as $set_key => $data_arr) {
-            //If there is a sub array or an array in $data_arr, then loop into it
-            if (is_array($data_arr)) {
-                foreach ($data_arr as $key_name => $key_data) {
-                    if (in_array(strtolower($key_name), $sensitive_data) && is_string($key_name)) {
-                        $input_array[$set_key][$key_name] = '';
-                    }
-                }
-            } else {
-                //Else process keys in this array
-                if (in_array(strtolower($set_key), $sensitive_data) && is_string($set_key)) {
-                    $input_array[$set_key] = '';
-                }
-            }
-        }
+    //if restore area contains a forward slash, then we want to restore into a sub-area
+    //split string to get the main area and sub-area
+    if (stripos($restore_Area, "/") !== false) {
+        $restore_area_arr = explode("/", $restore_Area);
+        $restore_area_main = $restore_area_arr[0]; //main area is first
+    } else {
+        $restore_area_main = $restore_Area;
     }
 
-    return $input_array;
+    //Make sure a valid restore area has been specified
+    if (array_key_exists($restore_area_main, $system_config_areas)) {
+        //successful decode
+        if ($file_contents_decoded !== false && is_array($file_contents_decoded)) {
+            //Get value of protected state and remove it from the array
+            if (array_key_exists('protected', $file_contents_decoded)) {
+                $uploadData_IsProtected = $file_contents_decoded['protected'];
+                unset($file_contents_decoded['protected']);
+            }
+
+            //work out of backup file is version 2 or not
+            //if it's not a version 2 file, then we can only really restore settings
+            //email can be restored because it's contained in the settings
+
+            //Version 2 backups need to restore the schedule file to the old locations (auto converted on FPPD restart)
+            //Version 3 backups need to restore the schedule to a different file
+            //Check backup version
+            if (array_key_exists('fpp_backup_version', $file_contents_decoded)) {
+                if (!is_null($file_contents_decoded['fpp_backup_version'])) {
+                    $_fpp_backup_version = floatval($file_contents_decoded['fpp_backup_version']); //Minimum supported version is 7
+                } else {
+                    $_fpp_backup_version = floatval($fpp_backup_format_version);
+                }
+            }
+            //Version 4-6 so far don't need any compatibility fixes when being restored
+            //Handling of version differences for specific areas is also done in more detail in processRestoreData()
+
+            //Remove the platform key as it's not used for anything yet
+            unset($file_contents_decoded['platform']);
+            unset($file_contents_decoded['fpp_backup_version']);
+            unset($file_contents_decoded['backup_comment']);
+            unset($file_contents_decoded['backup_taken']);
+
+            //Restore all areas
+            if (strtolower($restore_Area) == "all") {
+                // ALL SETTING RESTORE
+                //read each area and process it
+                foreach ($file_contents_decoded as $restore_area_key => $area_data) {
+                    //Pass the restore area and data to the restore function
+                    $restore_result = processRestoreData($restore_area_key, $area_data, $_fpp_backup_version);
+                    //Restore is done - results will be printed on the page
+                    $restore_done = true;
+                }
+
+                //Restore all other areas, settings can be restored regardless of version
+                //if the area is not settings or it's not a v2 backup then nothing will be done
+            } else {
+                // ALL OTHER SETTING RESTORE
+                //Process specific restore areas, this work almost like the 'all' area
+                //general settings, but only a matching area is cherry picked
+
+                //If the key exists in the decoded data then we can process
+                if (is_array($file_contents_decoded) && array_key_exists($restore_area_main, $file_contents_decoded)) {
+                    $restore_area_key = $restore_area_main;
+                    $area_data = $file_contents_decoded[$restore_area_main];
+
+                    //If we're restoring channelOutputs, we might need the system settings.. eg when restoring the LED panel data we need to set the layout in settings
+                    if ($restore_area_key == "channelOutputs" && array_key_exists('settings', $file_contents_decoded)) {
+                        $system_settings = array();
+                        if (is_array($file_contents_decoded['settings']) && array_key_exists('system_settings', $file_contents_decoded['settings'])) {
+                            $system_settings = $file_contents_decoded['settings']['system_settings'];
+                            //modify the area data
+                            $area_data_new = array('area_data' => $area_data, 'system_settings' => $system_settings);
+                            $area_data = $area_data_new;
+                        }
+                    }
+
+                    //Pass the restore area and data to the restore function
+                    $restore_result = processRestoreData($restore_Area, $area_data, $_fpp_backup_version);
+                    //Restore is done - results will be printed on the page
+                    $restore_done = true;
+                }
+            }
+
+            //All processed
+            //$restore_done = true;
+        } else {
+            $backup_error_string = "doRestore: The backup " . $restore_Filepath . " data could not be decoded properly. Is it a valid backup file?";
+            $backup_errors[] = $backup_error_string;
+            error_log($backup_error_string);
+        }
+    } else {
+        $backup_error_string = "doRestore: Invalid restore area specified" . $restore_area_main . " data could not be decoded properly. Is it a valid backup file?";
+        $backup_errors[] = $backup_error_string;
+        error_log($backup_error_string);
+    }
+
+    // Restoring can bring in state from a box that doesn't match what's
+    // actually installed/running here -- packages, plugins, Service_*
+    // settings, and more -- the same reconciliation an FPPOS reflash already
+    // needs. Rather than re-deriving which specific area(s) require which
+    // piece of that reconciliation (services, packages, plugin binaries...),
+    // just feed every restore into the exact same boot-time path a reflash
+    // already uses, unconditionally: handleBootActions() and
+    // checkInstallPackages() (FPPINIT_Config.cpp) already run every boot and
+    // no-op unless triggered, so this needs no new C++ -- see copystorage.php
+    // for the full rationale and what each trigger does. Both require a full
+    // reboot, not just the fppd restart some areas above already request
+    // (fppinit start/postNetwork don't run on an fppd-only restart).
+    //
+    // Gated on $restore_done alone, not on $backup_errors being empty: even a
+    // partial restore (some sub-items failed, others succeeded within the
+    // same request -- processRestoreData() tracks ATTEMPT/SUCCESS per item,
+    // not a clean top-level success flag) still needs reconciling for
+    // whatever DID land. A reboot is harmless if nothing needed it; skipping
+    // it because something else in the same restore failed would leave
+    // successfully-restored state unreconciled.
+    // /fpp_restored, not /fppos_upgraded: that one also says the OS was
+    // replaced, which resets the unknown-plugin record and holds every
+    // native plugin back until it is reinstalled.
+    if ($restore_done) {
+        WriteSettingToFile('BootActions', 'settings');
+        WriteSettingToFile('rebootFlag', 1);
+        exec('sudo touch /fpp_restored');
+    }
+
+    //$restore_done is set if we got to actually call the function to restore data, if there was some sort of error with the data beforehand it will never get set
+    //use this as a simple check so we can return other data (what errors we had)
+    return !empty($restore_result) ? array('success' => true, 'message' => $restore_result) : array('success' => false, 'message' => $backup_errors);
 }
 
 /**
- * Looks in a directory and reads file contents of files within it
- * @param $directory String directory to search in
- * @param $return_data Boolean switch to include file data
- * @return array Array of file names and respective data
+ * Read one of FPP's ini-style config files for a backup.
+ *
+ * Not parse_ini_string(): PHP's ini parser treats " as a string delimiter and
+ * strips it, so any value containing embedded quotes comes back mangled.  The
+ * settings file holds one -- privacyConsent, a JSON object written unquoted by
+ * WriteSettingToFile() -- and it was arriving in backups as
+ * {settings:{statsPublish:{value:Disabled...}}}, which json_decode() rejects.  A
+ * restore then wrote that back, ReadPrivacyConsent() got null from it, and
+ * PrivacyConsentShortfall() reported 'absent' instead of 'other-device' --
+ * losing both the audit trail and the reason the consent record is carried
+ * across a restore at all.
+ *
+ * custom_parse_ini_file() in common.php is FPP's own reader for these files,
+ * written for this exact limitation, and is what WriteSettingToFile() uses.
+ * Using it here makes the backup round-trip agree with how FPP reads and writes
+ * the file the rest of the time.
+ *
+ * @param string $config_filepath Path to the file.
+ * @return array Key => value, empty if the file is missing or unreadable.
  */
-function read_directory_files($directory, $return_data = true)
+function ParseIniConfigForBackup($config_filepath)
 {
-    $file_list = array();
-    $file_data = false;
-
-    if ($handle = opendir($directory)) {
-        while (false !== ($file = readdir($handle))) {
-            // do something with the file
-            // note that '.' and '..' is returned even
-            // if file isn't this directory or its parent, add it to the results
-            if ($file != "." && $file != "..") {
-                // collect the filenames & data
-                if ($return_data == true) {
-                    $file_data = explode("\n", file_get_contents($directory . '/' . $file));
-                }
-
-                $file_list[$file] = $file_data;
-            }
-        }
-        closedir($handle);
+    //The callers relied on file_get_contents() failing quietly for a file that
+    //is not there; custom_parse_ini_file() would warn on file().
+    if (!is_string($config_filepath) || $config_filepath === '' || !is_readable($config_filepath)) {
+        return array();
     }
-    return $file_list;
+
+    $parsed_config = custom_parse_ini_file($config_filepath);
+
+    return is_array($parsed_config) ? $parsed_config : array();
+}
+
+/**
+ * Setting keys that a backup written before "Protect Sensitive Data" was removed
+ * may have blanked.
+ *
+ * That option wrote '' over these keys, so in a backup carrying protected=true an
+ * empty value is ambiguous: it may be a redaction, or a setting the user
+ * genuinely cleared.  For these keys we read it as a redaction and leave this
+ * device's own value alone.  For every other key '' is a value the user chose and
+ * is restored.
+ *
+ * This is a closed historical fact, not a policy: it describes what the removed
+ * remove_sensitive_data() actually blanked, which is not the same question as
+ * what is sensitive.  Deriving it from the type="password" declarations looks
+ * tidier and is wrong -- those cover MQTTPassword, TetherPSK and gitHubPAT, which
+ * that redactor never blanked (its list was compared case-sensitively against a
+ * lowercased key, and the last two were not in the list at all).  Including them
+ * would make this refuse to restore a value the user really did clear.
+ *
+ * password is handled by the block above before it can reach here; it is listed
+ * for completeness of the historical record.
+ *
+ * The whole mechanism can go once FPP no longer restores backups written before
+ * "Protect Sensitive Data" was removed.
+ *
+ * @return array Key name => true, for use with array_key_exists().
+ */
+function GetRedactableSettingKeys()
+{
+    //Neither emailgpass nor secret is declared in settings.json at all, which is
+    //the other reason this cannot be derived from the declarations.
+    return array(
+        'emailpass' => true,
+        'emailgpass' => true,
+        'password' => true,
+        'secret' => true,
+    );
+}
+
+/**
+ * Is this backup one this same player made?
+ *
+ * The consent record is stamped with the device UUID when it is written, so a
+ * backup carrying a record that matches this device came from this device.  That
+ * is a rollback of the box's own state -- reflash the card, restore your own
+ * backup -- and nothing in it belongs to anybody else, so none of the exclusions
+ * below apply to it.  Without this, rebuilding a player from its own backup
+ * would drop its privacy answers and send its owner back through the setup
+ * wizard to re-answer questions they had already answered on that same box.
+ *
+ * Three answers, because two would be wrong in one direction or the other:
+ *
+ *   'own'     - the record decodes (or can be recovered, below) and names this
+ *               device.  Nothing is withheld; the restore is a rollback.
+ *   'foreign' - the record names a different, real device.  Its privacy
+ *               answers, identity AND its login credentials stay with it: they
+ *               are applied, not merely stored (see GetSettingsNotCarriedByRestore),
+ *               and restoring them locks the operator out of the box in front
+ *               of them with somebody else's password.
+ *   'unknown' - no record, or one that names nobody.  The privacy answers and
+ *               identity are still withheld (this box answers the step itself,
+ *               which costs one pass through the wizard), but credentials and
+ *               the mail destination are carried, as every release before the
+ *               provenance check did.  Treating "unknown" as "foreign" here
+ *               turned off web authentication on every player rebuilt from a
+ *               backup its own earlier release had written: those carry the
+ *               consent record with its quotes stripped by parse_ini_string(),
+ *               and every automatic backup on every upgraded box is one.
+ *
+ * A quote-stripped record cannot be decoded, but its uuid can still be read
+ * out of it ("...,uuid:M1-abcdef...}"), so a same-box backup from an earlier
+ * release is recognised as 'own' rather than merely 'unknown'.
+ *
+ * @param array $restore_data Settings block from the backup being restored.
+ * @return string 'own', 'foreign' or 'unknown'.
+ */
+function BackupProvenance($restore_data)
+{
+    if (!is_array($restore_data) || !isset($restore_data['privacyConsent'])) {
+        return 'unknown';
+    }
+
+    $backup_uuid = '';
+    $consent_record = json_decode((string) $restore_data['privacyConsent'], true);
+    if (is_array($consent_record)) {
+        $backup_uuid = isset($consent_record['uuid']) && is_string($consent_record['uuid']) ? $consent_record['uuid'] : '';
+    } elseif (preg_match('/(?:^|[{,])\s*"?uuid"?\s*:\s*"?([^",}\s]+)/', (string) $restore_data['privacyConsent'], $m)) {
+        //parse_ini_string() stripped the quotes; the value is still there.
+        $backup_uuid = $m[1];
+    }
+
+    //getSystemUUID() returns the literal "Unknown" when identity cannot be
+    //established, and RecordPrivacyConsent() stamps whatever it returns.  Two
+    //different identity-less players therefore both carry "Unknown", and
+    //comparing the strings would call one player's backup the other's own -
+    //turning off every exclusion below, including the FPP_UUID one.  Require a
+    //real identity on both sides before the comparison means anything.
+    if ($backup_uuid === '' || !isValidSystemUUID($backup_uuid)) {
+        return 'unknown';
+    }
+    $device_uuid = getSystemUUID();
+    if (!isValidSystemUUID($device_uuid)) {
+        return 'unknown';
+    }
+
+    return ($backup_uuid === $device_uuid) ? 'own' : 'foreign';
+}
+
+/**
+ * True only when the backup provably came from this device.  For the settings
+ * loop's three-way decision use BackupProvenance() directly.
+ */
+function BackupIsFromThisDevice($restore_data)
+{
+    return BackupProvenance($restore_data) === 'own';
+}
+
+/**
+ * Settings a restore must not carry from the player the backup came from.
+ *
+ * The privacy step's answers are this device's record of what its owner was
+ * asked and agreed to.  They are not configuration and do not travel: a restored
+ * box answers the step itself.  Carrying statsPublish in particular would let a
+ * box transmit on a decision made by somebody else, since fppd starts publishing
+ * shortly after the setting flips to Enabled while the wizard is answered some
+ * time later.
+ *
+ * LegalJurisdiction is the frame those answers were given under and travels with
+ * them.  FPP_UUID is here for a different reason: scripts/get_uuid honours a
+ * developer-only FPP_UUID key, so a box that adopted the source's UUID would then
+ * validate the source's consent record as its own and defeat
+ * PrivacyConsentShortfall()'s other-device check silently.
+ *
+ * privacyConsent itself is deliberately NOT in this list.  It must restore: the
+ * other-device detection works by seeing the foreign record arrive, and stripping
+ * it degrades the shortfall to the weaker 'absent' and loses the audit trail.
+ *
+ * Each key maps to the tier that decides when it is withheld (see
+ * BackupProvenance): 'identity' is withheld unless the backup is provably this
+ * device's own; 'credential' is withheld only when it provably belongs to a
+ * different device.  Callers that only need "is it in the list" can still use
+ * array_key_exists().
+ *
+ * @return array Key name => 'identity' | 'credential'.
+ */
+function GetSettingsNotCarriedByRestore()
+{
+    global $settingGroups;
+    static $excluded_keys = null;
+
+    if ($excluded_keys !== null) {
+        return $excluded_keys;
+    }
+
+    $excluded_keys = array(
+        'LegalJurisdiction' => 'identity',
+        'FPP_UUID' => 'identity',
+
+        //Login credentials.  These are applied, not merely stored: ApplySetting()
+        //sends password to SetUIPassword(), which rewrites config/.htpasswd
+        //mid-request, and osPassword to SetOSPassword(), which runs chpasswd on
+        //the fpp account.  So restoring somebody else's backup locks you out of
+        //the web UI and SSH of the player in front of you, with their
+        //credentials.  passwordEnable rides along and can switch UI
+        //authentication off entirely.
+        //
+        //password was one of the four keys the removed redactor did blank, so
+        //excluding it here restores the behaviour that shipped before; osPassword
+        //it never matched, so that one is a fix.  A player restoring its own
+        //backup keeps all of them, and so does one restoring a backup of unknown
+        //provenance - see BackupProvenance() for why "unknown" must not count as
+        //"foreign" here.
+        'password' => 'credential',
+        'passwordVerify' => 'credential',
+        'passwordEnable' => 'credential',
+        'osPassword' => 'credential',
+        'osPasswordVerify' => 'credential',
+        'osPasswordEnable' => 'credential',
+
+        //The address the restored player would send mail TO.  emailAddress is
+        //excluded below as part of the privacy group; this is the same person's
+        //inbox arriving by another route, and a player that mails the previous
+        //owner is not a working clone.  The relay credentials - emailserver,
+        //emailuser, emailpass - are configuration and do restore.
+        'emailtoemail' => 'credential',
+    );
+
+    //Read the group rather than naming its members, so a sixth privacy setting
+    //added to settings.json is covered without touching this.  MissingSetupSettings()
+    //in common.php reads the same group -- but drops emailAddress, because
+    //"finish setup because you have not given an e-mail address" would be false.
+    //Here the opposite is wanted: emailAddress is the contact the privacy step
+    //collected for crash reports, it is answered on that screen, and it is the
+    //one the crash reporter lifts into contact.json - so it is part of the answer
+    //and goes with the rest of the group.
+    //
+    //This is not a claim that no e-mail address survives a restore.  The email
+    //area below restores emailuser, emailfromuser and emailtoemail, which may
+    //well be the same person's address, and deliberately so: that is mail server
+    //configuration and a clone needs it to send mail at all.  The distinction is
+    //purpose, not the value.
+    $privacy_group = array('statsPublish', 'ShareCrashData', 'FetchVendorLogos', 'SendVendorSerial', 'emailAddress');
+    if (isset($settingGroups['initialSetup-privacy']['settings']) &&
+        is_array($settingGroups['initialSetup-privacy']['settings']) &&
+        !empty($settingGroups['initialSetup-privacy']['settings'])) {
+        $privacy_group = $settingGroups['initialSetup-privacy']['settings'];
+    }
+
+    foreach ($privacy_group as $privacy_setting) {
+        if (is_string($privacy_setting) && $privacy_setting !== '') {
+            $excluded_keys[$privacy_setting] = 'identity';
+        }
+    }
+
+    return $excluded_keys;
 }
 
 /**
  * Function to look after backup restorations
  * @param $restore_area String  Area to restore
  * @param $restore_area_data array  Area data as an array
- * @return boolean Save result
+ * @param $backup_version boolean Version of the backup
+ * @return array Save result
  */
-function process_restore_data($restore_area, $restore_area_data)
+function processRestoreData($restore_area, $restore_area_data, $backup_version)
 {
-    global $SUDO, $settings, $system_config_areas, $keepMasterSlaveSettings, $keepNetworkSettings, $uploadDataProtected, $settings_restored,
-           $network_settings_restored, $network_settings_restored_post_apply, $network_settings_restored_applied_ips,
-           $known_ini_config_files, $known_json_config_files;
+    global $SUDO, $settings, $mediaDirectory, $scheduleFile, $system_config_areas, $keepMasterSlaveSettings, $keepNetworkSettings, $uploadData_IsProtected, $settings_restored,
+    $network_settings_restored, $network_settings_restored_post_apply, $network_settings_restored_applied_ips,
+    $known_ini_config_files, $known_json_config_files;
     global $args;
 
     $restore_area_key = $restore_area_sub_key = "";
@@ -500,38 +713,43 @@ function process_restore_data($restore_area, $restore_area_data)
     //split string to get the main area and sub-area
     if (stripos($restore_area, "/") !== false) {
         $restore_area_arr = explode("/", $restore_area);
-        $restore_area_key = $restore_area_arr[0];//main area is first
-        $restore_area_sub_key = $restore_area_arr[1];//sub-area is 2nd
+        $restore_area_key = $restore_area_arr[0]; //main area is first
+        $restore_area_sub_key = $restore_area_arr[1]; //sub-area is 2nd
     } else {
         $restore_area_key = $restore_area;
     }
 
-    //set the initial value
-    $settings_restored[$restore_area_key] = $save_result;
-
     //Check to see if the area data contains the area_data or system_settings keys
     //break them out if so & overwrite $restore_area_data with the actual area data
-    if (array_key_exists('area_data', $restore_area_data) && array_key_exists('system_settings', $restore_area_data)) {
+    if (is_array($restore_area_data) && array_key_exists('area_data', $restore_area_data) && array_key_exists('system_settings', $restore_area_data)) {
         $restore_area_system_settings = $restore_area_data['system_settings'];
         $restore_area_data = $restore_area_data['area_data'];
     }
 
-//    $is_empty = is_array_empty($restore_area_data);
+    //Should probably skip restoring data if the restore data is actually empty (maybe no config existed when the backup was made)
+    //this is also avoid false negatives of restore failures for areas where there wasn't any data to restore
+    $restore_data_is_empty = (empty($restore_area_data) || is_null($restore_area_data)) ? true : false;
+
+    //set some initial values
+    $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
+    $settings_restored[$restore_area_key]['VALID_DATA'] = !$restore_data_is_empty; //Negate the value as this described is the data is empty or not, so false is valid data, true means data was empty so it isn't valid data
 
     //////////////////////////////////
+    //// Handle processing of each restore area
+    //////////////////////////////////
     //OutputProcessors - OutputProcessors
-    if ($restore_area_key == "outputProcessors") {
+    if ($restore_area_key == "outputProcessors" && !$restore_data_is_empty) {
         //Just overwrite the Output processors file
-		$settings_restored[$restore_area_key]['ATTEMPT'] = true;
-		$channel_remaps_json_filepath = $system_config_areas['outputProcessors']['file'];
-		//PrettyPrint the JSON data and save it
-		$outputProcessors_data = prettyPrintJSON(json_encode($restore_area_data));
+        $settings_restored[$restore_area_key]['ATTEMPT'] = true;
+        $channel_remaps_json_filepath = $system_config_areas['outputProcessors']['file'];
+        //PrettyPrint the JSON data and save it
+        $outputProcessors_data = prettyPrintJSON(json_encode($restore_area_data));
 
-		if (file_put_contents($channel_remaps_json_filepath, $outputProcessors_data) === FALSE) {
-			$save_result = false;
-		} else {
-			$save_result = true;
-		}
+        if (file_put_contents($channel_remaps_json_filepath, $outputProcessors_data) === false) {
+            $save_result = false;
+        } else {
+            $save_result = true;
+        }
         $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
 
         //Set FPPD restart flag
@@ -539,190 +757,159 @@ function process_restore_data($restore_area, $restore_area_data)
     }
 
     //CHANNEL MEMORY MAPS - PIXEL OVERLAYS
-    if ($restore_area_key == "channelmemorymaps") {
+    if ($restore_area_key == "channelmemorymaps" && !$restore_data_is_empty) {
         //Overwrite channel outputs JSON
         $channelmemorymaps_filepath = $system_config_areas['channelmemorymaps']['file'];
-		$settings_restored[$restore_area_key]['ATTEMPT'] = true;
+        $settings_restored[$restore_area_key]['ATTEMPT'] = true;
 
-		$data = implode("\n", $restore_area_data);
+        $data = implode("\n", $restore_area_data);
 
-		if (file_put_contents($channelmemorymaps_filepath, $data) === FALSE) {
-			$save_result = false;
-		} else {
-			$save_result = true;
-		}
+        if (file_put_contents($channelmemorymaps_filepath, $data) === false) {
+            $save_result = false;
+        } else {
+            $save_result = true;
+        }
 
         $overlays_json_filepath = $system_config_areas['model-overlays']['file'];
         //PrettyPrint the JSON data and save it
         $outputProcessors_data = prettyPrintJSON(json_encode($restore_area_data));
-        
-        if (file_put_contents($overlays_json_filepath, $outputProcessors_data) === FALSE) {
+
+        if (file_put_contents($overlays_json_filepath, $outputProcessors_data) === false) {
             $save_result = false;
         } else {
             $save_result = true;
         }
         $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
-        
+
         //Set FPPD restart flag
         WriteSettingToFile('restartFlag', 1);
     }
 
-    //CHANNEL INPUTS - E1.31 BRIDGE
-	if ($restore_area_key == "channelInputs") {
-		//Just overwrite the channeInputs file
-		$channelInputs_filepath = $system_config_areas['channelInputs']['file'];
+    //PIXEL OVERLAY MODELS - MODEL-OVERLAYS
+    if ($restore_area_key == "model-overlays" && !$restore_data_is_empty) {
+        //Just overwrite the model-overlays JSON file
+        $settings_restored[$restore_area_key]['ATTEMPT'] = true;
+        $overlays_json_filepath = $system_config_areas['model-overlays']['file'];
+        //PrettyPrint the JSON data and save it
+        $overlays_data = prettyPrintJSON(json_encode($restore_area_data));
 
-		$settings_restored[$restore_area_key]['ATTEMPT'] = true;
-		//PrettyPrint the JSON data and save it
-		$channelInputs_data = prettyPrintJSON(json_encode($restore_area_data));
-		if (file_put_contents($channelInputs_filepath, $channelInputs_data) === FALSE) {
-			$save_result = false;
-		} else {
-			$save_result = true;
-		}
+        if (file_put_contents($overlays_json_filepath, $overlays_data) === false) {
+            $save_result = false;
+        } else {
+            $save_result = true;
+        }
+        $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
 
-		$settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
-	}
+        //Set FPPD restart flag
+        WriteSettingToFile('restartFlag', 1);
+    }
 
-    //SHOW SETUP & CHANNEL OUTPUT RESTORATION
-    if ($restore_area_key == "show_setup" || $restore_area_key == "channelOutputs") {
+    //VIRTUAL DISPLAY MAP - 2D PREVIEW LAYOUT
+    if ($restore_area_key == "virtualdisplaymap" && !$restore_data_is_empty) {
+        //Just overwrite the virtualdisplaymap flat file
+        $settings_restored[$restore_area_key]['ATTEMPT'] = true;
+        $virtualdisplaymap_filepath = $system_config_areas['virtualdisplaymap']['file'];
+        $data = implode("\n", $restore_area_data);
+
+        if (file_put_contents($virtualdisplaymap_filepath, $data) === false) {
+            $save_result = false;
+        } else {
+            $save_result = true;
+        }
+        $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
+
+        //Set FPPD restart flag
+        WriteSettingToFile('restartFlag', 1);
+    }
+
+    //CHANNEL INPUTS - E1.31 BRIDGE, DMX
+    if ($restore_area_key == "channelInputs" && !$restore_data_is_empty) {
+        $settings_restored[$restore_area_key] = array();
+
+        //RESTORE TWEAKS FOR SPECIFIC VERSIONS
+        //Version 8.0 backups - channelInputs now holds an array of channel input configurations (E1.31/DDP, DMX etc), instead of a single entry for the default E1.31
+        //                    - <8.0 we massage the data so it's in the new format (channelInputs => ['universe_inputs' => "data", "dmx_inputs" => "data"]
+
+        if ($backup_version < 8.0) {
+            //Get the existing channel input data
+            $restore_area_data_ci['channelInputs'] = $restore_area_data;
+            //Remove the old channelInputs key and replace it with universe_inputs (to match the new format for the channel input section
+            unset($restore_area_data['channelInputs']);
+            $restore_area_data['universe_inputs'] = $restore_area_data_ci;
+            unset($restore_area_data_ci);
+        }
+
+        $restore_areas = $system_config_areas[$restore_area_key]['file'];
+        processRestoreDataArray($restore_area_key, $restore_area_sub_key, $restore_areas, $restore_area_data, $backup_version);
+    }
+
+    //GPIO INPUTS - GPIO Input Triggers
+    if ($restore_area_key == "gpio-input" && !$restore_data_is_empty) {
+        //Just write strain to the gpio.json file
+        $gpioInputs_filepath = $system_config_areas['gpio-input']['file'];
+
+        $settings_restored[$restore_area_key]['ATTEMPT'] = true;
+        //PrettyPrint the JSON data and save it
+        $gpioInputs_data = prettyPrintJSON(json_encode($restore_area_data));
+        if (file_put_contents($gpioInputs_filepath, $gpioInputs_data) === false) {
+            $save_result = false;
+        } else {
+            $save_result = true;
+        }
+
+        $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
+    }
+
+    //SHOW SETUP, CHANNEL OUTPUT AND MISC CONFIG RESTORATION
+    if (($restore_area_key == "show_setup" || $restore_area_key == "channelOutputs" || $restore_area_key == "misc_configs") && !$restore_data_is_empty) {
         $settings_restored[$restore_area_key] = array();
 
         $script_filenames = array();
         $restore_areas = $system_config_areas[$restore_area_key]['file'];
 
-        //search through the files that should of been backed up
-        //and then loop over the restore data and match up the data and restore it
-        foreach ($restore_areas as $restore_areas_idx => $restore_areas_data) {
-            $restore_location = $restore_areas_data['location'];
-            $restore_type = $restore_areas_data['type'];
-            $final_file_restore_data = "";
-
-            //If $restore_area_sub_key is empty then no sub-area has been chosen -- restore as normal and restore all sub areas
-            //Or if $restore_area_sub_key is equal to the $show_setup_area_index we're on, then restore just this area because it matches users selection
-            //and break the loop
-            if ($restore_area_sub_key == "" || ($restore_area_sub_key == $restore_areas_idx)) {
-                //if the restore key and the $system_config_areas key match then restore data to whatever location it is
-                //eg. if we are on events, then look for events in the restore data, when found restore data to the events location (eg look at the location)
-                foreach ($restore_area_data as $restore_area_data_index => $restore_area_data_data) {
-                    $save_result = false;
-
-                    //$restore_area_data_data is an array representing the file contents
-                    //$restore_area_data_index represents the filename (used to key the array)
-                    if ($restore_areas_idx == $restore_area_data_index) {
-                        //data is an array then we can go
-                        if (is_array($restore_area_data_data)) {
-                            //loop over all the files and their data and restore each
-                            //$restore_area_data_data array will look like
-                            //array ('event'=> array('01_01.fevt' => array(data), '21_10.fevt' => array(data)))
-                            foreach ($restore_area_data_data as $fn_to_restore => $fn_data) {
-                                $save_result = false;
-
-                                $restore_location = $restore_areas_data['location']; //reset
-                                $final_file_restore_data = ""; //store restore data in variable
-
-                                //Work out what method we need to use to get the data back into an array
-                                if ($restore_type == "dir" || $restore_type == "file") {
-                                    if (in_array($restore_area_data_index, $known_json_config_files)) {
-                                        //JSON
-                                        $final_file_restore_data = $fn_data;
-                                    } else {
-                                        //everything else
-                                        //line separate the lines
-                                        $final_file_restore_data = implode("\n", $fn_data);
-                                    }
-                                } else if ($restore_type == "function") {
-                                    //get the data as in without any modification so we can pass it into the restore function
-                                    $final_file_restore_data = $fn_data;
-                                }
-
-                                //If backup/restore type of a sub-area is folder, then build the full path to where the file will be restored
-                                if ($restore_type == "dir") {
-                                    $restore_location .= "/" . $fn_to_restore;
-                                }
-
-                                //if restore sub-area is scripts, capture the file names so we can pass those along through RestoreScripts which will perform any InstallActions
-                                if (strtolower($restore_areas_idx) == "scripts") {
-                                    $script_filenames[] = $fn_to_restore;
-                                }
-
-                                //if restore sub-area is LED panels, we need write the matrix size / layout setting to the settings file in case it's different to the backup
-                                if (strtolower($restore_areas_idx) == "led_panels") {
-                                    $panel_layout = null;
-                                    if (!empty($restore_area_system_settings)) {
-                                        $panel_layout = $restore_area_system_settings[0]['LEDPanelsLayout'];
-                                        if ($panel_layout != null) {
-                                            //LEDPanelsLayout = "4x4"
-                                            WriteSettingToFile('LEDPanelsLayout', $panel_layout);
-                                        }
-                                    }
-                                }
-
-                                //If we have data then write to where it needs to go
-                                if (!empty($final_file_restore_data) && ($restore_type == "dir" || $restore_type == "file")) {
-									$settings_restored[$restore_area_key][$restore_area_data_index]['ATTEMPT'] = true;
-
-									//Work out what method we need to use to get the data back out into the correct format
-                                    if (in_array($restore_area_data_index, $known_json_config_files)) {
-                                        //JSON
-                                        $final_file_restore_data = prettyPrintJSON(json_encode($final_file_restore_data));
-                                    }
-                                    //Save out the file
-                                    if (file_put_contents($restore_location, $final_file_restore_data) === FALSE) {
-                                        $save_result = false;
-                                    } else {
-                                        $save_result = true;
-                                    }
-                                } //If restore type is function
-                                else if ($restore_type == "function") {
-									$settings_restored[$restore_area_key][$restore_area_data_index]['ATTEMPT'] = true;
-
-									$restore_function = $restore_areas_data['location']['restore'];
-                                    //if we have valid ata and the function exists, call it
-                                    if (function_exists($restore_function) && !empty($final_file_restore_data)) {
-                                        $save_result = $restore_function($final_file_restore_data);
-                                    }
-                                } else {
-                                    $save_result = false;
-                                }
-                            }
-                        }
-                        $settings_restored[$restore_area_key][$restore_area_data_index]['SUCCESS'] = $save_result;
-                        break;//break after data is restored for this section
-                    }
-                }
-                //Don't break if area key is empty, because we want to process all the sub-areas
-                if ($restore_area_sub_key != "") {
-                    //we found the sub-area, stop looking
-                    break;
-                }
-            }
-        }
-
-        //Cause any InstallActions to be run for the restored scripts
-        RestoreScripts($script_filenames);
+        // Restored scripts are files only.  Their "# InstallAction:" lines are
+        // not run: a backup is a file anyone can hand you, and running shell
+        // lines out of it as root let a crafted one run anything.  A script
+        // that needs its install steps is reinstalled from the Script
+        // Repository, which fetches it from FPP's own scripts repository.
+        processRestoreDataArray($restore_area_key, $restore_area_sub_key, $restore_areas, $restore_area_data, $backup_version);
 
         //Set FPPD Restart flag
         WriteSettingToFile('restartFlag', 1);
     }
 
     //PLUGIN SETTING RESTORATION
-    if ($restore_area_key == "plugins") {
+    if ($restore_area_key == "plugins" && !$restore_data_is_empty) {
         if (is_array($restore_area_data)) {
-            //Just overwrite the universes file
+            //Just overwrite the plugin config file
             $plugin_settings_path_base = $settings['configDirectory'];
 
             //loop over the data and get the plugin name and then write the settings out
             foreach ($restore_area_data as $plugin_name => $plugin_data) {
-				$settings_restored[$restore_area_key][$plugin_name]['ATTEMPT']  = true;
+                $settings_restored[$restore_area_key][$plugin_name]['ATTEMPT'] = true;
 
-				$plugin_settings_path = $plugin_settings_path_base . "/plugin." . $plugin_name;
-                $data = implode("\n", $plugin_data[0]);
+                //plugin data is keyed into what file the data is from to make it easier to backup multiple config files per plugin
+                //and plugin config data is written back to the right file
 
-                if (file_put_contents($plugin_settings_path, $data) === FALSE) {
-                    $save_result = false;
-                } else {
-                    $save_result = true;
+                //Get the filename (to restore data into) and file data to go into that file
+                // Initialized: skipped (unsafe) filenames must not leave this
+                // undefined for the SUCCESS assignment below.
+                $save_result = false;
+                foreach ($plugin_data as $p_data_filename => $p_data_data) {
+                    // Same traversal guard as the dir restores below: the
+                    // filename comes from inside the uploaded backup.
+                    if (!IsSafeRestoreFilename($p_data_filename)) {
+                        continue;
+                    }
+                    $plugin_settings_path = $plugin_settings_path_base . "/" . $p_data_filename;
+                    $data = implode("\n", $p_data_data[0]);
+
+                    //Write the data out each time
+                    if (file_put_contents($plugin_settings_path, $data) === false) {
+                        $save_result = false;
+                    } else {
+                        $save_result = true;
+                    }
                 }
 
                 $settings_restored[$restore_area_key][$plugin_name]['SUCCESS'] = $save_result;
@@ -735,7 +922,7 @@ function process_restore_data($restore_area, $restore_area_data)
         $restore_areas = $system_config_areas[$restore_area_key]['file'];
 
         //Check what subkey was selected
-        //search through the files that should of been backed up
+        //search through the files that should have been backed up
         //and then loop over the restore data and match up the data and restore it
         foreach ($restore_areas as $restore_areas_idx => $restore_areas_data) {
             $restore_data = array();
@@ -743,55 +930,116 @@ function process_restore_data($restore_area, $restore_area_data)
             //Or if $restore_area_sub_key is equal to the $restore_areas_idx we're on, then restore just this area, because it matches user selection
             //and break the loop
             if ($restore_area_sub_key == "" || ($restore_area_sub_key == $restore_areas_idx)) {
-				$save_result = false;
+                $save_result = false;
 
-				//SYSTEM SETTING RESTORATION
+                //SYSTEM SETTING RESTORATION
                 if ($restore_areas_idx == "system_settings") {
                     if (is_array($restore_area_data)) {
-						$settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
-						//get data out of nested array
+                        $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                        //get data out of nested array
                         $restore_data = $restore_area_data['system_settings'][0];
 
+                        //Restoring this player's own backup is a rollback of its own state,
+                        //so the privacy exclusions below do not apply to it.  One of
+                        //unknown provenance keeps its credentials but not its privacy
+                        //answers; see BackupProvenance().
+                        $restore_provenance = BackupProvenance($restore_data);
+                        $not_carried = GetSettingsNotCarriedByRestore();
+
                         foreach ($restore_data as $setting_name => $setting_value) {
+                            //Verify fields are UI-only confirmation values, never persisted directly.
+                            if ($setting_name == "passwordVerify" || $setting_name == "osPasswordVerify") {
+                                continue;
+                            }
+
+                            //The privacy step's answers, the jurisdiction they were given under,
+                            //the device identity that binds them and the credentials that let
+                            //somebody in belong to the player the backup came from.  This box
+                            //answers the step itself -- unless the backup is this box's own, in
+                            //which case they already are its answers.
+                            if (array_key_exists($setting_name, $not_carried)) {
+                                //Anything not explicitly a credential is treated as identity,
+                                //the stricter tier.
+                                $tier = $not_carried[$setting_name];
+                                if (($tier !== 'credential' && $restore_provenance !== 'own') ||
+                                    ($tier === 'credential' && $restore_provenance === 'foreign')) {
+                                    continue;
+                                }
+                            }
+
+                            //privacyConsent is restorable on purpose: the other-device shortfall
+                            //works by seeing a foreign record arrive.  But a backup written before
+                            //backup.php stopped reading these files with parse_ini_string() carries
+                            //the record with its quotes stripped, and writing that over a record
+                            //that still decodes turns a real consent trail into an unreadable one --
+                            //degrading the shortfall to the weaker 'absent' and losing the audit
+                            //trail the record exists to provide.  Keep what is readable.
+                            if ($setting_name == "privacyConsent" &&
+                                json_decode((string) $setting_value, true) === null &&
+                                json_decode((string) ReadSettingFromFile('privacyConsent'), true) !== null) {
+                                continue;
+                            }
+
+                            if ($setting_name == "password" || $setting_name == "osPassword") {
+                                //Redaction never matched the verify fields - the old list was
+                                //compared case-sensitively against a lowercased key, so
+                                //passwordVerify and osPasswordVerify always came through - and in
+                                //a protected backup the real value is still sitting in there.
+                                //Recover it rather than leaving the credential behind.
+                                $verify_key = ($setting_name == "password") ? "passwordVerify" : "osPasswordVerify";
+                                if ($setting_value == "" && !empty($restore_data[$verify_key])) {
+                                    $setting_value = $restore_data[$verify_key];
+                                }
+                                //Still blank: do not write it.  This one is not about redaction
+                                //and outlives it - SetOSPassword('') resets the fpp account to the
+                                //published default 'falcon' (common/settings.php:191-198), so an
+                                //empty value in an unprotected backup would weaken this box rather
+                                //than configure it.
+                                if ($setting_value == "") {
+                                    continue;
+                                }
+                            }
+
+                            //A backup taken while "Protect sensitive data" existed carries ''
+                            //where a credential was blanked.  Writing that through clears a
+                            //working credential on this device: restoring one of the automatic
+                            //backups every box keeps wiped emailpass.  Leave what is already
+                            //here instead.  Only for keys redaction could have touched -
+                            //anywhere else '' is a value the user chose and must be restored.
+                            //
+                            //After the block above, so that a credential recoverable from its
+                            //verify field is restored rather than merely preserved.
+                            if ($uploadData_IsProtected == true && $setting_value === '' &&
+                                array_key_exists($setting_name, GetRedactableSettingKeys())) {
+                                continue;
+                            }
+
                             //check if we can change it (default value is checked - true)
                             if ($setting_name == "fppMode") {
                                 if ($keepMasterSlaveSettings == false) {
                                     WriteSettingToFile($setting_name, $setting_value);
                                 }
-                            } else {
-                                WriteSettingToFile($setting_name, $setting_value);
+                            } else if (!WriteSettingToFile($setting_name, $setting_value)) {
+                                //Refused (IsValidSettingValue) or unwritable: never apply a
+                                //value that is not what the settings file now holds.
+                                continue;
                             }
 
                             //Do special things that require some sort of system change
                             //eg. changing piRTC via GUI will fire off a shell command to set it up
                             //we'll also do this to keep consistency
-                            if ($setting_name == 'piRTC') {
-                                SetPiRTC($setting_value);
-                            } else if ($setting_name == "PI_LCD_Enabled") {
-                                //DO a weird work around and set our request params and then call
-                                //the function to enable the LCD
-                                if ($setting_value == 1) {
-                                    $_GET['enabled'] = "true";
-                                } else {
-                                    $_GET['enabled'] = "false";
-                                }
-                                SetPiLCDenabled();
-                            } else if ($setting_name == "AudioOutput") {
+                            if ($setting_name == "AudioOutput") {
                                 $args['value'] = $setting_value;
                                 SetAudioOutput($setting_value);
                             } else if ($setting_name == "volume") {
-                                $_GET['volume'] = trim($setting_value);
-                                SetVolume();
-                            } else if ($setting_name == "ntpServer") {
-                                SetNtpServer($setting_value);
-                                NtpServiceRestart();//Restart NTP client so changes take effect
-                            } else if ($setting_name == "NTP") {
-                                SetNtpState($setting_value);
+                                SetVolume(trim($setting_value));
+                            } else {
+                                ApplySetting($setting_name, $setting_value);
                             }
                         }
 
                         //Restart FFPD so any changes can take effect
-//                        RestartFPPD();
+                        //                        RestartFPPD();
                         //Write setting out so the user can restart FPPD, this is a work around for Pi Pixel Strings causing a reboot when it's enabled (FPPD is restated, the Pi is rebooted)
                         WriteSettingToFile('restartFlag', 1);
 
@@ -801,41 +1049,131 @@ function process_restore_data($restore_area, $restore_area_data)
                     }
                 }
 
+                //COMMAND PRESET RESTORE
+                if ($restore_areas_idx == "commandPresets") {
+                    //Get the restore data out of the array.  A backup that carries no
+                    //presets -- made on a player that had none, where the section is
+                    //[null], or by hand without it -- has nothing to restore here:
+                    //json_encode() of its absence wrote "null" over this player's
+                    //presets.  As with the proxies, ATTEMPT only when there is data.
+                    $restore_data = isset($restore_area_data['commandPresets'][0]) ? $restore_area_data['commandPresets'][0] : null;
+                    if (is_array($restore_data)) {
+                        $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+
+                        //Generate the filepath for the config file to be restored
+                        $commandPresets_filepath = $settings['configDirectory'] . "/commandPresets.json";
+
+                        //PrettyPrint the JSON data and save it
+                        $commandPresets_data_restore = prettyPrintJSON(json_encode($restore_data));
+                        if (file_put_contents($commandPresets_filepath, $commandPresets_data_restore) === false) {
+                            $save_result = false;
+                        } else {
+                            $save_result = true;
+                        }
+                    }
+                }
+
+                //PLUGIN PRIVACY ACCEPTANCE RESTORE. The record names the player
+                //that wrote it and is honoured only there (ReadPluginPrivacyAccepted
+                //in api/controllers/plugin.php). Only this player's own backup is
+                //restored: another player's acceptances would be ignored anyway,
+                //and writing them here would throw away the ones made on this
+                //player. A foreign backup that carries a record is reported as
+                //not restored; a backup with no record at all (every backup made
+                //before the record existed) is skipped silently. The results
+                //renderer only reports a sub-area that has an ATTEMPT key, so
+                //that key is set only when there was something to attempt.
+                if ($restore_areas_idx == "pluginPrivacyAccepted") {
+                    $restore_data = isset($restore_area_data['pluginPrivacyAccepted'][0]) ? $restore_area_data['pluginPrivacyAccepted'][0] : null;
+                    $system_settings_data = isset($restore_area_data['system_settings'][0]) ? $restore_area_data['system_settings'][0] : null;
+                    if (is_array($restore_data) && isset($restore_data['plugins']) && is_array($restore_data['plugins'])) {
+                        if (BackupIsFromThisDevice($system_settings_data)) {
+                            $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                            $filepath = $settings['configDirectory'] . "/pluginPrivacyAccepted.json";
+                            $save_result = (file_put_contents($filepath, prettyPrintJSON(json_encode($restore_data))) !== false);
+                        } else {
+                            $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = false;
+                            $save_result = false; // not this player's backup: this player's record is kept
+                        }
+                    }
+                }
+
                 //EMAIL SETTING RESTORATION
                 if ($restore_areas_idx == "email") {
                     //get data out of nested array
                     $restore_data = $restore_area_data['system_settings'][0];
 
                     //TODO rework this so it will work future email system implementation, were different providers are used
-                    if (is_array($restore_data)
-                        && array_key_exists('emailenable', $restore_data)
-                        && array_key_exists('emailguser', $restore_data)
-                        && array_key_exists('emailgpass', $restore_data)
+                    if (
+                        is_array($restore_data)
+                        //                        && array_key_exists('emailenable', $restore_data)
+                        && array_key_exists('emailserver', $restore_data)
+                        && array_key_exists('emailuser', $restore_data)
+                        && array_key_exists('emailpass', $restore_data)
                         && array_key_exists('emailfromtext', $restore_data)
                         && array_key_exists('emailtoemail', $restore_data)
                     ) {
-						$settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                        $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
 
-						$emailenable = $restore_data['emailenable'];
-                        $emailguser = $restore_data['emailguser'];
-                        $emailgpass = $restore_data['emailgpass'];
+                        if (is_array($restore_data) && array_key_exists('emailenable', $restore_data)) {
+                            $emailenable = $restore_data['emailenable'];
+                            WriteSettingToFile('emailenable', $emailenable);
+                        }
+                        //
+                        $email_server = $restore_data['emailserver'];
+                        //
+                        $emailuser = $restore_data['emailuser'];
+                        $emailpass = $restore_data['emailpass'];
+                        //
+                        $email_from_user = $restore_data['emailfromuser'];
                         $emailfromtext = $restore_data['emailfromtext'];
                         $emailtoemail = $restore_data['emailtoemail'];
 
                         //Write them out
-                        WriteSettingToFile('emailenable', $emailenable);
-                        WriteSettingToFile('emailguser', $emailguser);
+                        //                        WriteSettingToFile('emailenable', $emailenable);
+                        //Email Server
+                        WriteSettingToFile('emailserver', $email_server);
+                        //Email Server Port if set
+                        if (array_key_exists('emailport', $restore_data)) {
+                            $email_server_port = $restore_data['emailport'];
+                            WriteSettingToFile('emailport', $email_server_port);
+                        }
+                        //Email User Name and Pass + From & To Uemails
+                        WriteSettingToFile('emailuser', $emailuser);
+                        //
+                        WriteSettingToFile('emailfromuser', $email_from_user);
                         WriteSettingToFile('emailfromtext', $emailfromtext);
-                        WriteSettingToFile('emailtoemail', $emailtoemail);
 
-                        //Only save password and generate exim config if upload data is unprotected
-                        //meaning the password was included in the backup,
-                        //otherwise existing (valid) config may be overwritten
-                        if ($uploadDataProtected == false && $emailgpass != "") {
-                            WriteSettingToFile('emailgpass', $emailgpass);
-                            //Update the email config (writes out exim config)
-                            SaveEmailConfig($emailguser, $emailgpass, $emailfromtext, $emailtoemail);
-                            $save_result = true;
+                        //This is a separate restore area, reached in its own pass, so the
+                        //settings loop's exclusions do not reach it and its local flag is not
+                        //in scope - ask again rather than depending on pass order.  The one
+                        //that matters here is the destination address: it belongs to whoever
+                        //made the backup, and a restored player mailing the previous owner is
+                        //not a working clone.  Withheld only from a provably foreign backup,
+                        //like the other credentials (BackupProvenance).
+                        if (BackupProvenance($restore_data) !== 'foreign') {
+                            WriteSettingToFile('emailtoemail', $emailtoemail);
+                        }
+
+                        //A redacted emailpass arrives empty and the settings loop above has
+                        //already declined to write it, so an empty value here means the backup
+                        //carries no password to apply - whether it was redacted or never set.
+                        //Either way there is nothing to configure exim with.
+                        if ($emailpass != "") {
+                            WriteSettingToFile('emailpass', $emailpass);
+                            //Update the email config in the global settings array,  so can call the function that sets up and  writes out exim4 config
+                            $settings['emailserver'] = $restore_data['emailserver'];
+                            if (array_key_exists('emailport', $restore_data)) {
+                                $settings['emailport'] = $restore_data['emailport'];
+                            }
+                            //Creds
+                            $settings['emailuser'] = $restore_data['emailuser'];
+                            $settings['emailpass'] = $restore_data['emailpass'];
+                            //
+                            $settings['emailfromuser'] = $restore_data['emailfromuser'];
+                            $settings['emailfromtext'] = $restore_data['emailfromtext'];
+                            $settings['emailtoemail'] = $restore_data['emailtoemail'];
+                            ApplyEmailConfig();
                         }
                         $save_result = true;
                     }
@@ -844,15 +1182,52 @@ function process_restore_data($restore_area, $restore_area_data)
                 //TIMEZONE RESTORATION
                 if ($restore_areas_idx == "timezone") {
                     //get data out of nested array
-                    $restore_data = $restore_area_data['timezone'][0];
+                    $restore_data = isset($restore_area_data['timezone'][0]) ? $restore_area_data['timezone'][0] : null;
 
                     //Make sure we have an array, there will be 2 indexes, 0 the timezone and 1 a linebreak
-                    if (is_array($restore_data)) {
-                        $data = $restore_data[0];//first index has the timezone, index 1 is empty to due carriage return in file when its backed up
-                        if (!empty($data)) {
-							$settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                    if (is_array($restore_data) || !is_null($restore_data)) {
+                        $data = $restore_data;
 
-							SetTimezone($data);
+                        if (!empty($data)) {
+                            //
+                            $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                            //Apply timezone settings via API
+                            $url = 'http://localhost/api/settings/TimeZone';
+                            //options for the request
+                            $options = array(
+                                'http' => array(
+                                    'header' => "Content-type: text/plain",
+                                    'method' => 'PUT',
+                                    'content' => $data,
+                                ),
+                            );
+                            $context = stream_context_create($options);
+
+                            if (file_get_contents($url, false, $context) !== false) {
+                                $save_result = true;
+                            } else {
+                                $save_result = true;
+                            }
+                        }
+                    }
+                }
+
+                //PROXY CONFIG RESTORATION
+                if ($restore_areas_idx == "proxies") {
+                    //Get the restore data out of the array.  A backup with no proxies
+                    //section (one made by hand, or before proxies were backed up) has
+                    //nothing to restore here: implode() on its absence was a fatal that
+                    //took every later sub-area of the restore with it.  As with the
+                    //plugin privacy record, ATTEMPT is only set when there is data.
+                    $restore_data = isset($restore_area_data['proxies'][0]) ? $restore_area_data['proxies'][0] : null;
+                    if (is_array($restore_data)) {
+                        $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                        $data = implode("\n", $restore_data);
+
+                        //This is a standard file with webserver config, just write it out
+                        if (file_put_contents($settings['configDirectory'] . "/proxies", $data) === false) {
+                            $save_result = false;
+                        } else {
                             $save_result = true;
                         }
                     }
@@ -863,288 +1238,833 @@ function process_restore_data($restore_area, $restore_area_data)
         }
     }
 
-	//Network Settings (Wired and WiFi)
-	if ($restore_area_key == "network") {//If the user doesn't want to keep the existing network settings, we can overwrite them
-		if ($keepNetworkSettings == false) {
-			//Overwrite existing network settings
-			$network_config_filepath = $system_config_areas['network']['file'];
+    //Network Settings (Wired and WiFi)
+    if ($restore_area_key == "network" && !$restore_data_is_empty) {
+        //If the user doesn't want to keep the existing network settings, we can overwrite them
+        if ($keepNetworkSettings == false) {
 
-			foreach ($network_config_filepath as $network_type => $network_setting_filepath) {
-				//If there is a sub_key (being either wired or wifi, then keep breaking the loop until we're on the one specified in the sub key
-				//this will match the users selection. Eg. if they select wired then only the wired config is restored
-				//if there is no sub key, eg the user chose Network or ALL, then this doesn't apply
-				if (!empty($restore_area_sub_key)) {
-					if ($network_type != $restore_area_sub_key) {
-						//break the loop
-						break;
-					}
-				}
+            //check the supplied network data for any extra interfaces over the std eth0 and wlan0
+            // all them to the network config area, then process as normal, if the interface key exits in the network config area then
+            // it will match upon restoration and the file will get written out
+            // this is a cheat to get around not knowing if there is more than the standard interfaces were backed up
+            //$network_data = $restore_area_data[$network_type][0];
+            foreach ($restore_area_data as $net_type => $net_data) {
+                //An unknown key becomes a file name under config/, so only an
+                //interface config (interface.<ifname>) is accepted -- never a
+                //path, and never some other config file.
+                if (!array_key_exists($net_type, (array) $system_config_areas['network']['file']) &&
+                    !preg_match('/^interface\.[A-Za-z0-9_][A-Za-z0-9_.:-]{0,14}$/', (string) $net_type)) {
+                    continue;
+                }
+                //Check if the net_type in the network config area
+                //the new type will be wired_network, wifi_network or like interface.eth1 etc for an extra interface(s)
+                //the net_type is also the filename of the interfaces file when it was backed up
+                if (is_array($system_config_areas['network']['file']) && !array_key_exists($net_type, $system_config_areas['network']['file'])) {
+                    //Set it's location for restore
+                    $system_config_areas['network']['file'][$net_type] = array('type' => 'file', 'location' => $settings['configDirectory'] . "/" . $net_type);
 
-				$settings_restored[$restore_area_key][$network_type]['ATTEMPT'] = true;
-				//Get the actual location for the network setting
-				$network_setting_filepath = $network_setting_filepath['location'];
+                    //Also add interface to the array used to track which network interfaces were restored and what their settings are
+                    $network_settings_restored_post_apply[$net_type] = "";
+                    $network_settings_restored_applied_ips[$net_type] = array();
+                }
+            }
+            //Remove unused vars so they don't linger
+            unset($net_type);
+            unset($net_data);
 
-				$network_data = $restore_area_data[$network_type][0];
-				//Check to make sure we have data, so we don't accidently wipe out the network
-				if (!empty($network_data)) {
+            //Overwrite existing network settings with a fresh copy from the area map
+            $network_config_filepath = $system_config_areas['network']['file'];
 
-					$ini_string = "";
-					foreach ($network_data as $ini_key => $ini_value) {
-						$ini_string .= "$ini_key=\"$ini_value\"\n";
-					}
+            foreach ($network_config_filepath as $network_type => $network_setting_filepath) {
+                //If there is a sub_key (being either wired or wifi, then keep breaking the loop until we're on the one specified in the sub key
+                //this will match the users selection. Eg. if they select wired then only the wired config is restored
+                //if there is no sub key, eg the user chose Network or ALL, then this doesn't apply
+                if (!empty($restore_area_sub_key)) {
+                    if ($network_type != $restore_area_sub_key) {
+                        //break the loop
+                        continue;
+                    }
+                }
 
-					//If we can parse out generated INI string, then it's value.
-					//Save it to the network file
-					if ((parse_ini_string($ini_string) !== FALSE) && !empty($ini_string)) {
+                $settings_restored[$restore_area_key][$network_type]['ATTEMPT'] = true;
+                //Get the actual location for the network setting
+                $network_setting_filepath = $network_setting_filepath['location'];
+                //Get the interface config data
+                $network_data = $restore_area_data[$network_type][0];
+                //Check to make sure we have data, so we don't accidentally wipe out the network
+                if (!empty($network_data)) {
 
-						if (file_put_contents($network_setting_filepath, $ini_string) === FALSE) {
-							$save_result = false;
-						} else {
-							$save_result = true;
-							$network_settings_restored = true;
+                    $ini_string = "";
+                    //The wired and wifi network interfaces which don't have a configuration have empty file data in the backup file
+                    //to save any issues, check the first "line" of data, if its empty then there was no configuration for the interface
+                    //else it will hold the first line of the interface configuration e.g. "INTERFACE=wlan0",
+                    if (!empty($network_data[0])) {
+                        foreach ($network_data as $ini_key => $ini_value) {
+                            //One KEY=VALUE per entry: a line break inside one would
+                            //add lines the network save path never allows.
+                            if (!is_string($ini_value) || strpbrk($ini_value, "\r\n\0") !== false) {
+                                continue;
+                            }
+                            $ini_string .= "$ini_value\n";
+                        }
+                    }
+
+                    //If we can parse out generated INI string, then it's value.
+                    //Save it to the network file
+                    if ((parse_ini_string($ini_string) !== false) && !empty($ini_string)) {
+
+                        if (file_put_contents($network_setting_filepath, $ini_string) === false) {
+                            $save_result = false;
+                        } else {
+                            $save_result = true;
+                            $network_settings_restored = true;
                             //Map out the interface wired network and wifi network
                             $parsed_ini_string = parse_ini_string($ini_string);
-//							$interface = $parsed_ini_string['INTERFACE'];
-//
-//							$network_settings_restored_post_apply[$network_type] = ($SUDO . " " . $settings['fppDir'] . "/scripts/config_network $interface");
-							$network_settings_restored_applied_ips[$network_type] = $parsed_ini_string;
 
-							//Reboot required for network settings to be applied.
-							WriteSettingToFile('rebootFlag', 1);
-						}
-						$settings_restored[$restore_area_key][$network_type]['SUCCESS'] = $save_result;
-					} else {
-						error_log("RESTORE: Failed to restore " . $restore_area_key . " - Could not generate network settings - " . $ini_string);
-					}
-				} else {
-					error_log("RESTORE: Failed to restore " . $restore_area_key . " - Network settings empty - Found: " . json_encode($network_data));
-				}
-			}
-		} else {
-			error_log("RESTORE: Failed to restore " . $restore_area_key . " - 'Keep Existing Network Settings' selected - NOT OVERWRITING: ");
-		}
+                            $network_settings_restored_applied_ips[$network_type] = $parsed_ini_string;
 
-//		$settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
-	}
+                            //Reboot required for network settings to be applied.
+                            WriteSettingToFile('rebootFlag', 1);
+                        }
+                        $settings_restored[$restore_area_key][$network_type]['SUCCESS'] = $save_result;
+                    } else {
+                        error_log("RESTORE: Failed to restore " . $restore_area_key . " - Could not generate network settings - " . $ini_string);
+                    }
+                } else {
+                    error_log("RESTORE: Failed to restore " . $restore_area_key . " - Network settings empty - Found: " . json_encode($network_data));
+                }
+            }
+        } else {
+            error_log("RESTORE: Not restoring " . $restore_area_key . " - 'Keep Existing Network Settings' selected - NOT OVERWRITING: ");
+            //no attempt was made so remove the key for tracking attempts
+            unset($settings_restored[$restore_area_key]);
+        }
 
-    //PIXELNET/DMX (FPD) RESTORATION
-//    if ($restore_area_key == "pixelnet_DMX") {
-//        //Just overwrite the universes file
-//        $pixlnet_filepath = $system_config_areas['pixelnetDMX']['file'];
-//        $data = implode("\n", $restore_area_data);
-//        $save_result = file_put_contents($pixlnet_filepath, $data);
-//        $settings_restored[$restore_area_key] = $save_result;
-//    }
-//
-//    //DEPRECATED - UNIVERSE RESTORATION
-//    if ($restore_area_key == "universes") {
-//        //Just overwrite the universes file
-//        $universe_filepath = $system_config_areas['universes']['file'];
-//        $data = implode("\n", $restore_area_data);
-//        $save_result = file_put_contents($universe_filepath, $data);
-//
-//        $settings_restored[$restore_area_key] = $save_result;
-//    }
+    }
+
+    //Virtual EEPROM for capes
+    if ($restore_area_key == "virtualEEPROM" && !$restore_data_is_empty) {
+        $settings_restored[$restore_area_key]['ATTEMPT'] = true;
+        $save_result = false;
+        foreach ($system_config_areas['virtualEEPROM']['file'] as $fn => $finfo) {
+            if (isset($restore_area_data[$fn])) {
+                file_put_contents("/home/fpp/media/tmp/here.$fn", json_encode($restore_area_data));
+                if (file_put_contents($finfo['location'], base64_decode($restore_area_data[$fn][0])) === false) {
+                    $save_result = false;
+                } else {
+                    $save_result = true;
+                }
+            }
+        }
+
+        $settings_restored[$restore_area_key]['SUCCESS'] = $save_result;
+
+        //Set FPPD reboot flag
+        WriteSettingToFile('rebootFlag', 1);
+    }
+
+    //finally if there was no data for the restore area remove it's key for tracking attempts, this is fine here as the separate restore area tests above will avoid restore areas with no data
+    if ($restore_data_is_empty) {
+        unset($settings_restored[$restore_area_key]);
+    }
 
     //wrote message out
-    if (!$save_result) {
+    if (
+        !$restore_data_is_empty &&
+        (array_key_exists($restore_area_key, $settings_restored)
+            && array_key_exists('ATTEMPT', $settings_restored[$restore_area_key])
+            && $settings_restored[$restore_area_key]['ATTEMPT']
+            && !$save_result
+        )
+    ) {
         error_log("RESTORE: Failed to restore " . $restore_area . " - " . json_encode($settings_restored));
     }
 
     //Return save result
+    return $settings_restored;
+}
+
+/**
+ * Process restore data that exists an array of multiple files (e.g channelOutputs is made yp of multiple files)
+ *
+ * @param $restore_area_key String The parent restore area e.g channelOutputs
+ * @param $restore_area_sub_key String The child area e.g pixel_strings (under channelOutputs
+ * @param $restore_areas Array The parent restore area and its child areas's/files
+ * @param $restore_area_data Array The uploaded data for this parent restore area
+ * @param $backup_version Float Backup version used to determine any backward compatibility tweaks
+ * @return void
+ */
+function processRestoreDataArray($restore_area_key, $restore_area_sub_key, $restore_areas, $restore_area_data, $backup_version)
+{
+    global $SUDO, $settings, $mediaDirectory, $scheduleFile, $system_config_areas, $keepMasterSlaveSettings, $keepNetworkSettings, $uploadData_IsProtected, $settings_restored,
+    $network_settings_restored, $network_settings_restored_post_apply, $network_settings_restored_applied_ips,
+    $known_ini_config_files, $known_json_config_files;
+    global $args;
+
+    //RESTORE TWEAKS FOR SPECIFIC VERSIONS (all changes done by the logic below
+    //Version >7.2 backups - Panel layout is generated from the actual panel config (using col & row data) if the layout doesn't exist anywhere
+    //                    - Single Panel size is generated from the same config and also written to the system settings
+
+    //search through the files that should of been backed up for the specified area, eg. channelOutputs has multiple files
+    //and then loop over the restore data and match up the data and restore it if anything exists.
+    foreach ($restore_areas as $restore_areas_idx => $restore_areas_data) {
+        $restore_location = $restore_areas_data['location'];
+        $restore_type = $restore_areas_data['type'];
+        $final_file_restore_data = "";
+
+        //If $restore_area_sub_key is empty then no sub-area has been chosen -- restore as normal and restore all sub areas, which should be everything under e.g $system_config_areas['channelOutputs']
+        //Or if $restore_area_sub_key is equal to the $show_setup_area_index we're on, then restore just this area because it matches users selection e.g user may just want the show schedule
+        //and break the loop
+        if ($restore_area_sub_key == "" || ($restore_area_sub_key == $restore_areas_idx)) {
+            //if the restore key and the $system_config_areas key match then restore data to whatever location it is
+            //eg. if we are on events, then look for events in the restore data, when found restore data to the events location (eg look at the location)
+            foreach ($restore_area_data as $restore_area_data_index => $restore_area_data_payload) {
+                $save_result = false;
+
+                //$restore_area_data_data is an array representing the file contents
+                //$restore_area_data_index represents the filename (used to key the array)
+                if ($restore_areas_idx == $restore_area_data_index) {
+                    //data is an array then we can go
+                    if (is_array($restore_area_data_payload)) {
+                        //loop over all the files and their data and restore each
+                        //e.g $restore_area_data_data array will look like
+                        //array ('event'=> array('01_01.fevt' => array(data), '21_10.fevt' => array(data)))
+                        foreach ($restore_area_data_payload as $filename_to_restore => $file_data) {
+                            $save_result = false;
+
+                            // Filenames come from inside the uploaded backup. A
+                            // crafted name ("../../...") would escape the
+                            // target directory when appended below, so skip
+                            // anything that isn't a bare directory entry.
+                            // Legitimate backups only contain bare names (see
+                            // read_directory_files()), so valid restores are
+                            // unaffected. Skipped files leave the per-area
+                            // status to the remaining files.
+                            if ($restore_type == "dir" && !IsSafeRestoreFilename($filename_to_restore)) {
+                                continue;
+                            }
+
+                            $restore_location = $restore_areas_data['location']; //reset
+                            $final_file_restore_data = ""; //store restore data in variable
+
+                            //Work out what method we need to use to get the data back into an array
+                            if ($restore_type == "dir" || $restore_type == "file") {
+                                if (in_array($restore_area_data_index, $known_json_config_files)) {
+                                    //JSON
+                                    $final_file_restore_data = $file_data;
+                                } else {
+                                    //everything else
+                                    //line separate the lines
+                                    $final_file_restore_data = implode("\n", $file_data);
+                                }
+                            } else if ($restore_type == "function") {
+                                //get the data as in without any modification so we can pass it into the restore function
+                                $final_file_restore_data = $file_data;
+                            }
+
+                            //If backup/restore type of a sub-area is folder, then build the full path to where the file will be restored
+                            if ($restore_type == "dir") {
+                                $restore_location .= "/" . $filename_to_restore;
+                            }
+
+                            //if restore sub-area is LED panels, we need write the matrix size / layout setting to the settings file in case it's different to the backup
+                            if (strtolower($restore_areas_idx) == "led_panels") {
+                                $panel_layout = null;
+
+                                //Generate the single LED Panel size from info in the LED Panel layout e.g 32x16 1/2 Scan
+                                if (
+                                    is_array($final_file_restore_data['channelOutputs'][0]) &&
+                                    (
+                                        array_key_exists('panelHeight', $final_file_restore_data['channelOutputs'][0])
+                                        && array_key_exists('panelWidth', $final_file_restore_data['channelOutputs'][0])
+                                        && array_key_exists('panelScan', $final_file_restore_data['channelOutputs'][0])
+                                    )
+                                ) {
+                                    $singlePanelSize = $final_file_restore_data['channelOutputs'][0]['panelWidth'] . 'x' . $final_file_restore_data['channelOutputs'][0]['panelHeight'] . 'x' . $final_file_restore_data['channelOutputs'][0]['panelScan'];
+                                    WriteSettingToFile('LEDPanelsSize', $singlePanelSize);
+                                }
+
+                                //Write the panel layout, e.g 4x4 into the system settings
+                                //This setting can exist in a few places (by default it's in the system settings)
+                                if (
+                                    is_array($final_file_restore_data['channelOutputs'][0]) &&
+                                    array_key_exists('ledPanelsLayout', $final_file_restore_data['channelOutputs'][0])
+                                ) {
+                                    WriteSettingToFile('LEDPanelsLayout', $final_file_restore_data['channelOutputs'][0]['ledPanelsLayout']);
+                                } elseif (!empty($restore_area_system_settings)) {
+                                    // If it's a full backup we can get the panel settings from the system settings
+                                    $panel_layout = $restore_area_system_settings[0]['LEDPanelsLayout'];
+
+                                    if ($panel_layout != null) {
+                                        //LEDPanelsLayout = "4x4"
+                                        WriteSettingToFile('LEDPanelsLayout', $panel_layout);
+                                    }
+                                } else {
+                                    // ledPanelsLayout && LEDPanelsLayout don't exist so we can't determine the matrix size
+                                    //As a last resort we can calculate the matrix size from the led panel layout
+                                    $maxCol = $maxRow = null;
+                                    $panel_layout_data = $final_file_restore_data['channelOutputs'][0]['panels'];
+
+                                    foreach ($panel_layout_data as $idx => $panel) {
+                                        if ($panel['col'] > $maxCol) {
+                                            $maxCol = $panel['col'];
+                                        }
+                                        if ($panel['row'] > $maxRow) {
+                                            $maxRow = $panel['row'];
+                                        }
+                                    }
+
+                                    if ($maxCol != null && $maxRow != null) {
+                                        //Adjust max values due to the array being 0 base
+                                        $maxCol = $maxCol + 1;
+                                        $maxRow = $maxRow + 1;
+
+                                        //LEDPanelsLayout = "4x4"
+                                        WriteSettingToFile('LEDPanelsLayout', $maxCol . "x" . $maxRow);
+                                    }
+
+                                }
+                            }
+
+                            ///////////////////////////////////////////////////
+                            //////////////////////////////////////////////////
+                            //If we have data then write to where it needs to go
+                            if (!empty($final_file_restore_data)) {
+                                //Set we have valid ata
+                                $settings_restored[$restore_area_key][$restore_area_data_index]['VALID_DATA'] = true;
+
+                                //Decide what action to take based on the restore type
+                                if (($restore_type == "dir" || $restore_type == "file")) {
+                                    $settings_restored[$restore_area_key][$restore_area_data_index]['ATTEMPT'] = true;
+
+                                    //Work out what method we need to use to get the data back out into the correct format
+                                    if (in_array($restore_area_data_index, $known_json_config_files)) {
+                                        //JSON
+                                        $final_file_restore_data = prettyPrintJSON(json_encode($final_file_restore_data));
+                                    }
+                                    //Save out the file
+                                    if (file_put_contents($restore_location, $final_file_restore_data) === false) {
+                                        $save_result = false;
+                                    } else {
+                                        $save_result = true;
+                                    }
+                                } //If restore type is function - call the function
+                                else if ($restore_type == "function") {
+                                    $settings_restored[$restore_area_key][$restore_area_data_index]['ATTEMPT'] = true;
+
+                                    $restore_function = $restore_areas_data['location']['restore'];
+                                    //if we have valid data and the function exists, call it
+                                    if (function_exists($restore_function)) {
+                                        $save_result = $restore_function($final_file_restore_data);
+                                    }
+                                } else {
+                                    //Unlikely - but no match on restore type
+                                    $save_result = false;
+                                }
+                            } else {
+                                //Restore data is still empty after massaging
+                                $settings_restored[$restore_area_key][$restore_area_data_index]['VALID_DATA'] = false;
+                            }
+                        }
+                    } else {
+                        //Not an array, we need an array here, so data is not valid
+                        $settings_restored[$restore_area_key][$restore_area_data_index]['VALID_DATA'] = false;
+                    }
+                    $settings_restored[$restore_area_key][$restore_area_data_index]['SUCCESS'] = $save_result;
+
+                    //Cheat and remove the success key if no attempt was even made (no attempt key) and there was no valid data
+                    //meaning that we didn't even try, this check is done after the key and value is set because $restore_area_data_index might not exist at all if the ATTEMPT or VALID_DATA key was set
+                    if (
+                        !array_key_exists('ATTEMPT', $settings_restored[$restore_area_key][$restore_area_data_index])
+                        &&
+                        !array_key_exists('VALID_DATA', $settings_restored[$restore_area_key][$restore_area_data_index])
+                    ) {
+                        unset($settings_restored[$restore_area_key][$restore_area_data_index]);
+                    }
+
+                    break; //break after data is restored for this section
+                }
+            }
+            //Don't break if area key is empty, because we want to process all the sub-areas
+            if ($restore_area_sub_key != "") {
+                //we found the sub-area, stop looking
+                break;
+            }
+        }
+    }
+
+}
+
+/**
+ * Whether a filename from inside an uploaded backup is safe to restore.
+ *
+ * Backup payloads key files by name, so a crafted backup can carry names
+ * like "../../config/settings" or absolute paths. Legitimate backups only
+ * ever contain bare directory entries (see read_directory_files(): no
+ * slashes, never "." or ".."), so anything else is skipped, never written
+ * or executed. Allows spaces, unicode,
+ * leading dashes and dotfiles -- anything that stays a single entry.
+ *
+ * @param mixed $filename array key from the decoded backup payload
+ * @return bool
+ */
+function IsSafeRestoreFilename($filename)
+{
+    if (is_int($filename)) {
+        $filename = (string) $filename;
+    }
+    if (!is_string($filename)) {
+        return false;
+    }
+    if ($filename === "" || $filename === "." || $filename === "..") {
+        return false;
+    }
+    if (basename($filename) !== $filename) {
+        return false;
+    }
+    return true;
+}
+
+// SetAudioOutput() now lives in common.php: the settings API calls it too, and
+// only backup.php ever included this file, so the API's call fatalled.
+
+/**
+ * Helper function to read the TimeZone setting for backups (no longer stored in the TimeZone file
+ *
+ * @return string
+ */
+function ReadTimeZone()
+{
+    $TimeZone_setting = ReadSettingFromFile('TimeZone');
+    return $TimeZone_setting;
+}
+
+/**
+ * Reads any JSON files in the config folder and returns an array keyed with the filename and it's contents
+ * the keys, attempts to ignore any files specified as belonging to other areas
+ *
+ * @return array
+ */
+function BackupConfigFolderConfigs()
+{
+    global $settings, $system_config_areas;
+
+    //Get a list of files in the config directory
+    $json_config_files = read_directory_files($settings['configDirectory'], false);
+
+    //Loop over the files we have found and weed out the non .json files
+    foreach ($json_config_files as $filename => $fn_bool) {
+        //If the filename has the extension of .json, then we want to keep it, discard all others
+        //eg no .htaccess, .htpassword or .db files
+        //
+        //This tests the extension, not "contains .json anywhere".  A substring
+        //test also matched every sidecar copy sitting beside a config file -
+        //co-other.json.backup, gpio.json.conflict, channeloutputs.json_not_working,
+        //xlights-modelgroups.json.pre-grouptype - so each backup carried a second
+        //copy of config it had already backed up.  On a box with a large xLights
+        //layout that was a third of the whole backup, repeated for every kept
+        //backup.  A copy of a config file is not itself config.
+        if (!str_ends_with(strtolower($filename), ".json")) {
+            unset($json_config_files[$filename]);
+        }
+        //else true so we keep the filename
+    }
+
+    //One we have the list, we need to remove any that other areas, e.g co-universes.json etc
+    $system_config_areas_local = $system_config_areas;
+    unset($system_config_areas_local['all']);
+    unset($system_config_areas_local['network']);
+    unset($system_config_areas_local['misc_configs']); //to avoid something weird happening
+    //remove email as its in the general settings file and not a separate section
+    unset($system_config_areas_local['settings']['file']['email']);
+
+    //loop over the preconfigured areas and process them
+    //This loop will remove any files we picked up in the config folder which may already be known about and mapped to a existing area (e.g co-universes.json)
+    //any files left after this are extra config files we need to backup
+    foreach ($system_config_areas_local as $config_key => $config_data) {
+        $setting_file_to_backup = $config_data['file'];
+
+        //if setting file value is an array then there are one or more setting files related to this backup
+        if (is_array($setting_file_to_backup)) {
+            //loop over the array
+            foreach ($setting_file_to_backup as $settings_file => $settings_file_data) {
+                //We only want files, so check the type first and only process files further
+                if ($settings_file_data['type'] == "file") {
+                    //Check if the file location(s) is an array, if so there will likely be more than 1 file location to read
+                    //All other times location should just be a simple string for the file location
+                    if (is_array($settings_file_data['location'])) {
+                        //loop over the locations to read them all in
+                        foreach ($settings_file_data['location'] as $location_filename => $location_path) {
+                            //Get just the filename from the path
+                            $path_parts = pathinfo($location_path);
+                            if (!empty($path_parts['extension'])) {
+                                $path_parts_filename = $path_parts['filename'] . '.' . $path_parts['extension'];
+                            } else {
+                                $path_parts_filename = $path_parts['filename'];
+                            }
+                            //Check if the file is in our misc/extra json config files list
+                            if (array_key_exists($path_parts_filename, $json_config_files)) {
+                                //remove it from the list of misc json config files as it will get backed up in another area
+                                unset($json_config_files[$path_parts_filename]);
+                                //                                echo "Excluding file from Extra Config backup" . $path_parts_filename;
+                            }
+                        } //end loop
+                    } else {
+                        //Not an array so just a single file or filepath
+                        //Do the same as above, check if the file is in our misc/extra json config files list
+
+                        //Get just the filename from the path
+                        $path_parts = pathinfo($settings_file_data['location']);
+                        if (!empty($path_parts['extension'])) {
+                            $path_parts_filename = $path_parts['filename'] . '.' . $path_parts['extension'];
+                        } else {
+                            $path_parts_filename = $path_parts['filename'];
+                        }
+
+                        if (array_key_exists($path_parts_filename, $json_config_files)) {
+                            //remove it from the list of misc json config files as it will get backed up in another area
+                            unset($json_config_files[$path_parts_filename]);
+                            //                            echo "Excluding file from Extra Config backup" . $path_parts_filename;
+                        }
+                    } //end else
+                }
+            }
+        } else {
+            //Location is not an array, so likely just holds the filename,
+            //check if the file is in our misc/extra json config files list
+            if ($setting_file_to_backup !== false) {
+                $path_parts = pathinfo($setting_file_to_backup);
+
+                if (!empty($path_parts['extension'])) {
+                    $path_parts_filename = $path_parts['filename'] . '.' . $path_parts['extension'];
+                } else {
+                    $path_parts_filename = $path_parts['filename'];
+                }
+
+                if (!empty($path_parts['filename'])) {
+                    if (array_key_exists($path_parts_filename, $json_config_files)) {
+                        unset($json_config_files[$path_parts_filename]);
+                        //                        echo "Excluding file from Extra Config backup" . $path_parts_filename;
+                    }
+                }
+            }
+        }
+    }
+
+    //Once we have our final list of extra config files, read them in
+    //file reading them in, we'll try decoding the string which will test if it's actually a json file
+    //if the string cannot be successfully decoded, the the contents is likely not a json file
+    //unset these because want to reuse them
+    unset($filename);
+    unset($fn_bool);
+    //
+    foreach ($json_config_files as $filename => $fn_bool) {
+        if (is_string($filename)) {
+            //Read in the config file
+            $file_data = file_get_contents($settings['configDirectory'] . '/' . $filename);
+            //Attempt json_decode on the string, if there is a error then can the data and the filename (json file should have json data)
+            $json_result = json_decode($file_data);
+            //
+            if (json_last_error() === JSON_ERROR_NONE) {
+                // JSON is valid
+                // Keep the data - decode it so it's kept as an array for encoding
+                $json_config_files[$filename] = json_decode($file_data, true);
+            } else {
+                //Invalid data, don't keep it and remove the filename from the backup
+                unset($json_config_files[$filename]);
+            }
+        }
+        //       $file_data = parse_ini_string(file_get_contents($setting_file_to_backup));
+        //       $file_data = json_decode(file_get_contents($setting_file_to_backup), true);
+    }
+
+    return $json_config_files;
+}
+
+/**
+ * Takes the file-named keyed array generated by backup_config_folder_configs and basically loops through
+ * restoring data into each of the files
+ *
+ * @return boolean
+ */
+function RestoreConfigFolderConfigs($restore_data)
+{
+    global $settings, $system_config_areas;
+
+    //basically restore the files into the config directory, using the array key as the filename and just write the data into the file
+    //pretty print the JSON before doing this
+    $save_result = false;
+    //make sure data is supplied before doing anything, just in case
+    if (!empty($restore_data)) {
+        //Loop over the data to restore, the array key is the filename e.g joysticks.json, it's value is a array representing the file contents
+        foreach ($restore_data as $restore_filename => $restore_file_data) {
+            // Traversal guard: the filename comes from inside the uploaded
+            // backup. Legitimate backups only contain bare names.
+            if (!IsSafeRestoreFilename($restore_filename)) {
+                continue;
+            }
+            //Generate the filepath for the config file to be restored
+            $misc_data_rest_filepath = $settings['configDirectory'] . '/' . $restore_filename;
+
+            //PrettyPrint the JSON data and save it
+            $misc_data_restore = prettyPrintJSON(json_encode($restore_file_data));
+            if (file_put_contents($misc_data_rest_filepath, $misc_data_restore) === false) {
+                $save_result = false;
+            } else {
+                $save_result = true;
+            }
+        }
+    }
+
     return $save_result;
 }
 
 /**
- * Looks after script restorations and running of associated InstallActions
- * @param $file_names array of script file names
- */
-function RestoreScripts($file_names)
-{
-    global $SUDO, $fppDir;
-    global $scriptDirectory;
-
-    if (!empty($file_names)) {
-        foreach ($file_names as $filename) {
-            exec("$SUDO $fppDir/scripts/restoreScript $filename");
-        }
-    }
-}
-
-/**
- * Sets the timezone (taken from timeconfig.php)
- * @param $timezone_setting String Timezone in correct format
- * @see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones For a list of timezones
- */
-function SetTimezone($timezone_setting)
-{
-    global $SUDO, $mediaDirectory;
-    //TODO: Check timezone for validity
-    $timezone = $timezone_setting;
-    error_log("RESTORE: Changing timezone to '" . $timezone . "'.");
-    if (file_exists('/usr/bin/timedatectl')) {
-        exec($SUDO . " timedatectl set-timezone $timezone", $output, $return_val);
-        unset($output);
-    } else {
-        exec($SUDO . " bash -c \"echo $timezone > /etc/timezone\"", $output, $return_val);
-        unset($output);
-        //TODO: check return
-        exec($SUDO . " dpkg-reconfigure -f noninteractive tzdata", $output, $return_val);
-        unset($output);
-        //TODO: check return
-    }
-    exec(" bash -c \"echo $timezone > $mediaDirectory/timezone\"", $output, $return_val);
-    unset($output);
-    //TODO: check return
-}
-
-/**
- * Sets the PiRTC setting exec's the appropriate command (taken from timeconfig.php)
- * @param $pi_rtc_setting String PIRTC setting
- */
-function SetPiRTC($pi_rtc_setting)
-{
-    global $SUDO, $fppDir;
-
-    $piRTC = $pi_rtc_setting;
-    WriteSettingToFile("piRTC", $piRTC);
-    exec($SUDO . " $fppDir/scripts/piRTC set");
-    error_log("RESTORE: Set RTC: " . $piRTC);
-}
-
-/**
- * Sets the Audio Output device (extracted from fppjson.php)
- * @param $card String soundcard
- * @return  string
- */
-function SetAudioOutput($card)
-{
-    global $args, $SUDO, $debug;
-
-	if ($card != 0 && file_exists("/proc/asound/card$card")) {
-		exec($SUDO . " sed -i 's/card [0-9]/card " . $card . "/' /root/.asoundrc", $output, $return_val);
-		unset($output);
-		if ($return_val) {
-			error_log("Failed to set audio to card $card!");
-			return;
-		}
-		if ($debug)
-			error_log("Setting to audio output $card");
-	} else if ($card == 0) {
-		exec($SUDO . " sed -i 's/card [0-9]/card " . $card . "/' /root/.asoundrc", $output, $return_val);
-		unset($output);
-		if ($return_val) {
-			error_log("Failed to set audio back to default!");
-			return;
-		}
-		if ($debug)
-			error_log("Setting default audio");
-	}
-
-    return $card;
-}
-
-/**
- * Reads the Falcon.FPDV1 - Falcon Pixelnet/DMX file
- * extracted & modified from LoadPixelnetDMXFile() in ./fppxml.php
+ * Performs all the work to gather files to be backed up for the specified backup area
+ * optionally $allowDownload can be set to false in order to prevent the backup being sent to the users browser and just have the file backed up to the config/backups folder
  *
- * @return array|void
- */
-function LoadPixelnetDMXFile_FPDv1()
-{
-    global $settings;
-    //Pull in the class
-    require_once './pixelnetdmxentry.php';
-    //Store data in an array instead of session
-    $return_data = array();
-
-    $f = fopen($settings['configDirectory'] . "/Falcon.FPDV1", "rb");
-    if ($f == FALSE) {
-        fclose($f);
-        return;
-    }
-
-    if ($f != FALSE) {
-        $s = fread($f, 1024);
-        fclose($f);
-        $sarr = unpack("C*", $s);
-
-        $dataOffset = 7;
-
-        $i = 0;
-        for ($i = 0; $i < 12; $i++) {
-            $outputOffset = $dataOffset + (4 * $i);
-            $active = $sarr[$outputOffset + 0];
-            $startAddress = $sarr[$outputOffset + 1];
-            $startAddress += $sarr[$outputOffset + 2] * 256;
-            $type = $sarr[$outputOffset + 3];
-            $return_data[$i] = new PixelnetDMXentry($active, $type, $startAddress);
-        }
-    }
-
-    return $return_data;
-}
-
-/**
- * Restores the FPDv1 channel data from the supplied array
- * extracted & modified from LoadPixelnetDMXFile() in ./fppxml.php
+ * This function can be called directly to perform a backup of settings, $allowDownload should be false in this instance to avoid header issues
  *
- * @param $restore_data array FPDv1 data to restore
- * @return bool Success state file write
+ * @param string $area Backup area to be backed up, refer $system_config_areas for the currently defined list of area
+ * @param bool $allowDownload Toggle to allow or disallow the backup file being sent to the users browser
+ * @param string $backupComment Optionally add a comment to the backup file that may be useful to describe what the backup is for
+ * @param string $backupTriggerSource Optionally add where/what triggered the backup
  */
-function SavePixelnetDMXFile_FPDv1($restore_data)
+function performBackup($area = "all", $allowDownload = true, $backupComment = "User Initiated Manual Backup", $backupTriggerSource = null)
 {
-    global $settings;
-    $outputCount = 12;
-    $write_status = false;
-    if (!empty($restore_data) && is_array($restore_data)) {
+    global $fpp_backup_format_version, $system_config_areas, $known_json_config_files, $known_ini_config_files;
 
-        $carr = array();
-        for ($i = 0; $i < 1024; $i++) {
-            $carr[$i] = 0x0;
-        }
+    //Toggle the flag to disallow the backup file to be downloaded by the browser
+    if ($allowDownload === false) {
+        preventPromptUserBrowserDownloadBackup();
+    }
 
-        $i = 0;
-        // Header
-        $carr[$i++] = 0x55;
-        $carr[$i++] = 0x55;
-        $carr[$i++] = 0x55;
-        $carr[$i++] = 0x55;
-        $carr[$i++] = 0x55;
-        $carr[$i++] = 0xCC;
+    if (array_key_exists($area, $system_config_areas)) {
+        //Create a copy of the areas array to manipulate
+        $tmp_config_areas = $system_config_areas;
 
-//    $_SESSION['PixelnetDMXentries']=NULL;
-        for ($o = 0; $o < $outputCount; $o++) {
-            // Active Output
-            if (isset($restore_data[$o]['active']) && ($restore_data[$o]['active'] == '1' || intval($restore_data[$o]['active']) == 1)) {
-                $active = 1;
-                $carr[$i++] = 1;
-            } else {
-                $active = 0;
-                $carr[$i++] = 0;
+        //remove email as its in the general settings file and not a separate section (no actual file to backup)
+        unset($tmp_config_areas['settings']['file']['email']);
+
+        //Generate backup for selected area
+        //AREA - ALL
+        if (strtolower($area) == "all") {
+            //combine all backup areas into a single file
+
+            //remove the 'all' key and do some processing of areas array
+            unset($tmp_config_areas['all']);
+
+            //loop over the areas and process them
+            foreach ($tmp_config_areas as $config_key => $config_data) {
+                $setting_file_to_backup = $config_data['file'];
+                $file_data = array();
+                $backup_file_data = '';
+                //if setting file value is an array then there are one or more setting files related to this backup
+                if (is_array($setting_file_to_backup)) {
+                    //loop over the array
+                    foreach ($setting_file_to_backup as $sfi => $sfd) {
+                        $file_data = array();
+                        //           'events' => array('type' => 'dir', 'location' => $eventDirectory),
+
+                        //File or directory, read data accordingly
+                        if ($sfd['type'] == "dir") {
+                            //read all files in directory and read data
+                            $file_data = read_directory_files($sfd['location']);
+                        } else if ($sfd['type'] == "file") {
+                            //read setting file as normal
+
+                            //Check if the file location(s) is an array, if so there will likely be more than 1 file location to read
+                            //All other times location should just be a simple string for the file location
+                            if (is_array($sfd['location'])) {
+                                //loop over the locations to read them all in
+                                foreach ($sfd['location'] as $location_filename => $location_path) {
+                                    //Check if the file to be backed up is one of a known type
+                                    if (in_array($sfi, $known_ini_config_files)) {
+                                        //INI
+                                        //parse ini properly
+                                        $backup_file_data = ParseIniConfigForBackup($location_path);
+                                    } else if (in_array($sfi, $known_json_config_files)) {
+                                        //JSON
+                                        //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
+                                        $backup_file_data = json_decode(@file_get_contents($location_path), true);
+                                    } else if (isset($config_data['binary']) && $config_data['binary']) {
+                                        $backup_file_data = base64_encode(@file_get_contents($location_path));
+                                    } else {
+                                        //all other files are std flat files, process them into an array by splitting at line breaks
+                                        $backup_file_data = explode("\n", @file_get_contents($location_path));
+                                    }
+
+                                    //Collect the backup data
+                                    $file_data[$location_filename] = array($backup_file_data);
+                                } //end loop
+                            } else {
+                                //Not an array so just a single file or filepath
+
+                                //Check if the file to be backed up is one of a known type
+                                if (in_array($sfi, $known_ini_config_files)) {
+                                    //INI
+                                    //parse ini properly
+                                    $backup_file_data = ParseIniConfigForBackup($sfd['location']);
+                                } else if (in_array($sfi, $known_json_config_files)) {
+                                    //JSON
+                                    //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
+                                    $backup_file_data = json_decode(@file_get_contents($sfd['location']), true);
+                                } else if (isset($config_data['binary']) && $config_data['binary']) {
+                                    $backup_file_data = base64_encode(@file_get_contents($sfd['location']));
+                                } else {
+                                    //all other files are std flat files, process them into an array by splitting at line breaks
+                                    $backup_file_data = explode("\n", @file_get_contents($sfd['location']));
+                                }
+
+                                //Collect the backup data
+                                $file_data = array($backup_file_data);
+                            } //end else
+
+                        } else if ($sfd['type'] == "function") {
+                            //If the type is function, call the function defined under the backup location
+                            //this function will return the necessary data
+                            $backup_function = $sfd['location']['backup'];
+                            if (function_exists($backup_function)) {
+                                $backup_file_data = $backup_function();
+                            }
+                            $file_data = array($backup_file_data);
+                        }
+
+                        $tmp_settings_data[$config_key][$sfi] = $file_data;
+                    }
+                } else {
+                    if ($setting_file_to_backup !== false && file_exists($setting_file_to_backup)) {
+                        //what type of file are we dealing with? json, ini, csv, flatfile?
+                        //ultimately the data should be returned as an array
+                        //it will later be json_encoded
+
+                        if (in_array($config_key, $known_ini_config_files)) {
+                            //INI
+                            //parse ini properly
+                            $file_data = ParseIniConfigForBackup($setting_file_to_backup);
+                        } else if (in_array($config_key, $known_json_config_files)) {
+                            //JSON
+                            //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
+                            $file_data = json_decode(file_get_contents($setting_file_to_backup), true);
+                        } else if (isset($config_data['binary']) && $config_data['binary']) {
+                            $file_data = base64_encode(file_get_contents($setting_file_to_backup));
+                        } else {
+                            //all other files are std flat files, process them into an array by splitting at line breaks
+                            $file_data = explode("\n", file_get_contents($setting_file_to_backup));
+                        }
+                        $tmp_settings_data[$config_key] = $file_data;
+                    }
+                }
+                //End for loop processing each individual "area" in order to get all areas
             }
-            // Start Address
-            $startAddress = intval($restore_data[$o]['startAddress']);
-            $carr[$i++] = $startAddress % 256;
-            $carr[$i++] = $startAddress / 256;
-            // Type
-            $type = intval($restore_data[$o]['type']);
-            $carr[$i++] = $type;
-//        $_SESSION['PixelnetDMXentries'][] = new PixelnetDMXentry($active,$type,$startAddress);
-        }
-        $f = fopen($settings['configDirectory'] . "/Falcon.FPDV1", "wb");
-//        fwrite($f, implode(array_map("chr", $carr)), 1024);
-
-        if (fwrite($f, implode(array_map("chr", $carr)), 1024) === FALSE) {
-            $write_status = false;
+            //End processing "ALL" backup areas
         } else {
-            $write_status = true;
+            //AREA - Individual Backup section selections will arrive here
+            //All other backup areas for individual selections
+            $setting_file_to_backup = $tmp_config_areas[$area]['file'];
+
+            //if setting file value is an array then there are one or more setting files related to this backup
+            if (is_array($setting_file_to_backup)) {
+                //loop over the array
+                foreach ($setting_file_to_backup as $sfi => $sfd) {
+                    $file_data = array();
+                    if ($sfd['type'] == "dir") {
+                        $file_data = read_directory_files($sfd['location']);
+                    } else if ($sfd['type'] == "file") {
+
+                        //Check if the file location(s) is an array, if so there will likely be more than 1 file location to read
+                        //All other times location should just be a simple string for the file location
+                        if (is_array($sfd['location'])) {
+                            //loop over the locations to read them all in
+                            foreach ($sfd['location'] as $location_filename => $location_path) {
+                                //Check if the file to be backed up is one of a known type
+                                if (in_array($sfi, $known_ini_config_files)) {
+                                    //INI
+                                    //parse ini properly
+                                    $backup_file_data = ParseIniConfigForBackup($location_path);
+                                } else if (in_array($sfi, $known_json_config_files)) {
+                                    //JSON
+                                    //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
+                                    $backup_file_data = json_decode(file_get_contents($location_path), true);
+                                } else if (isset($tmp_config_areas[$area]['binary']) && $tmp_config_areas[$area]['binary']) {
+                                    $backup_file_data = base64_encode(file_get_contents($location_path));
+                                } else {
+                                    //all other files are std flat files, process them into an array by splitting at line breaks
+                                    $backup_file_data = explode("\n", file_get_contents($location_path));
+                                }
+
+                                //Collect the backup data
+                                $file_data[$location_filename] = array($backup_file_data);
+                            } //end loop
+                        } else {
+                            //Not an array so just a single file or filepath
+
+                            //Check if the file to be backed up is one of a known type
+                            if (in_array($sfi, $known_ini_config_files)) {
+                                //INI
+                                //parse ini properly
+                                $backup_file_data = ParseIniConfigForBackup($sfd['location']);
+                            } else if (in_array($sfi, $known_json_config_files)) {
+                                //JSON
+                                //channelOutputsJSON is a formatted (prettyPrint) JSON file, decode it into an assoc. array
+                                $backup_file_data = json_decode(file_get_contents($sfd['location']), true);
+                            } else if (isset($tmp_config_areas[$area]['binary']) && $tmp_config_areas[$area]['binary']) {
+                                $backup_file_data = base64_encode(file_get_contents($sfd['location']));
+                            } else {
+                                //all other files are std flat files, process them into an array by splitting at line breaks
+                                $backup_file_data = explode("\n", file_get_contents($sfd['location']));
+                            }
+
+                            //Collect the backup data
+                            $file_data = array($backup_file_data);
+                        } //end else
+
+                    } else if ($sfd['type'] == "function") {
+                        $backup_function = $sfd['location']['backup'];
+                        $backup_file_data = array();
+                        if (function_exists($backup_function)) {
+                            $backup_file_data = $backup_function();
+                        }
+                        $file_data = array($backup_file_data);
+                    }
+                    $tmp_settings_data[$area][$sfi] = $file_data;
+                }
+            } else {
+                if ($setting_file_to_backup !== false && file_exists($setting_file_to_backup)) {
+                    if (in_array($area, $known_ini_config_files)) {
+                        $file_data = ParseIniConfigForBackup($setting_file_to_backup);
+                    } else if (in_array($area, $known_json_config_files)) {
+                        $file_data = json_decode(file_get_contents($setting_file_to_backup), true);
+                    } else if (isset($tmp_config_areas[$area]['binary']) && $tmp_config_areas[$area]['binary']) {
+                        $file_data = base64_encode(file_get_contents($setting_file_to_backup));
+                    } else {
+                        $file_data = explode("\n", file_get_contents($setting_file_to_backup));
+                    }
+                    $tmp_settings_data[$area] = $file_data;
+                }
+            }
+            //End individual / specific backup area processing
         }
 
-        fclose($f);
-//    SendCommand('w');
+        //Add the backup comment into settings data that has been gathered
+        $tmp_settings_data['backup_comment'] = $backupComment;
+        //Add the trigger source also, this may be used internally when clearing/manging number of backup files
+        $tmp_settings_data['backup_trigger_source'] = $backupTriggerSource;
+        //Lastly insert the backup system version (moved from doBackupDownload to here)
+        $tmp_settings_data['fpp_backup_version'] = $fpp_backup_format_version;
+        //Add the current UNIX epoc time, representing the time the backup as taken, may make it easier in the future to calculate when the backup was taken
+        $tmp_settings_data['backup_taken'] = time();
+
+        //DO IT!
+        if (!empty($tmp_settings_data)) {
+            $backup_result = doBackupDownload($tmp_settings_data, $area);
+            return $backup_result;
+        } else {
+            $backup_error_string = "SETTINGS BACKUP: Something went wrong while generating backup file for " . ucwords(str_replace("_", " ", $area)) . ", no data was found. Have these settings been configured?";
+            $backup_errors[] = $backup_error_string;
+            return false;
+        }
     }
-    return $write_status;
 }
 
 /**
@@ -1154,47 +2074,131 @@ function SavePixelnetDMXFile_FPDv1($restore_data)
  */
 function doBackupDownload($settings_data, $area)
 {
-    global $settings, $protectSensitiveData, $fpp_backup_version, $fpp_backup_location;
+    global $settings, $fpp_major_version, $fpp_backup_prompt_download, $fpp_backup_location, $backup_errors;
 
     if (!empty($settings_data)) {
-        //is sensitive data removed (selectively used on restore to skip some processes)
-        $settings_data['protected'] = $protectSensitiveData;
+        //Backups are complete: nothing is withheld from them.  The key stays in
+        //the format because restore reads it to recognise the older, redacted
+        //backups that are still sitting in config/backups on every box.
+        $settings_data['protected'] = false;
         //platform identifier
         $settings_data['platform'] = $settings['Platform'];
-        //insert the backup system version
-        $settings_data['fpp_backup_version'] = $fpp_backup_version;
 
         //Once we have all the settings, process the array and dump it back to the user
         //filename
-        $backup_fname = $settings['HostName'] . "_" . $area . "-backup_" . "v" . $fpp_backup_version . "_";
-        //change filename if sensitive data is not protected
-        if ($protectSensitiveData == false) {
-            $backup_fname .= "unprotected_";
-        }
-        $backup_fname .= date("YmdHis") . ".json";
+        $backup_fname = $settings['HostName'] . "_" . $area . "-backup_" . "v" . $fpp_major_version . "_";
+        $backup_fname_prefix = $backup_fname;
 
         //check to see fi the backup directory exists
         if (!file_exists($fpp_backup_location)) {
-            mkdir($fpp_backup_location);
+            if (mkdir($fpp_backup_location) == false) {
+                $backup_error_string = "SETTINGS BACKUP: Something went wrong creating the backup file directory '" . $fpp_backup_location . "' , backup file can't be created (permissions error?) and backup download will fail as a result.";
+                $backup_errors[] = $backup_error_string;
+                error_log($backup_error_string);
+            }
+        } else {
+            //Backup location exists, test if writable
+            if (is_writable($fpp_backup_location) == false) {
+                $backup_error_string = "SETTINGS BACKUP: Something went wrong, '" . $fpp_backup_location . "'  is not writable.";
+                $backup_errors[] = $backup_error_string;
+                error_log($backup_error_string);
+            }
         }
 
-        //Write a copy locally as well
-        $backup_local_fpath = $fpp_backup_location . '/' . $backup_fname;
-        //Write data into backup file
-        file_put_contents($backup_local_fpath, json_encode($settings_data));
+        //Write a copy locally into "config/backups"
+        //
+        //The name carries a timestamp that is only precise to the second, so two
+        //backups started within the same second would pick the same name and one
+        //would silently overwrite the other.  A settings save now hands its backup
+        //to a detached process and returns (see PutSetting), so two backups
+        //overlapping is realistic rather than theoretical.  Claim the name with an
+        //exclusive create - the first process to get the file owns that second -
+        //and step forward a second at a time for anyone who loses the race.  The
+        //name has to stay strictly YmdHis: the listing recovers a backup's date by
+        //parsing everything after the last underscore.
+        $backup_stamp = time();
+        for ($backup_name_attempt = 0; $backup_name_attempt < 60; $backup_name_attempt++) {
+            $backup_fname = $backup_fname_prefix . date("YmdHis", $backup_stamp + $backup_name_attempt) . ".json";
+            $backup_local_fpath = $fpp_backup_location . '/' . $backup_fname;
 
-        ///Generate the headers to prompt browser to start download
-        header("Content-Disposition: attachment; filename=\"" . $backup_fname . "\"");
-        header("Content-Type: application/json");
-        header("Content-Length: " . filesize($backup_local_fpath));
-        header("Connection: close");
-        //Output the file
-        readfile($backup_local_fpath);
-        //die
-        exit;
+            $reserved = @fopen($backup_local_fpath, 'x');
+            if ($reserved !== false) {
+                //Ours.  The write below fills in the placeholder we just created.
+                fclose($reserved);
+                break;
+            }
+            if (!file_exists($backup_local_fpath)) {
+                //Failed for some reason other than the name being taken (an
+                //unwritable directory, say).  Stop here and let the write below
+                //fail and report it the way it always has.
+                break;
+            }
+        }
+
+        //Store the large, rarely-changing areas out of line so that every backup
+        //sharing an unchanged one shares a single copy of it - see
+        //ExtractBackupBlobs().  Only for backups that stay on the box: one being
+        //handed straight to a browser has to be self-contained, and is written
+        //whole.
+        $backup_blob_refs = array();
+        if ($fpp_backup_prompt_download == false) {
+            $settings_data = ExtractBackupBlobs(
+                $settings_data,
+                GetBackupBlobDir($fpp_backup_location),
+                $backup_blob_refs
+            );
+        }
+
+        $json = json_encode($settings_data);
+
+        //Write data into backup file
+        if (file_put_contents($backup_local_fpath, $json) !== false) {
+            //Record what we just wrote in the metadata cache so that listing the
+            //backups - which pruneOrRemoveAgedBackupFiles() is about to do - does
+            //not have to read this whole file back to recover its fields.
+            RememberBackupMetadata(
+                $backup_local_fpath,
+                isset($settings_data['backup_comment']) ? $settings_data['backup_comment'] : '',
+                isset($settings_data['backup_trigger_source']) ? $settings_data['backup_trigger_source'] : null,
+                $backup_blob_refs,
+                isset($settings_data['backup_taken']) ? $settings_data['backup_taken'] : null
+            );
+
+            //Once the backup has been written into our local directory, prune/remove any backups older than the max set age
+            pruneOrRemoveAgedBackupFiles();
+
+            //Make the users browser prompt a download and send the file
+            if ($fpp_backup_prompt_download == true) {
+                ///Generate the headers to prompt browser to start download
+                header("Content-Disposition: attachment; filename=\"" . SanitizeDownloadFilename(basename($backup_fname)) . "\"");
+                header("Content-Type: application/json");
+                header("Content-Length: " . filesize($backup_local_fpath));
+                header("Connection: close");
+                //Output the file
+                readfile($backup_local_fpath);
+                //die
+                exit;
+            }
+            //If any errors encountered along the way we should log them
+            if (!empty($backup_error_string)) {
+                error_log($backup_error_string);
+            }
+
+            return array('success' => true, 'backup_file_path' => $backup_local_fpath);
+        } else {
+            $backup_error_string = "SETTINGS BACKUP: Something went wrong while writing the backup file to '" . $backup_local_fpath . "', JSON backup file unable to be downloaded.";
+            $backup_errors[] = $backup_error_string;
+            error_log($backup_error_string);
+
+            return array('success' => false, 'backup_file_path' => '');
+        }
     } else {
         //no data supplied
-        error_log("BACKUP: Something went wrong while generating backup file for " . $area . ", no data was supplied.");
+        $backup_error_string = "SETTINGS BACKUP: Something went wrong while generating backup file for " . ucwords(str_replace("_", " ", $area)) . ", no data was supplied. Have these settings been configured?";
+        $backup_errors[] = $backup_error_string;
+        error_log($backup_error_string);
+
+        return array('success' => false, 'backup_file_path' => '');
     }
 }
 
@@ -1231,7 +2235,73 @@ function genSelectList($area_name = "backuparea")
 }
 
 /**
+ * Returns filenames of any interface configs in addition ot eth0 and wlan0, maybe the user has a USB ethernet adapter etc.
+ * The files and their contents are later read in as part of the backup process
+ *
+ * @return array Array of extra network interfaces
+ */
+function retrieveNetworkInterfaces()
+{
+    global $system_config_areas, $settings;
+
+    //Get a list of files in the config directory
+    $network_interfaces = read_directory_files($settings['configDirectory'], false);
+
+    //Loop over the files we have found and weed out the non .json files
+    foreach ($network_interfaces as $filename => $fn_bool) {
+        //If the filename contains 'interface.' or 'leases.', then we want to keep it, discard anything else
+        if (
+            (stripos(strtolower($filename), "interface") === false) &&
+            (stripos(strtolower($filename), "leases") === false)
+        ) {
+            unset($network_interfaces[$filename]);
+        }
+        //else true so we keep the file since it's a interface
+    }
+
+    //Remove eth0 and wlan0, since the backup system will already include them by default
+    //anything remaining is a extra interface
+    if (is_array($network_interfaces) && array_key_exists('interface.eth0', $network_interfaces)) {
+        unset($network_interfaces['interface.eth0']);
+    }
+    if (is_array($network_interfaces) && array_key_exists('interface.wlan0', $network_interfaces)) {
+        unset($network_interfaces['interface.wlan0']);
+    }
+
+    //Loop over the array, put the filenames into the network area so they can be backed up
+    foreach ($network_interfaces as $intername_name => $interface_bool) {
+        $system_config_areas['network']['file'][$intername_name] = array('type' => 'file', 'location' => $settings['configDirectory'] . '/' . $intername_name);
+
+        //Add into the array that tracks what interface & settings are restored
+        $network_settings_restored_post_apply[$intername_name] = "";
+        $network_settings_restored_applied_ips[$intername_name] = array();
+    }
+
+    return $network_interfaces;
+}
+
+/**
+ * Checks if a MIME type (as reported by finfo) is text-like and safe to back up as lines of text
+ * libmagic sniffs content so JSON/XML config files are reported as application/*, not text/*
+ *
+ * @param $mimeType string MIME type to check
+ * @return bool True if text-like, false for binary types (e.g. databases)
+ */
+function isTextMimeType($mimeType)
+{
+    $mimeType = strtolower((string) $mimeType);
+
+    if (strpos($mimeType, "text/") === 0) {
+        return true;
+    }
+
+    return in_array($mimeType, array('application/json', 'application/xml', 'application/x-yaml', 'application/yaml', 'application/x-empty', 'inode/x-empty'));
+}
+
+/**
  * Returns a list of plugin Config files
+ *
+ * @return array Array of plugins and respective config file data
  */
 function retrievePluginList()
 {
@@ -1240,16 +2310,45 @@ function retrievePluginList()
     $config_files = read_directory_files($settings['configDirectory'], false);
     $plugin_names = array();
 
-    //find the plugin configs
+    //find the plugin configs which are prepended with "plugin.", ignore normal JSON files
     foreach ($config_files as $fname => $fdata) {
-        if ((stripos(strtolower($fname), "plugin") !== false) && (stripos(strtolower($fname), ".json") == false)) {
-            //split the string to get jsut the plugin name
-            $plugin_name = explode(".", $fname);
-            $plugin_name = $plugin_name[1];
-            $plugin_names[$plugin_name] = array('type' => 'file', 'location' => $settings['configDirectory'] . "/" . $fname);
-            //array('name' => $plugin_name, 'config' => $fname);
+        //Make sure we pickup plugin config files, plugin config files are prepended with the word "plugin".
+        if ((stripos(strtolower($fname), "plugin.") !== false)) {
+            //Fine out the MINE type of the file we're backing up
+            $finfo_open_handle = finfo_open(FILEINFO_MIME_TYPE);
+            $fileInfo = finfo_file($finfo_open_handle, $settings['configDirectory'] . "/" . $fname);
+
+            //If it's a plain text file (incl. JSON/XML/empty) then we can back it up, things like databases are skipped
+            if (isTextMimeType($fileInfo)) {
+                //split the string to get just the plugin name
+                $plugin_name = explode(".", $fname);
+                $plugin_name = $plugin_name[1];
+
+                //Store config file locations here.  plugin.X and plugin.X.json
+                //both map to X, so add to the plugin's entry rather than replacing
+                //it: replacing kept whichever file readdir returned last.
+                $locations = isset($plugin_names[$plugin_name]) ? $plugin_names[$plugin_name]['location'] : array();
+                //Normal Plugin config file location
+                $locations[$fname] = ($settings['configDirectory'] . "/" . $fname);
+                //                //Check the extra backup locations where the plugin name matches this plugin and extra the extra path
+                //                if (isset($extra_backup_locations['plugins'][$plugin_name]) && !empty($extra_backup_locations['plugins'][$plugin_name]))
+                //                {
+                //                    //Loop over the extra locations and add them to the list in case there are more than 1 extra location
+                //                    foreach ($extra_backup_locations['plugins'][$plugin_name] as $p_extra_filename => $p_extra_file_location){
+                //                        $locations[$p_extra_filename] = $p_extra_file_location;
+                //                    }
+                //                }
+
+                //Add the expected & extra locations into the final array to be returned
+                $plugin_names[$plugin_name] = array('type' => 'file', 'location' => $locations);
+
+                //                $plugin_names[$plugin_name] = array('type' => 'file', 'location' => $settings['configDirectory'] . "/" . $fname);
+
+                //array('name' => $plugin_name, 'config' => $fname);
+            }
         }
     }
+    //Lookup the extra backup locations and merge those files in
 
     return $plugin_names;
 }
@@ -1273,250 +2372,1508 @@ function moveBackupFiles_ToBackupDirectory()
     }
 }
 
+/**
+ * Change the location where the Settings backup file is stored, a copy is always stored locally
+ * This just changes where that file is stored in case it needs to be temporarily somewhere else.
+ * @param $new_location
+ */
+function changeLocalFPPBackupFileLocation($new_location)
+{
+    global $fpp_backup_location;
+    if (isset($new_location)) {
+        $fpp_backup_location = $new_location;
+    }
+}
+
+/**
+ * Find and removes any JSON settings backup files that are over our specified max age
+ */
+function pruneOrRemoveAgedBackupFiles()
+{
+    global $fpp_backup_max_age, $fpp_backup_min_number_kept, $fpp_backup_max_plugin_backups_key, $fpp_backup_location, $backups_verbose_logging;
+
+    //gets all the files in the configs/backup directory via the API now since it will look in multiple areas
+    $config_dir_files = file_get_contents('http://localhost/api/backups/configuration/list');
+    $config_dir_files = json_decode($config_dir_files, true);
+    $config_dir_files_tmp = $config_dir_files;
+    $backups_to_delete = array();
+    $num_backups_deleted = 0;
+
+    //If the number of backup files that exist IS LESS than what the minimum we want to keep, return and stop processing
+    if (count($config_dir_files) < $fpp_backup_min_number_kept) {
+        if ($backups_verbose_logging) {
+            $aged_backup_removal_message = "SETTINGS BACKUP: NOT removing JSON Settings backup files. Since there are (" . count($config_dir_files) . ") backups available and this is less than the minimum backups we want to keep ($fpp_backup_min_number_kept) \r\n";
+            error_log($aged_backup_removal_message);
+        }
+        return;
+    }
+
+    //Reverse the results so we get oldest to newest, the API by default returns results with newest first
+//    $config_dir_files = array_reverse($config_dir_files);
+
+    //Select the backups that lie outside what we want to keep, because the array is a list of backups with the newest first then we'll be selecting older/dated backups
+    $plugin_backups_to_delete_tmp = array();
+
+    //Look through all the backups, select ones with a trigger source, because the backups are newest first, we'll be selecting the file at the position of our max limit through to the end of the list
+    $backups_by_trigger_source = array();
+    foreach ($config_dir_files as $backups_by_trigger_source_index => $backups_by_trigger_source_meta_data) {
+        $backup_filename = $backups_by_trigger_source_meta_data['backup_filename'];
+
+        if ((stripos(strtolower($backup_filename), "-backup_") !== false) && (stripos(strtolower($backup_filename), ".json") !== false)) {
+            //
+            if (array_key_exists('backup_trigger_source', $backups_by_trigger_source_meta_data) && $backups_by_trigger_source_meta_data['backup_trigger_source'] !== null) {
+                //Get the trigger source name & add it and the backup meta data to a temp array, this will group like sources together
+                //then we'll limit those lists to enforce our backup limit
+                $backup_trigger_source = $backups_by_trigger_source_meta_data['backup_trigger_source'];
+                $backups_by_trigger_source[$backup_trigger_source][] = $backups_by_trigger_source_meta_data;
+
+                //Check the number of items for this trigger source, if it's > than our allowed limit then add the backup file to the $backups_to_delete list
+                if (count($backups_by_trigger_source[$backup_trigger_source]) > $fpp_backup_max_plugin_backups_key) {
+                    $plugin_backups_to_delete_tmp[] = $backups_by_trigger_source_meta_data;
+                    //Remove the entry from the list of backup files, because it will be deleted (we want this list to reflect the list after enforcing plugin backup limits)
+                    //so that we can enforce the global limit after
+                    unset($config_dir_files_tmp[$backups_by_trigger_source_index]);
+                }
+            }
+        }
+    }
+
+    //Fix indexes
+    $config_dir_files_tmp = array_values($config_dir_files_tmp);
+
+    if (count($config_dir_files_tmp) > $fpp_backup_min_number_kept) {
+        $backups_to_delete = array_slice($config_dir_files_tmp, $fpp_backup_min_number_kept);
+    }
+
+    //tack on the plugin backups to be deleted
+    foreach ($plugin_backups_to_delete_tmp as $plugin_backups_to_delete_tmp_data) {
+        $backups_to_delete[] = $plugin_backups_to_delete_tmp_data;
+    }
+
+    //loop over the backup files we've found that are beyond our set limit, all these to be deleted
+    foreach ($backups_to_delete as $backup_file_index => $backup_file_meta_data) {
+        $backup_filename = $backup_file_meta_data['backup_filename'];
+
+        if ((stripos(strtolower($backup_filename), "-backup_") !== false) && (stripos(strtolower($backup_filename), ".json") !== false)) {
+            //File is one of our backup files, this check is just in case there is other json files in this directory placed there by the user which we want to avoid touching.
+
+            //reconstruct the path
+            $backup_file_location = $backup_file_meta_data['backup_filedirectory'];
+            $backup_file_path = $backup_file_location . $backup_filename;
+            //Backup Directory
+            $backup_directory = !$backup_file_meta_data['backup_alternative_location'] ? 'JsonBackups' : 'JsonBackupsAlternate';
+            //Collect the backup file
+            $backup_time = $backup_file_meta_data['backup_time_unix'];
+            //backup max_age time in seconds, since we are dealing with UNIX epoc time
+            $backup_max_age_seconds = ($fpp_backup_max_age * 86400);
+
+            //Remove the file via API instead
+            //Build the URL
+            $url = 'http://localhost/api/backups/configuration/' . $backup_directory . '/' . $backup_filename;
+            //options for the request
+            $options = array(
+                'http' => array(
+                    'header' => "Content-type: text/plain",
+                    'method' => 'DELETE',
+                ),
+            );
+            $context = stream_context_create($options);
+
+            //Make the call to the API to delete the backup file
+            $backup_deleted_call = file_get_contents($url, false, $context);
+            $backup_deleted_call_decoded = json_decode($backup_deleted_call, true);
+
+            if ($backup_deleted_call !== false && $backup_deleted_call_decoded['Status'] == 'OK') {
+                //Track how many were deleted
+                $num_backups_deleted++;
+            } else {
+                $aged_backup_removal_message = "SETTINGS BACKUP: Something went wrong pruning old JSON settings backup file ($backup_file_path). Error: " . $backup_deleted_call;
+                error_log($aged_backup_removal_message . PHP_EOL);
+            }
+        }
+    }
+
+    //Note how many were deleted
+    if ($num_backups_deleted > 0) {
+        //Note what happened in the logs also
+        $aged_backup_removal_message = "SETTINGS BACKUP: Removed ($num_backups_deleted) old JSON settings backup files, because we only want to keep the $fpp_backup_min_number_kept most recent backups";
+        error_log($aged_backup_removal_message . PHP_EOL);
+    }
+
+    //Now the old backups are gone, drop any blob they were the last user of.
+    //
+    //$config_dir_files is the complete listing this function fetched above, so
+    //subtracting the ones just deleted leaves the full set of backups that
+    //remain - and every hash any of them still needs.  Working from anything
+    //less than a complete set would delete data that is still referenced, which
+    //is why this is done here and not from somewhere with a partial view.
+    $deleted_backups = array();
+    foreach ($backups_to_delete as $deleted_backup) {
+        $deleted_backups[$deleted_backup['backup_filename']] = true;
+    }
+
+    $referenced_blobs = array();
+    foreach ($config_dir_files as $remaining_backup) {
+        if (isset($deleted_backups[$remaining_backup['backup_filename']])) {
+            continue;
+        }
+        if (!empty($remaining_backup['backup_alternative_location'])) {
+            //Lives on the removable device, along with its own copy of the blobs
+            continue;
+        }
+        foreach (isset($remaining_backup['backup_blob_refs']) ? $remaining_backup['backup_blob_refs'] : array() as $hash) {
+            $referenced_blobs[$hash] = $hash;
+        }
+    }
+
+    $blobs_removed = CollectUnreferencedBackupBlobs(GetDirSetting('JsonBackups'), $referenced_blobs);
+    if ($blobs_removed > 0) {
+        error_log("SETTINGS BACKUP: Removed ($blobs_removed) stored config blobs that no remaining backup referenced" . PHP_EOL);
+    }
+}
+
+/**
+ * Prevent or stop the users browser from showing a download prompt for the backup file
+ * Useful for if we just want to trigger a backup and just have it saved locally instead of both saving locally and sending it to the users browser
+ */
+function preventPromptUserBrowserDownloadBackup()
+{
+    global $fpp_backup_prompt_download;
+    //
+    $fpp_backup_prompt_download = false;
+}
+
+/**
+ * Extracts the FPP Major version
+ * @return array|mixed|string|string[]
+ */
+function collectFppMajorVersion()
+{
+    //First try get the FPP version and break it down so we can get the major version
+    $fpp_version = explode(".", getFPPVersion());
+    $fpp_major_version = 0;
+
+    //If explode worked correctly, the major version will be at indec 0
+    if (array_key_exists(0, $fpp_version)) {
+        $fpp_major_version = $fpp_version[0];
+    } else {
+        //Else something went wrong, try get the FPP version from the GIT Branch
+        //replace the v in e.g v6.3 so we just have the digit
+        $fpp_git_branch = str_replace("v", "", explode(".", getFPPBranch()));
+        $fpp_major_version = $fpp_git_branch[0];
+    }
+
+    return $fpp_major_version;
+}
+
+/**
+ * Set a new defined max backup age for the existing JSON settings backup files
+ * @param $new_max_age
+ */
+function setBackupMaxAge($new_max_age)
+{
+    global $fpp_backup_max_age;
+    //
+    if (!empty($new_max_age) && ($new_max_age != 0)) {
+        $fpp_backup_max_age = $new_max_age;
+    }
+}
+
+/**
+ * Set a new minimum number of backup files to keep
+ * @param $new_backup_count
+ */
+function setMinimumBackupCount($new_backup_count)
+{
+    global $fpp_backup_min_number_kept;
+    //
+    if (!empty($new_backup_count) && ($new_backup_count != 0)) {
+        $fpp_backup_min_number_kept = $new_backup_count;
+    }
+}
+
 function is_array_empty($InputVariable)
 {
-	$Result = true;
+    $Result = true;
 
-	if (is_array($InputVariable) && count($InputVariable) > 0)
-	{
-		foreach ($InputVariable as $Value)
-		{
-			$Result = $Result && is_array_empty($Value);
-		}
-	}
-	else
-	{
-		$Result = empty($InputVariable);
-	}
+    if (is_array($InputVariable) && count($InputVariable) > 0) {
+        foreach ($InputVariable as $Value) {
+            $Result = $Result && is_array_empty($Value);
+        }
+    } else {
+        $Result = empty($InputVariable);
+    }
 
-	return $Result;
+    return $Result;
 }
 
 //Move backup files
 moveBackupFiles_ToBackupDirectory();
+
 ?>
-<!DOCTYPE html>
-<html>
-<head>
-    <?php require_once 'common/menuHead.inc'; ?>
-    <title><? echo $pageTitle; ?></title>
-    <!--    <script>var helpPage = "help/backup.php";</script>-->
-    <script type="text/javascript">
-        var settings = new Array();
-        <?
-        ////Override restartFlag setting not reflecting actual value after restoring, just read what's in the settings file
-        $settings['restartFlag'] = ReadSettingFromFile('restartFlag');
-		$settings['rebootFlag'] = ReadSettingFromFile('rebootFlag');
+<?php
+//See if we should skip spitting out the HTML code below
+if ($skipHTMLCodeOutput === false) {
+    ?>
 
-        foreach ($settings as $key => $value) {
-            printf("	settings['%s'] = \"%s\";\n", $key, $value);
-        }
+    <!DOCTYPE html>
+    <html lang="en">
 
+    <head>
+        <?php include 'common/htmlMeta.inc'; ?>
+        <?php require_once 'common/menuHead.inc'; ?>
+        <title><?= $pageTitle ?></title>
+        <!--    <script>var helpPage = "help/backup.php";</script>-->
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+        <script src="js/fpp-backup-filecopy.js?ref=<?= filemtime('js/fpp-backup-filecopy.js'); ?>"></script>
+
+        <?php
+        $backupHosts = getKnownFPPSystems();
         ?>
-        var pageName = "<? echo str_ireplace('.php', '', basename($_SERVER['PHP_SELF'])) ?>";
+        <script type="text/javascript">
+            var settings = new Array();
+            var list_of_existing_backups;
+            var debug_mode = <? echo $backups_verbose_logging; ?>
+                <?php
+                ////Override restartFlag setting not reflecting actual value after restoring, just read what's in the settings file
+                $settings['restartFlag'] = ReadSettingFromFile('restartFlag');
+                $settings['rebootFlag'] = ReadSettingFromFile('rebootFlag');
 
-        var helpPage = "<? echo basename($_SERVER['PHP_SELF']) ?>";
-        if (pageName == "plugin") {
-            var pluginPage = "<? echo preg_replace('/.*page=/', '', $_SERVER['REQUEST_URI']); ?>";
-            var pluginBase = "<? echo preg_replace("/^\//", "", preg_replace('/page=.*/', '', $_SERVER['REQUEST_URI'])); ?>";
-            helpPage = pluginBase + "nopage=1&page=help/" + pluginPage;
-        }
-        else {
-            helpPage = "help/" + helpPage;
-        }
-    </script>
-</head>
-<body>
-<div id="bodyWrapper">
-    <?php include 'menu.inc'; ?>
-    <br/>
-    <form action="backup.php" method="post" name="frmBackup" enctype="multipart/form-data">
-        <div id="global" class="settings">
-            <fieldset>
-                <legend>FPP Settings Backup</legend>
-                <ul>
-                    <li>
-                        <span style="color: #AA0000"><b>Backups made from FPP v1.x are incompatible with the FPP 2.x system.</b></span>
-                    </li>
-                </ul>
-                <?php if ($restore_done == true) {
-                    ?>
-                    <div id="rebootFlag" style="display: block;">Backup Restored, FPPD Restart or Reboot may be required.
-                    </div>
-                    <div id="restoreSuccessFlag">What was restored: <br>
-                        <?php
-						foreach ($settings_restored as $area_restored => $success) {
-                            $success_str = "";
-							if (is_array($success)) {
-								$success_area_data = false;
-								$success_messages = "";
+                foreach ($settings as $key => $value) {
+                    if (!is_array($value)) {
+                        if (preg_match('/\n/', $value)) {
+                            continue;
+                        }
 
-								//If the ATTEMPT and SUCCESS keys don't exist in the array, then try to process the internals which will be a sub areas and possibly have them.
-								if (!array_key_exists('ATTEMPT', $success) && !array_key_exists('SUCCESS', $success) && !empty($success)) {
-									//process internal array for areas with sub areas
-									foreach ($success as $success_area_idx => $success_area_data) {
-										if (array_key_exists('ATTEMPT', $success_area_data) && array_key_exists('SUCCESS', $success_area_data)) {
-											$success_area_attempt = $success_area_data['ATTEMPT'];
-											$success_area_success = $success_area_data['SUCCESS'];
+                        printf("	settings[%s] = %s;\n", json_encode((string) $key), json_encode((string) $value));
+                    } else {
+                        $js_array = json_encode($value);
+                        printf("    settings[%s] = %s;\n", json_encode((string) $key), $js_array);
+                    }
+                }
 
-											if ($success_area_attempt == true && $success_area_success == true) {
-												$success_str = "Success";
-											} else {
-												$success_str = "Failed";
-											}
+                ?>
+            var pageName = <?= json_encode(str_ireplace('.php', '', basename($_SERVER['PHP_SELF']))) ?>;
 
-											$success_messages .= ucwords(str_replace("_", " ", $success_area_idx)) . " - " . $success_str . "<br/>";
-										}
-									}
-								} //There is an ATTEMPT and SUCCESS key, check values of both
-								else if (array_key_exists('ATTEMPT', $success) && array_key_exists('SUCCESS', $success)) {
-									$success_area_attempt = $success['ATTEMPT'];
-									$success_area_success = $success['SUCCESS'];
+            var helpPage = <?= json_encode(basename($_SERVER['PHP_SELF'])) ?>;
+            if (pageName == "plugin") {
+                var pluginPage = <?= json_encode(preg_replace('/.*page=/', '', $_SERVER['REQUEST_URI'])) ?>;
+                var pluginBase = <?= json_encode(preg_replace("/^\//", "", preg_replace('/page=.*/', '', $_SERVER['REQUEST_URI']))) ?>;
+                helpPage = pluginBase + "nopage=1&page=help/" + pluginPage;
+            }
+            else {
+                helpPage = "help/" + helpPage;
+            }
 
-									if ($success_area_attempt == true && $success_area_success == true) {
-										$success_str = "Success";
-									} else {
-										$success_str = "Failed";
-									}
+            fppFileCopy.config = {
+                direction: '#backup\\.Direction',
+                usbDevice: '#backup\\.USBDevice',
+                pathSelect: '#backup\\.PathSelect',
+                host: '#backup\\.Host',
+                remoteStorage: '#backup\\.RemoteStorage',
+                deleteExtra: '#backup\\.DeleteExtra',
+                copyText: '#copyText',
+                showUSB: '.copyUSB',
+                showHost: '.copyHost',
+                showHostDevice: '.copyHostDevice',
+                showPathSelect: '.copyPathSelect',
+                showPath: '.copyPath',
+                showBackups: '.copyBackups',
+                showCompressed: '.sendCompressed',
+                popupModalId: 'copyPopup_Modal',
+                popupCloseBtnId: 'copyPopup_ModalCloseButton',
+                copyPopupBodyId: 'copyPopup',
+                copyButton: '#backupCopyBtn'
+            };
 
-									$success_messages .= ucwords(str_replace("_", " ", $area_restored)) . " - " . $success_str . "<br/>";
-								} // No Attempt key, then we shouldn't print the success
-								else if (!array_key_exists('ATTEMPT', $success) && array_key_exists('SUCCESS', $success)) {
-									//Ignore
-								}
-                                //Print out the restore successes
-								echo $success_messages;
-							} else {
-                                //normal area
-                                if ($success == true) {
-                                    $success_str = "Success";
-                                } else {
-                                    $success_str = "Failed";
-                                }
-                                echo ucwords(str_replace("_", " ", $area_restored)) . " - " . $success_str . "<br/>";
+            function BackupDirectionChanged() {
+                fppFileCopy.directionChanged();
+            }
+
+            function GetBackupDevices() {
+                $('#jsonConfigbackup\\.USBDevice').parent().closest('div').addClass('fpp-backup-action-loading');
+                fppFileCopy.getBackupDevices();
+            }
+
+            fppFileCopy.config.onDevicesLoaded = function (data) {
+                $('#jsonConfigbackup\\.USBDevice').parent().closest('div').removeClass('fpp-backup-action-loading');
+                var defaultOption = "<option value='none' selected>None</option>";
+                var options = '';
+                for (var i = 0; i < data.length; i++) {
+                    var desc = data[i].name;
+                    if (data[i].vendor != '') desc += ' - ' + data[i].vendor;
+                    if (data[i].model != '') {
+                        desc += (data[i].vendor != '') ? ' ' : ' - ';
+                        desc += ' ' + data[i].model;
+                    }
+                    desc += ' - ' + data[i].size + 'GB';
+                    options += "<option value='" + EscapeHtmlAttr(data[i].name) + "'>" + EscapeHtml(desc) + "</option>";
+                }
+                $('#jsonConfigbackup\\.USBDevice').html(defaultOption + options);
+                GetJSONConfigBackupDevice();
+            };
+
+            function GetBackupDeviceDirectories() {
+                fppFileCopy.getBackupDeviceDirectories();
+            }
+
+            function GetRestoreDeviceDirectories() {
+                fppFileCopy.getRestoreDeviceDirectories();
+            }
+
+            function USBDeviceChanged(toFromRemote) {
+                fppFileCopy.usbDeviceChanged();
+            }
+
+            function GetBackupDirsViaAPI(host, remoteStorageSelected, excludeRoot) {
+                fppFileCopy.getBackupDirsViaAPI(host, remoteStorageSelected, excludeRoot);
+            }
+
+            function GetBackupHostBackupDirs(remoteStorageSelected) {
+                // The Backup Host select passes its setting name. A new host
+                // means new storage choices, and reloading them lists the
+                // folders too.
+                if (remoteStorageSelected === 'backup.Host') {
+                    GetRemoteHostUSBStorage();
+                    return;
+                }
+                fppFileCopy.getBackupHostBackupDirs(remoteStorageSelected);
+            }
+
+            function PopulateBackupDirs(data, excludeRoot) {
+                fppFileCopy.populateBackupDirs(data, excludeRoot);
+            }
+
+            function CheckRemoteHasRsyncdEnabled(host) {
+                fppFileCopy.checkRemoteHasRsyncdEnabled(host);
+            }
+
+            function GetRemoteHostUSBStorage() {
+                fppFileCopy.getRemoteHostUSBStorage();
+            }
+
+            function CloseCopyDialog() {
+                fppFileCopy.closeCopyDialog();
+            }
+
+            function CopyDone() {
+                fppFileCopy.copyDone();
+            }
+
+            function CopyTimeoutError() {
+                fppFileCopy.copyTimeoutError();
+            }
+
+            function GetCopyFlags() {
+                var flags = "";
+
+                if (document.getElementById("backup.Configuration").checked) {
+                    flags += " Configuration";
+                }
+                if (document.getElementById("backup.Playlists").checked) {
+                    flags += " Playlists";
+                }
+                if (document.getElementById("backup.Plugins").checked) {
+                    flags += " Plugins";
+                }
+                if (document.getElementById("backup.Sequences").checked) {
+                    flags += " Sequences";
+                }
+                if (document.getElementById("backup.Effects").checked) {
+                    flags += " Effects";
+                }
+                if (document.getElementById("backup.Images").checked) {
+                    flags += " Images";
+                }
+                if (document.getElementById("backup.Scripts").checked) {
+                    flags += " Scripts";
+                }
+                if (document.getElementById("backup.Music").checked) {
+                    flags += " Music";
+                }
+                if (document.getElementById("backup.Videos").checked) {
+                    flags += " Videos";
+                }
+                if (document.getElementById("backup.EEPROM").checked) {
+                    flags += " EEPROM";
+                }
+                if (document.getElementById("backup.Backups").checked) {
+                    flags += " Backups";
+                }
+
+                if (flags.length)
+                    flags = flags.substring(1);
+
+                return flags;
+            }
+
+            function PerformCopy() {
+                var dev = document.getElementById("backup.USBDevice").value;
+                var path = document.getElementById("backup.Path").value.replaceAll('\\', '/');
+                var pathSelect = document.getElementById("backup.PathSelect").value;
+                var remoteStorage = document.getElementById("backup.RemoteStorage").value;
+                var host = document.getElementById("backup.Host").value;
+                var direction = document.getElementById("backup.Direction").value;
+                var flags = GetCopyFlags();
+
+                var url = "copystorage.php?wrapped=1&feed=" + fppFileCopy.newFeedId() + "&direction=" + direction;
+
+                // Substite back in case we changed \ to /
+                document.getElementById("backup.Path").value = path;
+
+                if ((direction == 'TOUSB') ||
+                    (direction == 'FROMUSB')) {
+                    storageLocation = document.getElementById("backup.USBDevice").value;
+                } else if ((direction == 'TOREMOTE') ||
+                    (direction == 'FROMREMOTE')) {
+                    if (host == '') {
+                        DialogError('Copy Failed', 'No host specified');
+                        return;
+                    }
+
+                    //Add the remote storage value is restoring to or from remote hosts
+                    if (typeof (remoteStorage) !== 'undefined' || remoteStorage !== '') {
+                        url += '&remoteStorage=' + remoteStorage;
+                    }
+
+                    storageLocation = host;
+                } else {
+                    storageLocation = settings['mediaDirectory'] + "/backups";
+                }
+
+                //Add in the specified backup path
+                if (direction.substring(0, 4) == 'FROM') {
+                    if (pathSelect == '') {
+                        DialogError('Copy Failed', 'No path specified');
+                        return;
+                    }
+
+                    url += '&path=' + pathSelect;
+                } else {
+                    if (path == '') {
+                        document.getElementById("backup.Path").value = '/';
+                        path = '/';
+                        SetSetting('backup.Path', '/', 0, 0, false);
+                    }
+
+                    url += '&path=' + path;
+                }
+
+                url += '&storageLocation=' + storageLocation;
+                url += '&flags=' + flags;
+
+                var warningMsg = "Confirm File restore of '" + flags + "' from " + storageLocation + "?\n\nWARNING: This will overwrite any current files with the copies being restored";
+
+                if (document.getElementById("backup.DeleteExtra").checked) {
+                    url += '&delete=yes';
+                    warningMsg += " and delete any local files which do not exist in the backup.";
+                } else {
+                    url += '&delete=no';
+                }
+
+                if (document.getElementById("backup.sendCompressed").checked) {
+                    url += '&compress=yes';
+                } else {
+                    url += '&compress=no';
+                }
+
+                if (direction.substring(0, 4) == 'FROM') {
+                    if (!confirm(warningMsg)) {
+                        $.jGrowl("Restore canceled.", { themeState: 'success' });
+                        return;
+                    }
+                }
+
+                var title_txt = (direction.substring(0, 4) == 'FROM') ? "FPP File Copy Restore" : "FPP File Copy Backup";
+
+                DoModalDialog({
+                    id: "copyPopup_Modal",
+                    title: title_txt,
+                    height: 600,
+                    width: 900,
+                    autoResize: true,
+                    closeOnEscape: false,
+                    backdrop: true,
+                    body: $('#copyPopup').html(),
+                    class: "no-close modal-dialog-scrollable",
+                    buttons: {
+                        Close: {
+                            text: 'Please Wait',
+                            disabled: true,
+                            id: 'copyPopup_ModalCloseButton',
+                            class: 'btn-secondary',
+                            click: function () {
+                                CloseCopyDialog();
                             }
                         }
-						//If network settings have been restored, print out the IP addresses that should come info effect
-						if ($network_settings_restored) {
-							//Print the IP addresses out
-							foreach ($network_settings_restored_applied_ips as $idx => $network_ip_address) {
-								if (!empty($network_ip_address)) {
-									echo ucwords(str_replace("_", " ", $idx)) . " - Network Settings" . "<br/>";
-									//If there is a SSID, print it also
-									if (array_key_exists('SSID', $network_ip_address)) {
-										echo "SSID: " . ($network_ip_address['SSID']) . "<br/>";
-									}
-									//Print out details for static addresses
-									echo "Type: " . ($network_ip_address['PROTO']) . "<br/>";
-									if (strtolower($network_ip_address['PROTO']) == 'static') {
-										echo "IP: " . "<a href='http://" . $network_ip_address['ADDRESS'] . "'>" . $network_ip_address['ADDRESS'] . "</a>" . "<br/>";
-										echo "Netmask: " . ($network_ip_address['NETMASK']) . "<br/>";
-										echo "GW: " . ($network_ip_address['GATEWAY']) . "<br/>";
-									}
-									echo "<br/>";
-								}
-							}
+                    }
+                });
 
-							echo "REBOOT REQUIRED: Please VERIFY the above settings, if they seem incorrect please adjust them in <a href='./networkconfig.php'>Network Settings</a> BEFORE rebooting.";
-						}
-                        ?>
-                    </div>
-                    <?php
-                }
-                ?>
-                <fieldset>
-                    <legend>Backup Configuration</legend>
-                    Select settings to backup, then download the selected system configuration in JSON format.
-                    <br/>
-                    <table width="100%">
-                        <tr>
-                            <td width="35%"><b>Protect sensitive data?</b></td>
-                            <td width="65%">
-                                <input id="dataProtect" name="protectSensitive"
-                                       type="checkbox"
-                                       checked="true">
-                            </td>
-                        </tr>
-                        <tr>
-                            <td width="25%">Backup Area</td>
-                            <td width="75%"><?php echo genSelectList('backuparea'); ?></td>
-                        </tr>
-                        <tr>
-                            <td width="25%"></td>
-                            <td width="75%">
-                                <input name="btnDownloadConfig" type="Submit" style="width:30%" class="buttons"
-                                       value="Download Configuration">
-                            </td>
-                        </tr>
-                    </table>
-                </fieldset>
-                <br/>
-                <fieldset>
-                    <legend>Restore Configuration</legend>
-                    Select settings to restore and then choose backup file containing backup data.
-                    <br/>
-                    <table width="100%">
-                        <tr>
-                            <td width="35%"><b>Keep Existing Network Settings</b></td>
-                            <td width="65%">
-                                <input name="keepExitingNetwork"
-                                       type="checkbox"
-                                       checked="true">
-                            </td>
-                        </tr>
-                        <tr>
-                            <td width="35%"><b>Keep Existing Master/Slave Settings</b></td>
-                            <td width="65%">
-                                <input name="keepMasterSlave"
-                                       type="checkbox"
-                                       checked="true">
-                            </td>
-                        </tr>
-                        <tr>
-                            <td width="25%">Restore Area</td>
-                            <td width="75%">
-                                <?php echo genSelectList('restorearea'); ?></td>
-                        </tr>
-                        <tr>
-                            <td width="25%"></td>
-                            <td width="75%">
-                                <input name="conffile" type="file" accept=".json" class="formbtn" id="conffile"
-                                       size="50"
-                                       autocomplete="off"></td>
-                        </tr>
-                        <tr>
-                            <td width="25%"></td>
-                            <td width="75%">
-                                <input name="btnRestoreConfig" type="Submit" style="width:30%" class="buttons"
-                                       value="Restore  Configuration">
-                            </td>
-                        </tr>
-                    </table>
-                </fieldset>
-            </fieldset>
-        </div>
-    </form>
-    <div id="dialog" title="Warning!" style="display:none">
-        <p>Un-checking this box will disable protection (automatic removal) of sensitive data like passwords.
-            <br/> <br/>
-            <b>ONLY</b> Un-check this if you want to be able make an exact clone of settings to another FPP.
-            <br/> <br/>
-            <b>NOTE:</b> The backup will include passwords in plaintext, you assume full responsibility for this
-            file.
-        </p>
-    </div>
-    <script>
-        $('#dataProtect').click(function () {
-            var checked = $(this).is(':checked');
-            if (!checked) {
-                $("#dialog").dialog({
-                    width: 580,
-                    height: 280
+                // The modal element persists in the DOM between copies (CloseCopyDialog
+                // does not reload the page), so force the button back to its disabled
+                // "Please Wait" state on each open.
+                $('#copyPopup_ModalCloseButton').prop('disabled', true).text('Please Wait');
+                $('#copyText').val('');
+
+                StreamURL(url, 'copyText', 'CopyDone', 'CopyTimeoutError', 'POST');
+
+            }
+
+            function JSONConfigBackupUSBDeviceChanged() {
+                var storage_location = document.getElementById("jsonConfigbackup.USBDevice").value;
+
+                //Add a loading spinner to indicate the setting is being saved
+                $('#jsonConfigbackup\\.USBDevice').parent().closest('div').addClass('fpp-backup-action-loading');
+
+                //Write setting to system
+                $.ajax({
+                    url: 'api/settings/jsonConfigBackupUSBLocation',
+                    type: 'PUT',
+                    data: storage_location,
+                    success: function (data) {
+                        $('#jsonConfigbackup\\.USBDevice').parent().closest('div').removeClass('fpp-backup-action-loading');
+
+                        if (storage_location !== "none") {
+                            $.jGrowl('JSON Configuration Backups will now be copied to: ' + storage_location, { themeState: 'success' });
+
+                            //Pop a dialog and let the user choose if they want to copy backups to USB
+                            //Only copy existing backup files to the selected storage if something  other than no device has been selected
+                            //so for example only do the initial  copy if going from none -> sda1
+                            DoModalDialog({
+                                id: "dialog_copyToUsb_Modal",
+                                title: "Copy Backups to USB",
+                                width: 400,
+                                autoResize: true,
+                                closeOnEscape: false,
+                                backdrop: true,
+                                body: $('#dialog_copyToUsb').html(),
+                                class: "modal-dialog-scrollable",
+                                buttons: {
+                                    "Yes Copy To USB": {
+                                        id: "dialog_copyToUsb_DoCopy",
+                                        click: function () {
+                                            CopyBackupsToUSBHelper();
+                                            CloseModalDialog("dialog_copyToUsb_Modal");
+                                        }
+                                    },
+                                    "Not Right Now": {
+                                        id: "dialog_copyToUsb_NoCopy",
+                                        click: function () {
+                                            CloseModalDialog("dialog_copyToUsb_Modal");
+                                        }
+                                    }
+                                }
+                            });
+                        } else {
+                            $.jGrowl('JSON Configuration Backups will no longer be copied to an additional storage device: ', { themeState: 'detract' });
+                        }
+
+                        //Reload the list of JSON backups on the device, it will now show backups on the selected device
+                        GetJSONConfigBackupList();
+                    },
+                    error: function (data) {
+                        $('#jsonConfigbackup\\.USBDevice').parent().closest('div').removeClass('fpp-backup-action-loading');
+
+                        DialogError('JSON Configuration Backup Storage Location', 'Failed to set additional storage location.');
+
+                        //Reload the list of JSON backups on the device
+                        GetJSONConfigBackupList();
+                    }
                 });
             }
-        });
-    </script>
-    <?php include 'common/footer.inc'; ?>
-</div>
-</body>
-</html>
+
+            function CopyBackupsToUSBHelper() {
+                //Get the backup path from the File Copy Backup page
+                var selected_jsonConfigBackupUSBLocation = $('#jsonConfigbackup\\.USBDevice').val()
+
+                //Generate the URL
+                var url = 'copystorage.php?wrapped=1&direction=TOUSB&path=' + 'Automatic_Backups' + '&storageLocation=' + selected_jsonConfigBackupUSBLocation + '&flags=JsonBackups&delete=no';
+
+                $.ajax({
+                    url: url,
+                    type: 'POST',
+                    success: function (data) {
+                        $.jGrowl('JSON Configuration Backups copied to: ' + selected_jsonConfigBackupUSBLocation, { themeState: 'success' });
+                    },
+                    error: function (data) {
+                        //do nothing
+                    }
+                });
+            }
+
+            function GetJSONConfigBackupDevice() {
+                //Add a the loading spinner to show something is happening
+                $('#jsonConfigbackup\\.USBDevice').parent().closest('div').addClass('fpp-backup-action-loading');
+
+                $.ajax({
+                    url: 'api/settings/jsonConfigBackupUSBLocation',
+                    type: 'GET',
+                    success: function (data) {
+                        if (typeof (data.value) !== "" || typeof (data.value) !== "undefined") {
+                            //Change the JSON Config backup location to the one set by the user if a valid value is set
+                            $('#jsonConfigbackup\\.USBDevice option[value="' + data.value + '"]').attr('selected', true);
+                            //
+                            $('#jsonConfigbackup\\.USBDevice').parent().closest('div').removeClass('fpp-backup-action-loading');
+                        }
+                    },
+                    error: function (data) {
+                        //do nothing
+                        DialogError('JSON Configuration Backup Storage Location', 'Failed to read additional storage location.');
+
+                        $('#jsonConfigbackup\\.USBDevice').parent().closest('div').removeClass('fpp-backup-action-loading');
+                    }
+                });
+            }
+
+            function GetJSONConfigBackupList() {
+                $.ajax({
+                    url: 'api/backups/configuration/list',
+                    type: 'GET',
+                    success: function (data) {
+                        //Store the list of backups found so we can reuse this for the restore panel which is the exact same but diffrent actions
+                        list_of_existing_backups = data;
+
+                        //Add a placeholder saying we're loading data
+                        $('#table-download-existing-backups-content').html('<tr><td></td><td>Loading Existing Backups....</td><td></td></tr>');
+
+                        if (typeof (data) !== "undefined") {
+                            //Clear the table again
+                            $('#table-download-existing-backups-content').html('');
+                            //Loop over the results and build the rows
+                            $.each(data, function (backup_filename_id, backup_filename_meta) {
+                                //
+                                //Path and Directory
+                                var backup_filename = backup_filename_meta.backup_filename;
+                                var backup_filedirectory = backup_filename_meta.backup_filedirectory;
+                                //Comment and time
+                                var backup_comment = backup_filename_meta.backup_comment;
+                                var backup_time = backup_filename_meta.backup_time;
+                                var backup_is_in_location = backup_filename_meta.backup_alternative_location;
+
+                                //By default
+                                var location_icon = '<span><i class="fas fa-sd-card"></i></span>';
+                                //
+                                //Build the onclick command for downloading the backuo
+                                var onclick_download_command = "DownloadJsonBackupFile('JsonBackups', ['" + backup_filename + "']);";
+                                //Build the onclick command for deleting the backup
+                                var onclick_delete_command = "DeleteJsonBackupFile('JsonBackups', '." + backup_filename_id + "', ['" + backup_filename + "']);";
+
+                                if (backup_is_in_location === true) {
+                                    location_icon = '<span><i class="fas fa-hdd"></i></span>';
+
+                                    onclick_download_command = "DownloadJsonBackupFile('JsonBackupsAlternate', ['" + backup_filename + "']);";
+                                    onclick_delete_command = "DeleteJsonBackupFile('JsonBackupsAlternate', '." + backup_filename_id + "', ['" + backup_filename + "']);";
+                                }
+
+                                var backup_file_data_row = '<tr id="backup-file-id" class="' + backup_filename_id + '" > ' +
+                                    '<td  id="backup-file-date">' + location_icon + ' ' + backup_filename_meta.backup_time + '</td>' +
+                                    '<td  id="backup-file-configuration-change">' + backup_filename_meta.backup_comment + '</td>' +
+                                    '<td id="backup-file-configuration-actions">' +
+
+                                    //Button to Download the Backup
+                                    '<button name="btnDownloadConfig_' + backup_filename_id + '" type="button" class="buttons downloadConfigButton" value="Download Backup" onClick="' + onclick_download_command + '"> ' +
+                                    '<i class="fas fa-fw fa-download"></i> ' +
+                                    '</button>' +
+
+                                    //Button to delete the backup
+                                    '<button name="btnDeleteConfig_' + backup_filename_id + '" type="button" class="buttons deleteConfigButton" value="Delete Backup" onclick="' + onclick_delete_command + '"> ' +
+                                    '<i class="fas fa-fw fa-trash"></i> ' +
+                                    '</button>' +
+
+                                    '</td>' +
+                                    '</tr>'
+
+                                //Append each row to the table content
+                                $('#table-download-existing-backups-content').append(backup_file_data_row);
+                            });
+                            //Once were done with the backup panel, populate the restore list
+                            GetJSONConfigRestoreList();
+
+                            $('table').floatThead('reflow');
+                        }
+                    },
+                    error: function (data) {
+                        var backup_file_data_row = '<tr id="backup-file-id" class="" > ' +
+                            '<td  id="backup-file-date"> </td>' +
+                            '<td  id="backup-file-configuration-change">Error Occured Retreiving Existing Backup List</td>' +
+                            '<td id="backup-file-configuration-actions"> </td>' +
+                            '</tr>'
+
+                        //Add a row saying there was a error
+                        $('#table-download-existing-backups-content').html('');
+                        $('#table-download-existing-backups-content').append(backup_file_data_row);
+                    }
+                });
+            }
+
+            function GetJSONConfigRestoreList() {
+                var data = list_of_existing_backups;
+
+                //Add a placeholder saying we're loading data
+                $('#table-restore-existing-backups-content').html('<tr><td></td><td>Loading Existing Backups....</td><td></td></tr>');
+
+                if (typeof (data) !== "undefined") {
+                    //Clear the table again
+                    $('#table-restore-existing-backups-content').html('');
+                    //Loop over the results and build the rows
+                    $.each(data, function (backup_filename_id, backup_filename_meta) {
+                        //Path and Directory
+                        var backup_filename = backup_filename_meta.backup_filename;
+                        var backup_filedirectory = backup_filename_meta.backup_filedirectory;
+                        //Comment and time
+                        var backup_comment = backup_filename_meta.backup_comment;
+                        var backup_time = backup_filename_meta.backup_time;
+                        var backup_is_in_location = backup_filename_meta.backup_alternative_location
+                            ;
+                        //By default
+                        var location_icon = '<span><i class="fas fa-sd-card"></i></span>';
+                        //
+                        var onclick_restore_command = "RestoreJsonBackup('JsonBackups', ['" + backup_filename + "'], '." + backup_filename_id + "');";
+
+                        //Build the onclick command for restoreing the backuo
+                        if (backup_is_in_location === true) {
+                            location_icon = '<span><i class="fas fa-hdd"></i></span>';
+                            onclick_restore_command = "RestoreJsonBackup('JsonBackupsAlternate', ['" + backup_filename + "'], '." + backup_filename_id + "');";
+                        }
+                        //Build the onclick command for deleting the backup
+                        // var onclick_delete_command = "DeleteFile('JsonBackups', '." + backup_filename_id + "', ['" + backup_filename + "']);"
+
+                        var backup_file_data_row = '<tr id="backup-file-id" class="' + backup_filename_id + '" > ' +
+                            '<td  id="backup-file-date">' + location_icon + ' ' + backup_filename_meta.backup_time + '</td>' +
+                            '<td  id="backup-file-configuration-change">' + backup_filename_meta.backup_comment + '</td>' +
+                            '<td id="backup-file-configuration-actions">' +
+
+                            //Button to restore the Backup
+                            '<button name="btnrestoreConfig_' + backup_filename_id + '" type="button" class="buttons restoreJsonConfigActionButton" value="Restore Backup" onClick="' + onclick_restore_command + '"> ' +
+                            '<i class="fas fa-fw fa-undo"></i> ' +
+                            '</button>' +
+
+                            // //Button to delete the backup
+                            // '<button name="btnDeleteConfig_' + backup_filename_id + '" type="button" class="buttons" value="Delete Backup" onclick="' + onclick_delete_command + '"> ' +
+                            // '<i class="fas fa-fw fa-trash"></i> ' +
+                            // '</button>' +
+
+                            '</td>' +
+                            '</tr>'
+
+                        //Append each row to the table content
+                        $('#table-restore-existing-backups-content').append(backup_file_data_row);
+                    });
+                } else {
+                    var backup_file_data_row = '<tr id="backup-file-id" class="" > ' +
+                        '<td  id="backup-file-date"> </td>' +
+                        '<td  id="backup-file-configuration-change">Error Occured Retreiving Existing Backup List</td>' +
+                        '<td  id="backup-file-configuration-actions"> </td>' +
+                        '</tr>'
+
+                    //Add a row saying there was a error
+                    $('#table-restore-existing-backups-content').html('');
+                    $('#table-restore-existing-backups-content').append(backup_file_data_row);
+
+                }
+            }
+
+            function DownloadJsonBackupFile(dir, files) {
+                //Clone of GetFiles() but with a different URL and just dealing with a single file
+                if (files.length == 1) {
+                    location.href = "api/backups/configuration/" + dir + "/" + encodeURIComponent(files[0].replace(/\//g, '_'));
+                }
+            }
+
+            function DeleteJsonBackupFile(dir, row, file, silent = false) {
+                //Clone of DeleteFiles with a different URL
+                if (file.indexOf("/") > -1) {
+                    alert("You can not delete this file.");
+                    return;
+                }
+
+                //Add a loading  spinner to the delete button for the row we're deleting to add some feedback to the user something is happening
+                $(row + ' .deleteConfigButton > i').addClass('fpp-backup-action-loading');
+
+                $.ajax({
+                    url: "api/backups/configuration/" + dir + "/" + encodeURIComponent(file),
+                    type: 'DELETE'
+                }).done(function (data) {
+                    if (data.Status == "OK") {
+                        $(row).remove();
+                    } else {
+                        if (!silent)
+                            DialogError("ERROR", "Error deleting file \"" + file + "\": " + data.Status);
+                    }
+                }).fail(function () {
+                    if (!silent)
+                        DialogError("ERROR", "Error deleting file: " + file);
+                });
+            }
+
+            function RestoreJsonBackup(directory, filename, row) {
+                //Get the selected backup area in case teh user has selected a specific area to restore
+                var selected_restore_area = $('#restorearea').val();
+
+                //validate directory and filename are not emptry
+                if (typeof (selected_restore_area) && (typeof (directory) !== 'undefined' && typeof (filename) !== 'undefined')) {
+                    //Add a loading  spinner to the delete button for the row we're deleting to add some feedback to the user something is happening
+                    $(row + ' .restoreJsonConfigActionButton > i').addClass('fpp-backup-action-loading');
+
+                    //all the API backend to do the restore
+                    $.ajax({
+                        url: 'api/backups/configuration/restore/' + directory + '/' + filename,
+                        type: 'POST',
+                        data: selected_restore_area,
+                        processData: false,
+                        success: function (data) {
+                            //Remove the loading spinner
+                            $(row + ' .restoreJsonConfigActionButton > i').removeClass('fpp-backup-action-loading');
+
+                            if (data.Success === true) {
+                                $.jGrowl('Successfully restored selected backup: ', { themeState: 'success' });
+                            } else {
+                                $.jGrowl('Error occurred restoring selected backup: ', { themeState: 'danger' });
+                            }
+                        },
+                        error: function (data) {
+                            //Remove the loading spinner also if we fail
+                            $(row + ' .restoreJsonConfigActionButton > i').removeClass('fpp-backup-action-loading');
+
+                            DialogError('Error occurred attempting to restore data', data.Message);
+                        }
+                    });
+                }
+
+
+            }
+
+            //Save the selected remote backup storage device selection to settings
+            function backupRemoteStorageChanged() {
+                //Get the value of the selected remove storage device
+                var value = encodeURIComponent($('#backup\\.RemoteStorage').val());
+
+                //Add the loading spinner
+                $('#backup\\.RemoteStorage').parent().closest('td').addClass('fpp-backup-action-loading');
+
+                //Write setting to system (Copy waits for it and the folder lookup it starts)
+                fppFileCopy.trackLookup($.ajax({
+                    url: 'api/settings/backup.RemoteStorage/',
+                    type: 'PUT',
+                    data: value,
+                    success: function (data) {
+                        $('#backup\\.RemoteStorage').parent().closest('td').removeClass('fpp-backup-action-loading');
+
+                        $.jGrowl('Remote Backup Storage saved', { themeState: 'success' });
+                        settings['backup.RemoteStorage'] = value;
+
+                        //Get the directories on the selected storage
+                        GetBackupHostBackupDirs(encodeURIComponent(value));
+                    },
+                    error: function (data) {
+                        DialogError('Remote Backup Storage', 'Failed to save Backup Storage');
+                        //remove the spinner
+                        $('#backup\\.RemoteStorage').parent().closest('td').removeClass('fpp-backup-action-loading');
+                    }
+                }));
+            }
+
+            //Select the remote storage device saved for the File Copy again once the host's devices are loaded.
+            //Copy stays disabled until this has finished, so it can't go to the wrong device.
+            function GetBackupRemoteStorageDevice() {
+                var storageSelect = $('#backup\\.RemoteStorage');
+                var shown = storageSelect.val();
+                storageSelect.parent().find('.remoteStorageWarning').remove();
+
+                fppFileCopy.trackLookup($.ajax({
+                    url: 'api/settings/backup.RemoteStorage',
+                    type: 'GET',
+                    success: function (data) {
+                        var saved = (typeof (data.value) === 'string') ? data.value : '';
+                        //A device the user picked while this was loading wins (and is already saved)
+                        if (saved !== '' && storageSelect.val() === shown) {
+                            //The list only has devices the host can use, so a missing one is unplugged or mounted elsewhere
+                            if (storageSelect.find('option').filter(function () { return this.value === saved; }).length) {
+                                storageSelect.val(saved);
+                            } else {
+                                var host = document.getElementById("backup.Host").value;
+                                storageSelect.parent().append("<span class='remoteStorageWarning'> <b>Warning:</b> " + EscapeHtml(saved) + " is not available. Check device is attached to host and that is not currently mounted. Check <a href='http://" + EscapeHtmlAttr(host) + "/settings.php#settings-storage' target='_blank'>" + EscapeHtml(host) + " - Mounted USB Devices</a></span>");
+                            }
+                        }
+                    },
+                    error: function () {
+                        DialogError('Remote Host Backup Storage Location', 'Failed to read remote storage location.');
+                    }
+                }).always(function () {
+                    //List the folders on whatever ended up selected (only done for a copy from the remote)
+                    GetBackupHostBackupDirs(storageSelect.val());
+                }));
+            }
+
+            fppFileCopy.config.onRemoteStorageLoaded = GetBackupRemoteStorageDevice;
+
+
+
+            function pageSpecific_PageLoad_DOM_Setup() {
+                $('#backup\\.Path').attr('list', 'usbDirectories');
+                GetBackupDevices();
+                GetJSONConfigBackupList();
+            }
+
+            function pageSpecific_PageLoad_PostDOMLoad_ActionsSetup() {
+                $('a[data-bs-toggle="pill"]').on('shown.bs.tab', function (e) {
+                    $('table').floatThead('reflow');
+                });
+
+                //float th thead on download existing backups table
+                $('.table-download-existing-backups').floatThead({
+                    zIndex: 990,
+                    debug: true,
+                    scrollContainer: function () {
+                        return $('.table-download-existing-backups').closest(".table-download-existing-backups-container");
+                    }
+                });
+
+
+                //float th thead on restore existing backups table
+                $('.table-restore-existing-backups').floatThead({
+                    zIndex: 990,
+                    debug: false,
+                    scrollContainer: function () {
+                        return $('.table-restore-existing-backups').closest(".table-restore-existing-backups-container");
+                    }
+                });
+
+
+            }
+
+            var activeTabNumber =
+                <?php
+                if (isset($_GET['tab']) and is_numeric($_GET['tab'])) {
+                    print $_GET['tab'];
+                } else {
+                    print "0";
+                }
+
+                ?>;
+        </script>
+
+        <style>
+            .copyHost {
+                display: none;
+            }
+
+            .copyPathSelect {
+                display: none;
+            }
+
+            .copyHostDevice {
+                display: none;
+            }
+
+            .sendCompressed {
+                display: none;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div id="bodyWrapper">
+            <?php
+            $activeParentMenuItem = 'status';
+            include 'menu.inc'; ?>
+            <div class="mainContainer">
+                <h1 class='title'>FPP Backups</h1>
+                <div class="pageContent">
+                    <div class="fppTabs">
+                        <div id="fppBackups">
+                            <ul id="fppBackupTabs" class="nav nav-pills pageContent-tabs" role="tablist">
+
+                                <li class="nav-item">
+                                    <a class="nav-link active" id="backups-jsonBackup-tab" data-bs-toggle="tab"
+                                        data-bs-target="#tab-jsonBackup" href="#tab-jsonBackup" role="tab"
+                                        aria-controls="tab-jsonBackup" aria-selected="true">
+                                        JSON Configuration Backup
+                                    </a>
+                                </li>
+                                <li class="nav-item">
+                                    <a class="nav-link" id="backups-fileCopy-tab" data-bs-toggle="tab"
+                                        data-bs-target="#tab-fileCopy" href="#tab-fileCopy" role="tab"
+                                        aria-controls="tab-fileCopy" aria-selected="false">
+                                        File Copy Backup
+                                    </a>
+                                </li>
+                            </ul>
+
+                            <div id="fppBackupsTabsContent" class="tab-content">
+                                <div id="tab-jsonBackup" class="tab-pane fade show active" role="tabpanel"
+                                    aria-labelledby="backups-jsonBackup-tab">
+                                    <form action="backup.php" method="post" name="frmBackup" enctype="multipart/form-data">
+                                        <?php
+                                        //Spit out the backup errors if the backup_errors array isn't empty
+                                        if (!is_array_empty($backup_errors)) {
+                                            ?>
+                                            <div id="rebootFlag"
+                                                style="display: block; margin-right: auto; margin-left: auto; width: 60%;">
+                                                Backup failed: <br>
+                                                <ul>
+                                                    <?php
+                                                    foreach ($backup_errors as $backup_error) {
+                                                        echo "<li>$backup_error</li>";
+                                                    }
+                                                    ?>
+                                                </ul>
+                                            </div>
+                                            <?php
+                                        }
+                                        ?>
+                                        <?php if ($restore_done == true) {
+                                            ?>
+                                            <div id="rebootFlag" style="display: block;" class="callout callout-warning">Backup
+                                                Restored, FPPD Restart or Reboot may be required.
+                                            </div>
+                                            <div id="restoreSuccessFlag" class="callout callout-primary">What was restored: <br>
+                                                <?php
+                                                foreach ($settings_restored as $area_restored => $success) {
+                                                    $success_str = "";
+                                                    if (is_array($success)) {
+                                                        //                $success_area_data = false;
+                                                        $success_messages = "";
+
+                                                        //If the ATTEMPT and SUCCESS keys don't exist in the array, then try to process the internals which will be a sub areas and possibly have them.
+                                                        if (!array_key_exists('ATTEMPT', $success) && !array_key_exists('SUCCESS', $success) && !empty($success)) {
+                                                            //process internal array for areas with sub areas
+                                                            foreach ($success as $success_area_idx => $success_area_data) {
+                                                                if (is_array($success_area_data) && array_key_exists('ATTEMPT', $success_area_data) && array_key_exists('SUCCESS', $success_area_data)) {
+                                                                    $success_area_attempt = $success_area_data['ATTEMPT'];
+                                                                    $success_area_success = $success_area_data['SUCCESS'];
+
+                                                                    if ($success_area_attempt == true && $success_area_success == true) {
+                                                                        $success_str = "Success";
+                                                                        $success_messages .= "<span class='callout callout-success' style='padding-top: 0.2em; padding-bottom: 0.2em;margin-top: 0.2em;margin-bottom: 0.2em;'>" . ucwords(str_replace("_", " ", $success_area_idx)) . " - " . "<b>" . $success_str . "</b>" . "</span><br/>";
+                                                                    } else {
+                                                                        $success_str = "Failed";
+                                                                        $success_messages .= "<span class='callout callout-danger' style='padding-top: 0.2em; padding-bottom: 0.2em;margin-top: 0.2em;margin-bottom: 0.2em;'>" . ucwords(str_replace("_", " ", $success_area_idx)) . " - " . "<b>" . $success_str . "</b>" . "</span><br/>";
+                                                                    }
+                                                                }
+                                                            }
+                                                        } //There is an ATTEMPT and SUCCESS key, check values of both
+                                                        else if (array_key_exists('ATTEMPT', $success) && array_key_exists('SUCCESS', $success)) {
+                                                            $success_area_attempt = $success['ATTEMPT'];
+                                                            $success_area_success = $success['SUCCESS'];
+
+                                                            if ($success_area_attempt == true && $success_area_success == true) {
+                                                                $success_str = "Success";
+                                                                $success_messages .= "<span class='callout callout-success' style='padding-top: 0.2em; padding-bottom: 0.2em;margin-top: 0.2em;margin-bottom: 0.2em;'>" . ucwords(str_replace("_", " ", $area_restored)) . " - " . "<b>" . $success_str . "</b>" . "</span><br/>";
+                                                            } else {
+                                                                $success_str = "Failed";
+                                                                $success_messages .= "<span class='callout callout-danger' style='padding-top: 0.2em; padding-bottom: 0.2em;margin-top: 0.2em;margin-bottom: 0.2em;'>" . ucwords(str_replace("_", " ", $area_restored)) . " - " . "<b>" . $success_str . "</b>" . "</span><br/>";
+                                                            }
+
+                                                        } // No Attempt key, then we shouldn't print the success
+                                                        else if (!array_key_exists('ATTEMPT', $success) && array_key_exists('SUCCESS', $success)) {
+                                                            //Ignore
+                                                        }
+                                                        //Print out the restore successes
+                                                        echo $success_messages;
+                                                    } else {
+                                                        //normal area
+                                                        if ($success == true) {
+                                                            $success_str = "Success";
+                                                            $success_messages = "<span class='callout callout-success' style='padding-top: 0.2em; padding-bottom: 0.2em;margin-top: 0.2em;margin-bottom: 0.2em;'>" . ucwords(str_replace("_", " ", $area_restored)) . " - " . "<b>" . $success_str . "</b>" . "</span><br/>";
+                                                        } else {
+                                                            $success_str = "Failed";
+                                                            $success_messages = "<span class='callout callout-danger' style='padding-top: 0.2em; padding-bottom: 0.2em;margin-top: 0.2em;margin-bottom: 0.2em;'>" . ucwords(str_replace("_", " ", $area_restored)) . " - " . "<b>" . $success_str . "</b>" . "</span><br/>";
+
+                                                        }
+                                                        echo $success_messages;
+                                                    }
+                                                }
+                                                //If network settings have been restored, print out the IP addresses that should come info effect
+                                                if ($network_settings_restored) {
+                                                    //Print the IP addresses out
+                                                    foreach ($network_settings_restored_applied_ips as $idx => $network_ip_address) {
+                                                        if (!empty($network_ip_address)) {
+                                                            echo ucwords(str_replace("_", " ", $idx)) . " - Network Settings" . "<br/>";
+                                                            //If there is a SSID, print it also
+                                                            if (is_array($network_ip_address) && array_key_exists('SSID', $network_ip_address)) {
+                                                                echo "SSID: " . ($network_ip_address['SSID']) . "<br/>";
+                                                            }
+                                                            //Print out details for static addresses
+                                                            echo "Type: " . ($network_ip_address['PROTO']) . "<br/>";
+                                                            if (strtolower($network_ip_address['PROTO']) == 'static') {
+                                                                echo "IP: " . "<a href='http://" . $network_ip_address['ADDRESS'] . "'>" . $network_ip_address['ADDRESS'] . "</a>" . "<br/>";
+                                                                echo "Netmask: " . ($network_ip_address['NETMASK']) . "<br/>";
+                                                                echo "GW: " . ($network_ip_address['GATEWAY']) . "<br/>";
+                                                            }
+                                                            echo "<br/>";
+                                                        }
+                                                    }
+
+                                                    echo "<span class='callout callout-danger'>REBOOT REQUIRED: Please VERIFY the above settings, if they seem incorrect please adjust them in <a href='./networkconfig.php'>Network Settings</a> BEFORE rebooting. </span>";
+                                                }
+                                                ?>
+                                            </div>
+                                            <?php
+                                        }
+                                        ?>
+                                        <div class="backdrop">
+                                            <div class="container-fluid">
+                                                <div class="row">
+                                                    <div class="col-md-6 backup-config-start-panel">
+                                                        <div class="row">
+                                                            <h2>Backup Configuration</h2>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-12">
+                                                                <div class="callout callout-warning">
+                                                                    A backup contains everything needed to restore this
+                                                                    player, <b>including your passwords, WiFi passphrase
+                                                                    and access tokens, in plain text</b>. That is what
+                                                                    lets it bring a player back. Treat the file as you
+                                                                    would those credentials: do not attach it to a forum
+                                                                    post or a bug report.
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-md-4">
+                                                                <span class='jsonConfigUSB'>Copy Backups To Additional
+                                                                    Location:</span>
+                                                            </div>
+                                                            <div class="col-md-8">
+                                                                <select name='jsonConfigbackup.USBDevice'
+                                                                    id='jsonConfigbackup.USBDevice'
+                                                                    onChange='JSONConfigBackupUSBDeviceChanged();'></select>
+                                                                <input type='button'
+                                                                    class='buttons refreshBackupDevicesList'
+                                                                    onClick='GetBackupDevices();' value='Refresh List'>
+                                                                <img id="jsonConfigUSBUsage_img"
+                                                                    title="Specify an additional storage device where configuration backups will be copied to. Backups will first be saved to the config directory (<?php echo $settings['configDirectory'] . "/backups" ?>), and then copied to the alternative location. Each copied backup carries this player's credentials in plain text, and a USB stick is not encrypted."
+                                                                    src="images/redesign/help-icon.svg" class="icon-help">
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="row">
+                                                            <div class="col-md-4"><span>Backup Area</span></div>
+                                                            <div class="col-md-8"><?php echo genSelectList('backuparea'); ?>
+                                                            </div>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-md-4"></div>
+                                                            <div class="col-md-8">
+                                                                <button name="btnDownloadConfig" type="Submit"
+                                                                    class="buttons" value="Download Configuration"><i
+                                                                        class="fas fa-fw fa-nbsp fa-download"></i>Download
+                                                                    Configuration
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    <div class="col-md-6 backup-config-end-panel">
+                                                        <div class="row">
+                                                            <div class="col-md-12">
+                                                                <h2>Download Existing Backups</h2>
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="row">
+                                                            <div
+                                                                class="col-md-12 table-download-existing-backups-container table-responsive">
+                                                                <table class="table table-download-existing-backups">
+                                                                    <thead>
+                                                                        <tr>
+                                                                            <th scope="col">Date</th>
+                                                                            <th scope="col">Configuration Change</th>
+                                                                            <th scope="col">Actions</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody id="table-download-existing-backups-content">
+
+                                                                        <tr>
+                                                                            <td></td>
+                                                                            <td>Loading Existing Backups....</td>
+                                                                            <td></td>
+                                                                        </tr>
+
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="row">
+                                                            <div
+                                                                class="col-md-6 text-center table-download-existing-backups-legend">
+                                                                <span>
+                                                                    <i class="fas fa-sd-card"></i> - Located On FPP Storage
+                                                                    Device
+                                                                </span>
+                                                            </div>
+                                                            <div
+                                                                class="col-md-6 text-center table-download-existing-backups-legend">
+                                                                <span><i class="fas fa-hdd">
+                                                                    </i> - Located On Alternate Backup Location
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <br />
+
+                                        <div class="backdrop">
+
+                                            <div class="container-fluid">
+
+                                                <div class="row">
+                                                    <div class="col-md-6 restore-config-start-panel">
+                                                        <div class="row">
+                                                            <h2>Restore Configuration</h2>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-md-4">Keep Existing Network Settings</div>
+                                                            <div class="col-md-8">
+                                                                <input name="keepExitingNetwork" type="checkbox"
+                                                                    checked="true">
+                                                            </div>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-md-4">Keep Existing Player/Remote Settings</div>
+                                                            <div class="col-md-8">
+                                                                <input name="keepMasterSlave" type="checkbox"
+                                                                    checked="true">
+                                                            </div>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-md-4">Restore Area</div>
+                                                            <div class="col-md-8">
+                                                                <?php echo genSelectList('restorearea'); ?>
+                                                            </div>
+                                                        </div>
+                                                        <div class="row">
+                                                            <div class="col-md-4"></div>
+                                                            <div class="col-md-8">
+                                                                <i class="fas fa-fw fa-nbsp fa-upload"></i>
+                                                                <input id="btnUploadConfig" name="conffile" type="file"
+                                                                    accept=".json" id="conffile" autocomplete="off">
+                                                                <script>
+                                                                    $('#btnUploadConfig').on("change", function (e) {
+                                                                        if (e.target.files[0].name.length > 4) {
+                                                                            $('#btnRestoreConfig').show();
+                                                                        }
+                                                                    });
+                                                                </script>
+                                                            </div>
+                                                        </div>
+                                                        <div class='row'>
+                                                            <div class="col-md-4"></div>
+                                                            <div class="col-md-8">
+                                                                <button id="btnRestoreConfig" name="btnRestoreConfig"
+                                                                    type="Submit" class="buttons hidden">
+                                                                    <i class="fas fa-fw fa-nbsp fa-file-import"></i>Restore
+                                                                    Configuration
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    <div class="col-md-6 restore-config-end-panel">
+                                                        <div class="row">
+                                                            <div class="col-md-12">
+                                                                <h2>Restore Existing Backups</h2>
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="row">
+                                                            <div class="col-md-12 table-restore-existing-backups-container">
+                                                                <table class="table table-restore-existing-backups">
+                                                                    <thead>
+                                                                        <tr>
+                                                                            <th scope="col">Date</th>
+                                                                            <th scope="col">Configuration Change</th>
+                                                                            <th scope="col">Actions</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody id="table-restore-existing-backups-content">
+
+                                                                        <tr>
+                                                                            <td></td>
+                                                                            <td>Loading Existing Backups....</td>
+                                                                            <td></td>
+                                                                        </tr>
+
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        </div>
+
+                                                    </div>
+
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </form>
+                                </div>
+
+                                <div id="tab-fileCopy" class="tab-pane fade" role="tabpanel"
+                                    aria-labelledby="backups-fileCopy-tab">
+                                    <div class="backdrop">
+                                        <h2>File Copy Backup/Restore</h2>
+                                        Copy configuration, sequences, etc... to/from a backup device.
+                                        <table>
+                                            <tr>
+                                                <td>Copy Type:</td>
+                                                <td><select id="backup.Direction" onChange='BackupDirectionChanged();'>
+                                                        <option value="TOUSB" selected>Backup To USB</option>
+                                                        <option value="FROMUSB">Restore From USB</option>
+                                                        <option value="TOLOCAL">Backup To Local FPP Backups Directory
+                                                        </option>
+                                                        <option value="FROMLOCAL">Restore From Local FPP Backups Directory
+                                                        </option>
+                                                        <option value="TOREMOTE">Backup To Remote FPP Backups Directory
+                                                        </option>
+                                                        <option value="FROMREMOTE">Restore From Remote FPP Backups Directory
+                                                        </option>
+                                                    </select></td>
+                                            </tr>
+                                            <tr class='copyUSB'>
+                                                <td>USB Device:</td>
+                                                <td><select name='backup.USBDevice' id='backup.USBDevice'
+                                                        onChange='USBDeviceChanged();'></select> <input type='button'
+                                                        class='buttons' onClick='GetBackupDevices();' value='Refresh List'>
+                                                </td>
+                                            </tr>
+                                            <tr class='copyHost'>
+                                                <td>Remote Host:</td>
+                                                <td><?php PrintSettingSelect('Backup Host', 'backup.Host', 0, 0, '', $backupHosts, '', 'GetBackupHostBackupDirs'); ?>
+                                                </td>
+                                            </tr>
+                                            <tr class='copyHostDevice'>
+                                                <td>Remote Storage:</td>
+                                                <td><select id="backup.RemoteStorage"
+                                                        onchange="backupRemoteStorageChanged();">
+                                                        <option value="none" selected="">Default FPP Storage</option>
+                                                    </select></td>
+                                            </tr>
+                                            <tr class='copyPath'>
+                                                <td>Backup Path:</td>
+                                                <td><?php PrintSettingTextSaved('backup.Path', 0, 0, 128, 64, '', $settings["HostName"]); ?>
+                                                </td>
+                                            </tr>
+                                            <tr class='copyPathSelect'>
+                                                <td>Backup Path:</td>
+                                                <td><select name='backup.PathSelect' id='backup.PathSelect'></select></td>
+                                            </tr>
+                                            <tr class='sendCompressed'>
+                                                <td>Send Compressed Data: </td>
+                                                <td>
+                                                    <?php PrintSettingCheckbox('Send Compressed Data:', 'backup.sendCompressed', 0, 0, 1, 0, "", "", 0, ' (Compress files during copy to speed up the copy process. NOTE: Newer xLights versions already used a compressed FSEQ format, so this option may only slow down the transfer as FPP tries to recompress already-compressed data. Some data like Music and Videos are not compressed.)'); ?>
+                                                    <br>
+                                                </td>
+                                            </tr>
+
+                                            <tr>
+                                                <td>What to copy:</td>
+                                                <td>
+                                                    <table id="CopyFlagsTable">
+                                                        <tr>
+                                                            <td>
+                                                                <?php PrintSettingCheckbox('Backup Configuration', 'backup.Configuration', 0, 0, 1, 0, "", "", 1, 'Configuration'); ?><br>
+                                                                <?php PrintSettingCheckbox('Backup Playlists', 'backup.Playlists', 0, 0, 1, 0, "", "", 1, 'Playlists'); ?><br>
+                                                            </td>
+                                                            <td width='10px'></td>
+                                                            <td>
+                                                                <?php PrintSettingCheckbox('Backup Plugins', 'backup.Plugins', 0, 0, 1, 0, "", "", 1, 'Plugins'); ?><br>
+                                                            </td>
+                                                            <td width='10px'></td>
+                                                            <td>
+                                                                <?php PrintSettingCheckbox('Backup Sequences', 'backup.Sequences', 0, 0, 1, 0, "", "", 1, 'Sequences'); ?><span
+                                                                    style="color: #AA0000">*</span><br>
+                                                                <?php PrintSettingCheckbox('Backup Images', 'backup.Images', 0, 0, 1, 0, "", "", 1, 'Images'); ?><br>
+                                                            </td>
+                                                            <td width='10px'></td>
+                                                            <td>
+                                                                <?php PrintSettingCheckbox('Backup Scripts', 'backup.Scripts', 0, 0, 1, 0, "", "", 1, 'Scripts'); ?><br>
+                                                                <?php PrintSettingCheckbox('Backup Effects', 'backup.Effects', 0, 0, 1, 0, "", "", 1, 'Effects'); ?><br>
+                                                            </td>
+                                                            <td width='10px'></td>
+                                                            <td>
+                                                                <?php PrintSettingCheckbox('Backup Music', 'backup.Music', 0, 0, 1, 0, "", "", 1, 'Music'); ?><br>
+                                                                <?php PrintSettingCheckbox('Backup Videos', 'backup.Videos', 0, 0, 1, 0, "", "", 1, 'Videos'); ?><br>
+                                                            </td>
+                                                            <td width='10px'></td>
+                                                            <td valign='top'>
+                                                                <?php
+                                                                $eepromValue = file_exists('/home/fpp/media/config/cape-eeprom.bin') ? 1 : 0;
+                                                                PrintSettingCheckbox('Backup Virtual EEPROM', 'backup.EEPROM', 0, 0, 1, 0, "", "", $eepromValue, 'Virtual EEPROM');
+                                                                ?>
+                                                                <span class='copyBackups'><br><input type='checkbox'
+                                                                        id='backup.Backups'>Backups <span
+                                                                        style="color: #AA0000">*</span></span>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+                                                </td>
+                                            </tr>
+                                            <tr>
+                                                <td>Delete extras:</td>
+                                                <td><input type='checkbox' id='backup.DeleteExtra'> (Delete extra files on
+                                                    destination that do not exist on the source)</td>
+                                            </tr>
+                                            <tr>
+                                                <td></td>
+                                                <td>
+                                                    <input type='button' id='backupCopyBtn' class="buttons" value="Copy"
+                                                        onClick="PerformCopy();">
+                                        </table>
+
+                                        <div class="callout callout-danger">
+                                            <h4>Notes:</h4>
+                                            <ul>
+                                                <li>Sequence backups may not work correctly when restored on other FPP
+                                                    systems if the sequences are FSEQ v2 files and the Channel Output
+                                                    configurations of the two systems do not match.</li>
+                                                <li class='copyBackups'>*Backing up Backups will copy all local backups to
+                                                    the USB device.</li>
+                                                <li>Copying <b>Configuration</b> includes the settings file and the
+                                                    network configuration as they are, with passwords, the WiFi
+                                                    passphrase and access tokens in plain text. A USB stick is not
+                                                    encrypted, and a copy to a remote host is sent over plain rsync.</li>
+                                            </ul>
+
+                                        </div>
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
+                    </div>
+                    <div id="dialog_copyToUsb" title="Do You To Copy Existing Backups to USB?" style="display:none">
+                        <p>Do you want to perform an initial copy of any existing backups on SD card to the chosen USB
+                            device?.
+                            <br>
+                            <b>If Yes</b>, any existing JSON Setting backups on the SD card will be copied to the selected
+                            USB storage device.
+                            <br>
+                            <b>If No</b>, backups will copied across on any future setting change.
+                        </p>
+                    </div>
+
+                </div>
+            </div>
+            <script>
+                // $("#tabs").tabs({cache: true, active: activeTabNumber, spinner: "", fx: { opacity: 'toggle', height: 'toggle' } });
+
+            </script>
+            <?php include 'common/footer.inc'; ?>
+        </div>
+        <div id='copyPopup' title='FPP Backup/Restore' class="d-none">
+            <textarea class="w-100" style='height: 55vh; min-height: 200px;' disabled id='copyText'></textarea>
+        </div>
+
+        <datalist id='usbDirectories'>
+        </datalist>
+    </body>
+
+    </html>
+    <?php
+}
+?>

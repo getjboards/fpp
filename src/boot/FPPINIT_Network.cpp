@@ -1,0 +1,1651 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2024 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include <arpa/inet.h>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <ifaddrs.h>
+#include <list>
+#include <map>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <set>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <systemd/sd-daemon.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#include "FPPINIT.h"
+
+// One single-quoted shell word: nothing inside single quotes is expanded.
+// Every name below that reaches a shell goes through this, as well as the
+// isShellSafeWord() checks the settings among them (TetherInterface,
+// WifiRegulatoryDomain) already get: this runs as root, and one missed
+// check should not be all that stands between a setting and the shell.
+static std::string ShellSingleQuote(const std::string& v) {
+    std::string out = "'";
+    for (char ch : v) {
+        out += (ch == '\'') ? std::string("'\\''") : std::string(1, ch);
+    }
+    out += "'";
+    return out;
+}
+
+std::string FindTetherWIFIAdapater() {
+    std::string ret;
+    if (!getRawSetting("TetherInterface", ret) || ret.empty()) {
+        // see if we can find a non-associated interface
+        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net/")) {
+            std::string dev = entry.path().filename();
+            if (startsWith(dev, "wl")) {
+                std::string output = execAndReturn("/usr/sbin/iw dev " + ShellSingleQuote(dev) + " link");
+                if (contains(output, "Not connected")) {
+                    return dev;
+                }
+            }
+        }
+    }
+    // Used unquoted in root commands; the UI only offers interface names.
+    if (ret.empty() || !isShellSafeWord(ret)) {
+        ret = "wlan0";
+    }
+    return ret;
+}
+
+static int getIntFromMap(const std::map<std::string, std::string>& m, const std::string& setting, int def) {
+    if (m.find(setting) != m.end()) {
+        std::string v = m.at(setting);
+        if (v.empty()) {
+            return def;
+        }
+        return std::stoi(v);
+    }
+    return def;
+}
+// Boolean flags in interface.<if> are written by the UI as "1" (checked) or
+// "" (unchecked); treat an API/hand-written "0"/"false" as off too rather than
+// as "non-empty, therefore on".
+static bool settingEnabled(const std::map<std::string, std::string>& m, const std::string& setting) {
+    auto it = m.find(setting);
+    if (it == m.end()) {
+        return false;
+    }
+    return !it->second.empty() && it->second != "0" && it->second != "false";
+}
+static std::string netmaskToSubnet(const std::string& nm) {
+    const std::map<std::string, std::string> NETMASK2SUBNET = {
+        { "255.255.255.252", "30" },
+        { "255.255.255.248", "29" },
+        { "255.255.255.240", "28" },
+        { "255.255.255.224", "27" },
+        { "255.255.255.192", "26" },
+        { "255.255.255.128", "25" },
+        { "255.255.255.0", "24" },
+        { "255.255.254.0", "23" },
+        { "255.255.252.0", "22" },
+        { "255.255.248.0", "21" },
+        { "255.255.240.0", "20" },
+        { "255.255.224.0", "19" },
+        { "255.255.192.0", "18" },
+        { "255.255.128.0", "17" },
+        { "255.255.0.0", "16" }
+    };
+    if (NETMASK2SUBNET.contains(nm)) {
+        return NETMASK2SUBNET.at(nm);
+    }
+    return "24";
+}
+
+static bool compareAndCopyFiles(std::map<std::string, std::string> filesNeeded) {
+    bool changed = false;
+    for (auto& nf : filesNeeded) {
+        if (FileExists(nf.first)) {
+            std::string c = GetFileContents(nf.first);
+            if (c != nf.second) {
+                PutFileContents(nf.first, nf.second);
+                changed = true;
+            }
+        } else {
+            PutFileContents(nf.first, nf.second);
+            changed = true;
+        }
+    }
+    return changed;
+}
+// A value for a WIFI: QR code field, where \ ; , : and " are escaped.
+static std::string WifiQREscape(const std::string& v) {
+    std::string out;
+    for (char ch : v) {
+        if (ch == '\\' || ch == ';' || ch == ',' || ch == ':' || ch == '"') {
+            out += '\\';
+        }
+        out += ch;
+    }
+    return out;
+}
+static std::string CreateHostAPDConfig(const std::string& interface) {
+    std::string ssid = "FPP";
+    std::string psk = "Christmas";
+    std::string WifiRegulatoryDomain = "US";
+    getRawSetting("WifiRegulatoryDomain", WifiRegulatoryDomain);
+    getRawSetting("TetherSSID", ssid);
+    getRawSetting("TetherPSK", psk);
+
+    std::string content;
+    content.append("interface=").append(interface).append("\ndriver=nl80211\nwpa_passphrase=").append(psk).append("\nssid=");
+    content.append(ssid).append("\ncountry_code=").append(WifiRegulatoryDomain);
+    content.append("\nhw_mode=g\nchannel=11\nmacaddr_acl=0\nauth_algs=3\nwpa=2\n");
+    content.append("wpa_key_mgmt=WPA-PSK\nwpa_pairwise=TKIP\nrsn_pairwise=CCMP\nwmm_enabled=0\nignore_broadcast_ssid=0\nwpa_group_rekey=3600\nwpa_gmk_rekey=86400\n");
+    content.append("reassociation_deadline=3000\npmk_r1_push=1\nft_over_ds=0\nbss_transition=1\n");
+    if (FileExists("/usr/bin/qrencode")) {
+        // The SSID and PSK are single-quoted for the shell: inside the double
+        // quotes they used to sit in, "$(...)" in either setting ran as root.
+        std::string payload = ShellSingleQuote("WIFI:T:WPA;S:" + WifiQREscape(ssid) + ";P:" + WifiQREscape(psk) + ";;");
+        // Low error correction MAY result in a QR that can be pixel doubled which generally works better for phones to pick up
+        std::string cmd = "/usr/bin/qrencode -t ASCII -m 0 -s 6 -l L -o ";
+        cmd.append(ShellSingleQuote(FPP_MEDIA_DIR + "/tmp/wifi-L.ascii")).append(" ").append(payload);
+        exec(cmd);
+        // Generate a High error correction as well.  If we cannot pixel double, this will give more info to the phone/device
+
+        cmd = "/usr/bin/qrencode -t ASCII -m 3 -s 6 -l H -o ";
+        cmd.append(ShellSingleQuote(FPP_MEDIA_DIR + "/tmp/wifi-H.ascii")).append(" ").append(payload);
+        exec(cmd);
+    }
+
+    return content;
+}
+// The [DHCPServer] block for the tethering AP.  The pool comes from
+// config/interface.<iface> (the DHCP Pool Offset / Size fields on the Network
+// page) whenever that file exists: maybeEnableTethering() rewrites this
+// .network file *after* setupNetwork() has already generated it from the
+// interface config, so hardcoding the pool here silently reverted whatever the
+// user had configured -- a box set to offset 100 kept handing out addresses
+// from .10 because the second write won.  10/100 remains the default for a
+// board that has no interface config at all (fresh install, no /config dir).
+static void AppendTetherDHCPServerSection(std::string& content, const std::string& interface) {
+    int offset = 10;
+    int poolSize = 100;
+    const std::string interfaceConfigFile = FPP_MEDIA_DIR + "/config/interface." + interface;
+    if (FileExists(interfaceConfigFile)) {
+        auto interfaceSettings = loadSettingsFile(interfaceConfigFile);
+        offset = getIntFromMap(interfaceSettings, "DHCPOFFSET", offset);
+        poolSize = getIntFromMap(interfaceSettings, "DHCPPOOLSIZE", poolSize);
+    }
+    // PersistLeases=yes is already the default on Debian 13/trixie (systemd
+    // >= 256, via systemd-networkd-persistent-storage.service); set explicitly
+    // here for clarity and so behavior doesn't silently depend on an OS-level
+    // default we don't control. Harmlessly ignored as an unknown key on older
+    // systemd (verified: an unrecognized [DHCPServer] key logs a warning but
+    // doesn't break parsing).
+    content.append("[DHCPServer]\n"
+                   "PersistLeases=yes\n"
+                   "PoolOffset=")
+        .append(std::to_string(offset))
+        .append("\nPoolSize=")
+        .append(std::to_string(poolSize))
+        .append("\nEmitDNS=no\n\n");
+    if (FileExists(FPP_MEDIA_DIR + "/config/leases." + interface)) {
+        content.append(GetFileContents(FPP_MEDIA_DIR + "/config/leases." + interface));
+        content.append("\n");
+    }
+}
+static void unblockWifi() {
+    if (FileExists("/usr/sbin/rfkill")) {
+        exec("/usr/sbin/rfkill unblock wifi");
+        exec("/usr/sbin/rfkill unblock all");
+    }
+}
+
+// Consumes the marker resetConfig.php drops for a "network" area reset. Must
+// only be called from the boot "start" path (FPPINIT.cpp), NOT from
+// setupNetwork() -- that function is also invoked live via `fppinit
+// setupNetwork <iface>` (network.php's interface-save path) while
+// systemd-networkd is already running, which would reintroduce the exact
+// live-daemon race this is meant to avoid. Boot's "start" action runs before
+// systemd-networkd.service is (re)started for this boot -- fppinit.service is
+// ordered Before= it -- so calling this only from there is race-free by
+// construction: the daemon that owns /var/lib/systemd/network/dhcp-server-lease/
+// isn't running yet.
+//
+// TODO(FPP11): this is one of several ad-hoc "do this on next boot" marker
+// files scattered around FPP (see also /fpp_kiosk, fpp_expand_rootfs,
+// /fppos_upgraded). Standardize these on a single settings-key convention
+// instead of bare marker files.
+void consumePendingDhcpLeaseReset() {
+    std::string marker = FPP_MEDIA_DIR + "/config/dhcpLeaseResetPending";
+    if (!FileExists(marker)) {
+        return;
+    }
+    // One JSON file per interface (not a per-lease directory), e.g.
+    // /var/lib/systemd/network/dhcp-server-lease/eth0 -- confirmed against a
+    // live device (systemd 257). Wipe all of them.
+    if (DirectoryExists("/var/lib/systemd/network/dhcp-server-lease")) {
+        for (const auto& entry : std::filesystem::directory_iterator("/var/lib/systemd/network/dhcp-server-lease")) {
+            std::error_code ec;
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
+    unlink(marker.c_str());
+}
+
+// hostapd is up or on its way up or down.  `systemctl is-active` prints one
+// word; "inactive" contains "active", so compare the whole word.
+static bool hostapdRunning() {
+    std::string state = execAndReturn("/usr/bin/systemctl is-active hostapd");
+    TrimWhiteSpace(state);
+    return state == "active" || state == "activating" || state == "deactivating" || state == "reloading";
+}
+
+void setupNetwork(bool fullReload) {
+    unblockWifi();
+    auto dnsSettings = loadSettingsFile(FPP_MEDIA_DIR + "/config/dns");
+    
+    // Load global gateway configuration with migration support
+    auto gatewaySettings = loadSettingsFile(FPP_MEDIA_DIR + "/config/gateway");
+    std::string globalGateway = gatewaySettings["GATEWAY"];
+    
+    // Migration: If no global gateway exists, check for old per-interface gateways
+    if (globalGateway.empty()) {
+        std::error_code cfgEc;
+        for (const auto& entry : std::filesystem::directory_iterator(FPP_MEDIA_DIR + "/config", cfgEc)) {
+            std::string filename = entry.path().filename();
+            if (startsWith(filename, "interface.")) {
+                auto interfaceSettings = loadSettingsFile(entry.path());
+                std::string oldGateway = interfaceSettings["GATEWAY"];
+                if (!oldGateway.empty() && oldGateway != "\"\"") {
+                    // Found an old gateway setting - migrate it to global
+                    printf("FPP - Migrating gateway %s from %s to global configuration\n", 
+                           oldGateway.c_str(), filename.c_str());
+                    
+                    // Save to global gateway file
+                    std::string gatewayContent = "GATEWAY=\"" + oldGateway + "\"\n";
+                    PutFileContents(FPP_MEDIA_DIR + "/config/gateway", gatewayContent);
+                    globalGateway = oldGateway;
+                    
+                    // Remove old GATEWAY setting from interface file (optional cleanup)
+                    std::string interfaceContent = GetFileContents(entry.path());
+                    size_t pos = interfaceContent.find("GATEWAY=");
+                    if (pos != std::string::npos) {
+                        size_t endPos = interfaceContent.find('\n', pos);
+                        if (endPos != std::string::npos) {
+                            interfaceContent.erase(pos, endPos - pos + 1);
+                            PutFileContents(entry.path(), interfaceContent);
+                        }
+                    }
+                    break; // Use first gateway found
+                }
+            }
+        }
+    }
+    
+    std::string dns = dnsSettings["DNS1"];
+    if (dnsSettings["DNS2"] != "") {
+        dns += ",";
+        dns += dnsSettings["DNS2"];
+    }
+    std::string WifiRegulatoryDomain = "US";
+    getRawSetting("WifiRegulatoryDomain", WifiRegulatoryDomain);
+    if (isShellSafeWord(WifiRegulatoryDomain)) {
+        exec("/usr/sbin/iw reg set " + ShellSingleQuote(WifiRegulatoryDomain));
+    }
+
+    int tetherEnabled = getRawSettingInt("EnableTethering", 0);
+    std::string tetherInterface = FindTetherWIFIAdapater();
+
+    const std::string dhcpProxyFile = FPP_MEDIA_DIR + "/config/dhcp-proxy-config.conf";
+    std::string dhcpProxies;
+
+    bool ipForward = false;
+    bool hostapd = false;
+    std::map<std::string, std::string> filesNeeded;
+    std::list<std::string> filesToConsider;
+    std::list<std::string> commandsToRun;
+    std::list<std::string> postCommandsToRun;
+    // error_code forms: a directory that isn't there (no wpasupplicant
+    // package, say) is simply empty, not an uncaught exception that ends
+    // fppinit before any of the network is configured.
+    std::error_code dirEc;
+    for (const auto& entry : std::filesystem::directory_iterator("/etc/systemd/network", dirEc)) {
+        std::string dev = entry.path().filename();
+        if (startsWith(dev, "10-") && endsWith(dev, ".network")) {
+            filesToConsider.emplace_back("/etc/systemd/network/" + dev);
+        }
+    }
+    for (const auto& entry : std::filesystem::directory_iterator("/etc/wpa_supplicant", dirEc)) {
+        std::string dev = entry.path().filename();
+        if (startsWith(dev, "wpa_supplicant-wl") && endsWith(dev, ".conf")) {
+            filesToConsider.emplace_back("/etc/wpa_supplicant/" + dev);
+        }
+    }
+    if (FileExists("/etc/hostapd/hostapd.conf")) {
+        filesToConsider.emplace_back("/etc/hostapd/hostapd.conf");
+    }
+    if (std::filesystem::exists(FPP_MEDIA_DIR + "/config")) {
+        for (const auto& entry : std::filesystem::directory_iterator(FPP_MEDIA_DIR + "/config")) {
+            std::string dev = entry.path().filename();
+            if (startsWith(dev, "interface.")) {
+                bool validConfig = true;
+                auto interfaceSettings = loadSettingsFile(FPP_MEDIA_DIR + "/config/" + dev);
+                std::string interface = dev.substr(10);
+
+                std::string content = "[Match]\nName=";
+                std::string addressLines;
+
+                int DHCPSERVER = getIntFromMap(interfaceSettings, "DHCPSERVER", 0);
+                int DHCPOFFSET = getIntFromMap(interfaceSettings, "DHCPOFFSET", 100);
+                int DHCPPOOLSIZE = getIntFromMap(interfaceSettings, "DHCPPOOLSIZE", 50);
+                int ROUTEMETRIC = getIntFromMap(interfaceSettings, "ROUTEMETRIC", 0);
+                int IPFORWARDING = getIntFromMap(interfaceSettings, "IPFORWARDING", 0);
+
+                if (DHCPSERVER == 1) {
+                    std::string address = interfaceSettings["ADDRESS"];
+                    address = address.substr(0, address.find_last_of("."));
+                    dhcpProxies += "RewriteRule ^" + address + ".([0-9:]*)$  http://" + address + ".$1/  [P,L]\n";
+                    dhcpProxies += "RewriteRule ^" + address + ".([0-9:]*)/(.*)$  http://" + address + ".$1/$2  [P,L]\n\n";
+                }
+
+                content.append(interface).append("\nType=");
+                if (startsWith(interface, "wl")) {
+                    content.append("wlan\n\n");
+                } else {
+                    content.append("ether\n\n");
+                }
+                content.append("[Network]\n");
+                if (dnsSettings["DNS1"] != "") {
+                    content.append("DNS=").append(dnsSettings["DNS1"]).append("\n");
+                }
+                if (dnsSettings["DNS2"] != "") {
+                    content.append("DNS=").append(dnsSettings["DNS2"]).append("\n");
+                }
+                if (interfaceSettings["PROTO"] == "dhcp") {
+                    addressLines = "DHCP=yes\n";
+                    DHCPSERVER = 0;
+                } else {
+                    addressLines = "Address=";
+                    addressLines.append(interfaceSettings["ADDRESS"]).append("/").append(netmaskToSubnet(interfaceSettings["NETMASK"])).append("\n");
+                }
+                if (startsWith(interface, "wl")) {
+                    // wifi settings
+                    if (tetherEnabled == 1 && interface == tetherInterface) {
+                        filesNeeded["/etc/hostapd/hostapd.conf"] = CreateHostAPDConfig(interface);
+                        DHCPSERVER = 1;
+                        hostapd = true;
+                        addressLines.append("Address=192.168.8.1/24\n");
+                    } else if (!interfaceSettings["SSID"].empty()) {
+                        bool wpa3 = settingEnabled(interfaceSettings, "WPA3");
+                        bool backupWpa3 = settingEnabled(interfaceSettings, "BACKUPWPA3");
+                        std::string wpa = "ctrl_interface=/var/run/wpa_supplicant\nctrl_interface_group=0\nupdate_config=1\ncountry=";
+                        wpa.append(WifiRegulatoryDomain);
+                        // Protected Management Frames (802.11w) as a GLOBAL "optional"
+                        // (pmf=1), never as a per-network ieee80211w=1.  The difference
+                        // matters: for the global default wpa_supplicant checks whether
+                        // the driver advertises a BIP cipher and silently skips PMF if
+                        // not, but a per-network ieee80211w is honoured blindly.  The
+                        // brcmfmac firmware on the Pi Zero W (BCM43430; the Pi 3B shares
+                        // the chip) has no MFP support, so with ieee80211w=1 it negotiated
+                        // PMF with any PMF-capable AP (most Wi-Fi 6 routers), failed to
+                        // install the IGTK ("WPA: Failed to configure IGTK to the driver")
+                        // and dropped an otherwise-good association - looked like a bad
+                        // password.  On boards whose driver does advertise a BIP cipher
+                        // (BCM43455, rtw88, ...) nothing changes: SAE still negotiates
+                        // PMF and WPA2 APs set to PMF-required still work.
+                        // This mirrors what NetworkManager does on stock Raspberry Pi
+                        // OS.  GitHub issue #2953.
+                        wpa.append("\npmf=1\n");
+                        if (wpa3 || backupWpa3) {
+                            // 2 = hash-to-element AND hunting-and-pecking.  With 1 (H2E only)
+                            // wpa_supplicant skips every BSS of an AP that lacks H2E ("skip -
+                            // SAE H2E required, but not supported by the AP"), so the WPA3
+                            // checkbox could never connect to such an AP on any board.
+                            wpa.append("sae_pwe=2\n");
+                        }
+                        wpa.append("\nnetwork={\n  ssid=\"").append(interfaceSettings["SSID"]);
+                        if (!interfaceSettings["PSK"].empty()) {
+                            wpa.append("\"\n  psk=\"").append(interfaceSettings["PSK"]);
+                        }
+                        wpa.append("\"\n  key_mgmt=");
+                        if (wpa3) {
+                            wpa.append("SAE WPA-PSK\n  sae_password=\"").append(interfaceSettings["PSK"]).append("\"");
+                        } else {
+                            wpa.append("WPA-PSK");
+                        }
+                        if (settingEnabled(interfaceSettings, "HIDDEN")) {
+                            wpa.append("\n  scan_ssid=1");
+                        }
+                        wpa.append("\n  priority=100\n}\n\n");
+                        if (!interfaceSettings["BACKUPSSID"].empty() && interfaceSettings["BACKUPSSID"] != "\"\"") {
+                            wpa.append("\nnetwork={\n  ssid=\"").append(interfaceSettings["BACKUPSSID"]);
+                            if (!interfaceSettings["BACKUPPSK"].empty()) {
+                                wpa.append("\"\n  psk=\"").append(interfaceSettings["BACKUPPSK"]);
+                            }
+                            wpa.append("\"\n  key_mgmt=");
+                            if (backupWpa3) {
+                                wpa.append("SAE WPA-PSK\n  sae_password=\"").append(interfaceSettings["BACKUPPSK"]).append("\"");
+                            } else {
+                                wpa.append("WPA-PSK");
+                            }
+                            if (settingEnabled(interfaceSettings, "BACKUPHIDDEN")) {
+                                wpa.append("\n  scan_ssid=1");
+                            }
+                            wpa.append("\n  priority=90\n}\n\n");
+                        }
+                        filesNeeded["/etc/wpa_supplicant/wpa_supplicant-" + interface + ".conf"] = wpa;
+                        // Queue these unconditionally rather than gating them on
+                        // `systemctl is-active`/`is-enabled` queries: during early
+                        // boot the systemd manager is saturated (dbus etc. take many
+                        // seconds to come up), so those synchronous queries block for
+                        // ~9s and stall fppinit -- and this wpa_supplicant@ branch
+                        // only runs once a wifi interface exists. The commands run
+                        // only if the wpa config actually changed (see commandsToRun
+                        // handling below), and `enable` + `reload-or-restart` are both
+                        // idempotent, so the pre-checks bought nothing but the stall.
+                        commandsToRun.emplace_back("systemctl enable \"wpa_supplicant@" + interface + ".service\" &");
+                        commandsToRun.emplace_back("systemctl reload-or-restart \"wpa_supplicant@" + interface + ".service\" &");
+                        postCommandsToRun.emplace_back("systemctl reload-or-restart \"wpa_supplicant@" + interface + ".service\" &");
+                    } else {
+                        validConfig = false;
+                    }
+                }
+                if (DHCPSERVER) {
+                    content.append("DHCPServer=yes\n");
+                }
+                if (IPFORWARDING == 1) {
+                    content.append("IPForward=yes\n");
+                    ipForward = true;
+                } else if (IPFORWARDING == 2) {
+                    // systemd-networkd might not have masquerade support compiled in, we'll just do it manually
+                    ipForward = true;
+                    exec("/usr/sbin/nft add table nat");
+                    exec("/usr/sbin/nft 'add chain nat postrouting { type nat hook postrouting priority 100 ; }'");
+                    exec("/usr/sbin/nft add rule nat postrouting oif " + ShellSingleQuote(interface) + " masquerade");
+                }
+                content.append(addressLines);
+                // some of the FPP7 images don't support this setting.  They use older gcc
+                // Pi Zero 2 W has issues with IgnoreCarrierLoss causing network visibility problems (Issue #2487)
+#ifdef PLATFORM_PI
+                if (!isPiZero2W()) {
+                    content.append("IgnoreCarrierLoss=5s\n");
+                }
+#else
+                content.append("IgnoreCarrierLoss=5s\n");
+#endif
+                content.append("\n");
+
+                // Apply global gateway to static interfaces only
+                if (!globalGateway.empty() && interfaceSettings["PROTO"] != "dhcp") {
+                    content.append("[Route]\nGateway=").append(globalGateway).append("\n");
+                    if (ROUTEMETRIC != 0) {
+                        content.append("Metric=").append(std::to_string(ROUTEMETRIC)).append("\n");
+                    }
+                }
+                content.append("\n");
+                if (interfaceSettings["PROTO"] == "dhcp") {
+                    content.append("[DHCPv4]\nClientIdentifier=mac\nUseDomains=true\n");
+                    // FPP owns the hostname (checkHostName writes /etc/hostname), so
+                    // there is nothing to learn from the lease. Leaving this at its
+                    // default of yes makes networkd call org.freedesktop.hostname1 the
+                    // moment the lease lands, which D-Bus-activates systemd-hostnamed,
+                    // which in turn activates polkit to authorize the call. Measured on
+                    // a single-core AM335x board that chain cost ~21s of boot (4.3s
+                    // hostnamed + 16.8s polkitd) for a hostname that was already
+                    // correct; nothing else on an FPP box uses polkit at all.
+                    content.append("UseHostname=false\n");
+                    // Only use NTP from DHCP if explicitly enabled
+                    std::string useNTPFromDHCP;
+                    getRawSetting("UseNTPFromDHCP", useNTPFromDHCP);
+                    if (useNTPFromDHCP != "1") {
+                        content.append("UseNTP=no\n");
+                    }
+                } else if (ROUTEMETRIC != 0) {
+                    content.append("[DHCPv4]\n");
+                }
+                if (ROUTEMETRIC != 0) {
+                    content.append("RouteMetric=").append(interfaceSettings["ROUTEMETRIC"]).append("\n\n");
+                    content.append("[IPv6AcceptRA]\nRouteMetric=").append(interfaceSettings["ROUTEMETRIC"]).append("\n\n");
+                } else {
+                    content.append("\n");
+                }
+                if (DHCPSERVER == 1) {
+                    // PersistLeases=yes is already the default on Debian 13/trixie
+                    // (systemd >= 256, via systemd-networkd-persistent-storage.service);
+                    // set explicitly here for clarity and so behavior doesn't silently
+                    // depend on an OS-level default we don't control. Harmlessly ignored
+                    // as an unknown key on older systemd (verified: an unrecognized
+                    // [DHCPServer] key logs a warning but doesn't break parsing).
+                    content.append("[DHCPServer]\nPersistLeases=yes\nDefaultLeaseTimeSec=8h\nMaxLeaseTimeSec=8h\nPoolOffset=").append(std::to_string(DHCPOFFSET)).append("\nPoolSize=").append(std::to_string(DHCPPOOLSIZE)).append("\n");
+                    if (!dnsSettings["DNS1"].empty()) {
+                        content.append("EmitDNS=yes\nDNS=").append(dnsSettings["DNS1"]).append("\n");
+                    }
+                    content.append("\n");
+                    if (FileExists(FPP_MEDIA_DIR + "/config/leases." + interface)) {
+                        content.append(GetFileContents(FPP_MEDIA_DIR + "/config/leases." + interface));
+                    }
+                    content.append("\n");
+                }
+                if (validConfig) {
+                    filesNeeded["/etc/systemd/network/10-" + interface + ".network"] = content;
+                }
+            }
+        }
+    }
+
+    // If tethering is explicitly enabled (==1) but no interface configs set it up,
+    // configure it now (handles fresh installs with no /config directory)
+    if (tetherEnabled == 1 && !hostapd) {
+        filesNeeded["/etc/hostapd/hostapd.conf"] = CreateHostAPDConfig(tetherInterface);
+        std::string content = "[Match]\nName=";
+        content.append(tetherInterface).append("\nType=wlan\n\n"
+                                               "[Network]\n"
+                                               "DHCP=no\n"
+                                               "Address=192.168.8.1/24\n"
+                                               "DHCPServer=yes\n\n");
+        AppendTetherDHCPServerSection(content, tetherInterface);
+        filesNeeded["/etc/systemd/network/10-" + tetherInterface + ".network"] = content;
+        hostapd = true;
+    }
+
+    bool reloadApache = false;
+    if (dhcpProxies.empty() && FileExists(dhcpProxyFile)) {
+        unlink(dhcpProxyFile.c_str());
+        reloadApache = true;
+    } else if (!dhcpProxies.empty()) {
+        PutFileContents(dhcpProxyFile, dhcpProxies);
+        reloadApache = true;
+    }
+
+    // FPP's NTP daemon is chrony. Large-offset stepping (ntpd's "-g") is handled
+    // by the "makestep" directive in /etc/chrony/chrony.conf, so there is nothing
+    // to inject per-boot. Here we only reconcile DHCP-provided NTP servers with
+    // the UseNTPFromDHCP setting: the networkd-dispatcher chrony hook drops any
+    // DHCP servers into /run/chrony-dhcp (consumed via "sourcedir" in
+    // chrony.conf) when the setting is enabled. When it's disabled, make sure
+    // none linger from a previous configuration. chrony is started after
+    // fpp_postnetwork, so clearing the dir now is enough -- no reload needed.
+    std::string useNTPFromDHCP;
+    getRawSetting("UseNTPFromDHCP", useNTPFromDHCP);
+    if (useNTPFromDHCP != "1") {
+        exec("/usr/bin/rm -f /run/chrony-dhcp/*.sources 2>/dev/null");
+    }
+
+    // Auto-detect default gateway as a fallback NTP server so that chrony has
+    // a reachable peer when internet pool servers are blocked (e.g. behind
+    // double NAT / a gateway that drops NTP replies -- see issue #2736). LAN
+    // traffic to the gateway does not cross any NAT boundary. chrony gracefully
+    // ignores non-responsive servers, so this is safe even if the gateway does
+    // not run NTP.
+    {
+        std::string gw = execAndReturn(
+            "/usr/bin/ip route show default 2>/dev/null | /usr/bin/awk '{print $3}'");
+        TrimWhiteSpace(gw);
+        if (!gw.empty()) {
+            struct sockaddr_in sa;
+            if (inet_pton(AF_INET, gw.c_str(), &(sa.sin_addr)) == 1) {
+                std::string chronyConf = GetFileContents("/etc/chrony/chrony.conf");
+                if (chronyConf.find("server " + gw) == std::string::npos) {
+                    chronyConf += "\n# Auto-detected default gateway fallback\nserver "
+                            + gw + " minpoll 10 maxpoll 12 iburst\n";
+                    PutFileContents("/etc/chrony/chrony.conf", chronyConf);
+                    execbg("/usr/bin/systemctl reload-or-restart chrony.service &");
+                    printf("FPP - Added default gateway %s as fallback NTP server\n",
+                           gw.c_str());
+                }
+            }
+        }
+    }
+    bool changed = false;
+    for (auto& ftc : filesToConsider) {
+        if (filesNeeded.find(ftc) == filesNeeded.end()) {
+            // No longer used/needed, remove it
+            unlink(ftc.c_str());
+            changed = true;
+            if (startsWith(ftc, "/etc/wpa_supplicant/")) {
+                std::string intf = ftc.substr(ftc.find("-") + 1);
+                intf = intf.substr(0, intf.find("."));
+                execbg("/usr/bin/systemctl disable wpa_supplicant@" + intf + ".service &");
+            }
+        }
+    }
+    changed |= compareAndCopyFiles(filesNeeded);
+    if (changed) {
+        bool localFullReload = false;
+        printf("Need to restart/reload stuff.\n");
+        if (!hostapd) {
+            // Out of AP mode before the Wi-Fi client starts: while hostapd
+            // still holds the radio, a wpa_supplicant started beside it often
+            // fails to associate, and leaving AP mode from the UI then needed
+            // a power cycle (#2825).
+            if (contains(execAndReturn("/usr/bin/systemctl is-enabled hostapd"), "enabled")) {
+                execbg("/usr/bin/systemctl disable hostapd.service &");
+                localFullReload = true;
+            }
+            if (hostapdRunning()) {
+                // Bounded: an unresponsive hostapd (driver/dbus hiccup) must not be
+                // able to wedge fppinit indefinitely - this runs synchronously in
+                // the interactive "Restart Network" request (network_apply_interface),
+                // so a hang here blocks that whole HTTP request and can make the
+                // rest of the appliance look unresponsive until it clears.
+                exec("/usr/bin/timeout 10 /usr/bin/systemctl stop hostapd.service");
+                if (hostapdRunning()) {
+                    printf("FPP - hostapd did not stop within 10s, killing it\n");
+                    exec("/usr/bin/systemctl kill --signal=SIGKILL hostapd.service");
+                }
+                localFullReload = true;
+            }
+            exec("rm -f /home/fpp/media/tmp/wifi-*.ascii");
+        }
+        // These end in "&" and must not be waited for: through exec()'s popen the
+        // backgrounded systemctl keeps the pipe open, so exec() blocks until it
+        // exits. A start job for an adapter that is not plugged in then held
+        // fppinit -- and systemd-networkd, ordered after it -- until the job
+        // timed out.
+        for (auto& c : commandsToRun) {
+            printf("    %s\n", c.c_str());
+            execbg(c);
+        }
+        if (fullReload) {
+            exec("/usr/bin/systemctl daemon-reload");
+        }
+        execbg("/usr/bin/systemctl reload-or-restart systemd-networkd.service &");
+        if (hostapd) {
+            unblockWifi();
+            execbg("/usr/bin/systemctl reload-or-restart hostapd.service &");
+        }
+        if (fullReload && localFullReload) {
+            exec("/usr/bin/systemctl daemon-reload");
+            exec("/usr/bin/systemctl reload-or-restart systemd-networkd.service");
+            for (auto& c : postCommandsToRun) {
+                printf("    %s\n", c.c_str());
+                execbg(c);
+            }
+        }
+    }
+
+    printf("FPP - Setting max IGMP memberships\n");
+    // rmem_max is the ceiling a plain SO_RCVBUF request is clamped to. The e131
+    // bridge input sockets ask for far more than the old 384KB when many
+    // universes are configured (and use SO_RCVBUFFORCE where possible), so raise
+    // the ceiling to 8MB to cover the burst of a several-hundred-universe frame.
+    exec("/usr/sbin/sysctl -w net/core/rmem_max=8388608 net/core/wmem_max=393216 net/ipv4/igmp_max_memberships=512  > /dev/null 2>&1");
+
+    printf("FPP - Configuring ethernet interfaces for show traffic\n");
+    for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net/")) {
+        std::string dev = entry.path().filename();
+        if (IsShowEthernetInterface(dev)) {
+            if (InterfaceHasRoutableIPv4(dev)) {
+                // fq is required for the per-socket pacing the UDP channel
+                // outputs use, and is a good general-purpose default even
+                // when pacing is off (whether to pace is decided per
+                // destination at runtime).  Only useful on interfaces that
+                // can carry routed UDP, so an address-less interface
+                // dedicated to a raw layer-2 output (ColorLight) keeps its
+                // default qdisc.  Not applied to wifi (mac80211 has its own
+                // internal queueing), and the helper refuses to replace an
+                // admin-installed custom qdisc.
+                InstallShowTrafficQdisc(dev);
+            }
+            // Energy Efficient Ethernet causes latency spikes and drops with
+            // bursty traffic on several NICs (including the Pi's)
+            exec("/usr/sbin/ethtool --set-eee " + ShellSingleQuote(dev) + " eee off > /dev/null 2>&1");
+        }
+    }
+    if (ipForward) {
+        exec("/usr/sbin/sysctl net.ipv4.ip_forward=1");
+    } else {
+        exec("/usr/sbin/sysctl net.ipv4.ip_forward=0");
+    }
+    if (reloadApache && (!contains(execAndReturn("/usr/bin/systemctl is-active apache2"), "inactive"))) {
+        exec("/usr/bin/systemctl reload-or-restart apache2");
+    }
+}
+
+// Whether an IPv4 address is one that reaches a real network. Excludes the
+// board's own USB gadget and tether addresses, and 169.254/16: networkd falls
+// back to link-local while DHCP is still pending (LinkLocalAddressing=yes), and
+// the probe can finish before a slow DHCP server answers, so treating it as
+// "the address" started fppd on it ahead of the real lease.
+static bool isUpstreamAddress(const std::string& addr) {
+    return !startsWith(addr, "169.254.") && addr != "192.168.6.2" && addr != "192.168.7.2" && addr != "192.168.8.1";
+}
+
+// Check if there are any network interfaces that could potentially receive NTP time
+// Returns true if there's at least one interface with a "real" IP address that could reach NTP servers
+// Excludes loopback, USB gadget, and tethering interfaces
+static bool hasNetworkInterfaceForNTP() {
+    // If EnableTethering is explicitly set to 1, user expects to use tethering
+    // which means no external network - skip NTP wait
+    int tetheringEnabled = getRawSettingInt("EnableTethering", 0);
+    if (tetheringEnabled == 1) {
+        printf("FPP - Tethering is enabled, skipping NTP time wait\n");
+        return false;
+    }
+
+    struct ifaddrs* ifAddrStruct = NULL;
+    struct ifaddrs* ifa = NULL;
+    void* tmpAddrPtr = NULL;
+    bool hasValidIP = false;
+
+    if (getifaddrs(&ifAddrStruct) != 0) {
+        // If we can't get interface info, assume we might have network
+        return true;
+    }
+
+    for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) {
+            continue;
+        }
+
+        std::string nm = ifa->ifa_name;
+        // Skip loopback and USB gadget interfaces (usb0, usb1, etc.)
+        if (nm == "lo" || startsWith(nm, "usb")) {
+            continue;
+        }
+
+        // Only check IPv4 addresses
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            tmpAddrPtr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+            char addressBuffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+            std::string addr = addressBuffer;
+
+            // Skip USB gadget, tethering and link-local addresses
+            if (!isUpstreamAddress(addr)) {
+                continue;
+            }
+
+            // Found a valid IP that could potentially reach NTP
+            hasValidIP = true;
+            break;
+        }
+    }
+
+    if (ifAddrStruct != NULL) {
+        freeifaddrs(ifAddrStruct);
+    }
+
+    // If no valid IP found, check if any "real" interfaces exist with link up
+    // An interface must have carrier (link) to potentially get DHCP
+    if (!hasValidIP) {
+        // Re-scan to check if interfaces exist with carrier
+        if (getifaddrs(&ifAddrStruct) == 0) {
+            std::string tetherInterface = FindTetherWIFIAdapater();
+            for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+                std::string nm = ifa->ifa_name;
+                // Skip loopback and USB gadget interfaces
+                if (nm == "lo" || startsWith(nm, "usb")) {
+                    continue;
+                }
+                // Skip the interface designated for tethering
+                if (nm == tetherInterface) {
+                    continue;
+                }
+                // Check for "real" network interface names
+                if (startsWith(nm, "eth") || startsWith(nm, "wlan") ||
+                    startsWith(nm, "en") || startsWith(nm, "wl") ||
+                    startsWith(nm, "br") || startsWith(nm, "bond")) {
+                    // Check carrier state via sysfs - most reliable across all drivers
+                    // /sys/class/net/<iface>/carrier returns 1 if link, 0 if no link
+                    std::string carrierPath = "/sys/class/net/" + nm + "/carrier";
+                    std::string carrier = GetFileContents(carrierPath);
+                    TrimWhiteSpace(carrier);
+                    if (carrier == "1") {
+                        printf("FPP - Interface %s has carrier, will wait for NTP\n", nm.c_str());
+                        hasValidIP = true;
+                        break;
+                    }
+                }
+            }
+            if (ifAddrStruct != NULL) {
+                freeifaddrs(ifAddrStruct);
+            }
+        }
+    }
+    return hasValidIP;
+}
+
+void handleBootDelay() {
+    int i = getRawSettingInt("bootDelay", -1);
+    const std::string delayFile = FPP_MEDIA_DIR + "/tmp/boot_delay";
+    const std::string skipFile = FPP_MEDIA_DIR + "/tmp/boot_delay_skip";
+
+    // bootDelay=0 means no delay at all - clean up any flag file and return immediately
+    if (i == 0) {
+        unlink(delayFile.c_str());
+        unlink(skipFile.c_str());
+        return;
+    }
+
+    if (i > 0) {
+        printf("FPP - Sleeping for %d seconds\n", i);
+        // Create flag file with start time and duration for UI countdown
+        time_t startTime = time(nullptr);
+        std::string flagContent = std::to_string(startTime) + "," + std::to_string(i);
+        PutFileContents(delayFile, flagContent);
+        // Notify systemd we're starting the delay and extend timeout
+        sd_notify(0, "STATUS=Boot delay in progress");
+        sd_notifyf(0, "EXTEND_TIMEOUT_USEC=%llu", (unsigned long long)(i + 30) * 1000000);
+
+        // Sleep in 100ms increments to allow UI to show countdown and respond to skip
+        int remainingMs = i * 1000;
+        int watchdogCounter = 0;
+        while (remainingMs > 0) {
+            // Check for skip request from UI every iteration
+            if (FileExists(skipFile)) {
+                printf("FPP - Boot delay skip requested by user\n");
+                unlink(skipFile.c_str());
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            remainingMs -= 100;
+            watchdogCounter++;
+
+            // Notify systemd watchdog every 10 seconds (100 iterations)
+            if (watchdogCounter >= 100) {
+                sd_notify(0, "WATCHDOG=1");
+                watchdogCounter = 0;
+            }
+        }
+        // Remove flag files when delay completes
+        unlink(delayFile.c_str());
+        unlink(skipFile.c_str());
+    } else if (i == -1) {
+        // Auto mode: nothing to wait on here. The is-there-an-NTP-capable-network
+        // decision and the quick SNTP set both happen in handleTimeSyncWait(),
+        // which runs on the network thread after waitForInterfacesUp() has
+        // already waited for link/IP properly. This used to pre-poll up to 5s
+        // for an interface, but that only serialized boot ahead of the
+        // concurrent audio/network threads and its verdict was recomputed
+        // later anyway. Just clean up any stale flag files.
+        unlink(delayFile.c_str());
+        unlink(skipFile.c_str());
+    }
+}
+
+// Minimal SNTP (RFC 4330) client: query an NTP server over UDP and step the
+// system clock to its transmit timestamp (second precision). This one-shot set
+// runs during boot so we never block ~20s waiting for the chrony daemon to step
+// the clock; chrony refines it to sub-millisecond afterwards. Note the socket is
+// left unbound, so the query sources from a random ephemeral port -- which (like
+// chrony itself) dodges routers/ISP gateways that drop NTP replies to source
+// port 123. Must run as root (clock_settime needs CAP_SYS_TIME). Returns true if
+// the clock was set.
+static bool quickSntpSet(const std::string& host, int timeoutSecs) {
+    struct addrinfo hints {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), "123", &hints, &res) != 0 || res == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock >= 0) {
+        struct timeval tv { timeoutSecs, 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        unsigned char pkt[48] = { 0 };
+        pkt[0] = 0x1b; // LI=0, VN=3, Mode=3 (client)
+        if (sendto(sock, pkt, sizeof(pkt), 0, res->ai_addr, res->ai_addrlen) == (ssize_t)sizeof(pkt)
+            && recv(sock, pkt, sizeof(pkt), 0) == (ssize_t)sizeof(pkt)) {
+            int stratum = pkt[1];
+            // Transmit timestamp: 32-bit seconds since 1900, big-endian, at offset 40.
+            uint32_t ntpSecs = ((uint32_t)pkt[40] << 24) | ((uint32_t)pkt[41] << 16) | ((uint32_t)pkt[42] << 8) | (uint32_t)pkt[43];
+            // stratum 0 == "kiss o' death"/invalid; 16+ == unsynchronized.
+            // 2208988800 = seconds between the 1900 (NTP) and 1970 (Unix) epochs.
+            if (stratum > 0 && stratum < 16 && ntpSecs > 2208988800U) {
+                struct timespec ts { (time_t)(ntpSecs - 2208988800U), 0 };
+                ok = (clock_settime(CLOCK_REALTIME, &ts) == 0);
+            }
+        }
+        close(sock);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+// Ensure the clock is sane before fppd starts - called AFTER waitForInterfacesUp
+// so we know network is available. On RTC-less boards the clock boots stale (at
+// the image build date), which would make schedules and logs wrong. Rather than
+// block boot for ~20s waiting for the chrony daemon to step the clock, do a
+// quick one-shot SNTP set now and continue; the daemon refines it afterwards.
+void handleTimeSyncWait() {
+    int i = getRawSettingInt("bootDelay", -1);
+    if (i != -1) {
+        // Only do time sync wait in auto mode
+        return;
+    }
+
+    const std::string delayFile = FPP_MEDIA_DIR + "/tmp/boot_delay";
+    const std::string skipFile = FPP_MEDIA_DIR + "/tmp/boot_delay_skip";
+
+    // Check if there are any network interfaces that could get NTP time
+    // If not, skip - no point trying NTP on a device with no network
+    if (!hasNetworkInterfaceForNTP()) {
+        printf("FPP - No network interface found, skipping NTP time set\n");
+        unlink(delayFile.c_str());
+        unlink(skipFile.c_str());
+        return;
+    }
+
+    struct stat attr;
+    stat("/etc/fpp/rfs_version", &attr);
+    time_t fileTime = attr.st_ctime;
+    time_t currentTime = time(nullptr);
+
+    if (difftime(fileTime, currentTime) <= 0) {
+        // Clock is already at or past the image build date - nothing to do.
+        unlink(delayFile.c_str());
+        unlink(skipFile.c_str());
+        return;
+    }
+
+    // Clock is stale (no RTC). Do a fast SNTP set against the configured server
+    // and move on -- do NOT block on full NTP convergence. Use the first
+    // pool/server from chrony.conf so a site-local time server is honoured; fall
+    // back to FPP's pool.
+    std::string ntpHost = execAndReturn(
+        "/usr/bin/awk '/^(pool|server)[[:space:]]/ { print $2; exit }' /etc/chrony/chrony.conf 2>/dev/null");
+    TrimWhiteSpace(ntpHost);
+    if (ntpHost.empty()) {
+        ntpHost = "falconplayer.pool.ntp.org";
+    }
+
+    printf("FPP - System clock is stale; doing a quick SNTP set from %s\n", ntpHost.c_str());
+    sd_notify(0, "STATUS=Setting system clock via SNTP");
+    bool set = false;
+    for (int attempt = 0; attempt < 2 && !set; ++attempt) {
+        set = quickSntpSet(ntpHost, 2);
+    }
+    if (set) {
+        currentTime = time(nullptr);
+        struct tm tmNow;
+        localtime_r(&currentTime, &tmNow);
+        char buffer[26];
+        strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", &tmNow);
+        printf("FPP - Clock set via SNTP to %s; chrony will refine it in the background\n", buffer);
+    } else {
+        printf("FPP - Quick SNTP set failed (no time server reachable yet); continuing, chrony will sync when available\n");
+    }
+    unlink(delayFile.c_str());
+    unlink(skipFile.c_str());
+}
+
+void checkWLANInterface() {
+    if (contains(execAndReturn("/usr/bin/systemctl is-enabled wpa_supplicant@wlan0"), "enabled") && contains(execAndReturn("/usr/bin/systemctl is-active wpa_supplicant@wlan0"), "inactive")) {
+        printf("Need to restart wpa_supplicant@wlan0\n");
+        execbg("systemctl restart \"wpa_supplicant@wlan0.service\" &");
+    }
+}
+
+// Build the spoken "I Have Found The Following I P Addresses, ..." string from
+// the current non-tether IPv4 addresses. Returns "" if none are present yet.
+static std::string buildIPAnnounceString() {
+    std::string announce = "I Have Found The Following I P Addresses";
+    bool found = false;
+    struct ifaddrs* ifAddrStruct = NULL;
+    struct ifaddrs* ifa = NULL;
+    void* tmpAddrPtr = NULL;
+    getifaddrs(&ifAddrStruct);
+    for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) {
+            continue;
+        }
+        std::string nm = ifa->ifa_name;
+        if (startsWith(nm, "usb") || startsWith(nm, "lo")) {
+            continue;
+        }
+        if (ifa->ifa_addr->sa_family == AF_INET) { // check it is IP4
+            // is a valid IP4 Address
+            tmpAddrPtr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+            char addressBuffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+            std::string addr = addressBuffer;
+            if (isUpstreamAddress(addr)) {
+                printf("FPP - Found %s IP Address %s\n", ifa->ifa_name, addressBuffer);
+                announce += ", " + std::string(addressBuffer);
+                found = true;
+            }
+        }
+    }
+    if (ifAddrStruct != NULL) {
+        freeifaddrs(ifAddrStruct);
+    }
+    return found ? announce : "";
+}
+
+// A USB network adapter can enumerate, bind, and bring up its netdev, and then
+// have the USB link itself fail at the protocol layer: every register access
+// returns -EPROTO, the radio never associates, and the board runs perfectly
+// while being completely unreachable. Measured at roughly 5% of boots on one
+// adapter/controller pairing, and the box stays dark until someone walks out
+// to it.
+//
+// Nothing recovers this in software. Tried on hardware and rejected: unbind and
+// rebind on the usb driver (re-enumerates, then fails its descriptor reads and
+// never returns), disabling and re-enabling the root-hub port (leaves it "not
+// attached"), and unbinding the host controller (brings the controller back but
+// not the device). Even a physical replug does not reliably fix it. A reboot
+// does, so that is what this does.
+//
+// The whole difficulty is firing only for this failure and nothing else. All of
+// the following must hold:
+//   - a USB-attached network interface exists and has no carrier
+//   - no other interface has an address, so we are not already reachable
+//   - tethering is not the configured intent
+//   - this boot's kernel log shows USB protocol errors
+// That last condition is what separates a wedged adapter from an ordinary "no
+// access point in range", "wrong passphrase", or "AP is down" -- none of which a
+// reboot would fix, and all of which it would hide.
+static constexpr int USB_WEDGE_MAX_REBOOTS = 2;
+
+static std::string usbWedgeStateFile() {
+    // /var/tmp, not media/tmp (fppinit.service wipes that on stop, and this has
+    // to survive exactly the reboot it is counting) and not media/config (this
+    // is transient state, and a restored config backup must not carry a stale
+    // count into an unrelated box).
+    return "/var/tmp/fpp-usbnet-wedge-reboots";
+}
+
+// Attempts made recently. Deliberately expires: a box power-cycled hours later
+// should get a fresh pair of tries rather than inheriting a stale count.
+static int usbWedgeRebootCount() {
+    std::string c = GetFileContents(usbWedgeStateFile());
+    int count = 0;
+    long long when = 0;
+    if (c.empty() || sscanf(c.c_str(), "%d %lld", &count, &when) != 2) {
+        return 0;
+    }
+    if ((((long long)time(nullptr)) - when) > 3600) {
+        return 0;
+    }
+    return count;
+}
+
+static void clearUsbWedgeRebootCount() {
+    unlink(usbWedgeStateFile().c_str());
+}
+
+// USB port ids (e.g. "1-1.2") of USB-attached network interfaces that have no
+// carrier. An interface that has carrier is working even if DHCP has not
+// finished, and is none of our business.
+static std::set<std::string> carrierlessUsbNetDeviceIds() {
+    std::set<std::string> ids;
+    std::error_code dirEc;
+    for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net", dirEc)) {
+        std::string ifName = entry.path().filename();
+        if (ifName == "lo" || startsWith(ifName, "usb")) {
+            continue; // usb0/usb1 are the board's own gadget interfaces, not adapters
+        }
+        std::string carrier = GetFileContents(entry.path().string() + "/carrier");
+        TrimWhiteSpace(carrier);
+        if (carrier == "1") {
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::path dev = std::filesystem::canonical(entry.path() / "device", ec);
+        if (ec || dev.string().find("/usb") == std::string::npos) {
+            continue; // onboard MAC; a reboot is not indicated for it
+        }
+        // .../usb1/1-1/1-1.2/1-1.2:1.0 -- the interface node's parent is the USB
+        // device, and its name is the port id the kernel logs errors against.
+        std::string usbId = dev.parent_path().filename();
+        if (!usbId.empty() && usbId.find(':') == std::string::npos) {
+            ids.insert(usbId);
+        }
+    }
+    return ids;
+}
+
+static bool anyInterfaceHasAddress() {
+    struct ifaddrs* addrs = nullptr;
+    if (getifaddrs(&addrs) != 0) {
+        return true; // cannot tell: assume reachable and do not reboot
+    }
+    bool found = false;
+    for (struct ifaddrs* ifa = addrs; ifa && !found; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        std::string nm = ifa->ifa_name;
+        if (nm == "lo" || startsWith(nm, "usb")) {
+            continue;
+        }
+        uint32_t a = ntohl(((struct sockaddr_in*)ifa->ifa_addr)->sin_addr.s_addr);
+        if ((a >> 16) == 0xA9FE) {
+            continue; // 169.254/16 link-local is not a usable address
+        }
+        found = true;
+    }
+    freeifaddrs(addrs);
+    return found;
+}
+
+// The signature of a link that has failed below the driver: -EPROTO/-ETIMEDOUT
+// against the adapter's own USB port id.
+//
+// Anchoring on the port id is what keeps a flaky USB stick from rebooting a box
+// whose WiFi is merely out of range -- both conditions would otherwise be true
+// at once. Every line the kernel and the driver emit for this failure carries
+// the id, in both forms:
+//   usb 1-1.2: device descriptor read/64, error -71
+//   rtw88_8822bu 1-1.2:1.0: write register 0x5 failed with -71
+// Thresholded because one retried transfer is normal; a real wedge produces
+// thousands.
+static bool kernelLogShowsUsbProtocolFailure(const std::set<std::string>& usbIds) {
+    if (usbIds.empty()) {
+        return false;
+    }
+    std::string ids;
+    for (const auto& id : usbIds) {
+        if (!ids.empty()) {
+            ids += "|";
+        }
+        for (char c : id) { // the ids contain '.', which must not be a wildcard
+            if (c == '.') {
+                ids += "\\.";
+            } else {
+                ids += c;
+            }
+        }
+    }
+    std::string out = execAndReturn(
+        "/bin/dmesg 2>/dev/null | /bin/grep -cE '(" + ids + "):.*(error -(71|110)" +
+        "|failed with -(71|110)|fail, status: -(71|110))'");
+    TrimWhiteSpace(out);
+    return atoi(out.c_str()) >= 4;
+}
+
+// Set once a reboot has been asked for, so the rest of postNetwork can stop
+// doing work for a boot that is about to be thrown away.
+static std::atomic<bool> s_usbWedgeRebootPending{false};
+
+bool usbWedgeRebootPending() {
+    return s_usbWedgeRebootPending.load();
+}
+
+// Returns true if a reboot was requested. Does NOT block waiting for it.
+//
+// fppd's start depends on fpp_postnetwork, so anything that stalls this service
+// past its TimeoutStartSec takes fppd down with it. /usr/sbin/reboot is a
+// symlink to systemctl, which asks logind over D-Bus to set a wall message;
+// on an early-boot box that activation can time out. Calling it synchronously
+// hung this service for 37+ seconds until systemd killed it -- the reboot never
+// happened AND fppd never started, which is worse than the wedge being fixed.
+// So: go straight to the system manager (no logind), don't wait for the job,
+// and background the call so it cannot stall this thread no matter what.
+static bool rebootIfUsbNetWedged() {
+    if (getRawSettingInt("AutoRebootOnUSBNetworkFailure", 1) == 0) {
+        return false;
+    }
+    if (getRawSettingInt("EnableTethering", 0) == 1) {
+        return false; // no upstream network is expected; being without one is the plan
+    }
+    std::set<std::string> stalled = carrierlessUsbNetDeviceIds();
+    if (stalled.empty()) {
+        return false; // no USB adapter in trouble, so a reboot cannot be the answer
+    }
+    if (anyInterfaceHasAddress()) {
+        return false; // reachable some other way; never reboot a box that is fine
+    }
+    if (!kernelLogShowsUsbProtocolFailure(stalled)) {
+        printf("FPP - USB network adapter has no carrier, but its USB link is healthy "
+               "(no access point in range?); not rebooting\n");
+        return false;
+    }
+    int count = usbWedgeRebootCount();
+    if (count >= USB_WEDGE_MAX_REBOOTS) {
+        printf("FPP - USB network adapter is wedged, but %d reboots have not cleared it; "
+               "staying up rather than looping\n",
+               count);
+        return false;
+    }
+    printf("FPP - USB network adapter is wedged: USB protocol errors, no carrier, and no "
+           "other network. Rebooting (attempt %d of %d).\n",
+           count + 1, USB_WEDGE_MAX_REBOOTS);
+    PutFileContents(usbWedgeStateFile(),
+                    std::to_string(count + 1) + " " + std::to_string((long long)time(nullptr)));
+    sync();
+    s_usbWedgeRebootPending = true;
+    // Forced reboot, not a graceful one. The condition being recovered from is a
+    // wedged USB stack, which is precisely what stops a graceful shutdown from
+    // finishing: tasks block in uninterruptible sleep on the dead device, so
+    // neither SIGTERM nor SIGKILL clears them. Measured on hardware, an ordinary
+    // "systemctl start reboot.target" began stopping units 8s after this point
+    // and then sat there for 37 minutes, the controller logging
+    // "musb-hdrc: VBUS_ERROR in a_wait_bcon" while it churned -- the board was
+    // unreachable that whole time, which is the outage this is supposed to end.
+    // sync() above is what makes skipping the unmounts acceptable; the sysrq
+    // fallback covers systemctl itself being unable to run.
+    execbg("( /bin/systemctl --force --force reboot"
+           " || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; } ) &");
+    return true;
+}
+
+// WiFi interfaces with client settings, which may still associate and get an
+// address. Read from the config, so it includes adapters that are not present.
+static std::set<std::string> wifiClientInterfaces() {
+    std::set<std::string> ret;
+    int tetherEnabled = getRawSettingInt("EnableTethering", 0);
+    std::string tetherInterface;
+    if (tetherEnabled == 1) {
+        tetherInterface = FindTetherWIFIAdapater(); // its settings describe the AP, not a client
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(FPP_MEDIA_DIR + "/config", ec)) {
+        std::string name = entry.path().filename();
+        if (!startsWith(name, "interface.wl") || name.substr(10) == tetherInterface) {
+            continue;
+        }
+        auto settings = loadSettingsFile(entry.path());
+        if (!settings["SSID"].empty() && settings["SSID"] != "\"\"") {
+            ret.insert(name.substr(10));
+        }
+    }
+    // A hand-written supplicant config counts too
+    for (const auto& entry : std::filesystem::directory_iterator("/etc/wpa_supplicant", ec)) {
+        std::string name = entry.path().filename();
+        if (startsWith(name, "wpa_supplicant-wl") && endsWith(name, ".conf")) {
+            ret.insert(name.substr(15, name.size() - 15 - 5));
+        }
+    }
+    return ret;
+}
+
+// An address can only come from a wired interface once it has carrier (static
+// configs are not applied without it), or from a present WiFi adapter with
+// client settings. With neither, a first boot would sit out the whole wait
+// before tethering comes up, so for a board with no wired port and no
+// configured WiFi adapter, the wait ends once the set of interfaces has held
+// still for a moment -- enough for USB adapters enumerating one after another
+// behind a hub (seen ~1s apart).
+//
+// A wired port without carrier is never written off early: carrier cannot tell
+// "no cable" from "still autonegotiating", which took 5.1s on a Pi 5 against a
+// gigabit switch. Giving up there started tethering, then tore it down when
+// DHCP landed a few seconds later.
+//
+// A configured WiFi adapter that is absent is not worth waiting for: postNetwork
+// runs after network.target, which wpa_supplicant@<if> orders itself before, so
+// by now its start job has either seen the adapter appear or given up on it
+// (JobTimeoutSec in etc/systemd/wpa_supplicant@.service.d). If it turns up
+// later, udev starts its supplicant then.
+class UpstreamLinkWatch {
+public:
+    static constexpr int SETTLE_ITERATIONS = 20; // x 200ms
+
+    enum class State {
+        NONE,     // nothing can get an address
+        POSSIBLE, // something may still get link
+        LINK      // something has link; its address may be about to land
+    };
+
+    explicit UpstreamLinkWatch(std::set<std::string> wifiClients) :
+        wifiClients(std::move(wifiClients)) {}
+
+    State check(int count) {
+        std::set<std::string> state;
+        bool possible = false;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net", ec)) {
+            std::string dev = entry.path().filename();
+            if (dev == "lo" || startsWith(dev, "usb") || !FileExists(entry.path().string() + "/device")) {
+                continue; // loopback, the board's own gadget links, virtual devices
+            }
+            std::string flags = GetFileContents(entry.path().string() + "/flags");
+            bool up = strtol(flags.c_str(), nullptr, 16) & IFF_UP;
+            state.insert(dev + (up ? ":up" : ":down"));
+            if (FileExists(entry.path().string() + "/wireless") && !wifiClients.count(dev)) {
+                continue; // no client config, so it can only ever be the tether AP
+            }
+            std::string carrier = GetFileContents(entry.path().string() + "/carrier");
+            TrimWhiteSpace(carrier);
+            if (carrier == "1") {
+                return State::LINK;
+            }
+            possible = true;
+        }
+        if (state != lastState) {
+            lastState = state;
+            lastChange = count;
+        }
+        if (possible || lastState.empty() || (count - lastChange) < SETTLE_ITERATIONS) {
+            return State::POSSIBLE;
+        }
+        return State::NONE;
+    }
+
+private:
+    std::set<std::string> wifiClients;
+    std::set<std::string> lastState;
+    int lastChange = 0;
+};
+
+bool waitForInterfacesUp(int timeOut, bool allowUsbRecovery) {
+    int count = 0;
+    UpstreamLinkWatch linkWatch(wifiClientInterfaces());
+    // If no network interfaces have carrier/link, don't wait for IP address - likely no network available and no point waiting for DHCP/NTP
+    while (!hasNetworkInterfaceForNTP()) {
+        UpstreamLinkWatch::State link = linkWatch.check(count);
+        if (link == UpstreamLinkWatch::State::LINK) {
+            // Has link but no address yet: DHCP gets the rest of the timeOut
+            // below rather than being cut off at the halfway mark.
+            break;
+        }
+        bool giveUp = count >= (timeOut / 2); // spend half the timeOut waiting for interfaces to have link, then give up
+        if (!giveUp && link == UpstreamLinkWatch::State::NONE) {
+            printf("FPP - No wired port and no configured WiFi adapter present; nothing can get an address\n");
+            giveUp = true;
+        }
+        if (giveUp) {
+            // Before writing the network off, check for a USB adapter whose USB
+            // link has died, which only a reboot clears.
+            //
+            // Opt-in, and only the boot path opts in. The tether callers below
+            // are driven by networkd-dispatcher on carrier changes, and rebooting
+            // from a carrier-change handler is a boot loop with extra steps.
+            if (allowUsbRecovery && rebootIfUsbNetWedged()) {
+                // Reboot is queued. Return at once and let the caller skip the
+                // rest of postNetwork: this service is on fppd's dependency
+                // chain, so overrunning its start timeout here would fail fppd
+                // for the few seconds of life this boot has left.
+                return false;
+            }
+            printf("FPP - No network interfaces with link detected after waiting for %d ms, skipping IP wait\n", count * 200);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ++count;
+    }
+    printf("FPP - Waited for %0.1f seconds for network interfaces to have link...\n", (((float)count) * 0.2));
+    std::string announce;
+    do {
+        announce = buildIPAnnounceString();
+        if (announce.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            ++count;
+        }
+    } while (announce.empty() && (count < timeOut));
+    if (announce.empty()) {
+        printf("FPP - Could not get a valid IP address\n");
+        return false;
+    }
+    printf("FPP - Waited for %0.1f seconds for IP address\n", (((float)count) * 0.2f));
+    // Network came up, so whatever the last wedge was, it is over. Clearing here
+    // rather than letting the count expire keeps the next occurrence entitled to
+    // its full pair of attempts.
+    clearUsbWedgeRebootCount();
+    return true;
+}
+
+// Announce the device's IP address(es) over audio with flite + pw-play. Invoked
+// from fpp-announce-ip.service (ordered after fpp_postnetwork and the PipeWire
+// services) rather than inline in postNetwork, so the CPU-heavy flite synthesis
+// doesn't compete with the tail of postNetwork / fppd startup on single-core
+// boards. Network is already up by the time the service runs.
+void announceIPAddresses() {
+    if (getRawSettingInt("disableIPAnnouncement", 0) || !FileExists("/usr/bin/flite")) {
+        return;
+    }
+    std::string announce = buildIPAnnounceString();
+    // postNetwork's IP wait can time out with the DHCP lease landing moments
+    // later; this service is off fppd's critical path, so give the address a
+    // bounded chance to appear rather than silently skipping the announcement.
+    for (int i = 0; announce.empty() && i < 75; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        announce = buildIPAnnounceString();
+    }
+    if (announce.empty()) {
+        printf("FPP - announceIP: no usable IP address to announce\n");
+        return;
+    }
+    // flite is an ALSA client, so playing directly (flite -t) would route
+    // through the pipewire-alsa plugin + /root/.asoundrc -- the fragile ALSA
+    // chain we're retiring. Instead render to a WAV and play it through PipeWire
+    // natively with pw-play. pw-play needs the runtime env vars to find FPP's
+    // PipeWire instance at /run/pipewire-fpp. /run/fppd is created by setupAudio.
+    // Both halves are hard-capped. A PipeWire graph that cannot reach a working
+    // sink does not fail pw-play -- the node parks in error and the stream never
+    // starts *or* ends, so pw-play blocks in poll() indefinitely. Unbounded, that
+    // turns a cosmetic audio problem into an unbootable box. The real fix is
+    // upstream (FPP now stops WirePlumber from creating a second node fighting
+    // for the same PCM), but nothing about announcing an IP address is worth
+    // risking a hung boot service over, so cap it here too.
+    const std::string announceWav = "/run/fppd/ip-announce.wav";
+    std::string fliteCmd =
+        "/usr/bin/timeout 60 /usr/bin/flite -voice awb -t \"" + announce + "\" -o " + announceWav +
+        " && PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp"
+        " /usr/bin/timeout 60 /usr/bin/pw-play " +
+        announceWav;
+    exec(fliteCmd);
+    unlink(announceWav.c_str()); // don't leave the rendered WAV behind in /run
+}
+// Turn off 802.11 power saving on every wireless interface. A show controller
+// wants its network responsive, not its radio dozing between beacons; the power
+// saved is irrelevant on a mains-powered board.
+//
+// Was dead code until now -- written but never called, from the commit that
+// introduced it -- so this had simply never run. The drivers in use happen to
+// default power_save off, which is why nobody noticed; this makes it true by
+// intent rather than by luck, and covers an adapter whose driver defaults the
+// other way.
+void disableWLANPowerManagement() {
+    struct ifaddrs* ifAddrStruct = NULL;
+    getifaddrs(&ifAddrStruct);
+    // getifaddrs yields one entry per address family, so a single interface shows
+    // up as AF_PACKET plus AF_INET plus AF_INET6. Collect names first: otherwise
+    // this forks iw two or three times per adapter for no reason.
+    std::set<std::string> wireless;
+    for (struct ifaddrs* ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) {
+            continue;
+        }
+        std::string nm = ifa->ifa_name;
+        if (startsWith(nm, "wl")) {
+            wireless.insert(nm);
+        }
+    }
+    if (ifAddrStruct != NULL) {
+        freeifaddrs(ifAddrStruct);
+    }
+    for (const auto& nm : wireless) {
+        printf("FPP - Disabling power saving for %s\n", nm.c_str());
+        exec("/usr/sbin/iw dev " + ShellSingleQuote(nm) + " set power_save off 2>/dev/null > /dev/null");
+    }
+}
+
+void maybeEnableTethering() {
+    int te = getRawSettingInt("EnableTethering", 0);
+    if (te == 0) {
+        bool found = false;
+        struct ifaddrs* ifAddrStruct = NULL;
+        struct ifaddrs* ifa = NULL;
+        void* tmpAddrPtr = NULL;
+        getifaddrs(&ifAddrStruct);
+        for (ifa = ifAddrStruct; ifa != NULL; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr) {
+                continue;
+            }
+            std::string nm = ifa->ifa_name;
+            if (startsWith(nm, "usb") || startsWith(nm, "lo")) {
+                continue;
+            }
+            if (ifa->ifa_addr->sa_family == AF_INET) { // check it is IP4
+                // is a valid IP4 Address
+                tmpAddrPtr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+                char addressBuffer[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+                std::string addr = addressBuffer;
+                if (isUpstreamAddress(addr)) {
+                    found = true;
+                }
+            }
+        }
+        if (ifAddrStruct != NULL) {
+            freeifaddrs(ifAddrStruct);
+        }
+        if (!found) {
+            // Before enabling tethering, check if any wired interface has carrier/link.
+            // If a cable is connected, DHCP will likely succeed shortly - don't enable tethering.
+            // This matches the original bash MaybeEnableTethering logic that checked ethtool link.
+            bool hasWiredLink = false;
+            for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net/")) {
+                std::string dev = entry.path().filename();
+                if (startsWith(dev, "eth") || startsWith(dev, "en") || startsWith(dev, "br") || startsWith(dev, "bond")) {
+                    std::string carrierPath = "/sys/class/net/" + dev + "/carrier";
+                    if (FileExists(carrierPath)) {
+                        std::string carrier = GetFileContents(carrierPath);
+                        TrimWhiteSpace(carrier);
+                        if (carrier == "1") {
+                            printf("FPP - Wired interface %s has link, not enabling tethering\n", dev.c_str());
+                            hasWiredLink = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (hasWiredLink) {
+                // A wired interface has link - DHCP should complete soon.
+                // Don't enable tethering; the routable.d/check_tether dispatcher
+                // will clean up tethering if it was enabled from a previous boot.
+                return;
+            }
+            // Check if the tether interface has a wifi client configuration
+            std::string tetherInterface = FindTetherWIFIAdapater();
+            std::string interfaceConfigFile = FPP_MEDIA_DIR + "/config/interface." + tetherInterface;
+            if (FileExists(interfaceConfigFile)) {
+                auto interfaceSettings = loadSettingsFile(interfaceConfigFile);
+                if (!interfaceSettings["SSID"].empty()) {
+                    // WiFi client config exists - give it time to connect and get DHCP
+                    printf("FPP - %s has WiFi SSID configured, waiting up to 12s for connection and DHCP...\n", tetherInterface.c_str());
+                    int waitCount = 0;
+                    bool gotIP = false;
+                    bool connected = false;
+                    while (waitCount < 24 && !gotIP && !connected) { // 24 * 500ms = 12 seconds
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        // Check for IP address
+                        struct ifaddrs* ifAddrCheck = NULL;
+                        if (getifaddrs(&ifAddrCheck) == 0) {
+                            for (struct ifaddrs* ifa = ifAddrCheck; ifa != NULL; ifa = ifa->ifa_next) {
+                                if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+                                    std::string ifname = ifa->ifa_name;
+                                    if (ifname == tetherInterface) {
+                                        void* tmpAddrPtr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+                                        char addressBuffer[INET_ADDRSTRLEN];
+                                        inet_ntop(AF_INET, tmpAddrPtr, addressBuffer, INET_ADDRSTRLEN);
+                                        std::string addr = addressBuffer;
+                                        if (!contains(addr, "169.254.")) { // Ignore link-local
+                                            printf("FPP - %s got IP address %s\n", tetherInterface.c_str(), addr.c_str());
+                                            gotIP = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            freeifaddrs(ifAddrCheck);
+                        }
+                        // Also check if connected to AP (even without IP yet)
+                        if (!gotIP && waitCount > 10) { // After 5 seconds, start checking connection status
+                            std::string iwOutput = execAndReturn("/usr/sbin/iw " + ShellSingleQuote(tetherInterface) + " link");
+                            if (contains(iwOutput, "Connected to")) {
+                                printf("FPP - %s connected to WiFi, keeping WiFi config active\n", tetherInterface.c_str());
+                                connected = true;
+                            }
+                        }
+                        if (gotIP || connected)
+                            break;
+                        waitCount++;
+                    }
+                    if (!gotIP && !connected) {
+                        printf("FPP - %s no IP or connection after 12s, enabling tethering\n", tetherInterface.c_str());
+                        te = 1;
+                    }
+                } else {
+                    // Interface config exists but no SSID - enable tethering
+                    te = 1;
+                }
+            } else {
+                // did not find an ip address and no wifi client config exists
+                te = 1;
+            }
+        }
+    }
+    std::string tetherInterface = FindTetherWIFIAdapater();
+    if (te == 1) {
+        if (!FileExists("/sys/class/net/" + tetherInterface)) {
+            printf("No interface for tethering.\n");
+            te = 2;
+        }
+    }
+    if (te == 1) {
+        std::string c = CreateHostAPDConfig(tetherInterface);
+        PutFileContents("/etc/hostapd/hostapd.conf", c);
+
+        // Remove wpa_supplicant config if it exists (switching from client to AP mode)
+        std::string wpaConfig = "/etc/wpa_supplicant/wpa_supplicant-" + tetherInterface + ".conf";
+        if (FileExists(wpaConfig)) {
+            printf("FPP - Removing wpa_supplicant config for %s to enable tethering\n", tetherInterface.c_str());
+            unlink(wpaConfig.c_str());
+            exec("/usr/bin/systemctl stop " + ShellSingleQuote("wpa_supplicant@" + tetherInterface + ".service"));
+            exec("/usr/bin/systemctl disable " + ShellSingleQuote("wpa_supplicant@" + tetherInterface + ".service"));
+        }
+
+        std::string content = "[Match]\nName=";
+        content.append(tetherInterface).append("\nType=wlan\n\n"
+                                               "[Network]\n"
+                                               "DHCP=no\n"
+                                               "Address=192.168.8.1/24\n"
+                                               "DHCPServer=yes\n\n");
+
+        AppendTetherDHCPServerSection(content, tetherInterface);
+        PutFileContents("/etc/systemd/network/10-" + tetherInterface + ".network", content);
+        unblockWifi();
+        exec("/usr/bin/systemctl reload-or-restart systemd-networkd.service");
+        unblockWifi();
+        exec("/usr/bin/systemctl reload-or-restart hostapd.service");
+        // Only the boot-time symlink is wanted here. Plain "enable" also syncs
+        // hostapd's SysV init script through update-rc.d and then reloads the
+        // manager: measured 4.75s on a PocketBeagle2 even when already enabled,
+        // on fppd's startup path. systemd ignores the init script since a native
+        // unit exists, and nothing needs a reload to see a new wants link.
+        exec("SYSTEMCTL_SKIP_SYSV=1 /usr/bin/systemctl enable --no-reload hostapd.service");
+    }
+}
+void detectNetworkModules() {
+    std::string content;
+    for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net/")) {
+        const std::string filename = entry.path().filename();
+        std::string modName = "/sys/class/net/" + filename + "/device/driver/module";
+        if (FileExists(modName)) {
+            char buf[256];
+            size_t l = readlink(modName.c_str(), buf, sizeof(buf));
+            buf[l] = 0;
+            std::string mod = buf;
+            mod = mod.substr(mod.rfind("/") + 1);
+            content += mod;
+            content += "\n";
+        }
+    }
+    if (!content.empty()) {
+        PutFileContents("/etc/modules-load.d/fpp-network.conf", content);
+        // PutFileContents("/home/fpp/media/config/fpp-network-modules.conf", content);
+    }
+}
+void removeDummyInterface() {
+    exec("ip link delete dummy0 > /dev/null 2>&1");
+}

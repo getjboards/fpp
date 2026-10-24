@@ -1,474 +1,308 @@
 /*
- *   FrameBuffer Virtual Matrix handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#include <fcntl.h>
-#include <linux/kd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "fpp-pch.h"
 
-#include "common.h"
-#include "log.h"
+#include "fpp-json.h"
+
+#include "../common.h"
+#include "../log.h"
+
 #include "FBMatrix.h"
-#include "settings.h"
+#include "ChannelOutputSetup.h"
+#include "overlays/PixelOverlay.h"
 
-/////////////////////////////////////////////////////////////////////////////
-// To disable interpolated scaling on the GPU, add this to /boot/config.txt:
-// scaling_kernel=8
+#include "../Plugin.h"
+
+class FBMatrixPlugin : public FPPPlugins::Plugin, public FPPPlugins::ChannelOutputPlugin {
+public:
+    FBMatrixPlugin() :
+        FPPPlugins::Plugin("FBMatrix") {
+    }
+    virtual ChannelOutput* createChannelOutput(unsigned int startChannel, unsigned int channelCount) override {
+        return new FBMatrixOutput(startChannel, channelCount);
+    }
+};
+
+extern "C" {
+FPPPlugins::Plugin* createPlugin() {
+    return new FBMatrixPlugin();
+}
+}
 
 /*
  *
  */
 FBMatrixOutput::FBMatrixOutput(unsigned int startChannel,
-	unsigned int channelCount)
-  : ThreadedChannelOutputBase(startChannel, channelCount),
-	m_fbFd(0),
-	m_ttyFd(0),
-	m_width(0),
-	m_height(0),
-	m_useRGB(0),
-	m_inverted(0),
-	m_bpp(24),
-	m_device("/dev/fb0"),
-	m_fbp(nullptr),
-	m_screenSize(0),
-	m_lastFrame(nullptr),
-	m_rgb565map(nullptr)
-{
-	LogDebug(VB_CHANNELOUT, "FBMatrixOutput::FBMatrixOutput(%u, %u)\n",
-		startChannel, channelCount);
-
-	m_useDoubleBuffer = 1;
+                               unsigned int channelCount) :
+    ChannelOutput(startChannel, channelCount) {
+    LogDebug(VB_CHANNELOUT, "FBMatrixOutput::FBMatrixOutput(%u, %u)\n",
+             startChannel, channelCount);
 }
 
 /*
  *
  */
-FBMatrixOutput::~FBMatrixOutput()
-{
-	LogDebug(VB_CHANNELOUT, "FBMatrixOutput::~FBMatrixOutput()\n");
+FBMatrixOutput::~FBMatrixOutput() {
+    LogDebug(VB_CHANNELOUT, "FBMatrixOutput::~FBMatrixOutput()\n");
 
-	if (m_lastFrame)
-		free(m_lastFrame);
+    // Close() normally does this, but Init() can return failure after the
+    // listener is registered, and a failed output is deleted without a Close().
+    // A listener left pointing at a freed FBMatrixOutput is the very bug this
+    // is here to prevent, one level up.
+    if (!m_modelListenerName.empty()) {
+        PixelOverlayManager::INSTANCE.removeModelListener(modelName, m_modelListenerName);
+        m_modelListenerName.clear();
+    }
 
-	if (m_rgb565map)
-	{
-		for (int r = 0; r < 32; r++)
-		{
-			for (int g = 0; g < 64; g++)
-			{
-				delete[] m_rgb565map[r][g];
-			}
+    if (buffer)
+        delete[] buffer;
+}
 
-			delete[] m_rgb565map[r];
-		}
+int FBMatrixOutput::Init(Json::Value config) {
+    LogDebug(VB_CHANNELOUT, "FBMatrixOutput::Init()\n");
 
-		delete[] m_rgb565map;
-	}
+    if (config.isMember("modelName"))
+        modelName = config["modelName"].asString();
+
+    LogDebug(VB_CHANNELOUT, "FBMatrix::Init: modelName='%s', empty=%d\n", modelName.c_str(), modelName == "");
+
+    if (modelName == "") {
+        int width = 0;
+        int height = 0;
+        std::string device;
+
+        if ((config.isMember("width")) &&
+            (config.isMember("height")) &&
+            (config.isMember("device"))) {
+            width = config["width"].asInt();
+            height = config["height"].asInt();
+            device = config["device"].asString();
+
+            replaceStart(device, "/dev/");
+            modelName = "FB - ";
+            modelName += device;
+
+            LogDebug(VB_CHANNELOUT, "FBMatrix: Checking for existing model '%s', hasModel=%d\n",
+                     modelName.c_str(), PixelOverlayManager::INSTANCE.getModel(modelName) != nullptr);
+
+            // Delete existing model if it exists, so we can recreate with PixelSize
+            if (PixelOverlayManager::INSTANCE.getModel(modelName)) {
+                LogDebug(VB_CHANNELOUT, "FBMatrix: Removing existing model '%s' to recreate with PixelSize\n", modelName.c_str());
+                PixelOverlayManager::INSTANCE.removeAutoOverlayModel(modelName);
+            }
+
+            if (width && height && (device != "")) {
+                Json::Value val;
+                val["Name"] = modelName;
+                val["Type"] = "FB";
+                val["Width"] = width;
+                val["Height"] = height;
+                val["Device"] = device;
+                val["autoCreated"] = true;
+                
+                // Pass through pixelSize if specified in config
+                if (config.isMember("pixelSize")) {
+                    int ps = config["pixelSize"].asInt();
+                    val["PixelSize"] = ps;
+                    LogDebug(VB_CHANNELOUT, "FBMatrix: Setting PixelSize=%d for model '%s'\n", ps, modelName.c_str());
+                } else {
+                    LogDebug(VB_CHANNELOUT, "FBMatrix: No pixelSize in config for model '%s'\n", modelName.c_str());
+                }
+
+                PixelOverlayManager::INSTANCE.addModel(val);
+                m_autoCreatedFBModelName = modelName;
+            } else {
+                LogErr(VB_CHANNELOUT, "Empty Pixel Overlay Model name\n");
+                AddOutputConfigWarning(35, "VirtualMatrix: Empty Pixel Overlay Model name");
+                return 0;
+            }
+        } else {
+            LogErr(VB_CHANNELOUT, "Empty Pixel Overlay Model name\n");
+            AddOutputConfigWarning(35, "VirtualMatrix: Empty Pixel Overlay Model name");
+            return 0;
+        }
+    }
+
+    // Track the model rather than caching a bare pointer: an auto-created FB
+    // model is destroyed by removeAutoOverlayModel() whenever the outputs are
+    // reloaded, and the channel output thread can be inside PrepData()/
+    // SendData() at that moment.
+    m_modelListenerName = "FBMatrix" + std::to_string((uintptr_t)this);
+    PixelOverlayManager::INSTANCE.addModelListener(modelName, m_modelListenerName,
+        [this](PixelOverlayModel* m) {
+            std::lock_guard<std::mutex> lock(m_modelLock);
+            // buffer is sized for the model we saw in Init(), and SendData()
+            // hands it to model->setData(), which copies the *model's*
+            // width * height worth of bytes out of it.  A model re-created
+            // under the same name with other dimensions (a second
+            // VirtualMatrix on the same device, whose Init() replaces
+            // "FB - <device>") would turn that into a heap over-read, so only
+            // follow a replacement that still matches this output.
+            if (m && (m->getWidth() != width || m->getHeight() != height)) {
+                LogWarn(VB_CHANNELOUT, "FBMatrix: model '%s' is now %dx%d, this output is %dx%d; detaching\n",
+                        modelName.c_str(), m->getWidth(), m->getHeight(), width, height);
+                m = nullptr;
+            }
+            model = m;
+        });
+    model = PixelOverlayManager::INSTANCE.getModel(modelName);
+
+    if (!model) {
+        LogErr(VB_CHANNELOUT, "Invalid Pixel Overlay Model: '%s'\n", modelName.c_str());
+        AddOutputConfigWarning(35, "VirtualMatrix: Invalid Pixel Overlay Model: " + modelName);
+        return 0;
+    }
+
+    // buffer is 3 byte RGB and SendData() hands it to setData(), which reads
+    // the model's own bytes per pixel (4 for an RGBW submodel)
+    if (model->getBytesPerPixel() != 3) {
+        LogErr(VB_CHANNELOUT, "Pixel Overlay Model '%s' is not RGB\n", modelName.c_str());
+        AddOutputConfigWarning(35, "VirtualMatrix: model " + modelName + " is not an RGB model");
+        model = nullptr;
+        return 0;
+    }
+
+    width = model->getWidth();
+    height = model->getHeight();
+
+    // Calculate channel count from the model size
+    m_channelCount = width * height * 3;
+
+    inverted = config["invert"].asInt();
+    flipHorizontal = config["flipHorizontal"].asInt();
+
+    if (m_channelCount != (width * height * 3)) {
+        LogErr(VB_CHANNELOUT, "Error, channel count is incorrect\n");
+        AddOutputConfigWarning(35, "VirtualMatrix: Invalid Pixel Overlay Model: " + modelName);
+        return 0;
+    }
+
+    buffer = new unsigned char[width * height * 3];
+
+    if (PixelOverlayManager::INSTANCE.isAutoCreatePixelOverlayModels()) {
+        std::string dd = "VirtualMatrix";
+        if (config.isMember("description")) {
+            dd = config["description"].asString();
+        }
+        std::string desc = dd;
+        int count = 0;
+        while (PixelOverlayManager::INSTANCE.getModel(desc) != nullptr) {
+            count++;
+            desc = dd + "-" + std::to_string(count);
+        }
+        PixelOverlayManager::INSTANCE.addAutoOverlayModel(desc,
+                                                          m_startChannel, m_channelCount, 3,
+                                                          "H", "TL",
+                                                          height, 1);
+        m_autoCreatedModelName = desc;
+    }
+    return ChannelOutput::Init(config);
 }
 
 /*
  *
  */
-int FBMatrixOutput::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "FBMatrixOutput::Init('%s')\n", configStr);
+int FBMatrixOutput::Close(void) {
+    LogDebug(VB_CHANNELOUT, "FBMatrixOutput::Close()\n");
+    if (!m_modelListenerName.empty()) {
+        PixelOverlayManager::INSTANCE.removeModelListener(modelName, m_modelListenerName);
+        m_modelListenerName.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_modelLock);
+        model = nullptr;
+    }
+    if (!m_autoCreatedModelName.empty()) {
+        PixelOverlayManager::INSTANCE.removeAutoOverlayModel(m_autoCreatedModelName);
+    }
+    if (!m_autoCreatedFBModelName.empty()) {
+        PixelOverlayManager::INSTANCE.removeAutoOverlayModel(m_autoCreatedFBModelName);
+    }
+    return ChannelOutput::Close();
+}
 
-	std::vector<std::string> configElems = split(configStr, ';');
+void FBMatrixOutput::PrepData(unsigned char* channelData) {
+    std::lock_guard<std::mutex> lock(m_modelLock);
+    if (!model || !buffer) {
+        return;
+    }
+    channelData += m_startChannel;
 
-	for (int i = 0; i < configElems.size(); i++)
-	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
+    LogExcess(VB_CHANNELOUT, "FBMatrixOutput::SendData(%p)\n",
+              channelData);
 
-		if (elem[0] == "layout")
-		{
-			m_layout = elem[1];
+    int stride = width * 3;
 
-			std::vector<std::string> parts = split(m_layout, 'x');
-			m_width  = atoi(parts[0].c_str());
-			m_height = atoi(parts[1].c_str());
-		}
-		else if (elem[0] == "colorOrder")
-		{
-			if (elem[1] == "RGB")
-				m_useRGB = 1;
-		}
-		else if (elem[0] == "invert")
-		{
-			m_inverted = atoi(elem[1].c_str());
-		}
-		else if (elem[0] == "device")
-		{
-			m_device = "/dev/";
-			m_device += elem[1];
-		}
-	}
+    for (int y = 0; y < height; y++) {
+        unsigned char* src = channelData + (y * stride);
+        // Vertical flip: write source row y into the mirrored destination row
+        int dstRow = inverted ? (height - 1 - y) : y;
+        unsigned char* dst = buffer + (dstRow * stride);
 
-	LogDebug(VB_CHANNELOUT, "Using FrameBuffer device %s\n", m_device.c_str());
-	m_fbFd = open(m_device.c_str(), O_RDWR);
-	if (!m_fbFd)
-	{
-		LogErr(VB_CHANNELOUT, "Error opening FrameBuffer device: %s\n", m_device.c_str());
-		return 0;
-	}
+        if (flipHorizontal) {
+            // Horizontal flip: reverse the pixel order within the row
+            unsigned char* sp = src;
+            unsigned char* dp = dst + ((width - 1) * 3);
+            for (int x = 0; x < width; x++) {
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+                dp[2] = sp[2];
+                sp += 3;
+                dp -= 3;
+            }
+        } else {
+            memcpy(dst, src, stride);
+        }
+    }
+}
 
-	if (ioctl(m_fbFd, FBIOGET_VSCREENINFO, &m_vInfo))
-	{
-		LogErr(VB_CHANNELOUT, "Error getting FrameBuffer info\n");
-		close(m_fbFd);
-		return 0;
-	}
+int FBMatrixOutput::SendData(unsigned char* channelData) {
+    std::lock_guard<std::mutex> lock(m_modelLock);
+    if (!model || !buffer) {
+        return m_channelCount;
+    }
+    if (model->getState() == 0) {
+        // Pass-through mode: the model isn't being driven by an active
+        // overlay/effect, so push the current sequence channels into it
+        // and draw to the framebuffer right here.
+        model->setData(buffer);
+        // doOverlay() takes the whole sequence buffer: a submodel's parent
+        // writes at its own absolute channels, and channelData here is this
+        // output's slice, starting m_startChannel in.  (A framebuffer model
+        // ignores the argument and draws its own data.)
+        model->doOverlay(channelData - m_startChannel);
+    }
+    // else: the model is acting as an overlay (e.g., a Pixel Overlay
+    // effect is writing into channelData via flushOverlayBuffer). Don't
+    // call setData here — that would overwrite the effect's data with
+    // m_seqData every frame and leave the framebuffer mostly black.
+    // doOverlays() in ProcessSequenceData() drives the framebuffer in
+    // that case via PixelOverlayModelFB::doOverlay().
+    return m_channelCount;
+}
 
-	memcpy(&m_vInfoOrig, &m_vInfo, sizeof(struct fb_var_screeninfo));
-
-	if (m_vInfo.bits_per_pixel == 32)
-		m_vInfo.bits_per_pixel = 24;
-
-	m_bpp = m_vInfo.bits_per_pixel;
-	LogDebug(VB_CHANNELOUT, "FrameBuffer is using %d BPP\n", m_bpp);
-
-	if ((m_bpp != 24) && (m_bpp != 16))
-	{
-		LogErr(VB_CHANNELOUT, "Do not know how to handle %d BPP\n", m_bpp);
-		close(m_fbFd);
-		return 0;
-	}
-
-	if (m_bpp == 16)
-	{
-		LogExcess(VB_CHANNELOUT, "Current Bitfield offset info:\n");
-		LogExcess(VB_CHANNELOUT, " R: %d (%d bits)\n", m_vInfo.red.offset, m_vInfo.red.length);
-		LogExcess(VB_CHANNELOUT, " G: %d (%d bits)\n", m_vInfo.green.offset, m_vInfo.green.length);
-		LogExcess(VB_CHANNELOUT, " B: %d (%d bits)\n", m_vInfo.blue.offset, m_vInfo.blue.length);
-
-		// RGB565
-		m_vInfo.red.offset    = 11;
-		m_vInfo.red.length    = 5;
-		m_vInfo.green.offset  = 5;
-		m_vInfo.green.length  = 6;
-		m_vInfo.blue.offset   = 0;
-		m_vInfo.blue.length   = 5;
-		m_vInfo.transp.offset = 0;
-		m_vInfo.transp.length = 0;
-
-		LogExcess(VB_CHANNELOUT, "New Bitfield offset info should be:\n");
-		LogExcess(VB_CHANNELOUT, " R: %d (%d bits)\n", m_vInfo.red.offset, m_vInfo.red.length);
-		LogExcess(VB_CHANNELOUT, " G: %d (%d bits)\n", m_vInfo.green.offset, m_vInfo.green.length);
-		LogExcess(VB_CHANNELOUT, " B: %d (%d bits)\n", m_vInfo.blue.offset, m_vInfo.blue.length);
-	}
-
-	m_vInfo.xres = m_vInfo.xres_virtual = m_width;
-	m_vInfo.yres = m_vInfo.yres_virtual = m_height;
-
-	// Config to set the screen back to when we are done
-	// Once we determine how this interacts with omxplayer, this may change
-	m_vInfoOrig.bits_per_pixel = 16;
-	m_vInfoOrig.xres = m_vInfoOrig.xres_virtual = 640;
-	m_vInfoOrig.yres = m_vInfoOrig.yres_virtual = 480;
-
-	if (ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfo))
-	{
-		LogErr(VB_CHANNELOUT, "Error setting FrameBuffer info\n");
-		close(m_fbFd);
-		return 0;
-	}
-
-	if (ioctl(m_fbFd, FBIOGET_FSCREENINFO, &m_fInfo))
-	{
-		LogErr(VB_CHANNELOUT, "Error getting fixed FrameBuffer info\n");
-		close(m_fbFd);
-		return 0;
-	}
-
-	m_screenSize = m_vInfo.xres * m_vInfo.yres * m_vInfo.bits_per_pixel / 8;
-
-	if (m_screenSize != (m_width * m_height * m_vInfo.bits_per_pixel / 8))
-	{
-		LogErr(VB_CHANNELOUT, "Error, screensize incorrect\n");
-		ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfoOrig);
-		close(m_fbFd);
-		return 0;
-	}
-
-	if (m_channelCount != (m_width * m_height * 3))
-	{
-		LogErr(VB_CHANNELOUT, "Error, channel count is incorrect\n");
-		ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfoOrig);
-		close(m_fbFd);
-		return 0;
-	}
-
-	if (m_device == "/dev/fb0")
-	{
-		m_ttyFd = open("/dev/console", O_RDWR);
-		if (!m_ttyFd)
-		{
-			LogErr(VB_CHANNELOUT, "Error, unable to open /dev/console\n");
-			ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfoOrig);
-			close(m_fbFd);
-			return 0;
-		}
-
-		// Hide the text console
-		ioctl(m_ttyFd, KDSETMODE, KD_GRAPHICS);
-	}
-
-	m_fbp = (char*)mmap(0, m_screenSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_fbFd, 0);
-
-	if ((char *)m_fbp == (char *)-1)
-	{
-		LogErr(VB_CHANNELOUT, "Error, unable to map /dev/fb0\n");
-		ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfoOrig);
-		close(m_fbFd);
-		return 0;
-	}
-
-	m_lastFrame = (unsigned char*)malloc(m_channelCount);
-	if (!m_lastFrame)
-	{
-		LogErr(VB_CHANNELOUT, "Error, unable to allocate lastFrame buffer\n");
-		ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfoOrig);
-		close(m_fbFd);
-		return 0;
-	}
-
-	if (m_bpp == 16)
-	{
-		LogExcess(VB_CHANNELOUT, "Generating RGB565Map for Bitfield offset info:\n");
-		LogExcess(VB_CHANNELOUT, " R: %d (%d bits)\n", m_vInfo.red.offset, m_vInfo.red.length);
-		LogExcess(VB_CHANNELOUT, " G: %d (%d bits)\n", m_vInfo.green.offset, m_vInfo.green.length);
-		LogExcess(VB_CHANNELOUT, " B: %d (%d bits)\n", m_vInfo.blue.offset, m_vInfo.blue.length);
-
-		unsigned char rMask = (0xFF ^ (0xFF >> m_vInfo.red.length));
-		unsigned char gMask = (0xFF ^ (0xFF >> m_vInfo.green.length));
-		unsigned char bMask = (0xFF ^ (0xFF >> m_vInfo.blue.length));
-		int rShift = m_vInfo.red.offset - (8 + (8-m_vInfo.red.length));
-		int gShift = m_vInfo.green.offset - (8 + (8 - m_vInfo.green.length));
-		int bShift = m_vInfo.blue.offset - (8 + (8 - m_vInfo.blue.length));;
-
-		//LogDebug(VB_CHANNELOUT, "rM/rS: 0x%02x/%d, gM/gS: 0x%02x/%d, bM/bS: 0x%02x/%d\n", rMask, rShift, gMask, gShift, bMask, bShift);
-
-		uint16_t o;
-		m_rgb565map = new uint16_t**[32];
-
-		for (uint16_t b = 0; b < 32; b++)
-		{
-			m_rgb565map[b] = new uint16_t*[64];
-			for (uint16_t g = 0; g < 64; g++)
-			{
-				m_rgb565map[b][g] = new uint16_t[32];
-				for (uint16_t r = 0; r < 32; r++)
-				{
-					o = 0;
-
-					if (rShift >= 0)
-						o |= r >> rShift;
-					else
-						o |= r << abs(rShift);
-
-					if (gShift >= 0)
-						o |= g >> gShift;
-					else
-						o |= g << abs(gShift);
-
-					if (bShift >= 0)
-						o |= b >> bShift;
-					else
-						o |= b << abs(bShift);
-
-					m_rgb565map[b][g][r] = o;
-				}
-			}
-		}
-	}
-
-	return ThreadedChannelOutputBase::Init(configStr);
+void FBMatrixOutput::GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) {
+    addRange(m_startChannel, m_startChannel + (width * height * 3) - 1);
 }
 
 /*
  *
  */
-int FBMatrixOutput::Close(void)
-{
-	LogDebug(VB_CHANNELOUT, "FBMatrixOutput::Close()\n");
-
-	munmap(m_fbp, m_screenSize);
-
-	if (m_device == "/dev/fb0")
-	{
-		if (ioctl(m_fbFd, FBIOPUT_VSCREENINFO, &m_vInfoOrig))
-			LogErr(VB_CHANNELOUT, "Error resetting variable info\n");
-	}
-
-	close(m_fbFd);
-
-	if (m_device == "/dev/fb0")
-	{
-		// Re-enable the text console
-		ioctl(m_ttyFd, KDSETMODE, KD_TEXT);
-		close(m_ttyFd);
-	}
-
-	return ChannelOutputBase::Close();
+void FBMatrixOutput::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "VirtualMatrixOutput::DumpConfig()\n");
+    LogDebug(VB_CHANNELOUT, "    model  : %s\n", modelName.c_str());
+    LogDebug(VB_CHANNELOUT, "    width  : %d\n", width);
+    LogDebug(VB_CHANNELOUT, "    height : %d\n", height);
+    LogDebug(VB_CHANNELOUT, "    flipV  : %d\n", inverted);
+    LogDebug(VB_CHANNELOUT, "    flipH  : %d\n", flipHorizontal);
 }
-
-/*
- *
- */
-int FBMatrixOutput::RawSendData(unsigned char *channelData)
-{
-	LogExcess(VB_CHANNELOUT, "FBMatrixOutput::SendData(%p)\n",
-		channelData);
-
-	int ostride = m_width * m_bpp / 8;
-	int srow = 0;
-	int drow = m_inverted ? m_height - 1 : 0;
-	unsigned char *s = channelData;
-	unsigned char *d;
-	unsigned char *l = m_lastFrame;
-	unsigned char *sR = channelData;
-	unsigned char *sG = channelData + 1;
-	unsigned char *sB = channelData + 2;
-	int skipped = 0;
-
-	if (m_bpp == 16)
-	{
-		for (int y = 0; y < m_height; y++)
-		{
-			d = (unsigned char *)m_fbp + (drow * ostride);
-			for (int x = 0; x < m_width; x++)
-			{
-				if (memcmp(l, sR, 3))
-				{
-					if (skipped)
-					{
-						sG += skipped * 3;
-						sB += skipped * 3;
-						d  += skipped * 2;
-					}
-
-					if (m_useRGB) // RGB data to BGR framebuffer
-						*((uint16_t*)d) = m_rgb565map[*sR >> 3][*sG >> 2][*sB >> 3];
-					else // BGR data to BGR framebuffer
-						*((uint16_t*)d) = m_rgb565map[*sB >> 3][*sG >> 2][*sR >> 3];
-
-					sG += 3;
-					sB += 3;
-					d += 2;
-				}
-				else
-				{
-					skipped++;
-				}
-
-				sR += 3;
-				l += 3;
-			}
-
-			srow++;
-			drow += m_inverted ? -1 : 1;
-		}
-	}
-	else if (m_useRGB)
-	{
-		unsigned char *dR;
-		unsigned char *dG;
-		unsigned char *dB;
-
-		for (int y = 0; y < m_height; y++)
-		{
-			// RGB data to BGR framebuffer
-			dR = (unsigned char *)m_fbp + (drow * ostride) + 2;
-			dG = (unsigned char *)m_fbp + (drow * ostride) + 1;
-			dB = (unsigned char *)m_fbp + (drow * ostride) + 0;
-
-			for (int x = 0; x < m_width; x++)
-			{
-				if (memcmp(l, sB, 3))
-				{
-					*dR = *sR;
-					*dG = *sG;
-					*dB = *sB;
-				}
-
-				sR += 3;
-				sG += 3;
-				sB += 3;
-				dR += 3;
-				dG += 3;
-				dB += 3;
-			}
-
-			srow++;
-			drow += m_inverted ? -1 : 1;
-		}
-	}
-	else
-	{
-		if (m_inverted)
-		{
-			int istride = m_width * 3;
-			unsigned char *src = channelData;
-			unsigned char *dst = (unsigned char *)m_fbp + (ostride * (m_height-1));
-
-			for (int y = 0; y < m_height; y++)
-			{
-				memcpy(dst, src, istride);
-				src += istride;
-				dst -= ostride;
-			}
-		}
-		else
-		{
-			memcpy(m_fbp, channelData, m_screenSize);
-		}
-	}
-
-	memcpy(m_lastFrame, channelData, m_channelCount);
-
-	return m_channelCount;
-}
-
-void FBMatrixOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = min + (m_width * m_height * 3) - 1;
-}
-
-/*
- *
- */
-void FBMatrixOutput::DumpConfig(void)
-{
-	LogDebug(VB_CHANNELOUT, "FBMatrixOutput::DumpConfig()\n");
-	LogDebug(VB_CHANNELOUT, "    layout : %s\n", m_layout.c_str());
-	LogDebug(VB_CHANNELOUT, "    width  : %d\n", m_width);
-	LogDebug(VB_CHANNELOUT, "    height : %d\n", m_height);
-}
-

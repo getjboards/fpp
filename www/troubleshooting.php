@@ -1,34 +1,487 @@
 <!DOCTYPE html>
-<html>
-<?php
-require_once('troubleshootingCommands.php');
-?>
+<html lang="en">
 
 <head>
-<?php include 'common/menuHead.inc'; ?>
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-<title><? echo $pageTitle; ?></title>
+    <?php
+    include 'common/htmlMeta.inc';
+    require_once 'common.php';
+    require_once 'config.php';
+    include 'common/menuHead.inc'; ?>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <title><? echo $pageTitle; ?></title>
 </head>
 
 <body>
-<div id="bodyWrapper">
-  <?php include 'menu.inc'; ?>
-  <div style="margin:0 auto;"> <br />
-    <fieldset style="padding: 10px; border: 2px solid #000;">
-      <legend>Troubleshooting Commands</legend>
-      <div style="overflow: hidden; padding: 10px;">
-    <div class="clear"></div>
-<?
-foreach ($commands as $title => $command)
-{
-?>
-				<h3><? echo $title . ':&nbsp;&nbsp;&nbsp;&nbsp;' . $command; ?></h3><pre><? echo $results[$command]; ?></pre><hr>
-<?
-}
-?>
-    </fieldset>
-  </div>
-  <?php include 'common/footer.inc'; ?>
-</div>
+    <div id="bodyWrapper">
+        <?php
+        $activeParentMenuItem = 'help';
+        include 'menu.inc'; ?>
+        <div class="mainContainer">
+
+            <h1 class="title">Troubleshooting</h1>
+            <div class="pageContent">
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+                    <h2 class="mb-0">Troubleshooting Commands</h2>
+                    <button type="button" class="btn btn-outline-secondary btn-sm"
+                        onclick="DisplayErrorReportDialog();"
+                        title="Builds a diagnostic report on this FPP and helps you send it, then reference it on a GitHub issue.">
+                        <i class="fas fa-bug me-1"></i>Diagnostic Report
+                    </button>
+                </div>
+
+                <ul class="nav nav-pills mb-3 pageContent-tabs" id="pills-tab" role="tablist">
+                    <?
+                    //LoadCommands
+                    $troubleshootingCommandsLoaded = 0;
+                    LoadTroubleShootingCommands();
+                    $troubleshootingCommandGroups = FilterTroubleshootingCommandsByLevel($troubleshootingCommandGroups);
+                    $target_platforms = array('all', $settings['Platform']);
+
+                    //Display Nav Tabs - one per group
+                    foreach (array_keys($troubleshootingCommandGroups) as $commandGrpID) {
+                        //Loop through groupings
+                        //Display group if relevant for current platform
+                        if (count(array_intersect($troubleshootingCommandGroups[$commandGrpID]["platforms"], $target_platforms)) > 0) {
+                            echo "<li class=\"nav-item\" role=\"presentation\">";
+                            echo "<button class=\"nav-link" . ($commandGrpID == array_key_first($troubleshootingCommandGroups) ? " active" : "") . "\" id=\"pills-" . $commandGrpID . "-tab\" data-bs-toggle=\"pill\" data-bs-target=\"#pills-" . $commandGrpID . "\" type=\"button\" role=\"tab\" aria-controls=\"pills-" . $commandGrpID . "\" aria-selected=\"true\">" . $troubleshootingCommandGroups[$commandGrpID]["grpDisplayTitle"] . "<span class=\"text-nowrap\" id=\"tabstatus-" . $commandGrpID . "\"></span></button>";
+                            echo "</li>";
+                        }
+                    }
+                    ?>
+                </ul>
+
+
+                <div class="tab-content" id="pills-tabContent">
+                    <?
+                    ////Display Command Contents
+                    foreach ($troubleshootingCommandGroups as $commandGrpID => $commandGrp) {
+                        //Loop through groupings
+                        //Display group if relevant for current platform
+                        // Packed to content width rather than a fixed column count.  A
+                        // grid forces one column width on every group, and these groups
+                        // have very different title lengths -- wide enough for "GStreamer
+                        // Elements & Plugins" plus its count badge left the short-named
+                        // groups sparse, and narrow enough for "Wired" wrapped the long
+                        // ones and pushed their badges onto a line of their own.
+                        ${'hotlinks-' . $commandGrpID} = "<div class=\"d-flex flex-wrap column-gap-4 row-gap-1 mb-3\">";
+                        if (count(array_intersect($troubleshootingCommandGroups[$commandGrpID]["platforms"], $target_platforms)) > 0) {
+                            echo "<div class=\"tab-pane fade\"  id=\"pills-" . $commandGrpID . "\" role=\"tabpanel\" aria-labelledby=\"pills-" . $commandGrpID . "-tab\">";
+                            ?>
+                            <div id="troubleshooting-grp-<? echo $commandGrpID; ?>" class="backdrop">
+                                <h4><? echo $commandGrp["grpDescription"]; ?></h4>
+                                <div id="troubleshooting-hot-links-<? echo $commandGrpID; ?>"> </div>
+                            </div>
+                            <hr>
+                            <div style="overflow: hidden; padding: 10px;">
+
+                                <?
+                                //Loop through commands in grp
+                                echo "<div id=\"troubleshooting-results-" . $commandGrpID . "\">";
+                                foreach ($commandGrp["commands"] as $commandKey => $commandID) {
+                                    //Display command if relevant for current platform
+                                    if (count(array_intersect($commandID["platforms"], $target_platforms)) > 0) {
+                                        $commandTitle = $commandID["title"];
+                                        $commandCmd = $commandID["cmd"];
+                                        $commandDesc = $commandID["description"];
+                                        $header = "header_" . $commandKey;
+                                        // The badge is a flex sibling on the link's baseline, not
+                                        // inline text, so it cannot wrap away from its link; nowrap
+                                        // keeps a failure and warning pair together.
+                                        ${'hotlinks-' . $commandGrpID} .= "<div class=\"d-flex align-items-baseline\"><a href=\"#$header\">$commandTitle</a><span class=\"text-nowrap flex-shrink-0\" id=\"hotlinkstatus_$commandKey\"></span></div>";
+                                        ?>
+
+                                    <a class="troubleshoot-anchor" name="<? echo $header ?>">.</a>
+                                    <h3><? echo $commandTitle; ?><span class="text-nowrap" id="<? echo ("status_" . $commandKey) ?>"></span>
+                                    </h3>
+                                    <strong>Command Description: </strong><? echo $commandDesc; ?>
+                                        <br><strong>Command: </strong><? echo $commandCmd; ?>
+                                        <pre
+                                            id="<? echo ("command_" . $commandKey) ?>"><img src="./images/loading_spinner.gif" width="100" height="100"><i>Loading...</i></pre>
+                                        <hr>
+                                        <?
+                                    }
+                                }
+                                ${'hotlinks-' . $commandGrpID} .= "</div>";
+                                ?>
+                        </div>
+                    </div>
+                </div>
+                <?
+
+                        }
+
+                    }
+
+                    ?>
+        </div>
+
+
+    </div>
+    <?php include 'common/footer.inc'; ?>
+    </div>
+    <button type="button"
+        class="back2top btn btn-danger fw-bold rounded-pill position-fixed bottom-0 end-0 m-3 z-3 opacity-50">Back to
+        top</button>
+
+    <script type="application/javascript">
+
+        /*
+         * Anchors are dynamically via ajax thus auto scrolling if anchor is in url
+         * will fail.  This will workaround that problem by forcing a scroll
+         * afterward dynamic content is loaded.
+         */
+        /*
+         * Verdict highlighting.
+         *
+         * The commands emit plain text and that exact text is what
+         * troubleshootingText.php puts in the support bundle -- nothing here
+         * changes a byte of it.  This only decorates it on screen, so a
+         * single failure buried sixty lines into an output does not have to
+         * be found by reading every line.
+         *
+         * The diagnostic scripts mark each verdict with a leading
+         * [PASS]/[WARN]/[FAIL]/[INFO]/[SKIP].  Commands that just print raw
+         * state carry no markers and render exactly as they always have.
+         */
+        var troubleshootMarkerClasses = {
+            FAIL: 'bg-danger-subtle text-danger-emphasis fw-bold',
+            WARN: 'bg-warning-subtle text-warning-emphasis fw-bold',
+            PASS: 'text-success-emphasis',
+            INFO: 'text-body-secondary',
+            SKIP: 'text-body-secondary'
+        };
+
+        function appendTroubleshootSpan(parent, text, className) {
+            var span = document.createElement('span');
+            if (className) {
+                span.className = className;
+            }
+            span.textContent = text;
+            parent.appendChild(span);
+        }
+
+        function renderTroubleshootOutput(pre, data) {
+            /*
+             * Built from text nodes rather than innerHTML.  Command output is
+             * plain text and must never be parsed as markup: assigning it to
+             * innerHTML meant anything a tool printed in angle brackets - a
+             * <unavailable> value, a <node> name in gst-inspect output - was
+             * treated as an unknown tag and silently vanished from the page.
+             */
+            pre.textContent = '';
+
+            var counts = { FAIL: 0, WARN: 0, PASS: 0, SKIP: 0 };
+            var lines = String(data).split('\n');
+            // Severity of the verdict whose explanation the indented lines
+            // below it belong to, so the "what to do about it" text stays
+            // visually attached to the failure it explains.
+            var explaining = '';
+
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+                var marker = /^\[(FAIL|WARN|PASS|INFO|SKIP)\]/.exec(line);
+
+                if (marker) {
+                    var kind = marker[1];
+                    if (counts[kind] !== undefined) {
+                        counts[kind]++;
+                    }
+                    appendTroubleshootSpan(pre, line, troubleshootMarkerClasses[kind]);
+                    explaining = (kind === 'FAIL' || kind === 'WARN') ? kind : '';
+                } else if (explaining && /^\s+\S/.test(line)) {
+                    // Coloured but not banded: banding every follow-on line
+                    // would turn half the output into a block of red and lose
+                    // the verdict lines in it.
+                    var indent = line.match(/^\s*/)[0];
+                    pre.appendChild(document.createTextNode(indent));
+                    appendTroubleshootSpan(pre, line.slice(indent.length),
+                        explaining === 'FAIL' ? 'text-danger-emphasis' : 'text-warning-emphasis');
+                } else {
+                    explaining = '';
+                    if (/^\s*(===|---) .+ (===|---)\s*$/.test(line)) {
+                        appendTroubleshootSpan(pre, line, 'fw-bold');
+                    } else if (/^Result: /.test(line)) {
+                        appendTroubleshootSpan(pre, line,
+                            counts.FAIL > 0 ? 'text-danger-emphasis fw-bold'
+                                : counts.WARN > 0 ? 'text-warning-emphasis fw-bold'
+                                    : 'text-success-emphasis fw-bold');
+                    } else {
+                        pre.appendChild(document.createTextNode(line));
+                    }
+                }
+
+                if (i < lines.length - 1) {
+                    pre.appendChild(document.createTextNode('\n'));
+                }
+            }
+
+            return counts;
+        }
+
+        // One badge shape, used beside the heading, beside the hot link and on
+        // the tab, so the same verdict reads the same in all three places.
+        // The compact form drops the wording to fit a tab or a link, but keeps
+        // it in the title so the badge never depends on colour alone.
+        function troubleshootBadges(counts, compact) {
+            var kinds = [
+                { n: counts.FAIL, cls: 'text-bg-danger', one: 'failure', many: 'failures' },
+                { n: counts.WARN, cls: 'text-bg-warning', one: 'warning', many: 'warnings' }
+            ];
+            var html = '';
+            for (var i = 0; i < kinds.length; i++) {
+                if (kinds[i].n > 0) {
+                    var label = kinds[i].n + ' ' + (kinds[i].n === 1 ? kinds[i].one : kinds[i].many);
+                    html += '<span class="badge ' + kinds[i].cls + ' ms-2" title="' + label + '">' +
+                        (compact ? kinds[i].n : label) + '</span>';
+                }
+            }
+            // Only when there is nothing to report: an all-clear badge next to
+            // a failure badge would just be noise.
+            if (!html && counts.PASS > 0) {
+                var passed = counts.PASS + ' passed';
+                html += '<span class="badge text-bg-success ms-2" title="' + passed + '">' +
+                    (compact ? counts.PASS : passed) + '</span>';
+            } else if (!html && counts.SKIP > 0) {
+                // Every check skipped: the section had nothing that applies to
+                // this device - Network Audio on a simple-mode box with no
+                // AES67, Opus or RTSP configured skips all three.  With no
+                // badge at all that reads as "never ran", so say so in a
+                // neutral colour rather than claiming a pass nothing earned.
+                var skipped = 'nothing to check';
+                html += '<span class="badge text-bg-secondary ms-2" title="' + skipped + '">' +
+                    (compact ? '-' : skipped) + '</span>';
+            }
+            return html;
+        }
+
+        function setTroubleshootBadge(id, counts, compact) {
+            var el = document.querySelector('#' + id);
+            if (el) {
+                el.innerHTML = troubleshootBadges(counts, compact);
+            }
+        }
+
+        // Roll the group's tab badge up from the commands that have reported
+        // so far.  Commands run when their tab is first opened, so a tab shows
+        // a badge once it has been looked at - never a stale one from a run
+        // that has not happened.
+        function updateTroubleshootTabBadge(commandGrpID) {
+            var pane = document.querySelector('#pills-' + commandGrpID);
+            if (!pane) {
+                return;
+            }
+            var totals = { FAIL: 0, WARN: 0, PASS: 0, SKIP: 0 };
+            pane.querySelectorAll('pre[data-troubleshoot-fail]').forEach(function (pre) {
+                totals.FAIL += parseInt(pre.dataset.troubleshootFail, 10) || 0;
+                totals.WARN += parseInt(pre.dataset.troubleshootWarn, 10) || 0;
+                totals.PASS += parseInt(pre.dataset.troubleshootPass, 10) || 0;
+                totals.SKIP += parseInt(pre.dataset.troubleshootSkip, 10) || 0;
+            });
+            setTroubleshootBadge('tabstatus-' + commandGrpID, totals, true);
+        }
+
+        /*
+         * A few commands (Apache's server-status, phpinfo) print a web page,
+         * not text, and as text they are a wall of tags.  Those are marked
+         * "format": "html" in troubleshoot-commands.json and rendered in an
+         * iframe instead.  The sandbox has no allow-scripts, so nothing in the
+         * page can run; allow-same-origin is only so this page can read the
+         * document's height and size the frame to fit it.
+         */
+        function renderTroubleshootHtml(pre, data) {
+            var frame = document.createElement('iframe');
+            frame.id = pre.id;
+            frame.title = 'Command output';
+            frame.setAttribute('sandbox', 'allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+            // No background of its own: the page inside paints its canvas in
+            // whichever theme the frame takes from this page.
+            frame.className = 'w-100 border rounded';
+            frame.addEventListener('load', function () {
+                var doc = frame.contentDocument;
+                if (!doc || !doc.documentElement) {
+                    return;
+                }
+                // Links open in a new tab rather than inside the frame
+                var base = doc.createElement('base');
+                base.target = '_blank';
+                (doc.head || doc.documentElement).prepend(base);
+
+                // server-status brings no styles at all: browser-default serif
+                // with tables run together, and always light.  phpinfo has its
+                // own, with a prefers-color-scheme dark variant that already
+                // follows FPP's theme, and keeps them.
+                if (!doc.querySelector('style, link[rel="stylesheet"]')) {
+                    var style = doc.createElement('style');
+                    style.textContent = ':root { color-scheme: light dark; } ' +
+                        'body { font-family: sans-serif; font-size: 14px; } ' +
+                        'th, td { padding: 1px 6px; }';
+                    (doc.head || doc.documentElement).appendChild(style);
+                }
+
+                // The root's own box, not scrollHeight: scrollHeight is never
+                // less than the frame's current height, so the frame could
+                // grow as the page reflowed but never shrink back.
+                var fit = function () {
+                    frame.style.height = Math.ceil(doc.documentElement.getBoundingClientRect().height) + 'px';
+                };
+                fit();
+                // Re-fit as the page width changes and its text rewraps
+                new ResizeObserver(fit).observe(doc.documentElement);
+            });
+            frame.srcdoc = data;
+            pre.replaceWith(frame);
+        }
+
+        // Commands marked "runOnce" in troubleshoot-commands.json (a scan of every
+        // media file, say) run the first time their tab is opened, not on every
+        // later click on it.  Reloading the page runs them again.
+        var troubleshootStarted = {};
+
+        function ShowTroubleshootResult(commandKey, commandGrpID, data, format) {
+            var pre = document.querySelector('#command_' + commandKey);
+            if (!pre) {
+                return;
+            }
+
+            // A failed command returns a plain-text message, not a page
+            if (format === 'html' && /^\s*</.test(data)) {
+                renderTroubleshootHtml(pre, data);
+                return;
+            }
+
+            var counts = renderTroubleshootOutput(pre, data);
+            pre.dataset.troubleshootFail = counts.FAIL;
+            pre.dataset.troubleshootWarn = counts.WARN;
+            pre.dataset.troubleshootPass = counts.PASS;
+            pre.dataset.troubleshootSkip = counts.SKIP;
+
+            setTroubleshootBadge('status_' + commandKey, counts, false);
+            setTroubleshootBadge('hotlinkstatus_' + commandKey, counts, true);
+            updateTroubleshootTabBadge(commandGrpID);
+        }
+
+        function fixScroll() {
+            // Remove the # from the hash, as different browsers may or may not include it
+            var hash = location.hash.replace('#', '');
+
+            if (hash != '') {
+                var elements = document.getElementsByName(hash);
+                if (elements.length > 0) {
+                    elements[0].scrollIntoView();
+                }
+            }
+        }
+
+
+    <?
+    foreach ($troubleshootingCommandGroups as $commandGrpID => $commandGrp) {
+        //Create logic for grp if relevant for platform
+        if (count(array_intersect($commandGrp["platforms"], $target_platforms)) > 0) {
+            echo ("document.querySelector(\"#troubleshooting-hot-links-" . $commandGrpID . "\").innerHTML ='" . ${'hotlinks-' . $commandGrpID} . "'; \n");
+            ?> function dispTroubleTab<? echo $commandGrpID; ?>() {
+                    <?
+                    foreach ($commandGrp["commands"] as $commandKey => $commandID) {
+                        //Run command if relevant for current platform
+                        if (count(array_intersect($commandID["platforms"], $target_platforms)) > 0) {
+                            $url = "./troubleshootingHelper.php?key=" . urlencode($commandKey);
+                            $format = $commandID["format"] ?? "text";
+                            $runOnce = !empty($commandID["runOnce"]);
+                            if ($runOnce) {
+                                ?>
+                            if (!troubleshootStarted["<?php echo $commandKey ?>"]) {
+                                troubleshootStarted["<?php echo $commandKey ?>"] = true;
+                            <?
+                            }
+                            ?>
+                            $.ajax({
+                                url: "<?php echo $url ?>",
+                                type: 'GET',
+                                success: function (data) {
+                                    ShowTroubleshootResult("<?php echo $commandKey ?>", "<?php echo $commandGrpID ?>", data, "<?php echo $format ?>");
+                                    fixScroll();
+                                },
+                                error: function () {
+                                    <? if ($runOnce) { ?>troubleshootStarted["<?php echo $commandKey ?>"] = false; // let the next visit retry
+                                    <? } ?>DialogError('Failed to query command', "Error: Unable to query for <?php echo $commandKey ?>");
+                                }
+                            });
+                            <? if ($runOnce) { ?>}
+                            <? } ?>
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                <?
+                        }
+                    } ?>}<?
+        }
+    }
+    ?>
+
+        function pageSpecific_PageLoad_DOM_Setup() {
+            document.getElementById("pills-<? echo array_key_first($troubleshootingCommandGroups) ?>").classList.add('active');
+            document.getElementById("pills-<? echo array_key_first($troubleshootingCommandGroups) ?>").classList.add('show');
+        }
+
+        function pageSpecific_PageLoad_PostDOMLoad_ActionsSetup() {
+
+            //Setup action functions
+            // commands for selected tab
+            $('.nav-link').on('shown.bs.tab', function () {
+                var id = $(this).attr("id");
+                var cmdgrp = id.replace("pills-", "").replace("-tab", "");
+
+                var fn_string = "dispTroubleTab".concat(cmdgrp);
+                var fn = window[fn_string];
+                if (typeof fn === "function") fn();
+            });
+
+            //scroll to top
+            $(".back2top").click(() => $("html, body").animate({ scrollTop: 0 }, "slow") && false);
+            $(window).scroll(function () {
+                if ($(this).scrollTop() > 100) $('.back2top').fadeIn();
+                else $('.back2top').fadeOut();
+            });
+
+            //default to show first tab in grp array active
+            if (!location.hash) {
+                $('#pills-tab button[id="pills-<? echo array_key_first($troubleshootingCommandGroups) ?>-tab"]').tab('show');
+                dispTroubleTab<? echo array_key_first($troubleshootingCommandGroups) ?>();
+            }
+
+            //if hash is tab
+            if (location.hash.includes('pills-')) {
+                CmdGrp = location.hash.replace('#pills-', '').toString();
+                var fn_string = "dispTroubleTab".concat(CmdGrp);
+                var fn = window[fn_string];
+                if (typeof fn === "function") fn();
+
+            }
+
+            //if hash is location on a tab, derive correct tab and move to tab and hash
+            var hotlinks = [];
+            $('a.troubleshoot-anchor').each(function () {
+                hotlinks.push($(this).attr('name'));
+            });
+            if (location.hash && hotlinks.includes(location.hash.replace('#', ''))) {
+                orig_hotlink = location.hash;
+
+                //find ancestor with class tab-pane
+                target_tab = $('a.troubleshoot-anchor[name="' + location.hash.replace('#', '') + '"]').closest('.tab-pane').attr('id')
+                if (target_tab) {
+                    bootstrap.Tab.getOrCreateInstance(
+                        document.querySelector('[data-bs-target="#' + target_tab + '"]')
+                    ).show();
+                    window.location.hash = orig_hotlink;
+                    setTimeout(function () {
+                        SetTablePageHeader_ZebraPin();
+                        float_fppStickyThead();
+                        scrollToTop();
+                    }, 50);
+                }
+            }
+        }
+
+
+    </script>
+
 </body>
+
 </html>

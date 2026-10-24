@@ -1,63 +1,45 @@
+#pragma once
 /*
- *   Pixelnet USB handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _USBPIXELNET_H
-#define _USBPIXELNET_H
-
 #include <string>
+#include "fpp-json-fwd.h"
 
-#include "ThreadedChannelOutputBase.h"
+#include "SerialChannelOutput.h"
+#include "ThreadedChannelOutput.h"
+class USBPixelnetOutput : public ThreadedChannelOutput, public SerialChannelOutput {
+public:
+    USBPixelnetOutput(unsigned int startChannel, unsigned int channelCount);
+    virtual ~USBPixelnetOutput();
 
-class USBPixelnetOutput : public ThreadedChannelOutputBase {
-  public:
-	USBPixelnetOutput(unsigned int startChannel, unsigned int channelCount);
-	~USBPixelnetOutput();
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-	int Init(char *configStr);
-	int Close(void);
+    virtual int RawSendData(unsigned char* channelData) override;
 
-	int RawSendData(unsigned char *channelData);
+    virtual void DumpConfig(void) override;
 
-	void DumpConfig(void);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+private:
+    enum DongleType {
+        PIXELNET_DVC_UNKNOWN,
+        PIXELNET_DVC_LYNX,
+        PIXELNET_DVC_OPEN
+    };
 
-  private:
-	enum DongleType {
-		PIXELNET_DVC_UNKNOWN,
-		PIXELNET_DVC_LYNX,
-		PIXELNET_DVC_OPEN
-	};
-
-	std::string    m_deviceName;
-	unsigned char  m_rawData[4104];  // Sized to a multiple of 8 bytes
-	int            m_outputPacketSize;  // Header size + 4096 data bytes
-	unsigned char *m_outputData;
-	unsigned char *m_pixelnetData;
-	int            m_fd;
-	DongleType     m_dongleType;
+    unsigned char m_rawData[4104]; // Sized to a multiple of 8 bytes
+    int m_outputPacketSize;        // Header size + 4096 data bytes
+    unsigned char* m_outputData;
+    unsigned char* m_pixelnetData;
+    DongleType m_dongleType;
 };
-
-#endif /* _USBPIXELNET_H */

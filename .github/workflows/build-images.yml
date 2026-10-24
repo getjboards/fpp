@@ -1,0 +1,692 @@
+#############################################################################
+# Build FPP SD card images for Pi, Pi64, BBB, and BB64.
+#
+# Runs:
+#   - workflow_dispatch: manual trigger. Pick the branch/tag to build from the
+#                        "Use workflow from" dropdown. Options: build a subset
+#                        of platforms (for quickly testing this workflow), and
+#                        optionally check "make_release" to create/update a
+#                        release for that ref (name = ref, "v" prefix stripped)
+#                        -- add "overwrite_existing" to replace an existing
+#                        release's assets in place instead of failing.
+#   - schedule:          nightly at 04:00 UTC
+#   - push (release tag): release build (major version >= 10 only); results are
+#                        attached to a GitHub release named from the tag. Tags
+#                        are numeric with NO 'v' prefix (10.0-beta) -- see the
+#                        on.push.tags filter below and src/fppversion.sh.
+#
+# Strategy:
+#   - Pi64 / BB64 build on GitHub's free arm64 runners (native, fast)
+#   - Pi  / BBB  build on x86_64 runners via qemu-arm-static (slow, but
+#     avoids needing self-hosted hardware)
+#
+# All four build scripts use FPP_SRC_DIR pointing at the checkout, so local
+# changes in the tree are picked up without needing to push first.
+#############################################################################
+
+name: Build Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'One-off build version string (ignored if "Create/update a release" is checked; blank = nightly-YYYYMMDD)'
+        required: false
+        default: ''
+      platforms:
+        description: 'Platforms to build (use a subset to test this workflow quickly)'
+        type: choice
+        required: false
+        default: 'all'
+        options:
+          - 'all'
+          - 'pi'
+          - 'pi64'
+          - 'bb64'
+          - 'bbb'
+          - 'pi,pi64'
+          - 'bb64,bbb'
+      make_release:
+        description: 'Create/update a release from the branch or tag picked above ("Use workflow from"). Release name always matches that ref (leading "v" stripped).'
+        type: boolean
+        required: false
+        default: false
+      overwrite_existing:
+        description: 'If a release already exists for that ref, replace its assets in place instead of failing'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '0 4 * * *'
+  push:
+    # Auto-build only release tags for major version >= 10. Tags are numeric
+    # with NO 'v' prefix: src/fppversion.sh runs the tag through `git describe`
+    # and does MAJOR_VERSION=$(cut -f1 -d.), so a leading 'v' would corrupt every
+    # displayed version (v10 instead of 10).
+    #
+    # `[1-9][0-9]*` matches any tag whose major version has two-or-more digits
+    # (10.0-beta, 10.4, 11.2, 100.0 ...) and so skips every single-digit major
+    # (9.6, 9.5.4, 8.x ...). The 9.x and earlier branches are NOT wired for
+    # automated image creation, so they must stay manual. `!*-master` excludes
+    # the X.x-master branch-point markers (e.g. 10.x-master); 'nightly' is
+    # skipped automatically since it does not start with a digit.
+    tags:
+      - '[1-9][0-9]*'
+      - '!*-master'
+
+# A manual re-run on the same ref should cancel a running build to avoid
+# wasting a 2-hour qemu job when you realize you tagged the wrong commit.
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    if: github.repository == 'FalconChristmas/fpp'   # Only run nightly builds on main repo
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+      is_nightly: ${{ steps.ver.outputs.is_nightly }}
+      os_version: ${{ steps.osver.outputs.os_version }}
+    steps:
+      - name: Determine version string
+        id: ver
+        run: |
+          # Tag push -> release build. on.push.tags only fires this workflow for
+          # release-shaped tags, which by FPP convention carry NO 'v' prefix
+          # (10.0-beta, 9.5.3): src/fppversion.sh feeds the tag straight through
+          # `git describe`, so the version string IS the tag verbatim -- do not
+          # strip anything.
+          if [ "${{ github.event_name }}" = "push" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            V="${GITHUB_REF#refs/tags/}"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "is_nightly=false" >> "$GITHUB_OUTPUT"
+          # Manual dispatch, "make_release" checked -> release build from
+          # whatever branch/tag was picked in the "Use workflow from" dropdown.
+          # The release name always matches that ref (never the free-typed
+          # "version" input), same as the tag-push path above; a leading "v"
+          # is stripped since branches follow "vX.Y" but tags/releases/
+          # fppversion.sh all use the bare "X.Y" form (see header comment).
+          elif [ "${{ github.event.inputs.make_release }}" = "true" ]; then
+            V="${{ github.ref_name }}"
+            case "$V" in
+              v[0-9]*) V="${V#v}" ;;
+            esac
+            # Guard rail: the ref actually built is whatever's picked in the
+            # "Use workflow from" branch/tag selector at the top of the Run
+            # workflow form -- a control separate from the "version" text
+            # input below, defaults to "master", and is easy to leave
+            # unchanged. Refuse to silently turn a forgotten default into a
+            # release named "master"/"dev"/etc; require something that
+            # actually looks like a release ref (starts with a digit, same
+            # shape the tag-push trigger requires).
+            case "$V" in
+              [0-9]*) : ;;
+              *)
+                echo "::error::make_release is checked but the ref actually built ('${{ github.ref_name }}') doesn't look like a release branch/tag (expected e.g. 10.0-beta or v10.0-beta). This is controlled by the 'Use workflow from' picker at the top of the Run workflow form, NOT the 'version' text box -- it defaults to 'master', so it's easy to leave unchanged by mistake. Refusing to create a release named '${{ github.ref_name }}'."
+                exit 1
+                ;;
+            esac
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "is_nightly=false" >> "$GITHUB_OUTPUT"
+          # Manual dispatch with explicit version -> one-off build
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "is_nightly=false" >> "$GITHUB_OUTPUT"
+          # Schedule or manual dispatch without version -> nightly.
+          # Use fixed "nightly" string so artifact filenames are stable and
+          # URLs like releases/download/nightly/FPP-vnightly-Pi64.img.zip
+          # don't change night to night.
+          else
+            V="nightly"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "is_nightly=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Selected version: $V"
+
+      - name: Determine OS level
+        id: osver
+        # The OS level is the build month (2026-10). It is written into the
+        # image as /etc/fpp/rfs_version and into every .fppos name, and it is
+        # what about.php compares to decide whether a player is offered an OS
+        # update. A second release in the same month (a new OS-level security
+        # fix, say) must not reuse the month: a player that took the first
+        # release's image, and then the second release by git update, would be
+        # told its OS is current. So a release gets the next letter after the
+        # last one any other release used that month: 2026-10, then 2026-10b,
+        # then 2026-10c. The release being built is left out, so a rebuild of
+        # it keeps its level. Nightlies and one-off builds use the bare month.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MONTH="$(date -u +%Y-%m)"
+          OSV="$MONTH"
+          if [ "${{ steps.ver.outputs.is_release }}" = "true" ]; then
+            V="${{ steps.ver.outputs.version }}"
+            # Fail rather than guess: reusing a level would hide the update.
+            NAMES="$(gh api --paginate "repos/${{ github.repository }}/releases" \
+                       -q ".[] | select(.tag_name != \"$V\" and .tag_name != \"nightly\") | .assets[].name")"
+            # The letter each one used; no letter is the month's first, "a".
+            USED="$(printf '%s\n' "$NAMES" | sed -n -E "s/.*_${MONTH}([a-z]?)\.fppos\$/\1/p" | sed 's/^$/a/' | sort -u)"
+            if [ -n "$USED" ]; then
+              # The next level is one past the highest.
+              LAST="$(printf '%s\n' "$USED" | tail -1)"
+              if [ "$LAST" = "z" ]; then
+                echo "::error::every OS level letter for $MONTH is used"
+                exit 1
+              fi
+              NEXT="$(printf '%s' "$LAST" | tr 'a-y' 'b-z')"
+              OSV="${MONTH}${NEXT}"
+              echo "OS level $MONTH already used by a release (letters: $(echo $USED)); using $OSV"
+            fi
+          fi
+          echo "os_version=$OSV" >> "$GITHUB_OUTPUT"
+          echo "OS level: $OSV"
+
+  build:
+    needs: prep
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: pi
+            runner: ubuntu-24.04-arm
+            script: SD/build-image-pi.sh
+            extra_args: "--arch armhf"
+            suffix: Pi
+          - platform: pi64
+            runner: ubuntu-24.04-arm
+            script: SD/build-image-pi.sh
+            extra_args: "--arch arm64"
+            suffix: Pi64
+          - platform: bb64
+            runner: ubuntu-24.04-arm
+            script: SD/build-image-bb64.sh
+            extra_args: ""
+            suffix: BB64
+          - platform: bbb
+            runner: ubuntu-24.04-arm
+            script: SD/build-image-bbb.sh
+            extra_args: ""
+            suffix: BBB
+    runs-on: ${{ matrix.runner }}
+    # GHA hard cap is 360 min. armhf-under-qemu builds are the long pole
+    # (~2-3 hours for Pi, expected similar for BBB).
+    timeout-minutes: 350
+
+    steps:
+      - name: Skip if platform not requested
+        id: gate
+        run: |
+          REQ="${{ github.event.inputs.platforms }}"
+          if [ -n "$REQ" ] && [ "$REQ" != "all" ]; then
+            case ",$REQ," in
+              *",${{ matrix.platform }},"*) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+              *) echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            esac
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          # fppversion.sh runs `git describe` inside the chroot against the
+          # rsynced tree; without full history and tags it fails with
+          # "fatal: No names found, cannot describe anything."
+          fetch-depth: 0
+          fetch-tags: true
+          # Don't leave the short-lived runner token in .git/config --
+          # the tree gets baked into the shipped image and the token
+          # would (a) expire, breaking the user's first Upgrade, and
+          # (b) ship a credential we should never be publishing.
+          persist-credentials: false
+
+      - name: Resolve release branch to build from
+        # A release IMAGE must ship /opt/fpp on a real tracking BRANCH, never a
+        # detached tag. Two runtime paths depend on it:
+        #   * scripts/git_pull updates via `git rebase @{u}` -- an upstream only
+        #     exists on a branch, so a detached-tag checkout fails every user's
+        #     "Check for Updates" with "HEAD does not point to a branch".
+        #   * www/common.php keys version display + upgrade offers off a
+        #     `v<major>.<minor>` branch name; a detached HEAD reads back garbage.
+        # actions/checkout leaves a tag build in detached HEAD, and the branch
+        # usually has fixes PAST the tag, so we must check out the branch, not
+        # the tagged commit.
+        #
+        # Mapping (FPP convention, one branch per minor series): tag 10.1.2 ->
+        # branch v10.1. The 10.0 beta is the exception -- its branch is literally
+        # v10.0-beta -- so when v<major>.<minor> is absent, fall back to the
+        # single origin/v* branch that contains the tagged commit. A
+        # workflow_dispatch run already picks the branch in "Use workflow from",
+        # so its ref_name is used verbatim.
+        if: steps.gate.outputs.skip == 'false'
+        id: relbranch
+        run: |
+          set -euo pipefail
+          # Ensure every origin branch is present -- needed both to resolve here
+          # and because the rsynced .git is what FPP_Install.sh (--skip-clone)
+          # checks out inside the image. Unauthenticated fetch is fine (public
+          # repo; persist-credentials:false scrubbed the token).
+          git fetch --no-tags --quiet origin '+refs/heads/*:refs/remotes/origin/*' || true
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+            TAG_SHA="$(git rev-list -n1 "$TAG")"
+            CONV="v$(printf '%s' "$TAG" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
+            BRANCH=""
+            if git show-ref --verify --quiet "refs/remotes/origin/$CONV" \
+               && git merge-base --is-ancestor "$TAG_SHA" "origin/$CONV"; then
+              BRANCH="$CONV"
+            else
+              CANDS="$(git branch -r --contains "$TAG_SHA" --list 'origin/v[0-9]*' | sed 's#^[* ]*origin/##' | sort -u)"
+              N="$(printf '%s\n' "$CANDS" | grep -c . || true)"
+              if [ "$N" = "1" ]; then
+                BRANCH="$CANDS"
+              elif [ "$N" -gt 1 ]; then
+                echo "::error::Tag '$TAG' is contained in multiple release branches ($(echo $CANDS)); refusing to guess. Expected $CONV."
+                exit 1
+              fi
+            fi
+            if [ -z "$BRANCH" ]; then
+              echo "::error::No release branch found for tag '$TAG' (expected origin/$CONV, or exactly one origin/v* branch containing the tag). Push the release branch before tagging so images can track it."
+              exit 1
+            fi
+          else
+            # workflow_dispatch / schedule: build the branch that was checked out.
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "Resolved release branch: $BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "FPPBRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Maximize disk space
+        # Default GH runners have ~14 GB free; BBB / Pi builds easily use
+        # 12-15 GB (base image + work image + artifacts). Strip the pre-
+        # installed SDKs that nothing in this workflow uses.
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            2>/dev/null || true
+          docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - name: Install build dependencies
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static binfmt-support \
+            parted dosfstools e2fsprogs \
+            zerofree squashfs-tools zip xz-utils \
+            wget ca-certificates rsync
+
+      - name: Register qemu-arm binfmt
+        # qemu-user-static on arm64 Ubuntu doesn't register qemu-arm because
+        # the host arch is different; on x86_64 it usually registers fine,
+        # but be defensive.
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          if [ ! -f /proc/sys/fs/binfmt_misc/qemu-arm ]; then
+            echo "Registering qemu-arm binfmt manually..."
+            sudo sh -c 'printf ":qemu-arm:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:OCF" > /proc/sys/fs/binfmt_misc/register' || true
+          fi
+          ls /proc/sys/fs/binfmt_misc/qemu-arm 2>/dev/null || \
+            echo "WARNING: qemu-arm still not registered; armhf chroot will fail"
+
+      - name: Resolve base image cache id
+        # The BB builders discover the latest rcn-ee image at run time (rcn-ee
+        # keeps only a rolling window of dated builds), so the base filename --
+        # not the script -- is what changes week to week. Ask the script which
+        # image it would download and key the cache on that, so the ~6 of 7
+        # nightly runs where the base is unchanged get a cache hit instead of
+        # re-downloading ~1GB. Pi pins its base in-script, so its hash is stable.
+        id: baseid
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          case "${{ matrix.platform }}" in
+            bb64|bbb)
+              URL="$(bash ./${{ matrix.script }} --print-base-image-url 2>/dev/null || true)"
+              if [ -n "$URL" ]; then
+                ID="$(basename "$URL")"
+              else
+                echo "WARNING: base-image resolve failed; using script hash" >&2
+                ID="fallback-${{ hashFiles(matrix.script) }}"
+              fi
+              ;;
+            *)
+              ID="${{ hashFiles(matrix.script) }}"
+              ;;
+          esac
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Base image cache id: $ID"
+
+      - name: Cache base image download
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/cache@v5
+        with:
+          path: build/*.img.xz
+          # Keyed on the resolved base-image filename (BB) or script hash (Pi)
+          # so the cache tracks the actual image, not just the script source.
+          # No restore-keys: an exact miss means a new base, which should be
+          # downloaded fresh rather than restoring a stale prior week's image.
+          key: base-image-${{ matrix.platform }}-${{ steps.baseid.outputs.id }}
+
+      - name: Build image
+        if: steps.gate.outputs.skip == 'false'
+        # Pass the RESOLVED release branch (see "Resolve release branch" above),
+        # never github.ref_name: on a tag push ref_name is the tag, and building
+        # that leaves the image's /opt/fpp detached (broken self-update). Passing
+        # it as a --branch CLI arg -- not the FPPBRANCH env var -- is also
+        # required because plain `sudo` strips the environment, which is how CI
+        # run 30107796268 silently fell back to the script's "master" default
+        # and shipped every 10.0-beta image on master.
+        run: |
+          sudo ./${{ matrix.script }} \
+            --version "${{ needs.prep.outputs.version }}" \
+            --os-version "${{ needs.prep.outputs.os_version }}" \
+            --branch "${{ steps.relbranch.outputs.branch }}" \
+            --use-local-src \
+            ${{ matrix.extra_args }}
+
+      - name: List output
+        if: steps.gate.outputs.skip == 'false'
+        run: ls -la output/
+
+      - name: Upload image artifacts
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/upload-artifact@v6
+        with:
+          name: FPP-${{ needs.prep.outputs.version }}-${{ matrix.suffix }}
+          path: |
+            output/FPP-v*-${{ matrix.suffix }}.img.zip
+            output/${{ matrix.suffix }}-*.fppos
+            output/ccache-${{ matrix.suffix }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    # Only run on tag push. Creates a draft release so the maintainer can
+    # add notes before publishing. Attaches all four platforms' artifacts.
+    needs: [prep, build]
+    if: needs.prep.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Free disk space
+        # The four platforms' artifacts total ~11 GB. Strip unused preinstalled
+        # SDKs so the download + release staging can't exhaust the runner's
+        # ~14 GB root disk (see the nightly_release job for the failure this
+        # guards against).
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            2>/dev/null || true
+          df -h /
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Flatten artifact directory
+        run: |
+          mkdir -p release-files
+          # mv, not cp: copying would keep a second ~11 GB duplicate of every
+          # artifact on disk and can blow the runner's root volume.
+          find artifacts -type f \( -name '*.img.zip' -o -name '*.fppos' -o -name 'ccache-*.tar.gz' \) \
+            -exec mv -v {} release-files/ \;
+          ls -la release-files/
+
+      - name: Create draft release
+        # Skipped for manual "overwrite_existing" runs: this step always
+        # creates fresh, so it would fail with "already_exists" whenever the
+        # release we're meant to be replacing assets on is already there.
+        if: github.event.inputs.overwrite_existing != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: "FPP ${{ needs.prep.outputs.version }}"
+          tag_name: ${{ needs.prep.outputs.version }}
+          files: release-files/*
+          fail_on_unmatched_files: true
+
+      - name: Create or update release (overwrite existing assets)
+        # Manual-dispatch-only path (overwrite_existing is only ever set via
+        # workflow_dispatch inputs; a tag push leaves it unset/false). Moves
+        # the release's tag to the commit that was just built -- needed when
+        # re-releasing from a branch dropdown pick rather than a fresh tag
+        # push -- then upserts the release and replaces its assets in place,
+        # mirroring the nightly_release job's non-destructive pattern.
+        if: github.event.inputs.overwrite_existing == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prep.outputs.version }}"
+          TITLE="FPP ${{ needs.prep.outputs.version }}"
+
+          if gh api "repos/${{ github.repository }}/git/refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Moving '$TAG' tag to ${{ github.sha }}..."
+            gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/$TAG" \
+              -f sha="${{ github.sha }}" -F force=true >/dev/null
+          else
+            echo "Creating '$TAG' tag at ${{ github.sha }}..."
+            gh api -X POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="${{ github.sha }}" >/dev/null
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release '$TAG' already exists; replacing its assets in place."
+            gh release upload "$TAG" release-files/* --clobber
+          else
+            echo "No existing release for '$TAG'; creating a new draft."
+            gh release create "$TAG" release-files/* \
+              --draft \
+              --title "$TITLE" \
+              --verify-tag
+          fi
+
+  nightly_release:
+    # Runs on schedule + schedule-like manual dispatch. Publishes / replaces
+    # the "nightly" pre-release so URLs like
+    #   https://github.com/<owner>/<repo>/releases/download/nightly/<file>
+    # always point at last night's artifacts. Marked prerelease so GitHub's
+    # /releases/latest/download/ stays pointed at the last real versioned
+    # release -- nightly doesn't pollute the stable URL.
+    needs: [prep, build]
+    # Run even if SOME build legs failed, as long as prep succeeded and this is
+    # a nightly. A single platform flaking (e.g. a transient qemu/mold linker
+    # crash) should not block publishing the platforms that DID build -- the
+    # failed platform simply keeps its asset from the previous nightly (the
+    # publish step below is non-destructive). Versioned/tag RELEASES stay
+    # all-or-nothing: that is the separate `release` job, which keeps the
+    # default success() gate and only runs when every platform succeeds.
+    if: ${{ !cancelled() && needs.prep.result == 'success' && needs.prep.outputs.is_nightly == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Free disk space
+        # The four platforms' artifacts total ~11 GB. Downloading them plus
+        # staging for upload previously exhausted the runner's ~14 GB root disk
+        # and crashed the job MID-PUBLISH -- which, with the old
+        # delete-then-create logic below, wiped the nightly release entirely.
+        # Strip unused preinstalled SDKs for ~20 GB of headroom.
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/share/swift \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL \
+            2>/dev/null || true
+          df -h /
+
+      - name: Checkout (for gh CLI to know the repo)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Flatten artifact directory
+        run: |
+          mkdir -p release-files
+          # mv, not cp: copying kept a second ~11 GB duplicate of every artifact
+          # on disk, which is what tipped the runner over into "No space left on
+          # device" and triggered the wipeout.
+          find artifacts -type f \( -name '*.img.zip' -o -name '*.fppos' -o -name 'ccache-*.tar.gz' \) \
+            -exec mv -v {} release-files/ \;
+          ls -la release-files/
+
+      - name: Publish / update nightly pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+          SHORT="${GH_SHA:0:7}"
+
+          # Resilient nightly: this job runs even when some platforms failed to
+          # build. Publish whatever landed this run; a platform missing from
+          # this run keeps its asset from the previous nightly (the upload
+          # below is --clobber, never a delete). Report fresh vs carried-over
+          # so a partial nightly is never silent.
+          shopt -s nullglob
+          staged=(release-files/*)
+          if [ ${#staged[@]} -eq 0 ]; then
+            echo "No artifacts were produced by any platform this run;" \
+                 "leaving the existing nightly release untouched." >&2
+            exit 0
+          fi
+          echo "Platform coverage for this nightly:"
+          for suffix in Pi Pi64 BB64 BBB; do
+            if [ -e "release-files/FPP-vnightly-$suffix.img.zip" ]; then
+              echo "  [fresh]        $suffix"
+            else
+              echo "  [carried over] $suffix (build failed this run; keeping previous nightly's asset)"
+            fi
+          done
+
+          NOTES="Automated nightly build (unreleased development snapshot).
+
+          **Build date:** $BUILD_DATE UTC
+          **Commit:** [\`$SHORT\`](../../commit/$GH_SHA)
+
+          Static download URLs (always point at the most recent nightly):
+          - \`releases/download/nightly/FPP-vnightly-Pi.img.zip\`
+          - \`releases/download/nightly/FPP-vnightly-Pi64.img.zip\`
+          - \`releases/download/nightly/FPP-vnightly-BB64.img.zip\`
+          - \`releases/download/nightly/FPP-vnightly-BBB.img.zip\`
+
+          > :warning: Nightly builds are unreleased development snapshots.
+          > Latest production release can be found at https://github.com/FalconChristmas/fpp/releases/latest"
+
+          # NON-DESTRUCTIVE replacement. The old code deleted the release+tag
+          # BEFORE recreating it, so any failure between the two (a disk-full
+          # runner, a transient API error, a cancelled job) left the repo with
+          # NO nightly release at all. Instead:
+          #   1. force-move the 'nightly' tag to this commit,
+          #   2. create the release only if missing, else edit it in place,
+          #   3. overwrite assets with --clobber.
+          # The release is never in a deleted state, so a partial run can only
+          # ever leave last night's assets -- never zero.
+
+          # 1. Move (or create) the nightly tag to this commit.
+          if gh api "repos/$REPO/git/refs/tags/nightly" >/dev/null 2>&1; then
+            echo "Moving 'nightly' tag to $SHORT..."
+            gh api -X PATCH "repos/$REPO/git/refs/tags/nightly" \
+              -f sha="$GH_SHA" -F force=true >/dev/null
+          else
+            echo "Creating 'nightly' tag at $SHORT..."
+            gh api -X POST "repos/$REPO/git/refs" \
+              -f ref="refs/tags/nightly" -f sha="$GH_SHA" >/dev/null
+          fi
+
+          # 2. Create the release if it doesn't exist, else refresh its notes.
+          if gh release view nightly >/dev/null 2>&1; then
+            echo "Updating existing 'nightly' release..."
+            gh release edit nightly \
+              --prerelease \
+              --title "FPP Nightly ($BUILD_DATE)" \
+              --notes "$NOTES"
+          else
+            echo "Creating 'nightly' pre-release..."
+            gh release create nightly \
+              --prerelease \
+              --verify-tag \
+              --title "FPP Nightly ($BUILD_DATE)" \
+              --notes "$NOTES"
+          fi
+
+          # 3. Upload/overwrite assets. The .img.zip and ccache names are
+          # deterministic (fixed "nightly" version + fixed platform suffix) so
+          # --clobber replaces those in place.
+          echo "Uploading assets..."
+          gh release upload nightly release-files/* --clobber
+
+          # 4. Prune superseded .fppos assets. Unlike the images, the squashfs
+          # name embeds the OS-version tag the build job passes as
+          # --os-version "$(date -u +%Y-%m)":
+          #     Pi64-nightly_2026-08.fppos  ->  Pi64-nightly_2026-09.fppos
+          # so on the 1st of each month --clobber uploads a NEW name and last
+          # month's asset is orphaned in the release forever (they had to be
+          # deleted by hand). Delete the stale ones here.
+          #
+          # Scoped deliberately: only platforms that produced a fresh .fppos in
+          # THIS run are pruned. A platform whose build failed uploaded nothing,
+          # so its previous .fppos is a deliberate carry-over (see the coverage
+          # report above) and must survive -- pruning by "not uploaded today"
+          # would delete exactly those.
+          echo "Pruning superseded .fppos assets..."
+          keep=""
+          plats=""
+          for f in release-files/*.fppos; do
+            n="$(basename "$f")"
+            keep="$keep|$n"
+            plats="$plats ${n%%-*}"
+          done
+          if [ -n "$plats" ]; then
+            for asset in $(gh release view nightly --json assets -q '.assets[].name'); do
+              case "$asset" in *.fppos) ;; *) continue ;; esac
+              case "|$keep|" in *"|$asset|"*) continue ;; esac
+              for p in $plats; do
+                if [ "${asset%%-*}" = "$p" ]; then
+                  echo "  deleting superseded asset: $asset"
+                  # Never fail the run over a prune: the nightly is already
+                  # published and correct at this point, and a stale extra
+                  # asset is cosmetic. Worst case it is pruned tomorrow.
+                  gh release delete-asset nightly "$asset" --yes || \
+                    echo "  WARNING: could not delete $asset; leaving it in place"
+                  break
+                fi
+              done
+            done
+          fi

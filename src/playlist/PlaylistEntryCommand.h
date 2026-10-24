@@ -1,0 +1,45 @@
+#pragma once
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include <string>
+#include "fpp-json.h"
+#include <vector>
+
+#include "PlaylistEntryBase.h"
+#include "commands/Commands.h"
+
+class PlaylistEntryCommand : public PlaylistEntryBase {
+public:
+    PlaylistEntryCommand(Playlist* playlist, PlaylistEntryBase* parent = NULL);
+    virtual ~PlaylistEntryCommand();
+
+    virtual int Init(Json::Value& config) override;
+
+    virtual int StartPlaying(void) override;
+    virtual int Process(void) override;
+    virtual int Stop(void) override;
+
+    virtual void Dump(void) override;
+
+    virtual Json::Value GetConfig(void) override;
+
+    // The command has run to completion.  A completed command entry is only
+    // marked finished by the NEXT Process() call, so this is what tells a
+    // caller that has no next call coming (a restart) that the entry's work
+    // is already done.
+    bool CommandDone() { return m_result && m_result->isDone(); }
+
+private:
+    Json::Value m_command;
+    std::unique_ptr<Command::Result> m_result;
+};

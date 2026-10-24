@@ -1,346 +1,684 @@
 /*
- *   Mosquitto Client for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include "log.h"
-#include "mqtt.h"
-#include "settings.h"
-#include "events.h"
-#include "effects.h"
-#include "playlist/Playlist.h"
+#include "fpp-pch.h"
 
-#include <sstream>
-#include <string.h>
+#include "fpp-json.h"
+#include "fppversion.h"
+
+#include <atomic>
+#include <cstring>
+#include <fcntl.h>
+#include <chrono>
+#include <functional>
+#include <future>
+#include <list>
+#include <map>
+#include <memory>
+#include <mosquitto.h>
+#include <mutex>
+#include <stdlib.h>
+#include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
+#include "Events.h"
+#include "Timers.h"
+#include "Warnings.h"
+#include "common.h"      // SetThreadName() -- needed directly for NOPCH builds
+#include "common_mini.h" // FPPstrerror(), FPPrand() -- needed directly for NOPCH builds
+#include "log.h"
+#include "mqtt.h"
+#include "settings.h"
+#include "commands/Commands.h"
+
 #define FALCON_TOPIC "falcon/player"
 
-MosquittoClient *mqtt = NULL;
+MosquittoClient* mqtt = NULL;
 
-void mosq_disc_callback(struct mosquitto *mosq, void *userdata, int level)
-{
-	mosquitto_reconnect(mosq);
-}
+class MQTTCommand : public Command {
+public:
+    MQTTCommand() :
+        Command("MQTT") {
+        args.push_back(CommandArg("topic", "string", "Topic"));
+        args.push_back(CommandArg("message", "string", "Message"));
+        args.push_back(CommandArg("retain", "bool", "Retain").setDefaultValue("false"));
+    }
 
-void mosq_log_callback(struct mosquitto *mosq, void *userdata, int level, const char *str)
-{
-	mqtt->LogCallback(userdata, level, str);
-}
-
-void mosq_msg_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message)
-{
-	mqtt->MessageCallback(userdata, message);
-}
-
-
-/*
- *
- */
-MosquittoClient::MosquittoClient(const std::string &host, const int port,
-	const std::string &topicPrefix)
-  : m_port(port),
-	m_keepalive(60),
-	m_mosq(NULL),
-    m_host(host),
-    m_topicPrefix(topicPrefix)
-{
-	LogDebug(VB_CONTROL, "MosquittoClient::MosquittoClient('%s', %d, '%s')\n",
-		host.c_str(), port, topicPrefix.c_str());
-
-	if (m_topicPrefix.size()) {
-		m_topicPrefix += "/";
-	}
-		
-	m_baseTopic = m_topicPrefix;
-	m_baseTopic += FALCON_TOPIC;
-	m_baseTopic += "/";
-    
-	std::string hostname = getSetting("HostName");
-	if (hostname == "") {
-		hostname = "FPP";
-	}
-	m_baseTopic += hostname;
-
-	m_topicPlaylistOld = m_baseTopic + "/playlist/#"; //Legacy
-	m_topicPlaylist = m_baseTopic + "/set/playlist/#";
-
-	pthread_mutex_init(&m_mosqLock, NULL);
-}
-
-/*
- *
- */
-MosquittoClient::~MosquittoClient()
-{
-	mosquitto_loop_stop(m_mosq, true);
-
-	sleep(1);
-
-	mosquitto_destroy(m_mosq);
-	mqtt = NULL;
-
-	mosquitto_lib_cleanup();
-
-	pthread_mutex_destroy(&m_mosqLock);
-}
-
-/*
- *
- */
-int MosquittoClient::Init(const std::string &username, const std::string &password, const std::string &ca_file)
-{
-	mosquitto_lib_init();
-        std::string host = getSetting("HostName");
-        if (host == "") {
-	    host = "FPP";
+    virtual std::unique_ptr<Command::Result> run(const std::vector<std::string>& args) override {
+        if (args.size() < 2) {
+            return std::make_unique<Command::ErrorResult>("MQTT Requires two arguments");
         }
-        m_mosq = mosquitto_new(host.c_str(), true, NULL);
-	if (!m_mosq)
-	{
-		LogErr(VB_CONTROL, "Error, unable to create new Mosquitto instance.\n");
-		return 0;
-	}
+        bool retain = false;
+        if ((args.size() >= 3) &&
+            ((args[2] == "true") ||
+             (args[2] == "1"))) {
+            retain = true;
+        }
 
-	mosquitto_log_callback_set(m_mosq, mosq_log_callback);
-	mosquitto_message_callback_set(m_mosq, mosq_msg_callback);
-	mosquitto_disconnect_callback_set(m_mosq, mosq_disc_callback);
+        mqtt->PublishRaw(args[0], args[1], retain);
+        return std::make_unique<Command::Result>("OK");
+    }
+};
 
-	if (username != "") {
-            mosquitto_username_pw_set(m_mosq, username.c_str(), password.c_str());
-	}
+void mosq_disc_callback(struct mosquitto* mosq, void* userdata, int level) {
+    if (userdata) {
+        ((MosquittoClient*)userdata)->HandleDisconnect();
+    }
+    /*
+     * Don't call reconnect here. Per documentation, loop_start() will handle
+     * reconnect automatically.
+     */
+    // mosquitto_reconnect(mosq);
+}
 
-	if (ca_file != "") {
-	    LogInfo(VB_CONTROL, "Using CA File: %s for MQTT\n", ca_file.c_str());
-            int rc = mosquitto_tls_set(m_mosq, ca_file.c_str(), NULL, NULL, NULL, NULL);
-	    if (rc) {
-		LogErr(VB_CONTROL, "Error, unable to set MQTT_Ca_file. RC=  %d\n", rc);
-		return 0;
+// A broker that refuses the connection (bad credentials, not authorised, etc.)
+// makes libmosquitto retry forever, invoking the connect callback with a
+// non-zero result each attempt; count refusals so they can be logged without
+// flooding at the retry rate.
+static int mqttConnectRefusals = 0;
+static long long mqttLastRefusalLogMS = 0;
 
-	    }
+// The network thread, running mosquitto_loop_forever(), and its signal that
+// the loop has returned (see ~MosquittoClient()).  Kept here rather than in
+// MosquittoClient, whose layout plugins compile in (see mqtt.h).
+static std::thread mqttLoopThread;
+static std::future<void> mqttLoopStopped;
 
-	} else {
-	    LogInfo(VB_CONTROL, "No CA File specified for MQTT\n");
-	}
+// libmosquitto opens its connection to the broker without close-on-exec, and
+// has no hook to open it another way, so every shell and tool fppd ran
+// inherited it. Mark it once it is open: here, on each connect, since a
+// reconnect opens a new one, and straight after the first connect starts.
+static void MarkBrokerSocketCloseOnExec(struct mosquitto* mosq) {
+    int fd = mosquitto_socket(mosq);
+    if (fd >= 0) {
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+}
 
-	LogDebug(VB_CONTROL, "About to call MQTT Connect (%s, %d, %d)t\n", m_host.c_str(), m_port, m_keepalive);
+void mosq_connect_callback(struct mosquitto* mosq, void* userdata, int rc) {
+    MarkBrokerSocketCloseOnExec(mosq);
+    if (rc != 0) {
+        mqttConnectRefusals++;
+        long long now = GetMonotonicTimeMS();
+        if ((mqttConnectRefusals == 1) || ((now - mqttLastRefusalLogMS) >= 60000)) {
+            mqttLastRefusalLogMS = now;
+            LogErr(VB_CONTROL, "MQTT broker refused connection: %s (%d attempts so far)\n",
+                   mosquitto_connack_string(rc), mqttConnectRefusals);
+        }
+        return;
+    }
+    if (mqttConnectRefusals) {
+        LogWarn(VB_CONTROL, "MQTT broker accepted connection after %d refused attempts\n",
+                mqttConnectRefusals);
+        mqttConnectRefusals = 0;
+        mqttLastRefusalLogMS = 0;
+    }
+    if (userdata) {
+        ((MosquittoClient*)userdata)->HandleConnect();
+    }
+}
 
-	int result = mosquitto_connect(m_mosq, m_host.c_str(), m_port, m_keepalive);
+void mosq_log_callback(struct mosquitto* mosq, void* userdata, int level, const char* str) {
+    mqtt->LogCallback(userdata, level, str);
+}
 
-	if (result)
-	{
-		
-		LogErr(VB_CONTROL, "Error, unable to connect to Mosquitto Broker at %s: %d\n",
-			m_host.c_str(), result);
-		LogErr(VB_CONTROL, "MQTT Error: %s\n", strerror(result));
-		return 0;
-	}
-
-	std::vector<std::string> subscribe_topics;
-	subscribe_topics.push_back(m_baseTopic + "/set/#");
-	subscribe_topics.push_back(m_baseTopic + "/event/#"); // Legacy
-	subscribe_topics.push_back(m_baseTopic + "/effect/#"); // Legacy
-	subscribe_topics.push_back(m_baseTopic + "/playlist/name/set"); // Legacy
-	subscribe_topics.push_back(m_baseTopic + "/playlist/repeat/set"); // Legacy
-	subscribe_topics.push_back(m_baseTopic + "/playlist/selectionPosition/set"); // Legacy
-
-	for (auto t =subscribe_topics.begin(); t != subscribe_topics.end(); t++) {
-		std::string subscribe = *t;
-		LogDebug(VB_CONTROL, "MQTT Connected. Preparing to Subscribe to %s\n", subscribe.c_str());
-		int rc = mosquitto_subscribe(m_mosq, NULL, subscribe.c_str(), 0);
-		if (rc != MOSQ_ERR_SUCCESS) {
-			LogErr(VB_CONTROL, "Error, unable to subscribe to %s: %d\n", subscribe.c_str(), rc);
-			return 0;
-		}
-	}
-
-
-	int loop = mosquitto_loop_start(m_mosq);
-	if (loop != MOSQ_ERR_SUCCESS)
-	{
-		LogErr(VB_CONTROL, "Error, unable to start Mosquitto loop: %d\n", loop);
-		return 0;
-	}
-
-        LogInfo(VB_CONTROL, "MQTT Sucessfully Connected\n");
-	return 1;
+void mosq_msg_callback(struct mosquitto* mosq, void* userdata, const struct mosquitto_message* message) {
+    mqtt->MessageCallback(userdata, message);
 }
 
 /*
  *
  */
-int MosquittoClient::PublishRaw(const std::string &topic, const std::string &msg)
-{
-	LogDebug(VB_CONTROL, "Publishing message '%s' on topic '%s'\n", msg.c_str(), topic.c_str());
+// callbackTopics is walked on libmosquitto's thread for every message, and
+// changed on the main loop and API threads as callbacks come and go.  A file
+// static rather than a member so MosquittoClient's layout doesn't change.
+static std::mutex s_callbackTopicsLock;
 
-	pthread_mutex_lock(&m_mosqLock);
+static std::list<std::string> CopyTopics(const std::list<std::string>& topics) {
+    std::lock_guard<std::mutex> lock(s_callbackTopicsLock);
+    return topics;
+}
 
-	int result = mosquitto_publish(m_mosq, NULL, topic.c_str(), msg.size(), msg.c_str(), 1, 1);
+MosquittoClient::MosquittoClient(const std::string& host, const int port,
+                                 const std::string& topicPrefix) :
+    m_port(port),
+    m_keepalive(60),
+    m_mosq(NULL),
+    m_host(host),
+    m_canProcessMessages(false),
+    m_isConnected(false),
+    m_topicPrefix(topicPrefix) {
+    LogDebug(VB_CONTROL, "MosquittoClient::MosquittoClient('%s', %d, '%s')\n",
+             host.c_str(), port, topicPrefix.c_str());
 
-	pthread_mutex_unlock(&m_mosqLock);
+    WarningHolder::AddWarning(4, "MQTT Disconnected");
+    if (m_topicPrefix.size()) {
+        m_topicPrefix += "/";
+    }
 
-	if (result != 0)
-	{
-		LogErr(VB_CONTROL, "Error running mosquitto_publish: %d\n", result);
-		return 0;
-	}
+    m_baseTopic = m_topicPrefix;
+    m_baseTopic += FALCON_TOPIC;
+    m_baseTopic += "/";
 
-	return 1;
+    std::string hostname = getSetting("HostName");
+    if (hostname == "") {
+        hostname = "FPP";
+    }
+    m_baseTopic += hostname;
+
+} // End of MosquittoClient()
+
+/*
+ *
+ */
+MosquittoClient::~MosquittoClient() {
+    // Stop the network thread by disconnecting and joining it, not by
+    // cancelling it.  A cancel lands at whatever cancellation point the thread
+    // has reached, which can be inside a message callback running a command,
+    // and the catch (...) that guards those callbacks swallows the forced
+    // unwind, which aborts the process on the way out.  A clean disconnect
+    // means the broker drops our will, but shutdown has already published
+    // "ready" = 0 itself (Events::PrepareForShutdown), ahead of the
+    // DISCONNECT in the same queue.
+    //
+    // The callbacks go first: the disconnect this causes would otherwise run
+    // HandleDisconnect(), whose timer captures this object, and the others
+    // reach this object through the global `mqtt`.
+    //
+    // The join is bounded.  With the broker unreachable the thread can be
+    // inside a blocking connect() (about two minutes when SYNs are dropped),
+    // or a message callback can be stuck in a command, and fppd's restart and
+    // shutdown waited on it.  Every path from here ends in exec or _exit, so
+    // past the bound the client is left to the thread and never freed.
+    //
+    // The thread is ours, not mosquitto_loop_start()'s, so the join does not
+    // depend on libmosquitto still seeing it running: its own thread clears
+    // mosq->threaded on the way out, and a mosquitto_loop_stop() that read
+    // that first returned MOSQ_ERR_INVAL without joining, leaving
+    // mosquitto_destroy() to free the client under the exiting thread.
+    if (m_mosq) {
+        mosquitto_message_callback_set(m_mosq, nullptr);
+        mosquitto_log_callback_set(m_mosq, nullptr);
+        mosquitto_connect_callback_set(m_mosq, nullptr);
+        mosquitto_disconnect_callback_set(m_mosq, nullptr);
+        mosquitto_disconnect(m_mosq);
+
+        if (mqttLoopThread.joinable()) {
+            if (mqttLoopStopped.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+                LogWarn(VB_CONTROL, "MQTT network thread did not stop within 3 s; leaving it\n");
+                mqttLoopThread.detach();
+                mqtt = NULL;
+                return;
+            }
+            mqttLoopThread.join();
+        }
+    }
+
+    mosquitto_destroy(m_mosq);
+    mqtt = NULL;
+
+    mosquitto_lib_cleanup();
+}
+
+void MosquittoClient::PrepareForShutdown() {
+    for (const std::string& n : CopyTopics(callbackTopics)) {
+        RemoveCallback(n);
+    }
+    if (m_canProcessMessages && m_isConnected) {
+        std::vector<std::string> subscribe_topics;
+        subscribe_topics.push_back(m_baseTopic + "/set/#");
+
+        for (auto& subscribe : subscribe_topics) {
+            mosquitto_unsubscribe(m_mosq, NULL, subscribe.c_str());
+        }
+    }
+    m_canProcessMessages = false;
 }
 
 /*
  *
  */
-int MosquittoClient::Publish(const std::string &subTopic, const std::string &msg)
-{
-	std::string topic = m_baseTopic + "/" + subTopic;
+int MosquittoClient::Init(const std::string& username, const std::string& password, const std::string& ca_file) {
+    mosquitto_lib_init();
+    // Use supplied Client Id (If one)
+    std::string clientId = getSetting("MQTTClientId");
+    if (clientId == "") {
+        // If not, genereate one with random digits on end
+        clientId = getSetting("HostName");
+        if (clientId == "") {
+            clientId = "FPP";
+        }
+        clientId.append("_");
+        for (int i = 0; i < 4; i++) {
+            int digit = FPPrand() % 10;
+            char digitc = '0' + digit;
+            clientId.append(1, digitc);
+        }
+    }
+    LogDebug(VB_CONTROL, "Using MQTT client id of %s \n", clientId.c_str());
+    m_mosq = mosquitto_new(clientId.c_str(), true, NULL);
+    if (!m_mosq) {
+        LogErr(VB_CONTROL, "Error, unable to create new Mosquitto instance.\n");
+        return 0;
+    }
+    mosquitto_user_data_set(m_mosq, this);
+    // The network loop runs on a thread of our own (below), so libmosquitto
+    // has to lock as it would for mosquitto_loop_start().
+    mosquitto_threaded_set(m_mosq, true);
+    mosquitto_log_callback_set(m_mosq, mosq_log_callback);
+    mosquitto_disconnect_callback_set(m_mosq, mosq_disc_callback);
+    mosquitto_connect_callback_set(m_mosq, mosq_connect_callback);
 
-	return PublishRaw(topic, msg);
+    // Back off failed reconnects exponentially (1s doubling up to 60s) rather
+    // than libmosquitto's default fixed 1s retry, so an unreachable or
+    // refusing broker isn't hammered once per second indefinitely.
+    mosquitto_reconnect_delay_set(m_mosq, 1, 60, true);
+
+    if (username != "") {
+        mosquitto_username_pw_set(m_mosq, username.c_str(), password.c_str());
+    }
+
+    if (ca_file != "") {
+        LogDebug(VB_CONTROL, "Using CA File: %s for MQTT\n", ca_file.c_str());
+        int rc = mosquitto_tls_set(m_mosq, ca_file.c_str(), NULL, NULL, NULL, NULL);
+        if (rc) {
+            LogErr(VB_CONTROL, "Error, unable to set MQTT_Ca_file. RC=  %d\n", rc);
+            return 0;
+        }
+    } else {
+        LogDebug(VB_CONTROL, "No CA File specified for MQTT\n");
+    }
+
+    LogDebug(VB_CONTROL, "About to call MQTT Connect (%s, %d, %d)\n", m_host.c_str(), m_port, m_keepalive);
+
+    // Tell MQTT broker to make MQTT "ready" topic go to zero if crash or network loss
+    static std::string last_ready_message = "0";
+    static std::string last_ready_topic = m_baseTopic + "/" + MQTT_READY_TOPIC_NAME;
+    int rc = mosquitto_will_set(m_mosq, last_ready_topic.c_str(), last_ready_message.size(), last_ready_message.c_str(), 1, true);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        LogErr(VB_CONTROL, "MQTT: Unable to set last will for  %s. Error code: %d\n", MQTT_READY_TOPIC_NAME, rc);
+    }
+
+    rc = mosquitto_connect_async(m_mosq, m_host.c_str(), m_port, m_keepalive);
+    MarkBrokerSocketCloseOnExec(m_mosq);
+
+    if (rc) {
+        LogErr(VB_CONTROL, "Error, unable to connect to Mosquitto Broker at %s: %d\n",
+               m_host.c_str(), rc);
+        LogErr(VB_CONTROL, "MQTT Error: %s\n", FPPstrerror(rc));
+        return 0;
+    }
+
+    // What mosquitto_loop_start() would run, on a thread the destructor can
+    // join: sleep for the keepalive (or a day without one) between packets,
+    // since publish() and disconnect() wake the loop.
+    struct mosquitto* m = m_mosq;
+    int timeout = m_keepalive ? m_keepalive * 1000 : 1000 * 86400;
+    auto stopped = std::make_shared<std::promise<void>>();
+    mqttLoopStopped = stopped->get_future();
+    try {
+        mqttLoopThread = std::thread([m, timeout, stopped]() {
+            SetThreadName("FPP-MQTT");
+            mosquitto_loop_forever(m, timeout, 1);
+            stopped->set_value();
+        });
+    } catch (const std::system_error& e) {
+        LogErr(VB_CONTROL, "Error, unable to start Mosquitto loop: %s\n", e.what());
+        return 0;
+    }
+
+    CommandManager::INSTANCE.addCategorizedCommand(new MQTTCommand(), "Outputs", 1);
+
+    return 1;
+}
+
+/*
+ * Publish to an absolute topic.  Note the parameter order is (retain, qos);
+ * the Publish() overloads below must pass them through in that order.
+ * This signature is used directly by plugins (e.g. fpp-HomeAssistant) and
+ * must not change.
+ */
+int MosquittoClient::PublishRaw(const std::string& topic, const std::string& msg, const bool retain, const int qos) {
+    LogDebug(VB_CONTROL, "Publishing message '%s' on topic '%s'\n", msg.c_str(), topic.c_str());
+
+    int result;
+    {
+        // Scope the lock to just the mosquitto_publish() call, matching the
+        // coverage of the previous pthread_mutex_lock()/unlock() pair.
+        std::lock_guard<std::mutex> lock(m_mosqLock);
+        result = mosquitto_publish(m_mosq, NULL, topic.c_str(), msg.size(), msg.c_str(), qos, retain);
+    }
+
+    if (result != 0) {
+        // MOSQ_ERR_NO_CONN (4) is expected when disconnected, don't spam logs
+        if (result == 4 && !m_isConnected) {
+            LogDebug(VB_CONTROL, "Cannot publish to MQTT, not connected to broker\n");
+        } else {
+            LogErr(VB_CONTROL, "Error running mosquitto_publish: %d\n", result);
+        }
+        return 0;
+    }
+
+    return 1;
+}
+
+// Two-argument overloads used by Events::Publish() and by plugins.
+//
+// Everything published through here is retained (QoS 1).  Historically the
+// four-argument overloads below passed retain/qos to PublishRaw() in the wrong
+// order, which had the effect of retaining every message regardless of the
+// flag requested.  Consumers such as Home Assistant depend on that: retained
+// state topics (status, playlist/*, fppd_status, plugin light/switch state...)
+// are what let a subscriber recover the current state on (re)connect instead
+// of showing "unknown" until the next change.  Keep retaining state topics so
+// fixing the argument order does not change what is stored on the broker.
+bool MosquittoClient::Publish(const std::string& topic, const std::string& data) {
+    return Publish(topic, data, true, 1);
+}
+bool MosquittoClient::Publish(const std::string& topic, const int value) {
+    if (topic == MQTT_READY_TOPIC_NAME && value) {
+        SetReady();
+    }
+    return Publish(topic, value, true, 1);
 }
 
 /*
  *
  */
-int MosquittoClient::Publish(const std::string &subTopic, const int value)
-{
-	std::string topic = m_baseTopic + "/" + subTopic;
-	std::string msg = std::to_string(value);
+int MosquittoClient::Publish(const std::string& subTopic, const std::string& msg, const bool retain, const int qos) {
+    std::string topic = m_baseTopic + "/" + subTopic;
 
-	return PublishRaw(topic, msg);
+    return PublishRaw(topic, msg, retain, qos);
 }
 
 /*
  *
  */
-void MosquittoClient::LogCallback(void *userdata, int level, const char *str)
-{
-	switch (level)
-	{
-// FIXME, comment out the first 3 of these or tie to our own debug level
-//		case MOSQ_LOG_DEBUG:
-//		case MOSQ_LOG_INFO:
-//		case MOSQ_LOG_NOTICE:
-		case MOSQ_LOG_WARNING:
-		case MOSQ_LOG_ERR:
-			LogDebug(VB_CONTROL, "Mosquitto Log: %d:%s\n", level, str);
-	}
+int MosquittoClient::Publish(const std::string& subTopic, const int value, const bool retain, const int qos) {
+    std::string topic = m_baseTopic + "/" + subTopic;
+    std::string msg = std::to_string(value);
+
+    return PublishRaw(topic, msg, retain, qos);
 }
 
 /*
  *
  */
-void MosquittoClient::MessageCallback(void *obj, const struct mosquitto_message *message)
-{
-	bool match = 0;
-	std::string emptyStr;
-	std::string topic;
-	std::string payload;
+void MosquittoClient::LogCallback(void* userdata, int level, const char* str) {
+    switch (level) {
+        // FIXME, comment out the first 3 of these or tie to our own debug level
+        //		case MOSQ_LOG_DEBUG:
+        //		case MOSQ_LOG_INFO:
+        //		case MOSQ_LOG_NOTICE:
+    case MOSQ_LOG_WARNING:
+    case MOSQ_LOG_ERR:
+        LogDebug(VB_CONTROL, "Mosquitto Log: %d:%s\n", level, str);
+    }
+}
 
-	LogDebug(VB_CONTROL, "Received Mosquitto message: '%s' on topic '%s'\n",
-		(char*) message->payload, message->topic);
+bool MosquittoClient::IsConnected() {
+    return m_isConnected;
+}
 
-	if (message->topic)
-		topic = (char *)message->topic;
+void MosquittoClient::RegisterCallback(const std::string& topic) {
+    LogDebug(VB_CONTROL, "MQTT: In AddCallback with %s\n", topic.c_str());
+    {
+        std::lock_guard<std::mutex> lock(s_callbackTopicsLock);
+        callbackTopics.push_back(topic);
+    }
+    if (m_canProcessMessages && m_isConnected) {
+        if (topic.rfind("/set/", 0) != 0) {
+            // we are registered on all "/set/" already, no need to re-register
+            std::string tp = m_baseTopic + topic;
+            LogDebug(VB_CONTROL, "MQTT: Preparing to Subscribe to %s\n", tp.c_str());
+            int rc = mosquitto_subscribe(m_mosq, NULL, tp.c_str(), 0);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                LogErr(VB_CONTROL, "Error, unable to subscribe to %s: %d\n", tp.c_str(), rc);
+            }
+        }
+    }
+}
+void MosquittoClient::RemoveCallback(const std::string& topic) {
+    if (m_canProcessMessages && m_isConnected) {
+        if (topic.rfind("/set/", 0) != 0) {
+            // we are registered on all "/set/" already, no need to un-register
+            std::string tp = m_baseTopic + topic;
+            LogDebug(VB_CONTROL, "MQTT: Preparing to Unsubscribe to %s\n", tp.c_str());
+            int rc = mosquitto_unsubscribe(m_mosq, NULL, tp.c_str());
+            if (rc != MOSQ_ERR_SUCCESS) {
+                LogErr(VB_CONTROL, "Error, unable to Unsubscribe to %s: %d\n", tp.c_str(), rc);
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(s_callbackTopicsLock);
+    callbackTopics.remove(topic);
+}
+void MosquittoClient::SetReady() {
+    LogDebug(VB_CONTROL, "Mosquitto SetReady()\n");
+    if (!m_canProcessMessages) {
+        m_canProcessMessages = true;
+        mosquitto_message_callback_set(m_mosq, mosq_msg_callback);
+    }
 
-	if (message->payload)
-		payload = (char *)message->payload;
+    // Register topics which were set since we originally connected
+    // But only if already connected!
+    if (m_isConnected) {
+        HandleConnect();
+    }
+}
 
-	// If not our base, then return.
-	// Would only happen if subscribe is wrong
-        if (topic.find(m_baseTopic) != 0) {
-		return;
-	}
+void MosquittoClient::HandleConnect() {
+    m_isConnected = true;
+    LogWarn(VB_CONTROL, "Mosquitto Connected\n");
+    if (!m_canProcessMessages) {
+        LogWarn(VB_CONTROL, "HandleConnect() called before can process messages.  Won't Register topics yet.\n");
+        return;
+    }
 
-	// Normal Playlist
-	mosquitto_topic_matches_sub(m_topicPlaylist.c_str(), message->topic, &match);
-	if (match) {
-		topic.replace(0, m_topicPlaylist.size() -1, emptyStr); // Replace until /#
-		playlist->MQTTHandler(topic, payload);
-		return;
-	}
+    LogDebug(VB_CONTROL, "Mosquitto Connected.... Will Subscribe to Topics\n");
+    std::vector<std::string> subscribe_topics;
+    subscribe_topics.push_back(m_baseTopic + "/set/#");
 
-	// Check deprecated version of Playlist
-	mosquitto_topic_matches_sub(m_topicPlaylistOld.c_str(), message->topic, &match);
-	if (match) {
-		LogDebug(VB_CONTROL, "Received deprecated MQTT Topic: '%s' \n",
-			message->topic);
-		topic.replace(0, m_topicPlaylistOld.size() - 1, emptyStr); // Replace until /#
-		playlist->MQTTHandler(topic, payload);
-		return;
-	}
+    std::string add_topics = getSetting("MQTTSubscribe");
 
-	std::string eventTopic = m_baseTopic + "/set/event/#";
-	mosquitto_topic_matches_sub(eventTopic.c_str(), message->topic, &match);
-	if (match) {
-		TriggerEventByID(payload.c_str());
-		return;
-	}
+    if (add_topics != "") {
+        // Handle single topic with no semicolon
+        std::vector<std::string> subscribe_to_me;
+        if (add_topics.find(';') == std::string::npos && !add_topics.empty()) {
+            subscribe_to_me.push_back(add_topics);
+        }
 
-	// Check Legacy
-	eventTopic = m_baseTopic + "/event/#";
-	mosquitto_topic_matches_sub(eventTopic.c_str(), message->topic, &match);
-	if (match) {
-		LogDebug(VB_CONTROL, "Received deprecated MQTT Topic: '%s' \n",
-			message->topic);
-		TriggerEventByID(payload.c_str());
-		return;
-	}
+        // Handle multiple topics separated by semicolon
+        size_t start = 0, end = 0;
+        while ((end = add_topics.find(';', start)) != std::string::npos) {
+            std::string sub = add_topics.substr(start, end - start);
+            subscribe_to_me.push_back(sub);
+            start = end + 1;
+        }
+        // Add last topic if there is no trailing semicolon
+        if (start < add_topics.length()) {
+            subscribe_to_me.push_back(add_topics.substr(start));
+        }
 
-
-	std::string effectTopic = m_baseTopic + "/set/effect/#";
-	std::string effectTopicOld = m_baseTopic + "/effect/#";
-	// Check normal
-	mosquitto_topic_matches_sub(effectTopic.c_str(), message->topic, &match);
-	if (match) {
-		std::string s = m_baseTopic + "/set";
-		topic.replace(0,s.size() +1, emptyStr);
-	} else {
-		// Check Legacy
-		mosquitto_topic_matches_sub(effectTopicOld.c_str(), message->topic, &match);
-		if (match) {
-			LogDebug(VB_CONTROL, "Received deprecated MQTT Topic: '%s' \n",
-				message->topic);
-			topic.replace(0, m_baseTopic.size() + 1, emptyStr);
-		}
-	}
+        // Trip topic names and add to subscribe list
+        for (auto& s : subscribe_to_me) {
+            s.erase(0, s.find_first_not_of(" \t\n\r\f\v"));
+            s.erase(s.find_last_not_of(" \t\n\r\f\v") + 1);
+            if (!s.empty()) {
+                LogDebug(VB_CONTROL, "Adding extra MQTT subscribe topic: %s\n", s.c_str());
+                subscribe_topics.push_back(s);
+            }
+        }
+    }
 
 
-	if (match) {
-		// At this point, topic has had /set removed if it was present
-		if (topic == "effect/stop") {
-			if (payload == "") {
-				StopAllEffects();
-			} else {
-				StopEffect(payload.c_str());
-			}
-		} else if (topic == "effect/start") {
-			StartEffect(payload.c_str(), 0);
-		}
+    for (auto& topic : CopyTopics(callbackTopics)) {
+        if (topic.rfind("/set/", 0) != 0) {
+            std::string tp = m_baseTopic + topic;
+            subscribe_topics.push_back(tp);
+        }
+    }
 
-		return ;
-	}
+    for (auto& subscribe : subscribe_topics) {
+        LogDebug(VB_CONTROL, "MQTT: Preparing to Subscribe to %s\n", subscribe.c_str());
+        int rc = mosquitto_subscribe(m_mosq, NULL, subscribe.c_str(), 0);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            LogErr(VB_CONTROL, "Error, unable to subscribe to %s: %d\n", subscribe.c_str(), rc);
+        }
+    }
 
-	LogWarn(VB_CONTROL, "No match found for Mosquitto topic '%s'\n",
-		message->topic);
+    WarningHolder::RemoveWarning(4, "MQTT Disconnected");
+    
+    // Re-publish retained status messages on reconnection
+    // This ensures the broker has the current values after a network disconnection
+    // that may have triggered the last will (ready=0)
+    LogDebug(VB_CONTROL, "MQTT: Re-publishing retained status on reconnection\n");
+    Publish(MQTT_READY_TOPIC_NAME, 1, true, 1);
+    Publish("version", getFPPVersion(), true, 1);
+    Publish("branch", getFPPBranch(), true, 1);
+    
+    LogDebug(VB_CONTROL, "MQTT HandleConnect Complete\n");
+}
+
+void MosquittoClient::HandleDisconnect() {
+    long long tm = GetTimeMS();
+    if (!m_isConnected) {
+        // This fires after every refused reconnect attempt; the refusal is
+        // already logged (rate-limited) in mosq_connect_callback and the
+        // "MQTT Disconnected" warning is still active, so stay quiet here.
+        LogDebug(VB_CONTROL, "Mosquitto Disconnected (was not connected) %lld\n", tm);
+        return;
+    }
+    LogWarn(VB_CONTROL, "Mosquitto Disconnected. Will try reconnect %lld\n", tm);
+    m_isConnected = false;
+    Timers::INSTANCE.addTimer("MosquittoDisconnect", tm + 10000, [this, tm]() {
+        if (!m_isConnected) {
+            WarningHolder::AddWarning(4, "MQTT Disconnected");
+        }
+    });
+}
+
+/*
+ *
+ */
+void MosquittoClient::MessageCallback(void* obj, const struct mosquitto_message* message) {
+    if (!m_canProcessMessages) {
+        // FPPd is not yet in a state where incoming messages can be processed
+        return;
+    }
+    bool match = 0;
+    std::string emptyStr;
+    std::string topic;
+    std::string payload;
+
+    LogDebug(VB_CONTROL, "Received Mosquitto message: '%s' on topic '%s'\n",
+             (char*)message->payload, message->topic);
+
+    if (message->topic)
+        topic = (char*)message->topic;
+
+    if (message->payload)
+        payload = (char*)message->payload;
+
+    CacheSetMessage(topic, payload);
+
+    for (auto& a : CopyTopics(callbackTopics)) {
+        std::string s = m_baseTopic + a;
+        LogDebug(VB_CONTROL, "Testing Callback '%s'\n", s.c_str());
+        mosquitto_topic_matches_sub(s.c_str(), message->topic, &match);
+        if (match) {
+            std::string tp = message->topic;
+            tp.replace(0, m_baseTopic.size(), emptyStr);
+            Events::InvokeCallback(a, tp, payload);
+            LogDebug(VB_CONTROL, "Found and Completed Callback for '%s'\n", s.c_str());
+            return;
+        }
+    }
+
+    LogDebug(VB_CONTROL, "No match found for Mosquitto topic '%s'. Assuming it is an additional subscribe topic\n",
+            message->topic);
+}
+
+// Every message on every subscribed topic is cached, for conditions,
+// variables and playlist branches to read.  Unbounded, a broker with many
+// topics -- or anyone who can publish under the subscribed wildcards, one
+// topic name after another -- grew fppd until it ran out of memory.  Past
+// these, the topic updated longest ago makes room, and a payload too large
+// to be a value anything here compares is not kept.
+static constexpr size_t MQTT_CACHE_MAX_TOPICS = 4096;
+static constexpr size_t MQTT_CACHE_MAX_PAYLOAD = 64 * 1024;
+
+void MosquittoClient::CacheSetMessage(std::string& topic, std::string& message) {
+    std::unique_lock<std::mutex> lock(messageCacheLock);
+
+    LogDebug(VB_CONTROL, "MosquittoClient::CacheSetMessage('%s', '%s')\n", topic.c_str(), message.c_str());
+
+    if (message.size() > MQTT_CACHE_MAX_PAYLOAD) {
+        // not an older, smaller value standing in for it either
+        messageCache.erase(topic);
+        return;
+    }
+    auto it = messageCache.find(topic);
+    if (it == messageCache.end() && messageCache.size() >= MQTT_CACHE_MAX_TOPICS) {
+        auto oldest = messageCache.begin();
+        for (auto e = messageCache.begin(); e != messageCache.end(); ++e) {
+            if (e->second.lastUpdated < oldest->second.lastUpdated) {
+                oldest = e;
+            }
+        }
+        messageCache.erase(oldest);
+    }
+    messageCache[topic] = { message, time(nullptr) };
+}
+
+bool MosquittoClient::CacheCheckMessage(std::string& topic, std::string& message) {
+    std::unique_lock<std::mutex> lock(messageCacheLock);
+
+    auto search = messageCache.find(topic);
+    if (search != messageCache.end())
+        return search->second.value == message;
+
+    return false;
+}
+
+bool MosquittoClient::GetCachedMessage(const std::string& topic, std::string& message) {
+    time_t lastUpdated;
+    return GetCachedMessage(topic, message, lastUpdated);
+}
+
+bool MosquittoClient::GetCachedMessage(const std::string& topic, std::string& message, time_t& lastUpdated) {
+    std::unique_lock<std::mutex> lock(messageCacheLock);
+
+    auto search = messageCache.find(topic);
+    if (search == messageCache.end())
+        return false;
+
+    message = search->second.value;
+    lastUpdated = search->second.lastUpdated;
+    return true;
+}
+
+void MosquittoClient::dumpMessageCache(Json::Value& result, bool includeMetadata) {
+    // NOTE: This assumes that result is an Array
+    std::unique_lock<std::mutex> lock(messageCacheLock);
+
+    for (const auto& pair : messageCache) {
+        if (includeMetadata) {
+            result[pair.first]["value"] = pair.second.value;
+            result[pair.first]["lastUpdated"] = (Json::Int64)pair.second.lastUpdated;
+        } else {
+            result[pair.first] = pair.second.value;
+        }
+    }
 }

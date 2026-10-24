@@ -1,0 +1,584 @@
+<?
+require_once(__DIR__ . "/../../config.php");
+
+/**
+ * Proxy a command to remote FPP
+ *
+ * Proxies a named action to a remote FPP instance by IP address.
+ * Supported actions: `listUpgrades`, `reboot`, `restartFppd`, `updateLog`
+ * (the remote's running FPP/OS update, with its log tail). `reboot` and
+ * `restartFppd` change the remote: send them by POST, which FPP 11 will
+ * require of them. The others read and stay GETs. An OS upgrade of another
+ * player is a MultiSync job (`streamRemoteJobs.php`, type `upgradeOS`), which
+ * streams its progress.
+ *
+ * @route GET /api/remoteAction
+ * @route POST /api/remoteAction
+ * @response 400 Invalid action
+ * ```json
+ * {"error": "Invalid action given: badaction"}
+ * ```
+ */
+function remoteAction()
+{
+    global $settings;
+    $ip = htmlspecialchars(isset($_GET['ip']) ? $_GET['ip'] : null);
+    $action = htmlspecialchars(isset($_GET['action']) ? $_GET['action'] : null);
+
+    $action_map = [
+        'listUpgrades' => '/api/git/releases/os',
+        'reboot' => '/api/system/reboot',
+        'restartFppd' => '/api/system/fppd/restart',
+        'updateLog' => '/api/system/updateActivity?logTail=1&lines=300',
+    ];
+
+    // Another player, never this one: 127.0.0.1 reached this player's own
+    // local-only pages (Apache counts a request from itself as local).
+    $ipLong = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? ip2long($ip) : false;
+    if ($ipLong === false || ($ipLong & 0xFF000000) == 0x7F000000 || $ipLong == 0) {
+        http_response_code(400);
+        return json(['error' => "Invalid IP address: $ip"]);
+    }
+
+    if (!array_key_exists($action, $action_map)) {
+        http_response_code(400);
+        return json(['error' => 'HTTP Error: 400', 'details' => "Invalid action given: $action"]);
+    }
+
+    if (in_array($action, array('reboot', 'restartFppd'), true)) {
+        $request_content = RemotePlayerAction('http://' . $ip . $action_map[$action], 2000, $http_code);
+    } else {
+        $curl = curl_init('http://' . $ip . $action_map[$action]);
+        curl_setopt($curl, CURLOPT_FAILONERROR, true);
+        // Redirects are not followed: the remote would decide what this player
+        // fetches, and a Location of http://127.0.0.1/... reaches this player's
+        // own local-only pages, which the IP check above exists to keep out.
+        // No player redirects any of these paths.
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 2000);
+        $request_content = curl_exec($curl);
+        $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+    }
+    if ($http_code !== 200) {
+        http_response_code($http_code);
+        $details = $request_content ? $request_content : 'No response content';
+        http_response_code(400);
+        return json(['error' => 'HTTP Error: ' . $http_code, 'details' => $request_content]);
+    }
+
+    // The answer is the remote's, not this player's: never hand it back as
+    // the page (limonade's default text/html), where a host answering with
+    // markup would run script on this player's origin. Every action here
+    // answers JSON; anything else (an old player's plain-text reboot reply)
+    // goes back as a JSON string.
+    $decoded = json_decode($request_content);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        $decoded = ['response' => $request_content];
+    }
+    return json($decoded, JSON_HEX_TAG | JSON_HEX_AMP);
+}
+
+/**
+ * Reads the proxy config file and merges in active DHCP leases, marking each
+ * entry with `dhcp` and `pending` flags.
+ *
+ * @return array Array of proxy entries, each with host, description, dhcp, and pending keys.
+ */
+function LoadProxyList()
+{
+    global $settings;
+    $mediaDirectory = $settings['mediaDirectory'];
+    if (file_exists("$mediaDirectory/config/proxy-config.conf")) {
+        $hta = file("$mediaDirectory/config/proxy-config.conf", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    } else {
+        $hta = array();
+    }
+    $proxies = array();
+    $description = "";
+    foreach ($hta as $line) {
+        if (strpos($line, 'http://') !== false) {
+            $parts = preg_split("/[\s]+/", $line);
+            $host = preg_split("/[\/]+/", $parts[2])[1];
+            if (!str_contains($host, "$1")) {
+                $proxies[] = array("host" => $host, "description" => $description);
+                $description = "";
+            }
+        } else if (strpos($line, '# D:') !== false) {
+            $description = substr($line, 4);
+        }
+    }
+
+    $leases = getDHCPLeases();
+    foreach ($leases as $ip) {
+        $alreadyExists = false;
+        foreach ($proxies as $proxy) {
+            if ($proxy['host'] === $ip) {
+                $alreadyExists = true;
+                break;
+            }
+        }
+        if (!$alreadyExists) {
+            // Not in config, mark as pending
+            $proxies[] = array("host" => $ip, "description" => "", "dhcp" => true, "pending" => true);
+        }
+    }
+
+    // Mark all DHCP hosts in $proxies
+    foreach ($proxies as &$proxy) {
+        if (in_array($proxy['host'], $leases)) {
+            $proxy['dhcp'] = true;
+            // Only set pending if not already set (i.e., was just added above)
+            if (!isset($proxy['pending'])) {
+                $proxy['pending'] = false;
+            }
+        } else {
+            // Not a DHCP lease, ensure pending is false
+            $proxy['pending'] = false;
+        }
+    }
+    unset($proxy);
+
+    return $proxies;
+}
+
+/**
+ * Shared proxy-entry validation (used by every writer below and by the file
+ * sink itself). Hosts are IPv4 literals or dot/dash hostnames; descriptions
+ * are free-form text with tags stripped, line breaks flattened (they would
+ * otherwise inject Apache directives via the "# D:" comment lines), and a
+ * length cap. Anything failing validation is the caller's error, never
+ * written to the config.
+ */
+function proxyIsValidHost($host)
+{
+    return is_string($host) &&
+        (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ||
+         preg_match('/^[a-zA-Z0-9.-]+$/', $host));
+}
+
+function proxyCleanDescription($description)
+{
+    if (!is_string($description)) {
+        return '';
+    }
+    $description = strip_tags($description);
+    $description = str_replace(array("\r", "\n"), ' ', $description);
+    return substr($description, 0, 128);
+}
+
+/**
+ * Set proxy list
+ *
+ * Replaces the proxy list with the submitted array of `host`/`description` objects,
+ * validates each entry, and triggers an Apache graceful reload.
+ *
+ * @route POST /api/proxies
+ * @body [{"host": "192.168.1.2", "description": "Mega Tree"}]
+ * @response 200 Updated proxy list
+ * ```json
+ * [
+ *   {"host": "192.168.1.2", "description": "Mega Tree"},
+ *   {"host": "192.168.1.146", "description": "Yard"},
+ *   {"host": "192.168.1.148", "description": "Left House"}
+ * ]
+ * ```
+ * @response 400 No valid proxies provided
+ * ```json
+ * {"error": "No valid proxies provided"}
+ * ```
+ */
+function PostProxies()
+{
+    $proxies = $_POST;
+    $validProxies = [];
+
+    foreach ($proxies as $proxy) {
+        // Validate expected structure
+        if (!isset($proxy['host']))
+            continue;
+        $host = $proxy['host'];
+        $description = isset($proxy['description']) ? $proxy['description'] : '';
+
+        // Validate host as IPv4 or hostname
+        if (!proxyIsValidHost($host)) {
+            continue; // skip invalid host
+        }
+
+        // Sanitize description (strip tags, flatten line breaks, limit length)
+        $description = proxyCleanDescription($description);
+
+        $validProxies[] = [
+            'host' => $host,
+            'description' => $description
+        ];
+    }
+
+    if (!empty($validProxies)) {
+        WriteProxyFile($validProxies);
+        GenerateBackupViaAPI('Proxies were added.');
+        return json($validProxies);
+    } else {
+        http_response_code(400); // Bad Request
+        echo json_encode(['error' => 'No valid proxies provided']);
+    }
+}
+
+/**
+ * Writes the proxy list to `proxy-config.conf` and triggers an Apache
+ * graceful reload. DHCP leases are merged in automatically.
+ *
+ * @param array $proxies Array of proxy entries with host and description keys.
+ * @return void
+ */
+function WriteProxyFile($proxies)
+{
+    global $settings;
+    global $SUDO, $fppDir;
+    $mediaDirectory = $settings['mediaDirectory'];
+
+    // Merge in current DHCP leases, avoiding duplicates
+    $leases = getDHCPLeases();
+    foreach ($leases as $ip) {
+        $alreadyExists = false;
+        foreach ($proxies as $proxy) {
+            if ($proxy['host'] === $ip) {
+                $alreadyExists = true;
+                break;
+            }
+        }
+        if (!$alreadyExists) {
+            $proxies[] = array("host" => $ip, "description" => "", "dhcp" => true);
+        }
+    }
+
+    $newht = "";
+    foreach ($proxies as $item) {
+        $host = $item['host'];
+        $description = isset($item['description']) ? $item['description'] : '';
+        // Belt-and-braces: every caller above validates, but stored entries
+        // predate validation (and future callers may not). Never write an
+        // unvalidated host or a line-breaking description into Apache config.
+        if (!proxyIsValidHost($host)) {
+            continue;
+        }
+        $description = proxyCleanDescription($description);
+        // Mark DHCP hosts with a comment if desired
+        if (!empty($item['dhcp'])) {
+            $newht .= "# DHCP\n";
+        }
+        if ($description != "") {
+            $newht .= "# D:" . $description . "\n";
+        }
+        $newht .= "RewriteRule ^" . $host . "$  " . $host . "/  [R,L]\n";
+        $newht .= "RewriteRule ^" . $host . ":([0-9]*)$  http://" . $host . ":$1/  [P,L]\n";
+        $newht .= "RewriteRule ^" . $host . ":([0-9]*)/(.*)$  http://" . $host . ":$1/$2  [P,L]\n";
+        $newht .= "RewriteRule ^" . $host . "/(.*)$  http://" . $host . "/$1  [P,L]\n\n";
+    }
+    file_put_contents("$mediaDirectory/config/proxy-config.conf", $newht);
+
+    // Graceful reload of Apache to apply changes
+    system($SUDO . " $fppDir/scripts/common gracefullyReloadApacheConf > /dev/null 2>&1");
+    // exec('/opt/fpp/scripts/common gracefullyReloadApacheConf');
+}
+
+/**
+ * Get list of proxy IPs
+ *
+ * Returns the list of IP addresses this FPP instance can proxy.
+ *
+ * @route GET /api/proxies
+ * @response 200 Current proxy list
+ * ```json
+ * [
+ *   {"host": "192.168.1.2", "description": "Mega Tree"},
+ *   {"host": "192.168.1.146", "description": "Yard"},
+ *   {"host": "192.168.1.148", "description": "Left House"}
+ * ]
+ * ```
+ */
+function GetProxies()
+{
+    $proxies = LoadProxyList();
+    return json($proxies, true);
+}
+
+/**
+ * Add proxy
+ *
+ * Adds a single IP address to the FPP proxy list if it does not already exist.
+ *
+ * @route POST /api/proxies/{ProxyIp}
+ * @response 200 Updated proxy list
+ * ```json
+ * [
+ *   {"host": "192.168.1.2", "description": "Mega Tree"}
+ * ]
+ * ```
+ */
+function AddProxy()
+{
+    $pip = params('ProxyIp');
+    $pdesp = params('Description', ''); // Allow description to be passed
+    if (!proxyIsValidHost($pip)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid proxy host']);
+        return;
+    }
+    $pdesp = proxyCleanDescription($pdesp);
+    $proxies = LoadProxyList();
+    $exists = false;
+    foreach ($proxies as $proxy) {
+        if ($proxy['host'] === $pip) {
+            $exists = true;
+            break;
+        }
+    }
+    if (!$exists) {
+        $proxies[] = array("host" => $pip, "description" => $pdesp);
+        WriteProxyFile($proxies);
+        GenerateBackupViaAPI('Proxy ' . $pip . ' was added.');
+    }
+    return json($proxies);
+}
+
+/**
+ * Remove proxy
+ *
+ * Removes a single IP address from the FPP proxy list.
+ *
+ * @route DELETE /api/proxies/{ProxyIp}
+ * @response 200 Updated proxy list
+ * ```json
+ * []
+ * ```
+ */
+function DeleteProxy()
+{
+    $pip = params('ProxyIp');
+    $proxies = LoadProxyList();
+    $newproxies = [];
+    foreach ($proxies as $proxy) {
+        if ($proxy['host'] !== $pip) {
+            $newproxies[] = $proxy;
+        }
+    }
+    WriteProxyFile($newproxies);
+    GenerateBackupViaAPI('Proxy ' . $pip . ' was deleted.');
+    return json($newproxies);
+}
+
+/**
+ * Get all remote FPPs
+ *
+ * Returns the list of known remote FPP systems from `fppd` multiSync discovery,
+ * keyed by address. Addresses that can't serve as a useful command/plugin target
+ * are filtered out:
+ *   - loopback (127.0.0.0/8, ::1) — the local box discovering itself.
+ *   - IPv6 link-local (fe80::/10) — needs a host-specific zone id and can't be
+ *     unicast by fppd anyway (MultiSync::SendUnicastPacket is IPv4-only).
+ *   - IPv4 link-local / APIPA (169.254.0.0/16) — dropped when the same device
+ *     also has a routable address; kept only when it is all the device has, so a
+ *     link-local-only host stays selectable.
+ * Multiple routable addresses for one device are left intact.
+ *
+ * @route GET /api/remotes
+ * @response 200 Known remote FPP systems
+ * ```json
+ * {
+ *   "192.168.1.10": "192.168.1.10 - remote-fpp",
+ *   "192.168.1.11": "192.168.1.11"
+ * }
+ * ```
+ */
+function GetRemotes()
+{
+    $curl = curl_init('http://localhost:32322/fppd/multiSyncSystems');
+    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 200);
+    $request_content = curl_exec($curl);
+
+    $j = json_decode($request_content, true);
+    $systems = (is_array($j) && isset($j["systems"]) && is_array($j["systems"]))
+        ? $j["systems"]
+        : array();
+
+    // Classify an address: 'loopback', 'fe80', 'apipa' (IPv4 link-local) or 'routable'.
+    $classify = function ($ip) {
+        $ipl = strtolower($ip);
+        if (strpos($ip, '127.') === 0 || $ipl === '::1') {
+            return 'loopback';
+        }
+        if (strpos($ipl, 'fe80') === 0) {
+            return 'fe80';
+        }
+        if (strpos($ip, '169.254.') === 0) {
+            return 'apipa';
+        }
+        return 'routable';
+    };
+
+    // Group entries by device so we can tell whether a device has any routable
+    // address before deciding to drop its link-local one. Prefer UUID, then
+    // hostname, then the address itself.
+    $deviceKey = function ($host) {
+        if (!empty($host["uuid"])) {
+            return 'uuid:' . $host["uuid"];
+        }
+        if (!empty($host["hostname"])) {
+            return 'host:' . $host["hostname"];
+        }
+        return 'addr:' . $host["address"];
+    };
+
+    // First pass: which devices have at least one routable address?
+    $hasRoutable = array();
+    foreach ($systems as $host) {
+        if (!isset($host["address"])) {
+            continue;
+        }
+        if ($classify($host["address"]) === 'routable') {
+            $hasRoutable[$deviceKey($host)] = true;
+        }
+    }
+
+    // Second pass: build the address => label map, applying the filter.
+    $remotes = array();
+    foreach ($systems as $host) {
+        if (!isset($host["address"])) {
+            continue;
+        }
+        $address = $host["address"];
+        $class = $classify($address);
+        if ($class === 'loopback' || $class === 'fe80') {
+            continue;
+        }
+        // Drop APIPA only when the device has a routable address to use instead.
+        if ($class === 'apipa' && !empty($hasRoutable[$deviceKey($host)])) {
+            continue;
+        }
+        $hostname = isset($host["hostname"]) ? $host["hostname"] : $address;
+        if ($address != $hostname) {
+            $remotes[$address] = $address . " - " . $hostname;
+        } else {
+            $remotes[$address] = $address;
+        }
+    }
+    return json($remotes);
+}
+
+/**
+ * Get URL from remote FPP
+ *
+ * Fetches a URL on a remote FPP instance via server-side proxy to avoid CSP restrictions.
+ *
+ * @route GET /api/proxy/{Ip}/{urlPart}
+ * @response 400 Invalid IP address
+ * ```json
+ * {"error": "Invalid IP address"}
+ * ```
+ * @response 502 Proxy fetch failed
+ * ```json
+ * {"error": "Failed to fetch proxied URL"}
+ * ```
+ */
+function GetProxiedURL()
+{
+    $ip = params('Ip');
+    $urlPart = params('urlPart');
+
+    // Basic validation: Only allow IPv4 addresses and safe URL parts
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid IP address']);
+        return;
+    }
+    // Prevent directory traversal and unsafe characters
+    if (preg_match('/\.\.|[^\w\-\/\.]/', $urlPart)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid URL part']);
+        return;
+    }
+
+    $url = "http://$ip/$urlPart";
+    $data = @file_get_contents($url);
+
+    if ($data === false) {
+        http_response_code(502); // Bad Gateway
+        echo json_encode(['error' => 'Failed to fetch proxied URL']);
+        return;
+    }
+
+    // Optionally set content-type if known
+    header('Content-Type: text/plain');
+    echo $data;
+    return;
+}
+
+/**
+ * Returns the list of IP addresses currently offered as DHCP leases by this FPP instance.
+ *
+ * @return array Array of IPv4 address strings.
+ */
+function getDHCPLeases()
+{
+    $dhcpIps = array();
+    $interfaces = network_list_interfaces_array();
+    foreach ($interfaces as $iface) {
+        $iface = rtrim($iface, " :\n\r\t\v\x00");
+        $out = shell_exec("networkctl --no-legend -l -n 0 status " . escapeshellarg($iface));
+        if ($out == null) {
+            $out = "";
+        }
+        $lines = explode("\n", trim($out));
+        $inLeases = false;
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (!$inLeases && strpos($line, "Offered DHCP leases") === 0) {
+                $inLeases = true;
+                $line = trim(substr($line, 20));
+            }
+            if ($inLeases) {
+                $pos = strpos($line, "(to ");
+                if ($pos === false) {
+                    $inLeases = false;
+                } else {
+                    $line = trim(substr($line, 0, $pos));
+                    $dhcpIps[] = $line;
+                }
+            }
+        }
+    }
+    return $dhcpIps;
+}
+
+/**
+ * Delete all proxies
+ *
+ * Deletes all proxy entries by writing an empty `proxy-config.conf` and
+ * triggering an Apache graceful reload.
+ *
+ * @route DELETE /api/proxies
+ * @response 200 All proxies deleted
+ * ```json
+ * []
+ * ```
+ */
+function DeleteAllProxies()
+{
+    global $settings;
+    $mediaDirectory = $settings['mediaDirectory'];
+
+    // Write an empty proxy config file
+    file_put_contents("$mediaDirectory/config/proxy-config.conf", "");
+
+    // Graceful reload of Apache to apply changes
+    global $SUDO, $fppDir;
+    system($SUDO . " $fppDir/scripts/common gracefullyReloadApacheConf > /dev/null 2>&1");
+
+    GenerateBackupViaAPI('All proxies were deleted.');
+    return json([]);
+}

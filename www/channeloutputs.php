@@ -1,313 +1,620 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
 <head>
-<?php
-require_once("common.php");
-require_once('config.php');
-require_once('universeentry.php');
-include 'common/menuHead.inc';
+    <?php
+    include 'common/htmlMeta.inc';
+    require_once "common.php";
+    require_once 'config.php';
+    require_once 'universeentry.php';
+    if (file_exists(__DIR__ . "/fppdefines.php")) {
+        include_once __DIR__ . '/fppdefines.php';
+    } else {
+        include_once __DIR__ . '/fppdefines_unknown.php';
+    }
+    include 'common/menuHead.inc';
 
-//$settings['Platform'] = "Raspberry Pi"; // Uncomment for testing
-//$settings['Platform'] = "BeagleBone Black"; // Uncomment for testing
-//$settings['SubPlatform'] = "BeagleBone Black"; // Uncomment for testing
-?>
+    //$settings['Platform'] = "Raspberry Pi"; // Uncomment for testing
+    //$settings['Platform'] = "BeagleBone Black"; // Uncomment for testing
+    //$settings['SubPlatform'] = "BeagleBone Black"; // Uncomment for testing
+    ?>
+    <script>
+        var currentCapeName = '';
+        var verboseDebug = false; // set to true to enable verbose debugging, will show called functions in console along with parameters and trace
+    </script>
 
-<?
-$currentCape = "";
-$currentCapeInfo = json_decode("{ \"provides\": [\"all\"]}", true);
-if (isSet($settings['cape-info'])) {
-    $currentCapeInfo = $settings['cape-info'];
-    $currentCape = $currentCapeInfo["id"];
-    echo "<!-- current cape is " . $currentCape . "-->\n";
-}
-if (!isset($currentCapeInfo['provides'])) {
-    $currentCapeInfo['provides'][] = "all";
-} else if ($settings["showAllOptions"] == 1) {
-    $currentCapeInfo['provides'][] = "all";
-}
-?>
+    <style>
+        .outputTable {
+            background: #F0F0F0;
+            width: 100%;
+            border-spacing: 0px;
+            border-collapse: collapse;
+        }
 
-<script language="Javascript">
+        .outputTable th {
+            vertical-align: bottom;
+            text-align: center;
+            border: solid 2px #888888;
+            font-size: 0.8em;
+        }
 
-var channelOutputs = [];
-var channelOutputsLookup = [];
-var currentTabTitle = "E1.31 / ArtNet / DDP";
+        .outputTable td {
+            text-align: center;
+            padding: 0px 9px 0px 0px;
+        }
 
-/////////////////////////////////////////////////////////////////////////////
+        .outputTable tbody tr td input[type=text] {
+            text-align: center;
+            width: 100%;
+        }
 
-function UpdateChannelOutputLookup()
-{
-	var i = 0;
-	for (i = 0; i < channelOutputs.channelOutputs.length; i++)
-	{
-		channelOutputsLookup[channelOutputs.channelOutputs[i].type + "-Enabled"] = channelOutputs.channelOutputs[i].enabled;
-		if (channelOutputs.channelOutputs[i].type == "LEDPanelMatrix")
-		{
-			channelOutputsLookup["LEDPanelMatrix"] = channelOutputs.channelOutputs[i];
+        .outputTable tbody tr td input[type=number] {
+            text-align: center;
+            width: 100%;
+        }
 
-			var p = 0;
-			for (p = 0; p < channelOutputs.channelOutputs[i].panels.length; p++)
-			{
-				var r = channelOutputs.channelOutputs[i].panels[p].row;
-				var c = channelOutputs.channelOutputs[i].panels[p].col;
+        h2.divider {
+            width: 100%;
+            text-align: left;
+            color: var(--fpp-text-primary);
+            border-bottom: 2px solid var(--fpp-border);
+            line-height: 0.1em;
+            margin: 12px 0 10px;
+        }
 
-				channelOutputsLookup["LEDPanelOutputNumber_" + r + "_" + c]
-					= channelOutputs.channelOutputs[i].panels[p];
-				channelOutputsLookup["LEDPanelPanelNumber_" + r + "_" + c]
-					= channelOutputs.channelOutputs[i].panels[p];
-				channelOutputsLookup["LEDPanelColorOrder_" + r + "_" + c]
-					= channelOutputs.channelOutputs[i].panels[p];
-			}
-		}
-		else if (channelOutputs.channelOutputs[i].type == "BBB48String")
-		{
-			channelOutputsLookup["BBB48String"] = channelOutputs.channelOutputs[i];
-		}
-		else if (channelOutputs.channelOutputs[i].type == "BBBSerial")
-		{
-			channelOutputsLookup["BBBSerial"] = channelOutputs.channelOutputs[i];
-		}
-	}
-}
+        h2.divider span {
+            background: var(--fpp-bg-card);
+            padding: 0 10px;
+        }
 
-function GetChannelOutputConfig()
-{
-	var config = new Object();
+        /* prevent table header from scrolling: */
+        #PixelString {
+            text-align: left;
+            position: relative;
+            /* required for th sticky to work */
+        }
 
-	config.channelOutputs = [];
+        #PixelString thead th {
+            font-weight: bold;
+            background: var(--fpp-thead-bg);
+            color: var(--fpp-thead-color);
+            /* prevent add/delete circular buttons from showing through */
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            /* draw table header on top of add/delete buttons */
+            padding: 8px 0 0 5px;
+            border-bottom: 2px solid var(--fpp-border)
+        }
 
-	config.channelOutputs.push(GetLEDPanelConfig());
+        /* The Protocol column is only useful when the cape actually offers a
+           choice - most are ws281x only, where it would be a static label.
+           UpdateProtocolColumnVisibility() in co-pixelStrings.php sets this
+           class from the loaded cape, so it follows the subtype dropdown
+           rather than the platform. */
+        body.noPixelProtocolColumn #PixelString tr>th:nth-of-type(2),
+        body.noPixelProtocolColumn #PixelString tr>td:nth-of-type(2),
+        body.noPixelProtocolColumn div[aria-labelledby="PixelString"] .floatThead-table tr>th:nth-of-type(2) {
+            display: none;
+        }
 
-	var result = JSON.stringify(config);
-	return result;
-}
+        <?
+        if ((isset($settings['cape-info']) && $settings['cape-info']['id'] == "Unsupported")) {
+            // don't support virtual strings
+            ?>
+            #PixelString tr>th:nth-of-type(3),
+            div[aria-labelledby="PixelString"] .floatThead-table tr>th:nth-of-type(3) #PixelString tr>td:nth-of-type(3) {
+                display: none;
+            }
 
-function SaveChannelOutputsJSON()
-{
-	var configStr = GetChannelOutputConfig();
-
-	var postData = "command=setChannelOutputs&file=channelOutputsJSON&data=" + JSON.stringify(configStr);
-
-	$.post("fppjson.php", postData
-	).done(function(data) {
-		$.jGrowl(" Channel Output configuration saved");
-		SetRestartFlag();
-	}).fail(function() {
-		DialogError("Save Channel Output Config", "Save Failed");
-	});
-}
-
-function inputsAreSane()
-{
-	var result = 1;
-
-	result &= pixelStringInputsAreSane();
-
-	return result;
-}
-
-function okToAddNewInput(type)
-{
-	var result = 1;
-
-	result &= okToAddNewPixelStringInput(type);
-
-	return result;
-}
+            <?
+        }
+        ?>
 
 
-/////////////////////////////////////////////////////////////////////////////
+        #ModelPixelStrings_Output_0 tr>th:nth-of-type(2),
+        #ModelPixelStrings_Output_0 tr>td:nth-of-type(2) {
+            display: none;
+        }
+    </style>
 
-<?
+    <?
+    $currentCape = "";
+    $currentCapeInfo = json_decode("{ \"provides\": [\"all\"]}", true);
+    if (isset($settings['cape-info'])) {
+        $currentCapeInfo = $settings['cape-info'];
+        $currentCape = $currentCapeInfo["id"];
+        echo "<!-- current cape is " . $currentCape . "-->\n";
+        printf(
+            "<script>\ncurrentCapeName = '%s';\n</script>\n",
+            $currentCapeInfo["name"]
+        );
+    }
+    // What the cape itself declares it drives, captured before the UI-level
+    // augmentation below adds "all"/"udp" to the list. Used to pick which tab
+    // opens by default - see $defaultTabType where the tabs are emitted.
+    $capeProvides = array();
+    if (isset($currentCapeInfo['provides']) && is_array($currentCapeInfo['provides'])) {
+        $capeProvides = $currentCapeInfo['provides'];
+    }
+    if (!isset($currentCapeInfo['provides'])) {
+        $currentCapeInfo['provides'][] = "all";
+    } else if (isset($settings["showAllOptions"]) && $settings["showAllOptions"] == 1) {
+        $currentCapeInfo['provides'][] = "all";
+    } else if ($uiLevel >= 2) {
+        $currentCapeInfo['provides'][] = "all";
+    } else if ($uiLevel == 1) {
+        if (!isset($currentCapeInfo['provides']) || count($currentCapeInfo['provides']) == 0) {
+            $currentCapeInfo['provides'][] = "all";
+        } else {
+            $currentCapeInfo['provides'][] = "udp";
+        }
+    }
+    if (isset($settings['cape-info'])) {
+        // update provides with additional stuff computed above
+        $settings['cape-info']["provides"] = $currentCapeInfo["provides"];
+    }
+    ?>
 
-$channelOutputs = array();
-$channelOutputsJSON = "";
-if (file_exists($settings['channelOutputsJSON']))
-{
-	$channelOutputsJSON = file_get_contents($settings['channelOutputsJSON']);
-	$channelOutputsJSON = preg_replace("/\n|\r/", "", $channelOutputsJSON);
-	$channelOutputsJSON = preg_replace("/\"/", "\\\"", $channelOutputsJSON);
-}
+    <script language="Javascript">
 
-?>
+        var channelOutputs = [];
+        var channelOutputsLookup = [];
+        var currentTabType = 'UDP';
 
-function handleCOKeypress(e)
-{
-	if (e.keyCode == 113) {
-		if (currentTabTitle == "Pi Pixel Strings")
-			setPixelStringsStartChannelOnNextRow();
-        if (currentTabTitle == "BBB Strings")
-            setPixelStringsStartChannelOnNextRow();
-	}
-}
+        /////////////////////////////////////////////////////////////////////////////
+
+        function PopulateChannelOutputLookup() {
+            if (verboseDebug) {
+                console.trace("PopulateChannelOutputLookup called");
+            }
+            var i = 0;
+            for (i = 0; i < channelOutputs.channelOutputs.length; i++) {
+
+                if (channelOutputs.channelOutputs[i].type == "LEDPanelMatrix") {
+                    if (!channelOutputsLookup.hasOwnProperty("LEDPanelMatrices")) { channelOutputsLookup["LEDPanelMatrices"] = []; }
+                    if (typeof channelOutputs.channelOutputs[i].panelMatrixID == 'undefined') {
+                        channelOutputs.channelOutputs[i].panelMatrixID = i + 1;
+                    }
+
+                    if (typeof channelOutputs.channelOutputs[i].panelMatrixID !== 'undefined') {
+                        channelOutputsLookup["LEDPanelMatrices"]["panelMatrix" + channelOutputs.channelOutputs[i].panelMatrixID] = structuredClone(channelOutputs.channelOutputs[i]);
+
+                        if (!channelOutputsLookup["LEDPanelMatrices"]["panelMatrix" + channelOutputs.channelOutputs[i].panelMatrixID].hasOwnProperty("LEDPanelUIFrontView")) {
+                            channelOutputsLookup["LEDPanelMatrices"]["panelMatrix" + channelOutputs.channelOutputs[i].panelMatrixID]["LEDPanelUIFrontView"] = false;
+                        }
+
+                        if (typeof SetDefaultsInChannelOutputsLookup === 'function') {
+                            SetDefaultsInChannelOutputsLookup();
+                        }
 
 
-$(document).ready(function(){
-	$(document).on('keydown', handleCOKeypress);
+                        /*                         var p = 0;
+                                                for (p = 0; p < channelOutputs.channelOutputs[i].panels.length; p++) {
+                                                    var r = channelOutputs.channelOutputs[i].panels[p].row;
+                                                    var c = channelOutputs.channelOutputs[i].panels[p].col;
+                        
+                                                    channelOutputsLookup["LEDPanelMatrices"]["panelMatrix" + channelOutputs.channelOutputs[i].panelMatrixID]["LEDPanelOutputNumber_" + r + "_" + c]
+                                                        = channelOutputs.channelOutputs[i].panels[p];
+                                                    channelOutputsLookup["LEDPanelMatrices"]["panelMatrix" + channelOutputs.channelOutputs[i].panelMatrixID]["LEDPanelPanelNumber_" + r + "_" + c]
+                                                        = channelOutputs.channelOutputs[i].panels[p];
+                                                    channelOutputsLookup["LEDPanelMatrices"]["panelMatrix" + channelOutputs.channelOutputs[i].panelMatrixID]["LEDPanelColorOrder_" + r + "_" + c]
+                                                        = channelOutputs.channelOutputs[i].panels[p];
+                                                } */
+                    }
+                }
+            }
+        }
 
-	var channelOutputsJSON = "<? echo $channelOutputsJSON; ?>";
+        function GetChannelOutputConfig() {
+            if (verboseDebug) {
+                console.trace("GetChannelOutputConfig called");
+            }
+            var $i = 0;
+            var config = new Object();
 
-	if (channelOutputsJSON != "")
-		channelOutputs = jQuery.parseJSON(channelOutputsJSON);
-	else
-		channelOutputs.channelOutputs = [];
+            config.channelOutputs = [];
 
-	UpdateChannelOutputLookup();
+            //loop round the displayed tabs and gather up their configs
+            for ($i = 0; $i < $('.tab-content .divPanelMatrixID').length; $i++) {
+                var panelMatrixID = $('.tab-content .divPanelMatrixID')[$i].innerText;
+                if (parseInt(panelMatrixID) > 0) {
+                    var lpc = GetLEDPanelConfigFromUI(panelMatrixID);
+                    config.channelOutputs.push(lpc);
+                }
+            }
+            //channelOutputs = config;
+            var result = JSON.stringify(config);
+            //result = result.replace("'", "");
+            return result;
+        }
 
-	// Init tabs
-  $tabs = $("#tabs").tabs({
-  		activate: function(e, ui) {
-			currentTabTitle = $(ui.newTab).text();
-		},
-  		cache: true,
-		spinner: "",
-		fx: {
-			opacity: 'toggle',
-			height: 'toggle'
-		}
-	});
+        function DisplaySaveWarningIfRequired() {
+            if (verboseDebug) {
+                console.trace("DisplaySaveWarningIfRequired called");
+            }
+            if (DetectConfigChangesInUI()) {
+                console.log("Need to show save changes required...");
+                $("#SaveChangeWarningLabel").show();
+            }
+            else {
+                console.log("No changes detected...");
+                $("#SaveChangeWarningLabel").hide();
+            }
+        }
 
-	var total = $tabs.find('.ui-tabs-nav li').length;
-	var currentLoadingTab = 1;
-	$tabs.bind('tabsload',function(){
-		currentLoadingTab++;
-		if (currentLoadingTab < total)
-			$tabs.tabs('load',currentLoadingTab);
-		else
-			$tabs.unbind('tabsload');
-	}).tabs('load',currentLoadingTab);
-});
+        function SaveChannelOutputsJSON() {
+            if (verboseDebug) {
+                console.trace("SaveChannelOutputsJSON called");
+            }
+            var configStr = GetChannelOutputConfig();
+            configStr = configStr.replace("'", "");
+            $.post("api/configfile/channeloutputs.json",
+                configStr
+            ).done(function (data) {
+                $.jGrowl(" Channel Output configuration saved", { themeState: 'success' });
+                channelOutputs = JSON.parse(configStr);
+                //UpdateChannelOutputsFromConfigJSON();
+                HandleChangesInUIValues();
+                //PopulateChannelOutputLookup();
+                //DisplaySaveWarningIfRequired();
 
-</script>
-<!-- FIXME, move this to CSS to standardize the UI -->
-<style>
-.tblheader{
-    background-color:#CCC;
-    text-align:center;
-}
-.tblheader td {
-    border: solid 2px #888888;
-    text-align:center;
-}
-tr.rowUniverseDetails
-{
-    border:thin solid;
-    border-color:#CCC;
-}
+                // Auto-disable testing mode when output configs change
+                if (typeof disableTestModeIfActive === 'function') {
+                    disableTestModeIfActive();
+                }
+                // that also stops any panel test pattern, so reflect it in
+                // the Testing dropdown (set silently, no change event, so no
+                // redundant Test Stop is sent)
+                $("#PanelTestPatternType").val("0");
+                // the LED panels page shows an upgrade banner for pre-v3
+                // configs; the save just wrote cfgVersion 3, so re-evaluate
+                if (typeof CheckForOldConfigVersion === 'function') {
+                    CheckForOldConfigVersion();
+                }
+            }).fail(function () {
+                DialogError("Save Channel Output Config", "Save Failed");
+            });
+        }
 
-tr.rowUniverseDetails td
-{
-    padding:1px 5px;
-}
+        function UpdateChannelOutputsFromConfigJSON() {
+            if (verboseDebug) {
+                console.trace("UpdateChannelOutputsFromConfigJSON called");
+            }
+            const path = "<? echo $settings['channelOutputsJSON']; ?>";
+            const $filename = path.split('/').pop();
+            var channelOutputsJSON = $.getJSON("api/configfile/" + $filename, function (data) {
+                console.log("Channel Outputs JSON loaded");
+                console.log(data);
+                channelOutputs = data;
+                if (channelOutputs == null || channelOutputs.channelOutputs == null) {
+                    channelOutputs = { "channelOutputs": [] };
+                }
+            });
 
-.channelOutputTable
-{
-    border:thin;
-    border-color:#333;
-    border-collapse: collapse;
-}
+        }
 
-#tblUniverses th {
-	vertical-align: bottom;
-	text-align: center;
-	border: solid 2px #888888;
-    font-size: 0.8em;
-}
+        function inputsAreSane() {
+            if (verboseDebug) {
+                console.log("inputsAreSane called");
+            }
+            var result = 1;
 
-#tblUniverses td {
-	text-align: center;
-}
+            result &= pixelStringInputsAreSane();
 
-#tblUniverses input[type=text] {
-	text-align: center;
-	width: 100%;
-}
-#tblUniverses input[type=number] {
-    text-align: center;
-    width: 100%;
-}
+            return result;
+        }
 
-</style>
+        function okToAddNewInput(type) {
+            if (verboseDebug) {
+                console.trace("okToAddNewInput called with type: " + type);
+            }
+            var result = 1;
 
-<title><? echo $pageTitle; ?></title>
+            result &= okToAddNewPixelStringInput(type);
+
+            return result;
+        }
+
+
+        /////////////////////////////////////////////////////////////////////////////
+
+        <?
+
+        $channelOutputs = array();
+        $channelOutputsJSON = "";
+        if (file_exists($settings['channelOutputsJSON'])) {
+            $channelOutputsJSON = file_get_contents($settings['channelOutputsJSON']);
+            $channelOutputs = json_decode($channelOutputsJSON, true);
+            $channelOutputsJSON = preg_replace("/\n|\r/", "", $channelOutputsJSON);
+            $channelOutputsJSON = preg_replace("/\"/", "\\\"", $channelOutputsJSON);
+        }
+
+        // If led panels are enabled, make sure the page is displayed even if the cape is a string cape (could be a colorlight output)
+        if ($channelOutputs != null && $channelOutputs['channelOutputs'] != null && $channelOutputs['channelOutputs'][0] != null) {
+            foreach ($channelOutputs['channelOutputs'] as $i)
+                if ($i['type'] == "LEDPanelMatrix" && $i['enabled'] == 1) {
+                    $currentCapeInfo["provides"][] = 'panels';
+                }
+        }
+
+        ?>
+
+        // Called by handleKeypress() in fpp.js before custom shortcuts and the
+        // global F2 (Settings) default; returning true keeps them from running.
+        function pageSpecific_HandleKeypress(e) {
+            if (verboseDebug) {
+                console.trace("pageSpecific_HandleKeypress called with keyCode: " + e.keyCode);
+            }
+            if (e.keyCode == 113 && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+                if ($('.nav-link.active').attr('tabtype') == 'strings') {
+                    setPixelStringsStartChannelOnNextRow();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+
+        function pageSpecific_PageLoad_DOM_Setup() {
+            if (verboseDebug) {
+                console.trace("pageSpecific_PageLoad_DOM_Setup called");
+            }
+
+            var channelOutputsJSON = "<? echo $channelOutputsJSON; ?>";
+
+            if (channelOutputsJSON != "")
+                channelOutputs = jQuery.parseJSON(channelOutputsJSON);
+            else
+                channelOutputs.channelOutputs = [];
+
+
+            PopulateChannelOutputLookup();
+            if (typeof checkAndCorrectMissingChannelLookup === 'function') {
+                checkAndCorrectMissingChannelLookup();
+            }
+            if (typeof SetDefaultsInChannelOutputsLookup === 'function') {
+                SetDefaultsInChannelOutputsLookup();
+            }
+
+        }
+
+        function pageSpecific_PageLoad_PostDOMLoad_ActionsSetup() {
+            if (verboseDebug) {
+                console.trace("pageSpecific_PageLoad_PostDOMLoad_ActionsSetup called");
+            }
+        }
+
+
+
+    </script>
+    <title><? echo $pageTitle; ?></title>
 </head>
+
 <body>
-	<div id="bodyWrapper">
-		<?php include 'menu.inc'; ?>
-		<br/>
+    <div id="bodyWrapper">
+        <?php
+        $activeParentMenuItem = 'input-output';
+        include 'menu.inc'; ?>
+        <div class="mainContainer">
+            <h1 class='title'>Channel Outputs</h1>
+            <div class="pageContent">
+                <div id='channelOutputManager' class="ui-corner-all ui-widget ui-widget-content">
 
-<div id='channelOutputManager'>
-		<div class='title'>Channel Outputs</div>
-		<div id="tabs">
-			<ul>
-				<li><a href="#tab-e131">E1.31 / ArtNet / DDP</a></li>
-<?
-	if ($settings['Platform'] == "Raspberry Pi")
-	{
-        if (in_array('all', $currentCapeInfo["provides"]) || in_array('fpd', $currentCapeInfo["provides"])) {
-            echo "<li><a href='#tab-fpd'>Falcon Pixelnet/DMX</a></li>\n";
-        }
-        if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
-            echo "<li><a href='#tab-PixelStrings'>Pi Pixel Strings</a></li>\n";
-        }
-	}
-	if ($settings['Platform'] == "BeagleBone Black") {
-        if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
-            echo "<li><a href='#tab-BBB48String'>BBB Strings</a></li>\n";
-        }
-	}
-    if (in_array('all', $currentCapeInfo["provides"]) || in_array('panels', $currentCapeInfo["provides"])) {
-        echo "<li><a href='#tab-LEDPanels'>LED Panels</a></li>\n";
-    }
-?>
-				<li><a href="#tab-other">Other</a></li>
-			</ul>
+                    <?
+                    $lpTabStyle = " hidden";
+                    $stringTabStyle = " hidden";
+                    $e131TabStyle = " hidden";
+                    $e131TabStyleActive = "";
+                    $lpTabStyleActive = "";
+                    $stringTabStyleActive = "";
 
-<!-- --------------------------------------------------------------------- -->
+                    if (in_array('all', $currentCapeInfo["provides"])) {
+                        $lpTabStyle = "";
+                        $e131TabStyle = "";
+                        $stringTabStyle = "";
+                    } else {
+                        if (in_array('udp', $currentCapeInfo["provides"])) {
+                            $e131TabStyle = "";
+                            $lpTabStyle = "";
+                        }
+                        if (in_array('strings', $currentCapeInfo["provides"])) {
+                            $stringTabStyle = "";
+                        }
+                        if (
+                            in_array('panels', $currentCapeInfo["provides"])
+                            || !in_array('strings', $currentCapeInfo["provides"])
+                        ) {
+                            $lpTabStyle = "";
+                        }
+                        if (
+                            !in_array('panels', $currentCapeInfo["provides"])
+                            && !in_array('strings', $currentCapeInfo["provides"])
+                        ) {
+                            $e131TabStyle = "";
+                        }
+                    }
 
-<?
+                    // The Pixel Strings tab is only emitted on hardware that can drive
+                    // strings directly, independently of whether the cape allows it.
+                    $stringTabAvailable = $settings['BeaglePlatform'] || $settings['Platform'] == "Raspberry Pi" ||
+                        ((file_exists('/usr/include/X11/Xlib.h')) && ($settings['Platform'] == "Linux"));
 
-include_once('co-universes.php');
+                    // Open on the tab that matches what the cape actually drives rather
+                    // than always landing on E1.31: a string cape opens on Pixel Strings,
+                    // a panel-only cape (OctoPlus, PocketScroller, ...) on LED Panels.
+                    // A cape that declares "all", or no cape at all, keeps E1.31.
+                    $defaultTabType = 'UDP';
+                    if (!in_array('all', $capeProvides)) {
+                        if (in_array('strings', $capeProvides)) {
+                            // Capes providing both lead with strings - they are pixel
+                            // outputs first and panels second.
+                            $defaultTabType = 'strings';
+                        } else if (in_array('panels', $capeProvides)) {
+                            $defaultTabType = 'panels';
+                        }
+                    }
 
-if ($settings['Platform'] == "Raspberry Pi")
-{
-    if (in_array('all', $currentCapeInfo["provides"]) || in_array('fpd', $currentCapeInfo["provides"])) {
-        include_once('co-fpd.php');
-    }
-    if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
-        include_once('co-piPixelString.php');
-    }
-}
+                    $tabVisible = array(
+                        'UDP' => $e131TabStyle == "",
+                        'strings' => $stringTabStyle == "" && $stringTabAvailable,
+                        'panels' => $lpTabStyle == "",
+                    );
+                    // Fall back through the page's original order if the preferred tab
+                    // is hidden, so something is always selected.
+                    foreach (array($defaultTabType, 'UDP', 'strings', 'panels') as $t) {
+                        if ($tabVisible[$t]) {
+                            $defaultTabType = $t;
+                            break;
+                        }
+                    }
 
-if (in_array('all', $currentCapeInfo["provides"]) || in_array('panels', $currentCapeInfo["provides"])) {
-    include_once('co-ledPanels.php');
-}
+                    $e131TabStyleActive = $defaultTabType == 'UDP' ? "active" : "";
+                    $stringTabStyleActive = $defaultTabType == 'strings' ? "active" : "";
+                    $lpTabStyleActive = $defaultTabType == 'panels' ? "active" : "";
+                    ?>
+                    <script>
+                        currentTabType = '<?= $defaultTabType ?>';
+                    </script>
+                    <div class="d-flex align-items-end flex-wrap mb-3" style="border-bottom: 1px solid var(--fpp-border)">
+                        <ul class="nav nav-pills pageContent-tabs flex-grow-1 border-bottom-0 mb-0" id="channelOutputTabs" role="tablist">
+                            <li class="nav-item <?= $e131TabStyle ?>" id="tab-e131-LI" role="presentation">
+                                <a class="nav-link <?= $e131TabStyleActive ?>" id="tab-e131-tab" type="button"
+                                    tabType='UDP' data-bs-toggle="pill" data-bs-target="#tab-e131" role="tab"
+                                    aria-controls="tab-e131" aria-selected="true">
+                                    E1.31 / ArtNet / DDP / KiNet
+                                </a>
+                            </li>
 
-if ($settings['Platform'] == "BeagleBone Black")
-{
-    if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
-        include_once('co-bbbStrings.php');
-    }
-}
+                            <?
 
-include_once("co-other.php");
-?>
+                            if ($stringTabAvailable) {
+                                $stringTabText = "Pixel Strings";
+                                if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
+                                    if (isset($currentCapeInfo["labels"]) && isset($currentCapeInfo["labels"]["strings"])) {
+                                        $stringTabText = $currentCapeInfo["labels"]["strings"];
+                                    } else if (
+                                        ((in_array('all', $currentCapeInfo["provides"])) || (in_array('strings', $currentCapeInfo["provides"]))) &&
+                                        (isset($currentCapeInfo["name"]) && $currentCapeInfo["name"] != "Unknown")
+                                    ) {
+                                        $stringTabText = $currentCapeInfo["name"];
+                                        if (in_array('all', $currentCapeInfo["provides"]) || in_array('panels', $currentCapeInfo["provides"])) {
+                                            $stringTabText .= " Pixel Strings";
+                                        }
+                                    }
+                                }
+                                ?>
+                                <li class="nav-item <?= $stringTabStyle ?>" id="tab-strings-LI">
+                                    <a class="nav-link <?= $stringTabStyleActive ?>" id="stringTab-tab" type="button"
+                                        tabType='strings' data-bs-toggle="pill" data-bs-target='#stringTab' role="tab"
+                                        aria-controls="stringTab">
+                                        <? echo $stringTabText; ?>
+                                    </a>
+                                </li>
+                                <?
+                            }
+                            if (in_array('pwm', $currentCapeInfo["provides"]) && isset($currentCapeInfo['verifiedKeyId'])) {
+                                $pwmTabText = "PWM";
+                                if (isset($currentCapeInfo["labels"]) && isset($currentCapeInfo["labels"]["pwm"])) {
+                                    $pwmTabText = $currentCapeInfo["labels"]["pwm"];
+                                }
+                                ?>
+                                <li class="nav-item">
+                                    <a class="nav-link" id="tab-pwm-tab" type="button" tabType='PWM' data-bs-toggle="pill"
+                                        data-bs-target='#tab-pwm' role="tab" aria-controls="tab-pwm">
+                                        <? echo $pwmTabText; ?>
+                                    </a>
+                                </li>
+                                <?
+                            }
 
-<!-- --------------------------------------------------------------------- -->
+                            $ledTabText = "LED Panel Matrices";
+                            if (
+                                ((in_array('all', $currentCapeInfo["provides"])) || (in_array('panels', $currentCapeInfo["provides"]))) &&
+                                (isset($currentCapeInfo["name"]) && $currentCapeInfo["name"] != "Unknown")
+                            ) {
+                                $ledTabText = $currentCapeInfo["name"];
+                                if (in_array('all', $currentCapeInfo["provides"]) || in_array('strings', $currentCapeInfo["provides"])) {
+                                    $ledTabText .= " LED Panels";
+                                }
 
-</div>
-</div>
+                            }
+                            ?>
+                            <li class="nav-item <?= $lpTabStyle ?>" id="tab-LEDPanels-LI">
+                                <a class="nav-link <?= $lpTabStyleActive ?>" id="tab-LEDPanels-tab" type="button"
+                                    tabType='panels' data-bs-toggle="pill" data-bs-target='#tab-LEDPanels' role="tab"
+                                    aria-controls="tab-LEDPanels">
+                                    <? echo $ledTabText; ?>
+                                </a>
+                            </li>
+                        </ul>
+                        <div class="dropdown ms-auto" style="padding-bottom: 0.85em"
+                            id="tab-add-output-LI">
+                            <button class="btn btn-outline-success dropdown-toggle" type="button"
+                                data-bs-toggle="dropdown" aria-expanded="false" id="addOutputDropdown">
+                                <i class="fas fa-plus"></i> Add Output Group
+                            </button>
+                            <ul class="dropdown-menu dropdown-menu-end" id="addOutputCategoryMenu">
+                            </ul>
+                        </div>
+                    </div>
 
-<div id='debugOutput'>
-</div>
 
-<!-- FIXME, can we put this in co-ledPanels.php? -->
-<div id="dialog-panelLayout" title="panelLayout" style="display: none">
-  <div id="layoutText">
-  </div>
-</div>
+                    <!-- --------------------------------------------------------------------- -->
+                    <?
+                    $e131TabStyleActive = $defaultTabType == 'UDP' ? "show active" : "";
+                    $stringTabStyleActive = $defaultTabType == 'strings' ? "show active" : "";
+                    $lpTabStyleActive = $defaultTabType == 'panels' ? "show active" : "";
+                    ?>
 
-	<?php	include 'common/footer.inc'; ?>
-</div>
+                    <div id="channelOutputTabsContent" class="tab-content">
+                        <div class="tab-pane fade <?= $e131TabStyleActive ?>" id="tab-e131" role="tabpanel"
+                            aria-labelledby="tab-e131-tab">
+                            <? include_once 'co-universes.php'; ?>
+                        </div>
+
+                        <?
+
+                        if ($stringTabAvailable) {
+                            ?>
+                            <div class="tab-pane fade <?= $stringTabStyleActive ?>" id="stringTab" role="tabpanel"
+                                aria-labelledby="stringTab-tab">
+                                <? include_once 'co-pixelStrings.php'; ?>
+                            </div>
+                            <?
+                        }
+                        if (in_array('pwm', $currentCapeInfo["provides"])) {
+                            ?>
+                            <div class="tab-pane fade" id="tab-pwm" role="tabpanel" aria-labelledby="tab-pwm-tab">
+                                <? include_once 'co-pwm.php'; ?>
+                            </div>
+                            <?
+                        }
+                        ?>
+
+                        <div class="tab-pane fade <?= $lpTabStyleActive ?>" id="tab-LEDPanels" role="tabpanel"
+                            aria-labelledby="tab-LEDPanels-tab">
+                            <? include_once 'co-ledPanels.php'; ?>
+                        </div>
+                    </div> <!-- tabcontent close -->
+                    <? include_once "co-other.php"; ?>
+
+                    <!-- --------------------------------------------------------------------- -->
+
+
+                </div>
+
+
+
+            </div> <!-- page content -->
+
+            <div id='debugOutput'>
+            </div>
+
+        </div>
+
+        <?php include 'common/footer.inc'; ?>
+    </div>
 </body>
+
 </html>

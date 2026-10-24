@@ -3,9 +3,20 @@
 BINDIR=$(cd $(dirname $0) && pwd)
 
 . ${BINDIR}/common
+. ${BINDIR}/functions
 
 cd ${FPPDIR}/src/
 
-sudo -u ${FPPUSER} make clean
-sudo -u ${FPPUSER} make optimized
+# Exports DISTCC_HOSTS and sets BUILD_CPUS from the distcc developer settings;
+# a no-op (normal local build) when distcc is disabled. With DISTCC_HOSTS set,
+# the makefiles handle ccache/distcc, NOPCH, and the triplet compiler.
+SetupBuildEnv
+
+make clean
+
+make -j ${BUILD_CPUS} optimized
+BUILD_RC=$?
+# Flush the new binaries; a power loss can zero them (#3120).
+sync
+exit ${BUILD_RC}
 

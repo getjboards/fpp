@@ -1,339 +1,1201 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <?php
-require_once('config.php');
-require_once("common.php");
+// config.php defines $mediaDirectory, which the cape/channel-output pin
+// reservation below needs.  It has to be pulled in here rather than with the
+// rest of the includes in <head>: without it every path below resolved
+// relative to an empty string, so no pin was ever found to be reserved.
+require_once 'config.php';
 
-?>
-<head>
-<?php
-include 'common/menuHead.inc';
-
-	$eventFiles = scandir($eventDirectory);
-
-	function PrintEventOptions($gpio, $rising = true)
-	{
-		global $eventDirectory;
-		global $eventFiles;
-		global $settings;
-		$eventOptions = "";
-		$value = "";
-
-		$key = 'GPIOInput' . sprintf('%03d', $gpio) . 'Event' . ( $rising ? "Rising" : "Falling" );
-		if (isset($settings[$key]))
-		{
-			$value = $settings[$key];
-		}
-
-		$eventOptions .= "<option value=''> -- No Event -- </option>";
-		foreach ($eventFiles as $eventFile)
-		{
-			if($eventFile != '.' && $eventFile != '..' && preg_match('/.fevt$/', $eventFile))
-			{
-				$info = parse_ini_file($eventDirectory . "/" . $eventFile);
-
-				$eventFile = preg_replace('/.fevt$/', '', $eventFile);
-
-				$eventOptions .= "<option value='$eventFile'";
-				if ($value == $eventFile)
-					$eventOptions .= " selected";
-				$eventOptions .= ">" .
-						$info['majorID'] . ' / ' . $info['minorID'] . " - " .
-						$info['name'] .
-						"</option>";
-			}
-		}
-
-		echo "<select id='$key' onChange='SaveGPIOInputEvent(this);' style='max-width:95%'>";
-		echo $eventOptions;
-		echo "</select>";
-	}
-    if ($settings['Platform'] == "Raspberry Pi") {
-        $piFaceInputs = array(
-            "PiFace 1:200:200:P1 - Input 1",
-            "PiFace 2:201:201:P1 - Input 2",
-            "PiFace 3:202:202:P1 - Input 3",
-            "PiFace 4:203:203:P1 - Input 4",
-            "PiFace 5:204:204:P1 - Input 5",
-            "PiFace 6:205:205:P1 - Input 6",
-            "PiFace 7:206:206:P1 - Input 7",
-            "PiFace 8:207:207:P1 - Input 8"
-            );
-
-        $piFaceStyle = "style='display: none;'";
-        if (isset($settings['PiFaceDetected']) && ($settings['PiFaceDetected'] == "1"))
-            $piFaceStyle = "";
-
-        foreach ($piFaceInputs as $input)
-        {
-            $inputData = explode(":", $input);
-            $settingID = sprintf("GPIOInput%03dEnabled", $inputData[1]);
-
-            if (isset($settings[$settingID]) && ($settings[$settingID] == 1))
-                $piFaceStyle = "";
-        }
-    
-        $inputs = array(
-                    "BCM 4:4:7:P1 - Pin 7",
-                    "BCM 17:17:0:P1 - Pin 11",
-                    "BCM 18:18:1:P1 - Pin 12",
-                    "BCM 27:27:2:P1 - Pin 13",
-                    "BCM 22:22:3:P1 - Pin 15",
-                    "BCM 23:23:4:P1 - Pin 16",
-                    "BCM 24:24:5:P1 - Pin 18",
-                    $piFaceStyle == ""
-                    ? "BCM&nbsp;25&nbsp;**:25:6:P1 - Pin 22"
-                    : "BCM 25:25:6:P1 - Pin 22",
-                    "BCM 5:5:21:P1 - Pin 29",
-                    "BCM 6:6:22:P1 - Pin 31",
-                    "BCM 12:12:26:P1 - Pin 32",
-                    "BCM 13:13:23:P1 - Pin 33",
-                    "BCM 16:16:27:P1 - Pin 36",
-                    "BCM 19:19:24:P1 - Pin 35",
-                    "BCM 20:20:28:P1 - Pin 38",
-                    "BCM 21:21:29:P1 - Pin 40",
-                    "BCM 26:26:25:P1 - Pin 37",
-                    "BCM 28:28:17:P5 - Pin 3",
-                    "BCM 29:29:18:P5 - Pin 4",
-                    "BCM 30:30:19:P5 - Pin 5",
-                    "BCM 31:31:20:P5 - Pin 6"
-                    );
-    } else if ($settings['Platform'] == "BeagleBone Black") {
-        $piFaceStyle = "";
-        $piFaceInputs = array( );
-        if (strpos($settings['SubPlatform'], 'PocketBeagle') !== FALSE) {
-            $inputs = array(
-                            "gpio2_23:87:87:P1-02",
-                            "gpio2_25:89:89:P1-04",
-                            "gpio0_5:5:5:P1-06",
-                            "gpio0_2:2:2:P1-08",
-                            "gpio0_3:3:3:P1-10",
-                            "gpio0_4:4:4:P1-12",
-                            "gpio0_20:20:20:P1-20",
-                            "gpio0_12:12:12:P1-26",
-                            "gpio0_13:13:13:P1-28",
-                            "gpio3_21:117:117:P1-29",
-                            "gpio1_11:43:43:P1-30",
-                            "gpio3_18:114:114:P1-31",
-                            "gpio1_10:42:42:P1-32",
-                            "gpio3_15:111:111:P1-33",
-                            "gpio0_26:26:26:P1-34",
-                            "gpio2_24:88:88:P1-35",
-                            "gpio3_14:110:110:P1-36",
-                            "gpio1_18:50:50:P2-01",
-                            "gpio1_27:59:59:P2-02",
-                            "gpio0_23:23:23:P2-03",
-                            "gpio1_26:58:58:P2-04",
-                            "gpio0_30:30:30:P2-05",
-                            "gpio1_25:57:57:P2-06",
-                            "gpio0_31:31:31:P2-07",
-                            "gpio1_28:60:60:P2-08",
-                            "gpio0_15:15:15:P2-09",
-                            "gpio1_20:52:52:P2-10",
-                            "gpio0_14:14:14:P2-11",
-                            "gpio2_1:65:65:P2-17",
-                            "gpio1_15:47:47:P2-18",
-                            "gpio0_27:27:27:P2-19",
-                            "gpio2_0:64:64:P2-20",
-                            "gpio1_14:46:46:P2-22",
-                            "gpio1_12:44:44:P2-24",
-                            "gpio1_9:41:41:P2-25",
-                            "gpio1_8:40:40:P2-27",
-                            "gpio3_20:116:116:P2-28",
-                            "gpio0_7:7:7:P2-29",
-                            "gpio3_17:113:113:P2-30",
-                            "gpio0_19:19:19:P2-31",
-                            "gpio3_16:112:112:P2-32",
-                            "gpio1_13:45:45:P2-33",
-                            "gpio3_19:115:115:P2-34",
-                            "gpio2_22:86:86:P2-35"
-                            );
-        } else {
-            $inputs = array(
-                            "gpio1_6:38:38:P8-03",
-                            "gpio1_7:39:39:P8-04",
-                            "gpio1_2:34:34:P8-05",
-                            "gpio1_3:35:35:P8-06",
-                            "gpio2_2:66:66:P8-07",
-                            "gpio2_3:67:67:P8-08",
-                            "gpio2_5:69:69:P8-09",
-                            "gpio2_4:68:68:P8-10",
-                            "gpio1_13:45:45:P8-11",
-                            "gpio1_12:44:44:P8-12",
-                            "gpio0_23:23:23:P8-13",
-                            "gpio0_26:26:26:P8-14",
-                            "gpio1_15:47:47:P8-15",
-                            "gpio1_14:46:46:P8-16",
-                            "gpio0_27:27:27:P8-17",
-                            "gpio2_1:65:65:P8-18",
-                            "gpio0_22:22:22:P8-19",
-                            "gpio1_31:63:63:P8-20",
-                            "gpio1_30:62:62:P8-21",
-                            "gpio1_5:37:37:P8-22",
-                            "gpio1_4:36:36:P8-23",
-                            "gpio1_1:33:33:P8-24",
-                            "gpio1_0:32:32:P8-25",
-                            "gpio1_29:61:61:P8-26",
-                            "gpio2_22:86:86:P8-27",
-                            "gpio2_24:88:88:P8-28",
-                            "gpio2_23:87:87:P8-29",
-                            "gpio2_25:89:89:P8-30",
-                            "gpio0_10:10:10:P8-31",
-                            "gpio0_11:11:11:P8-32",
-                            "gpio0_9:9:9:P8-33",
-                            "gpio2_17:81:81:P8-34",
-                            "gpio0_8:8:8:P8-35",
-                            "gpio2_16:80:80:P8-36",
-                            "gpio2_14:78:78:P8-37",
-                            "gpio2_15:79:79:P8-38",
-                            "gpio2_12:76:76:P8-39",
-                            "gpio2_13:77:77:P8-40",
-                            "gpio2_10:74:74:P8-41",
-                            "gpio2_11:75:75:P8-42",
-                            "gpio2_8:72:72:P8-43",
-                            "gpio2_9:73:73:P8-44",
-                            "gpio2_6:70:70:P8-45",
-                            "gpio2_7:71:71:P8-46",
-                            "gpio0_30:30:30:P9-11",
-                            "gpio1_28:60:60:P9-12",
-                            "gpio0_31:31:31:P9-13",
-                            "gpio1_18:50:50:P9-14",
-                            "gpio1_16:48:48:P9-15",
-                            "gpio1_19:51:51:P9-16",
-                            "gpio0_5:5:5:P9-17",
-                            "gpio0_4:4:4:P9-18",
-                            "gpio0_13:13:13:P9-19",
-                            "gpio0_12:12:12:P9-20",
-                            "gpio0_3:3:3:P9-21",
-                            "gpio0_2:2:2:P9-22",
-                            "gpio1_17:49:49:P9-23",
-                            "gpio0_15:15:15:P9-24",
-                            "gpio3_21:117:117:P9-25",
-                            "gpio0_14:14:14:P9-26",
-                            "gpio3_19:115:115:P9-27",
-                            "gpio3_17:113:113:P9-28",
-                            "gpio3_15:111:111:P9-29",
-                            "gpio3_16:112:112:P9-30",
-                            "gpio3_14:110:110:P9-31",
-                            "gpio0_20:20:20:P9-41",
-                            "gpio3_20:116:116:P9-41",
-                            "gpio0_7:7:7:P9-42",
-                            "gpio3_18:114:114:P9-42"
-                            );
+// Check for cape-inputs.json file to determine which GPIO pins are already in use
+$capeInputsFile = $mediaDirectory . '/tmp/cape-inputs.json';
+$usedGpioPins = array();
+if (file_exists($capeInputsFile)) {
+    $capeInputsData = file_get_contents($capeInputsFile);
+    $capeInputsJson = json_decode($capeInputsData, true);
+    if (isset($capeInputsJson['inputs']) && is_array($capeInputsJson['inputs'])) {
+        foreach ($capeInputsJson['inputs'] as $input) {
+            if (isset($input['pin']) && isset($input['type'])) {
+                $usedGpioPins[$input['pin']] = $input['type'];
+            }
         }
     }
-?>
-<script language="Javascript">
-
-function SaveGPIOInputEvent(input)
-{
-	var event = $(input).val();
-	var setting = $(input).attr('id');
-
-	$.get("fppjson.php?command=setSetting&key=" + setting + "&value="
-		+ event)
-		.done(function() {
-			$.jGrowl('GPIO Input Event saved');
-		}).fail(function() {
-			DialogError("GPIO Input", "Save GPIO Event failed");
-			$('#' + setting).val("");
-		});
 }
 
-/////////////////////////////////////////////////////////////////////////////
-$(document).ready(function(){
+// A cape with a physical EEPROM has every pin hard-wired to an output buffer, so all of the
+// pins it lists have to stay reserved even for ports the user left empty.  A virtual EEPROM
+// describes a hand-wired setup (e.g. a DPI Pixels hat where only a few of the 24 ports are
+// wired up), so only the pins for ports that actually have pixels configured are reserved
+// and the rest remain available as GPIO inputs.  This mirrors which pins fppd claims, see
+// src/non-gpl/DPIPixels/DPIPixels.cpp.
+$capeIsVirtual = false;
+$capeInfoFile = $mediaDirectory . '/tmp/cape-info.json';
+if (file_exists($capeInfoFile)) {
+    $capeInfoJson = json_decode(file_get_contents($capeInfoFile), true);
+    if (isset($capeInfoJson['eepromLocation'])) {
+        $capeIsVirtual = strpos($capeInfoJson['eepromLocation'], 'sys/bus/i2c') === false;
+    }
+}
 
-});
+// For a virtual EEPROM, work out which ports of which cape string config are actually in use.
+// $activeCapePorts maps the enabled channel output's subType to the port numbers holding pixels.
+$activeCapePorts = array();
+if ($capeIsVirtual) {
+    $pixelStringsFile = $mediaDirectory . '/config/co-pixelStrings.json';
+    if (file_exists($pixelStringsFile)) {
+        $pixelStringsJson = json_decode(file_get_contents($pixelStringsFile), true);
+        if (isset($pixelStringsJson['channelOutputs']) && is_array($pixelStringsJson['channelOutputs'])) {
+            foreach ($pixelStringsJson['channelOutputs'] as $channelOutput) {
+                if (empty($channelOutput['enabled']) || !isset($channelOutput['subType']) ||
+                    !isset($channelOutput['outputs']) || !is_array($channelOutput['outputs'])) {
+                    continue;
+                }
+                $ports = array();
+                foreach ($channelOutput['outputs'] as $index => $port) {
+                    $portNumber = isset($port['portNumber']) ? $port['portNumber'] : $index;
+                    // A port may hold several virtual strings, and a port feeding smart
+                    // receivers holds a set of virtual strings per receiver (B through F).
+                    foreach ($port as $key => $value) {
+                        if (strpos($key, 'virtualStrings') !== 0 || !is_array($value)) {
+                            continue;
+                        }
+                        foreach ($value as $virtualString) {
+                            if (!empty($virtualString['pixelCount'])) {
+                                $ports[$portNumber] = true;
+                            }
+                        }
+                    }
+                }
+                $activeCapePorts[$channelOutput['subType']] = $ports;
+            }
+        }
+    }
+}
 
-</script>
+// Check for cape channel output configuration to block those GPIO pins as well
+$stringsDir = $mediaDirectory . '/tmp/strings/';
+if (is_dir($stringsDir)) {
+    $stringFiles = scandir($stringsDir);
+    foreach ($stringFiles as $file) {
+        if (substr($file, 0, 1) != '.' && substr($file, -5) == '.json') {
+            $stringFilePath = $stringsDir . $file;
+            $stringData = file_get_contents($stringFilePath);
+            $stringJson = json_decode($stringData, true);
 
-<title><? echo $pageTitle; ?></title>
-</head>
-<body>
-	<div id="bodyWrapper">
-		<?php include 'menu.inc'; ?>
-		<br/>
+            // On a virtual EEPROM, ignore string configs for a driver that isn't the one
+            // configured (a cape often ships one per driver) and reserve only the used ports.
+            $usedPorts = null;
+            if ($capeIsVirtual) {
+                $capeName = isset($stringJson['name']) ? $stringJson['name'] : substr($file, 0, -5);
+                if (!isset($activeCapePorts[$capeName])) {
+                    continue;
+                }
+                $usedPorts = $activeCapePorts[$capeName];
+            }
 
-<div id='channelOutputManager'>
-				<div id='divGPIO'>
-					<fieldset class="fs">
-						<legend> GPIO Input Triggers </legend>
-						<div id='divGPIOData'>
-
-<!-- --------------------------------------------------------------------- -->
-
-  <div style="overflow: hidden; padding: 10px;">
-	<table id='GPIOInputs' class='fppTable'>
-		<tr>
-				<td colspan=5 align='center'><b>Built-in GPIO Inputs</b></td>
-		</tr>
-		<tr class='fppTableHeader'>
-				<td width='5%'>En.</td>
-				<td width='12%'>GPIO #</td>
-				<td width='10%'>wiring #</td>
-				<td width='55%' colspan='2'>Events</td>
-				<td width='18%' align='center'>Hdr&nbsp;-&nbsp;Pin</td>
-		</tr>
-<?
-
-	foreach ($inputs as $input)
-	{
-		$inputData = explode(":", $input);
-		$settingID = sprintf("GPIOInput%03dEnabled", $inputData[1]);
+            if (isset($stringJson['outputs']) && is_array($stringJson['outputs'])) {
+                $portNumber = 1;
+                foreach ($stringJson['outputs'] as $output) {
+                    if (isset($output['pin']) && (($usedPorts === null) || isset($usedPorts[$portNumber - 1]))) {
+                        $pin = $output['pin'];
+                        $driverType = isset($stringJson['driver']) ? $stringJson['driver'] : 'Channel Output';
+                        $portInfo = $driverType . ' (Port ' . $portNumber . ')';
+                        if (isset($output['description']) && !empty($output['description'])) {
+                            $portInfo .= ' - ' . $output['description'];
+                        }
+                        if (!isset($usedGpioPins[$pin])) {
+                            $usedGpioPins[$pin] = $portInfo;
+                        }
+                    }
+                    $portNumber++;
+                }
+            }
+        }
+    }
+}
 ?>
-		<tr><td><? PrintSettingCheckbox("GPIO Input", $settingID, 1, 0, "1", "0"); ?></td>
-				<td><?= $inputData[0]; ?></td>
-				<td><?= $inputData[2]; ?></td>
-				<td>Rising: <? PrintEventOptions($inputData[1]); ?></td>
-				<td>Falling: <? PrintEventOptions($inputData[1], false); ?></td>
-				<td align='center'><?= $inputData[3]; ?></td>
-		</tr>
-<?
-	}
-if ($settings['Platform'] == "Raspberry Pi") {
+
+<head>
+    <?php
+    include 'common/htmlMeta.inc';
+    require_once 'config.php';
+    require_once "common.php";
+    include 'common/menuHead.inc';
+
+    // Generates an FPP-standard help icon with a Bootstrap tooltip.
+    // $tip may contain HTML (e.g. <br>, <strong>) for formatted tips.
+    function helpTip($tip) {
+        $t = htmlspecialchars($tip, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        return '<span data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="auto"'
+             . ' data-bs-container="body" data-bs-title="' . $t . '">'
+             . '<img src="images/redesign/help-icon.svg" class="icon-help" alt="help icon">'
+             . '</span>';
+    }
+
+    $gpioData = file_get_contents('http://127.0.0.1:32322/gpio');
+    $gpiojson = json_decode($gpioData, true);
+
+    $includeFilters = array();
+    $excludeFilters = array();
+    if (!isset($settings["showAllOptions"]) || $settings["showAllOptions"] == 0) {
+        if (isset($settings['cape-info']['show']) && isset($settings['cape-info']['show']['gpio'])) {
+            $includeFilters = $settings['cape-info']['show']['gpio'];
+        }
+        if (isset($settings['cape-info']['hide']) && isset($settings['cape-info']['hide']['gpio'])) {
+            $excludeFilters = $settings['cape-info']['hide']['gpio'];
+        }
+    }
+
+    $availablePins = array();
+    foreach ($gpiojson as $gpio) {
+        $pinName = $gpio['pin'];
+        if (isset($usedGpioPins[$pinName]))
+            continue;
+        if (count($includeFilters) > 0) {
+            $matched = false;
+            foreach ($includeFilters as $f) {
+                if (preg_match("/" . $f . "/", $pinName)) {
+                    $matched = true;
+                    break;
+                }
+            }
+            if (!$matched)
+                continue;
+        }
+        $skip = false;
+        foreach ($excludeFilters as $f) {
+            if (preg_match("/" . $f . "/", $pinName)) {
+                $skip = true;
+                break;
+            }
+        }
+        if (!$skip)
+            $availablePins[] = $gpio;
+    }
     ?>
-		<tr <? echo $piFaceStyle; ?>><td colspan=5><br>NOTE: ** - BCM 25 conflicts with PiFace GPIO Inputs, do not enable BCM 25 when using a PiFace.<br></td></tr>
-		<tr class='piFaceGPIO' <? echo $piFaceStyle; ?>>
-				<td colspan=6 align='center'><hr><b>PiFace GPIO Inputs</b></td>
-		</tr>
-		<tr class='fppTableHeader' <? echo $piFaceStyle; ?>>
-				<td>En.</td>
-				<td>GPIO #</td>
-				<td>wiring #</td>
-				<td colspan="2">Events</td>
-				<td align='center'>Input #</td>
-		</tr>
-<?
-	foreach ($piFaceInputs as $input)
-	{
-		$inputData = explode(":", $input);
-		$settingID = sprintf("GPIOInput%03dEnabled", $inputData[1]);
-?>
-		<tr class='piFaceGPIO' <? echo $piFaceStyle; ?>>
-				<td><? PrintSettingCheckbox("GPIO Input", $settingID, 1, 0, "1", "0"); ?></td>
-				<td><?= $inputData[0]; ?></td>
-				<td><?= $inputData[2]; ?></td>
-				<td>Rising: <? PrintEventOptions($inputData[1]); ?></td>
-				<td>Falling: <? PrintEventOptions($inputData[1], false); ?></td>
-				<td align='center'><?= $inputData[3]; ?></td>
-		</tr>
-<?
-	}
-}
-?>
-	</table>
 
-	</div>
+    <style>
+        /* Reserve the line so the row doesn't shift when a pin's details appear. */
+        #gpioModalPinInfo {
+            min-height: 1.2em;
+        }
 
-<!-- --------------------------------------------------------------------- -->
+        /* ── GPIO trigger cards ─────────────────────────────────────────────────────── */
+        .gpio-trigger-card {
+            border: 1px solid var(--bs-border-color);
+            border-radius: var(--fpp-radius-lg);
+            margin-bottom: var(--fpp-sp-md);
+            background: var(--fpp-bg-card);
+            box-shadow: var(--fpp-shadow-sm);
+            transition: box-shadow var(--fpp-transition-fast);
+        }
 
-						</div>
-					</fieldset>
-				</div>
-			</div>
+        .gpio-trigger-card:hover {
+            box-shadow: var(--fpp-shadow-md);
+        }
 
+        .gpio-trigger-card .card-header {
+            background: var(--bs-secondary-bg);
+            border-bottom: 1px solid var(--bs-border-color);
+            border-radius: var(--fpp-radius-lg) var(--fpp-radius-lg) 0 0;
+            padding: 0.6rem 1rem;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.5rem;
+        }
 
-	<?php	include 'common/footer.inc'; ?>
-</div>
+        .gpio-trigger-card .card-body {
+            padding: 0.75rem 1rem;
+        }
+
+        /* ── Command list ─────────────────────────────────────────────────────────── */
+        .gpio-cmd-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .gpio-cmd-list li {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.2rem 0;
+            border-bottom: 1px solid var(--bs-border-color);
+        }
+
+        .gpio-cmd-list li:last-child {
+            border-bottom: none;
+        }
+
+        .gpio-cmd-badge {
+            flex: 1;
+            font-family: var(--fpp-font-mono);
+            font-size: var(--fpp-fs-sm);
+            background: var(--bs-tertiary-bg);
+            border-radius: var(--fpp-radius-sm);
+            padding: 0.15rem 0.5rem;
+            overflow-wrap: break-word;
+            color: var(--bs-body-color);
+        }
+
+        .gpio-section-label {
+            font-weight: var(--fpp-fw-semibold);
+            font-size: var(--fpp-fs-xs);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--fpp-text-muted);
+            margin-bottom: 0.35rem;
+            margin-top: 0.6rem;
+        }
+
+        .gpio-section-label:first-child {
+            margin-top: 0;
+        }
+
+        .gpio-empty-text {
+            color: var(--fpp-text-muted);
+            font-style: italic;
+            font-size: var(--fpp-fs-sm);
+        }
+
+        /* ── Modal command rows ──────────────────────────────────────────────────── */
+        .gpio-cmd-row {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.4rem 0.6rem;
+            background: var(--bs-body-bg);
+            border: 1px solid var(--bs-border-color);
+            border-radius: var(--fpp-radius-sm);
+            margin-bottom: 0.4rem;
+        }
+
+        .gpio-cmd-row .cmd-label {
+            flex: 1;
+            font-family: var(--fpp-font-mono);
+            font-size: var(--fpp-fs-sm);
+            color: var(--bs-body-color);
+            overflow-wrap: break-word;
+        }
+
+        /* ── Modal section grouping ─────────────────────────────────────────────── */
+        .gpio-modal-section {
+            background: var(--bs-secondary-bg);
+            border: 1px solid var(--bs-border-color);
+            border-radius: var(--fpp-radius-md);
+            padding: 0.85rem 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .gpio-modal-section-title {
+            font-weight: var(--fpp-fw-semibold);
+            margin-bottom: 0.65rem;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: var(--bs-body-color);
+        }
+
+        .gpio-modal-section-title .section-subtitle {
+            font-weight: var(--fpp-fw-normal);
+            font-size: var(--fpp-fs-sm);
+            color: var(--fpp-text-muted);
+        }
+
+        /* ── Command group wrapper ───────────────────────────────────────────────── */
+        .gpio-cmd-group {
+            border: 2px solid var(--bs-primary);
+            border-radius: var(--fpp-radius-lg);
+            margin-bottom: 1rem;
+            overflow: hidden;
+        }
+
+        .gpio-cmd-group-header {
+            background: rgba(var(--bs-primary-rgb), 0.10);
+            border-bottom: 2px solid var(--bs-primary);
+            padding: 0.6rem 1rem;
+            font-weight: var(--fpp-fw-semibold);
+            color: var(--bs-primary);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .gpio-cmd-group-header .section-subtitle {
+            font-weight: var(--fpp-fw-normal);
+            font-size: var(--fpp-fs-sm);
+            color: var(--fpp-text-muted);
+        }
+
+        /* The command group stacks its sections vertically with even spacing. */
+        .gpio-cmd-group-body {
+            padding: 0.85rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+        }
+
+        .gpio-cmd-group-body .gpio-modal-section {
+            margin-bottom: 0;
+        }
+
+        /* fpp.css pins this modal 70px below the top (to clear the FPP menu
+           bar), forces a fixed dialog height and caps the scrollable content
+           at (100vh - 8rem) — that cap is the dead space BELOW the box, and
+           the fixed height is why earlier margin tweaks didn't resize it.
+           Keep the 70px top clearance, but let the box grow down to ~8px from
+           the bottom and tighten the header/footer padding. Scoped to this
+           modal so other modals keep their centered look. */
+        #gpioEditModal {
+            --bs-modal-padding: 1rem;
+            --bs-modal-header-padding: 0.5rem 1rem;
+        }
+
+        #gpioEditModal .modal-dialog {
+            margin: 70px auto 8px;
+            height: auto;
+            max-height: calc(100vh - 78px);
+        }
+
+        #gpioEditModal .modal-dialog-scrollable .modal-content {
+            height: auto;
+            max-height: 100%;
+        }
+
+        #gpioEditModal .modal-header,
+        #gpioEditModal .modal-footer {
+            padding-top: 0.5rem;
+            padding-bottom: 0.5rem;
+        }
+    </style>
+
+    <script>
+        allowMultisyncCommands = true;
+
+        var gpioPinData = <?php echo json_encode($gpiojson, JSON_PRETTY_PRINT); ?>;
+        var usedGpioPins = <?php
+        $usedOut = array();
+        foreach ($usedGpioPins as $pin => $usage) {
+            $usedOut[$pin] = $usage;
+        }
+        echo json_encode($usedOut);
+        ?>;
+        var availablePins = <?php echo json_encode(array_map(fn($g) => $g['pin'], $availablePins)); ?>;
+
+        extraCommands = [{
+            "name": "OLED Navigation",
+            "args": [{
+                "description": "Action", "name": "Action", "optional": false, "type": "string",
+                "contents": ["Up", "Down", "Back", "Enter", "Test", "Test/Down", "Test Multisync"]
+            }],
+            "supportsMulticast": false
+        }];
+
+        // ─── State ────────────────────────────────────────────────────────────────────
+        var gpioTriggers = [];
+        var currentEditIdx = -1;
+
+        var modalRising = [];
+        var modalFalling = [];
+        var modalHold = [];
+        var cmdTarget = null;    // 'rising'|'falling'|'hold'
+        var cmdListIdx = -1;      // -1 = add new
+
+        // ─── Normalisation ────────────────────────────────────────────────────────────
+        function normalizeActions(v) {
+            if (!v) return [];
+            if (Array.isArray(v)) return v.filter(function (c) { return c && c.command; });
+            if (typeof v === 'object' && v.command) return [v];
+            return [];
+        }
+
+        function normalizeTrigger(t) {
+            return {
+                pin: t.pin || '',
+                enabled: t.enabled !== false,
+                mode: t.mode || 'gpio',
+                desc: t.desc || '',
+                debounceTime: t.debounceTime || 100,
+                debounceEdge: t.debounceEdge || 'both',
+                rising: normalizeActions(t.rising),
+                falling: normalizeActions(t.falling),
+                holdTime: t.holdTime || 0,
+                hold: normalizeActions(t.hold),
+                // LED fields — backward compatible defaults
+                ledPin: t.ledPin || '',
+                ledActiveHigh: t.ledActiveHigh !== false,
+                ledIdleMode: t.ledIdleMode || 'off',
+                ledPulseRateMs: t.ledPulseRateMs || 500,
+                ledTriggerMode: t.ledTriggerMode || 'follow_input',
+                ledTriggerParam: t.ledTriggerParam || 0,
+                // Re-enable fields — backward compatible defaults
+                reEnableMode: t.reEnableMode || 'always',
+                reEnableDelay: t.reEnableDelay || 0
+            };
+        }
+
+        // ─── Load / Save ──────────────────────────────────────────────────────────────
+        function loadGPIOConfig() {
+            $.get('api/configfile/gpio.json', function (data) {
+                gpioTriggers = (Array.isArray(data) ? data : []).map(normalizeTrigger);
+                renderTriggerList();
+            }).fail(function () { gpioTriggers = []; renderTriggerList(); });
+        }
+
+        function saveGPIOInputs() {
+            $.ajax({
+                url: 'api/configfile/gpio.json', type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify(gpioTriggers, null, 4),
+                dataType: 'json',
+                success: function (data) {
+                    if (data.Status === 'OK') {
+                        $.jGrowl('GPIO Triggers Saved.', { themeState: 'success' });
+                        SetRestartFlag(2);
+                        common_ViewPortChange();
+                    } else {
+                        alert('ERROR: ' + data.Message);
+                    }
+                },
+                error: function () { alert('Error: Failed to save GPIO triggers'); }
+            });
+        }
+
+        // ─── Main list rendering ──────────────────────────────────────────────────────
+        function renderTriggerList() {
+            var c = $('#gpioTriggerList').empty();
+            if (!gpioTriggers.length) {
+                c.html('<div class="text-muted fst-italic p-3">No GPIO triggers configured. Click <strong>Add GPIO Trigger</strong> to get started.</div>');
+                return;
+            }
+            $.each(gpioTriggers, function (i, t) { c.append(buildTriggerCard(i, t)); });
+            markTriggerCommandProblems();
+        }
+
+        // Flags commands that would fail when an enabled trigger fires (a
+        // command that no longer exists, a missing playlist/preset/script...).
+        var triggerValidateSeq = 0;
+        function markTriggerCommandProblems() {
+            var cmds = [], keys = [];
+            var seq = ++triggerValidateSeq; // the list may be re-rendered before the answer arrives
+            $.each(gpioTriggers, function (i, t) {
+                if (!t.enabled) return;
+                $.each(['rising', 'falling', 'hold'], function (j, edge) {
+                    $.each(t[edge], function (n, c) {
+                        // Read by fppoled, not fppd, so fppd does not list it.
+                        if (c.command == 'OLED Navigation') return;
+                        cmds.push(c);
+                        keys.push(i + ':' + edge + ':' + n);
+                    });
+                });
+            });
+            ValidateCommands(cmds, function (results) {
+                if (seq != triggerValidateSeq) return;
+                $.each(results, function (k, problems) {
+                    if (!problems.length) return;
+                    $('#gpioTriggerList [data-cmd-key="' + keys[k] + '"]').append(
+                        $("<span class='cmdTmplWarning'>&#x26a0;</span>").attr('title', problems.join('\n')));
+                });
+            });
+        }
+
+        function buildTriggerCard(idx, t) {
+            var pinInfo = getPinInfo(t.pin);
+            var gpioLbl = (pinInfo && pinHasGpioNumbers(t.pin))
+                ? ' <span class="text-muted small">(' + esc(pinInfo.gpioChip) + '/' + esc(pinInfo.gpioLine) + ')</span>' : '';
+            var enBadge = t.enabled
+                ? '<span class="badge bg-success">Enabled</span>'
+                : '<span class="badge bg-secondary">Disabled</span>';
+            var holdBadge = (t.holdTime > 0 && t.hold.length)
+                ? '<span class="badge bg-info text-dark" title="Long-press hold">Hold ' + t.holdTime + 'ms</span>' : '';
+            var ledBadge = t.ledPin
+                ? '<span class="badge bg-warning text-dark"><i class="fas fa-lightbulb"></i> ' + esc(t.ledPin) + '</span>' : '';
+            var reEnableBadge = '';
+            if (t.reEnableMode === 'timed') {
+                reEnableBadge = '<span class="badge bg-secondary" title="Re-enable after delay"><i class="fas fa-clock"></i> ' + t.reEnableDelay + 'ms</span>';
+            } else if (t.reEnableMode === 'player_idle') {
+                reEnableBadge = '<span class="badge bg-secondary" title="Re-enable on player idle"><i class="fas fa-play-circle"></i> On idle</span>';
+            }
+            var modeLabel = { gpio: 'No pull', gpio_pu: 'Pull up', gpio_pd: 'Pull down' }[t.mode] || t.mode;
+
+            var card = $('<div class="gpio-trigger-card"></div>');
+            card.append(
+                '<div class="card-header">' +
+                enBadge +
+                '<strong>' + esc(t.pin) + '</strong>' + gpioLbl +
+                (t.desc ? '<span class="text-muted">' + esc(t.desc) + '</span>' : '') +
+                holdBadge + ledBadge + reEnableBadge +
+                '<span class="text-muted small ms-auto">' + esc(modeLabel) + ' · ' + t.debounceTime + 'ms debounce</span>' +
+                '<button class="btn btn-sm btn-outline-primary ms-2" onclick="openEditModal(' + idx + ')"><i class="fas fa-edit"></i> Edit</button>' +
+                '<button class="btn btn-sm btn-outline-danger ms-1" onclick="deleteTrigger(' + idx + ')"><i class="fas fa-trash"></i></button>' +
+                '</div>'
+            );
+
+            var risingHtml = previewCmds(t.rising, idx + ':rising');
+            var fallingHtml = previewCmds(t.falling, idx + ':falling');
+            var holdHtml = '';
+            if (t.holdTime > 0 && t.hold.length) {
+                holdHtml = '<div class="mt-2 pt-2" style="border-top:1px solid var(--bs-border-color)">' +
+                    '<div class="gpio-section-label"><i class="fas fa-hand-paper text-info"></i> Hold (' + t.holdTime + 'ms)</div>' +
+                    previewCmds(t.hold, idx + ':hold') + '</div>';
+            }
+
+            card.append(
+                '<div class="card-body">' +
+                '<div class="row">' +
+                '<div class="col-md-6">' +
+                '<div class="gpio-section-label"><i class="fas fa-arrow-up text-success"></i> Rising</div>' +
+                risingHtml +
+                '</div>' +
+                '<div class="col-md-6">' +
+                '<div class="gpio-section-label"><i class="fas fa-arrow-down text-danger"></i> Falling</div>' +
+                fallingHtml +
+                '</div>' +
+                '</div>' + holdHtml +
+                '</div>'
+            );
+            return card;
+        }
+
+        function previewCmds(cmds, keyPrefix) {
+            if (!cmds || !cmds.length) return '<div class="gpio-empty-text">No commands</div>';
+            var html = '<ul class="gpio-cmd-list">';
+            $.each(cmds, function (i, c) {
+                html += '<li data-cmd-key="' + keyPrefix + ':' + i + '"><span class="gpio-cmd-badge">' + esc(cmdSummary(c)) + '</span></li>';
+            });
+            return html + '</ul>';
+        }
+
+        function cmdSummary(cmd) {
+            if (!cmd || !cmd.command) return '(none)';
+            var s = cmd.command;
+            if (cmd.args && cmd.args.length) {
+                var def = commandListByName[cmd.command];
+                var defArgs = (def && def.args) ? def.args : [];
+                s += ': ' + cmd.args.map(function (a, i) {
+                    var v = (a !== '' && a !== null && typeof a !== 'undefined') ? a : '—';
+                    var label = defArgs[i] ? (defArgs[i].description || defArgs[i].name) : null;
+                    return label ? (label + '=' + v) : v;
+                }).join(', ');
+            }
+            // Multisync isn't part of args[] - it lives alongside it in the command
+            // JSON, with an empty host list meaning "every remote". Show it too so
+            // the card reflects everything the command editor captured.
+            if (cmd.multisyncCommand) {
+                s += ' · Multisync: ' + (cmd.multisyncHosts ? cmd.multisyncHosts : 'all remotes');
+            }
+            return s;
+        }
+
+        function getPinInfo(n) {
+            for (var i = 0; i < gpioPinData.length; i++) if (gpioPinData[i].pin === n) return gpioPinData[i];
+            return null;
+        }
+
+        // Whether to annotate a pin with the GPIO it maps to -- Pi P1 header only;
+        // see fppPinHasGpioNumbers() in fpp.js for why everything else is bare.
+        function pinHasGpioNumbers(n) {
+            return fppPinHasGpioNumbers(n);
+        }
+
+        // Header pin plus the gpiochip/line it drives, e.g. "P1-11 (0/17)", so the
+        // GPIO a pin maps to is visible while picking it rather than only after saving.
+        function pinLabel(n) {
+            if (!pinHasGpioNumbers(n)) return esc(n);
+            var info = getPinInfo(n);
+            if (!info || info.gpioChip === undefined || info.gpioLine === undefined) return esc(n);
+            return esc(n) + ' (' + esc(info.gpioChip) + '/' + esc(info.gpioLine) + ')';
+        }
+
+        function esc(s) { return $('<div>').text(String(s)).html(); }
+
+        // ─── Delete ───────────────────────────────────────────────────────────────────
+        function deleteTrigger(idx) {
+            if (!confirm('Remove trigger for ' + gpioTriggers[idx].pin + '?')) return;
+            gpioTriggers.splice(idx, 1);
+            renderTriggerList();
+        }
+
+        // ─── Open modal ───────────────────────────────────────────────────────────────
+        function openAddModal() {
+            currentEditIdx = -1;
+            var configured = gpioTriggers.map(function (t) { return t.pin; });
+            var free = '';
+            for (var i = 0; i < availablePins.length; i++) {
+                if (configured.indexOf(availablePins[i]) === -1) { free = availablePins[i]; break; }
+            }
+            openEditModalWith(normalizeTrigger({ pin: free }));
+        }
+
+        function openEditModal(idx) {
+            currentEditIdx = idx;
+            openEditModalWith(gpioTriggers[idx]);
+        }
+
+        function openEditModalWith(t) {
+            modalRising = t.rising.map(function (c) { return $.extend(true, {}, c); });
+            modalFalling = t.falling.map(function (c) { return $.extend(true, {}, c); });
+            modalHold = t.hold.map(function (c) { return $.extend(true, {}, c); });
+
+            // Pin selector
+            var configured = gpioTriggers.map(function (x) { return x.pin; });
+            var pinSel = $('#gpioModalPin').empty();
+            // A trigger saved before a cape claimed its pin keeps that pin as an option,
+            // flagged as reserved, so opening the trigger doesn't silently move it.
+            if (t.pin && availablePins.indexOf(t.pin) === -1) {
+                pinSel.append('<option value="' + esc(t.pin) + '" selected>' + pinLabel(t.pin) +
+                    ' — reserved: ' + esc(usedGpioPins[t.pin] || 'in use') + '</option>');
+            }
+            $.each(availablePins, function (i, p) {
+                if (configured.indexOf(p) === -1 || p === t.pin)
+                    pinSel.append('<option value="' + esc(p) + '"' + (p === t.pin ? ' selected' : '') + '>' + pinLabel(p) + '</option>');
+            });
+
+            $('#gpioModalEnabled').prop('checked', t.enabled);
+            $('#gpioModalMode').val(t.mode);
+            $('#gpioModalDesc').val(t.desc);
+            $('#gpioModalDebounce').val(t.debounceTime);
+            $('#gpioModalDebounceEdge').val(t.debounceEdge);
+            $('#gpioModalHoldTime').val(t.holdTime);
+
+            // LED fields
+            var ledSel = $('#gpioModalLedPin').empty().append('<option value="">None</option>');
+            if (t.ledPin && availablePins.indexOf(t.ledPin) === -1) {
+                ledSel.append('<option value="' + esc(t.ledPin) + '" selected>' + pinLabel(t.ledPin) +
+                    ' — reserved: ' + esc(usedGpioPins[t.ledPin] || 'in use') + '</option>');
+            }
+            $.each(availablePins, function (i, p) {
+                ledSel.append('<option value="' + esc(p) + '"' + (p === t.ledPin ? ' selected' : '') + '>' + pinLabel(p) + '</option>');
+            });
+            $('#gpioModalLedActiveHigh').val(t.ledActiveHigh ? 'true' : 'false');
+            $('#gpioModalLedIdleMode').val(t.ledIdleMode);
+            $('#gpioModalLedPulseRate').val(t.ledPulseRateMs);
+            $('#gpioModalLedTriggerMode').val(t.ledTriggerMode);
+            $('#gpioModalLedTriggerParam').val(t.ledTriggerParam);
+
+            // Re-enable fields
+            $('#gpioModalReEnableMode').val(t.reEnableMode);
+            $('#gpioModalReEnableDelay').val(t.reEnableDelay || 5000);
+            updateReEnableVisibility();
+
+            updateLEDVisibility();
+            updatePinModeOptions(t.pin);
+            $('#gpioModalPin').off('change').on('change', function () { updatePinModeOptions($(this).val()); });
+
+            renderModalList('rising');
+            renderModalList('falling');
+            renderModalList('hold');
+            toggleHoldSection();
+
+            $('#gpioEditModalLabel').text(currentEditIdx === -1 ? 'Add GPIO Trigger' : 'Edit GPIO Trigger — ' + t.pin);
+            $('#gpioEditModal').modal('show');
+        }
+
+        function updatePinModeOptions(pinName) {
+            var info = getPinInfo(pinName);
+            var sel = $('#gpioModalMode'), cur = sel.val();
+            sel.empty().append('<option value="gpio">None / External Pull</option>');
+            if (info && info.supportsPullUp) sel.append('<option value="gpio_pu">Pull Up</option>');
+            if (info && info.supportsPullDown) sel.append('<option value="gpio_pd">Pull Down</option>');
+            sel.val(cur) || sel.val('gpio');
+            updatePinInfoLabel(pinName);
+        }
+
+        function updatePinInfoLabel(pinName) {
+            var info = getPinInfo(pinName), lbl = $('#gpioModalPinInfo');
+            if (!info) { lbl.text(''); return; }
+            var parts = [];
+            if (pinHasGpioNumbers(pinName)) {
+                if (info.gpioChip !== undefined && info.gpioLine !== undefined) {
+                    parts.push('gpiochip' + info.gpioChip + ' line ' + info.gpioLine);
+                }
+                if (info.gpio !== undefined) parts.push('GPIO' + info.gpio);
+            }
+            if (!info.supportsPullUp && !info.supportsPullDown) parts.push('no internal pull');
+            if (usedGpioPins[pinName]) parts.push('reserved: ' + usedGpioPins[pinName]);
+            lbl.text(parts.join(' · '));
+        }
+
+        function toggleHoldSection() {
+            var t = parseInt($('#gpioModalHoldTime').val()) || 0;
+            $('#gpioModalHoldSection').toggleClass('d-none', !(t > 0));
+        }
+
+        function updateReEnableVisibility() {
+            var mode = $('#gpioModalReEnableMode').val();
+            $('#gpioReEnableDelayRow').toggleClass('d-none', mode !== 'timed');
+            $('#gpioReEnableInfo').toggleClass('d-none', mode === 'always');
+        }
+
+        function updateLEDVisibility() {
+            var hasPin = $('#gpioModalLedPin').val() !== '';
+            var idleMode = $('#gpioModalLedIdleMode').val();
+            var trigMode = $('#gpioModalLedTriggerMode').val();
+
+            $('#gpioLEDSettingsRow').toggleClass('d-none', !hasPin);
+            $('#gpioLEDPulseRateRow').toggleClass('d-none', !(hasPin && idleMode === 'pulse'));
+
+            var showParam = hasPin && (trigMode === 'flash' || trigMode === 'timed_on');
+            $('#gpioLEDTriggerParamRow').toggleClass('d-none', !showParam);
+
+            var labelText, helpText, tipText;
+            if (trigMode === 'flash') {
+                labelText = 'Number of flashes';
+                helpText  = 'How many times the LED flashes before returning to idle.';
+                tipText   = 'How many times the LED flashes after the button is pressed. Each flash is 150 ms on followed by 150 ms off.';
+            } else {
+                labelText = 'On duration (ms)';
+                helpText  = 'How long (ms) the LED stays on before returning to idle.';
+                tipText   = 'How long in milliseconds the LED stays on after the button is pressed before returning to idle mode.';
+            }
+            // Update label text node without touching the tooltip span child
+            $('#gpioLEDTriggerParamLabel').contents().filter(function () {
+                return this.nodeType === 3;
+            }).first().replaceWith(labelText + ' ');
+            $('#gpioLEDTriggerParamHelp').text(helpText);
+
+            // Refresh the dynamic tooltip
+            var tipEl = document.getElementById('gpioLEDTriggerParamTip');
+            if (tipEl) {
+                var existing = bootstrap.Tooltip.getInstance(tipEl);
+                if (existing) existing.dispose();
+                tipEl.setAttribute('data-bs-title', tipText);
+                new bootstrap.Tooltip(tipEl);
+            }
+        }
+
+        // ─── Save modal ───────────────────────────────────────────────────────────────
+        function saveGPIOModal() {
+            var pin = $('#gpioModalPin').val();
+            if (!pin) { alert('Please select a GPIO pin.'); return; }
+            if (currentEditIdx === -1) {
+                for (var i = 0; i < gpioTriggers.length; i++) {
+                    if (gpioTriggers[i].pin === pin) {
+                        alert('A trigger for pin ' + pin + ' already exists. Edit that entry instead.');
+                        return;
+                    }
+                }
+            }
+            var t = {
+                pin: pin,
+                enabled: $('#gpioModalEnabled').is(':checked'),
+                mode: $('#gpioModalMode').val(),
+                desc: $('#gpioModalDesc').val(),
+                debounceTime: parseInt($('#gpioModalDebounce').val()) || 100,
+                debounceEdge: $('#gpioModalDebounceEdge').val(),
+                rising: modalRising.slice(),
+                falling: modalFalling.slice(),
+                holdTime: parseInt($('#gpioModalHoldTime').val()) || 0,
+                hold: modalHold.slice(),
+                ledPin: $('#gpioModalLedPin').val(),
+                ledActiveHigh: $('#gpioModalLedActiveHigh').val() === 'true',
+                ledIdleMode: $('#gpioModalLedIdleMode').val(),
+                ledPulseRateMs: parseInt($('#gpioModalLedPulseRate').val()) || 500,
+                ledTriggerMode: $('#gpioModalLedTriggerMode').val(),
+                ledTriggerParam: parseInt($('#gpioModalLedTriggerParam').val()) || 0,
+                reEnableMode: $('#gpioModalReEnableMode').val(),
+                reEnableDelay: parseInt($('#gpioModalReEnableDelay').val()) || 0
+            };
+            if (currentEditIdx === -1) gpioTriggers.push(t);
+            else gpioTriggers[currentEditIdx] = t;
+            $('#gpioEditModal').modal('hide');
+            renderTriggerList();
+        }
+
+        // ─── Command list inside modal ─────────────────────────────────────────────────
+        function getModalList(name) {
+            return name === 'rising' ? modalRising : name === 'falling' ? modalFalling : modalHold;
+        }
+
+        function renderModalList(name) {
+            var list = getModalList(name);
+            var c = $('#gpioModal_' + name + '_list').empty();
+            if (!list.length) {
+                c.append('<div class="gpio-empty-text mb-2">No commands — click Add to configure.</div>');
+                return;
+            }
+            $.each(list, function (i, cmd) {
+                var row = $('<div class="gpio-cmd-row"></div>');
+                var label = $('<span class="cmd-label"></span>').text(cmdSummary(cmd));
+                var edit = $('<button class="btn btn-sm btn-outline-secondary" title="Edit"><i class="fas fa-pencil-alt"></i></button>');
+                var up = $('<button class="btn btn-sm btn-outline-secondary" title="Move up"' + (i === 0 ? ' disabled' : '') + '><i class="fas fa-arrow-up"></i></button>');
+                var dn = $('<button class="btn btn-sm btn-outline-secondary" title="Move down"' + (i === list.length - 1 ? ' disabled' : '') + '><i class="fas fa-arrow-down"></i></button>');
+                var del = $('<button class="btn btn-sm btn-outline-danger" title="Remove"><i class="fas fa-trash"></i></button>');
+                (function (n, idx) {
+                    edit.on('click', function () { editModalCmd(n, idx); });
+                    up.on('click', function () { moveModalCmd(n, idx, -1); });
+                    dn.on('click', function () { moveModalCmd(n, idx, +1); });
+                    del.on('click', function () { removeModalCmd(n, idx); });
+                })(name, i);
+                row.append(label, edit, up, dn, del);
+                c.append(row);
+            });
+        }
+
+        function addModalCmd(name) {
+            cmdTarget = name; cmdListIdx = -1;
+            ShowCommandEditor('gpio_modal_' + name + '_new', {}, 'gpioCommandSaved', '', {
+                title: 'Add Command — ' + name.charAt(0).toUpperCase() + name.slice(1) + ' Edge',
+                saveButton: 'Add Command', cancelButton: 'Cancel', showPresetSelect: true,
+                presetInsertsReference: true
+            });
+        }
+
+        function editModalCmd(name, idx) {
+            cmdTarget = name; cmdListIdx = idx;
+            ShowCommandEditor('gpio_modal_' + name + '_' + idx, getModalList(name)[idx], 'gpioCommandSaved', '', {
+                title: 'Edit Command — ' + name.charAt(0).toUpperCase() + name.slice(1) + ' Edge',
+                saveButton: 'Save Command', cancelButton: 'Cancel', showPresetSelect: true,
+                presetInsertsReference: true
+            });
+        }
+
+        function gpioCommandSaved(target, data) {
+            if (!data || !data.command) return;
+            var list = getModalList(cmdTarget);
+            if (cmdListIdx === -1) list.push(data);
+            else list[cmdListIdx] = data;
+            renderModalList(cmdTarget);
+        }
+
+        function removeModalCmd(name, idx) {
+            getModalList(name).splice(idx, 1);
+            renderModalList(name);
+        }
+
+        function moveModalCmd(name, idx, dir) {
+            var list = getModalList(name), t2 = idx + dir;
+            if (t2 < 0 || t2 >= list.length) return;
+            var tmp = list[idx]; list[idx] = list[t2]; list[t2] = tmp;
+            renderModalList(name);
+        }
+
+        $(document).ready(function () {
+            PopulateCommandListCache();
+            loadGPIOConfig();
+        });
+    </script>
+
+    <title><?php echo $pageTitle; ?></title>
+</head>
+
+<body>
+    <div id="bodyWrapper">
+        <?php
+        $activeParentMenuItem = 'input-output';
+        include 'menu.inc';
+        ?>
+
+        <div class="container-fluid">
+            <h1 class="title">GPIO Input Triggers</h1>
+            <div class="pageContent">
+
+                <div class="row tablePageHeader mb-3">
+                    <div class="col-md">
+                        <h2>GPIO Input Triggers</h2>
+                    </div>
+                    <div class="col-md-auto ms-lg-auto d-flex gap-2 align-items-center flex-wrap">
+                        <button class="btn btn-outline-primary" onclick="openAddModal()">
+                            <i class="fas fa-plus"></i> Add GPIO Trigger
+                        </button>
+                        <input type="button" value="Save" class="buttons btn-success" onclick="saveGPIOInputs()">
+                    </div>
+                </div>
+
+                <?php if (!empty($usedGpioPins)): ?>
+                    <div class="alert alert-info py-2 mb-3">
+                        <i class="fas fa-info-circle"></i>
+                        <strong><?php echo count($usedGpioPins); ?> pin(s)</strong> reserved by cape:
+                        <span class="font-monospace"><?php echo implode(', ', array_keys($usedGpioPins)); ?></span>
+                    </div>
+                <?php endif; ?>
+
+                <div id="gpioTriggerList">
+                    <div class="text-muted fst-italic p-3">Loading GPIO configuration…</div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- ═══ GPIO Edit Modal ═══════════════════════════════════════════════ -->
+        <div class="modal fade" id="gpioEditModal" tabindex="-1" aria-labelledby="gpioEditModalLabel"
+            aria-hidden="true">
+            <div class="modal-dialog modal-xl modal-dialog-scrollable">
+                <div class="modal-content">
+
+                    <div class="modal-header py-2">
+                        <h5 class="modal-title" id="gpioEditModalLabel">Configure GPIO Trigger</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+
+                    <div class="modal-body">
+
+                        <!-- Pin & General ──────────────────────────────────── -->
+                        <div class="gpio-modal-section">
+                            <div class="gpio-modal-section-title">
+                                <i class="fas fa-microchip"></i> Pin &amp; General Settings
+                            </div>
+                            <div class="row g-3">
+                                <div class="col-md-auto d-flex align-items-center">
+                                    <div class="form-check mb-0">
+                                        <input class="form-check-input" type="checkbox" id="gpioModalEnabled">
+                                        <label class="form-check-label ms-1" for="gpioModalEnabled">Enabled <?= helpTip('When unchecked this trigger is loaded but never fires, letting you disable it temporarily without losing its configuration.') ?></label>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label fw-semibold">GPIO Pin <?= helpTip('The GPIO input pin to monitor for signal changes.' . (GPIOPlatformHasStablePinNumbers() ? ' Each P1 pin is listed with the gpiochip/line it maps to.' : '') . ' Only pins not reserved by capes or channel outputs are listed.') ?></label>
+                                    <select class="form-select" id="gpioModalPin"></select>
+                                    <div class="form-text" id="gpioModalPinInfo"></div>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label fw-semibold">Pull Up / Down <?= helpTip('Configures the internal resistor on the pin.<br><strong>None</strong> – relies on an external pull resistor.<br><strong>Pull Up</strong> – pin reads HIGH at rest; pressing a button to GND produces a falling edge.<br><strong>Pull Down</strong> – pin reads LOW at rest; pressing a button to 3.3 V produces a rising edge.') ?></label>
+                                    <select class="form-select" id="gpioModalMode">
+                                        <option value="gpio">None / External Pull</option>
+                                        <option value="gpio_pu">Pull Up</option>
+                                        <option value="gpio_pd">Pull Down</option>
+                                    </select>
+                                </div>
+                                <div class="col-md">
+                                    <label class="form-label fw-semibold">Description <?= helpTip('Optional label shown on the trigger card. Useful for identifying buttons by function, e.g. <em>Start show</em> or <em>Emergency stop</em>.') ?></label>
+                                    <input class="form-control" type="text" id="gpioModalDesc" maxlength="128"
+                                        placeholder="e.g. Start button">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- ═══ Two-column layout: Commands | Options ════════ -->
+                        <div class="row g-3">
+
+                        <!-- ─── LEFT COLUMN — Trigger Commands ─────────────── -->
+                        <div class="col-lg-6">
+                        <div class="gpio-cmd-group">
+                            <div class="gpio-cmd-group-header">
+                                <i class="fas fa-terminal"></i> Trigger Commands
+                                <span class="section-subtitle">Commands to execute when the GPIO input fires</span>
+                            </div>
+
+                            <div class="gpio-cmd-group-body">
+
+                                <!-- Rising commands -->
+                                <div class="gpio-modal-section">
+                                    <div class="gpio-modal-section-title">
+                                        <i class="fas fa-arrow-up text-success"></i> Rising Edge Commands
+                                        <span class="section-subtitle">(button pressed / signal HIGH)</span>
+                                        <?= helpTip('Commands run when the GPIO signal transitions LOW → HIGH. With a pull-up circuit this is button release; with a pull-down circuit this is button press.') ?>
+                                    </div>
+                                    <div id="gpioModal_rising_list" class="mb-2"></div>
+                                    <button class="btn btn-sm btn-outline-success" onclick="addModalCmd('rising')">
+                                        <i class="fas fa-plus"></i> Add Command
+                                    </button>
+                                </div>
+
+                                <!-- Falling commands -->
+                                <div class="gpio-modal-section">
+                                    <div class="gpio-modal-section-title">
+                                        <i class="fas fa-arrow-down text-danger"></i> Falling Edge Commands
+                                        <span class="section-subtitle">(button released / signal LOW)</span>
+                                        <?= helpTip('Commands run when the GPIO signal transitions HIGH → LOW. With a pull-up circuit this is button press; with a pull-down circuit this is button release.<br>Not fired if a Hold command triggered during that press.') ?>
+                                    </div>
+                                    <p class="small text-muted mb-2">
+                                        <i class="fas fa-info-circle"></i>
+                                        Falling commands are suppressed when a Hold command fires for that press.
+                                    </p>
+                                    <div id="gpioModal_falling_list" class="mb-2"></div>
+                                    <button class="btn btn-sm btn-outline-danger" onclick="addModalCmd('falling')">
+                                        <i class="fas fa-plus"></i> Add Command
+                                    </button>
+                                </div>
+
+                                <!-- Hold / long-press -->
+                                <div class="gpio-modal-section">
+                                    <div class="gpio-modal-section-title">
+                                        <i class="fas fa-hand-paper text-info"></i> Long-Press / Hold Commands
+                                        <span class="section-subtitle">(optional)</span>
+                                        <?= helpTip('Commands that fire only when the button is held down for the configured duration. When hold fires, the falling-edge commands for that press are suppressed to prevent double-actions.') ?>
+                                    </div>
+                                    <div class="row g-3 mb-1">
+                                        <div class="col-md-6">
+                                            <label class="form-label fw-semibold">Hold Time (ms) <?= helpTip('How long in milliseconds the button must be continuously held before the hold commands fire. Set to 0 to disable hold detection entirely.') ?></label>
+                                            <input class="form-control" type="number" id="gpioModalHoldTime" min="0"
+                                                max="30000" value="0" placeholder="0 = disabled"
+                                                oninput="toggleHoldSection()">
+                                        </div>
+                                    </div>
+                                    <div class="form-text mb-3">0 = disabled. Falling commands suppressed when hold fires.</div>
+                                    <div id="gpioModalHoldSection" class="d-none">
+                                        <div id="gpioModal_hold_list" class="mb-2"></div>
+                                        <button class="btn btn-sm btn-outline-info" onclick="addModalCmd('hold')">
+                                            <i class="fas fa-plus"></i> Add Hold Command
+                                        </button>
+                                    </div>
+                                </div>
+
+                            </div><!-- /.gpio-cmd-group-body -->
+
+                        </div><!-- /.gpio-cmd-group -->
+                        </div><!-- /.col left -->
+
+                        <!-- ─── RIGHT COLUMN — Options ─────────────────────── -->
+                        <div class="col-lg-6">
+                        <div class="gpio-cmd-group">
+                            <div class="gpio-cmd-group-header">
+                                <i class="fas fa-sliders"></i> Options
+                                <span class="section-subtitle">Debounce, re-trigger behavior and button LED</span>
+                            </div>
+                            <div class="gpio-cmd-group-body">
+
+                        <!-- Debounce ─────────────────────────────────────────── -->
+                        <div class="gpio-modal-section">
+                            <div class="gpio-modal-section-title">
+                                <i class="fas fa-wave-square text-secondary"></i> Debounce
+                                <span class="section-subtitle">(filters mechanical switch bounce)</span>
+                            </div>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label class="form-label fw-semibold">Debounce Time (ms) <?= helpTip('Mechanical switches briefly bounce between open and closed. FPP ignores transitions shorter than this window to prevent false triggers. 50–200 ms is typical for push buttons.') ?></label>
+                                    <input class="form-control" type="number" id="gpioModalDebounce" min="10"
+                                        max="60000" value="100">
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label fw-semibold">Debounce On <?= helpTip('Which edges the debounce window applies to.<br><strong>Both</strong> – debounce rising and falling edges.<br><strong>Rising only</strong> – debounce the press; release fires immediately.<br><strong>Falling only</strong> – debounce the release; press fires immediately.') ?></label>
+                                    <select class="form-select" id="gpioModalDebounceEdge">
+                                        <option value="both">Both edges</option>
+                                        <option value="rising">Rising only</option>
+                                        <option value="falling">Falling only</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Re-enable Behavior ──────────────────────────────── -->
+                        <div class="gpio-modal-section">
+                            <div class="gpio-modal-section-title">
+                                <i class="fas fa-lock-open text-secondary"></i> Re-enable GPIO After Trigger
+                                <span class="section-subtitle">(optional — prevents rapid re-triggering)</span>
+                            </div>
+                            <div class="row g-3">
+                                <div class="col-12">
+                                    <label class="form-label fw-semibold">Re-enable Mode <?= helpTip('Controls when the input accepts another press after triggering.<br><strong>Always enabled</strong> – no delay; immediate re-triggering is allowed.<br><strong>Fixed delay</strong> – input is locked for the specified number of milliseconds after each trigger.<br><strong>Player idle</strong> – input stays locked until FPP finishes playback. If no playback starts within 2 seconds, the input re-enables automatically.') ?></label>
+                                    <select class="form-select" id="gpioModalReEnableMode"
+                                        onchange="updateReEnableVisibility()">
+                                        <option value="always">Always enabled (no suppression)</option>
+                                        <option value="timed">Re-enable after a fixed delay</option>
+                                        <option value="player_idle">Re-enable when player becomes idle</option>
+                                    </select>
+                                </div>
+                                <div class="col-md-6 d-none" id="gpioReEnableDelayRow">
+                                    <label class="form-label fw-semibold">Delay (ms) <?= helpTip('How many milliseconds the input is suppressed after triggering before it will accept another press. Minimum 100 ms.') ?></label>
+                                    <input class="form-control" type="number" id="gpioModalReEnableDelay" min="100"
+                                        max="3600000" value="5000">
+                                    <div class="form-text">Duration before the input is re-enabled.</div>
+                                </div>
+                            </div>
+                            <div class="alert alert-info py-2 mt-2 mb-0 d-none" id="gpioReEnableInfo">
+                                <i class="fas fa-info-circle"></i>
+                                While suppressed, additional button presses are ignored.
+                                <strong>Player idle</strong> mode re-enables once playback finishes;
+                                if no playback starts within 2 seconds the input re-enables automatically.
+                            </div>
+                        </div>
+
+                        <!-- LED / illuminated button ────────────────────────── -->
+                        <div class="gpio-modal-section">
+                            <div class="gpio-modal-section-title flex-wrap">
+                                <span class="text-nowrap"><i class="fas fa-lightbulb text-warning"></i> Illuminated Button LED</span>
+                                <span class="section-subtitle">(optional — drives a GPIO output for the button's LED)</span>
+                            </div>
+
+                            <div class="row g-3">
+                                <div class="col-12">
+                                    <label class="form-label fw-semibold">LED Output Pin <?= helpTip('GPIO output pin wired to the button\'s built-in LED. The pin is driven as a digital output — ensure it is not used for any other purpose such as pixel strings or cape outputs.') ?></label>
+                                    <select class="form-select" id="gpioModalLedPin" onchange="updateLEDVisibility()">
+                                        <option value="">None</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-text">GPIO output connected to the button's LED.</div>
+
+                            <div id="gpioLEDSettingsRow" class="mt-3 d-none">
+                                <div class="row g-3">
+                                    <div class="col-12">
+                                        <label class="form-label fw-semibold">LED Logic <?= helpTip('Which output level illuminates the LED.<br><strong>Active-high</strong> – writing HIGH turns the LED on. This is the most common wiring when the LED is connected directly between the GPIO pin and GND.<br><strong>Active-low</strong> – writing LOW turns the LED on. Typical when a transistor or open-collector driver is used.') ?></label>
+                                        <select class="form-select" id="gpioModalLedActiveHigh">
+                                            <option value="true">Active-high (HIGH = LED on)</option>
+                                            <option value="false">Active-low (LOW = LED on)</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                <hr class="my-3">
+                                <h6 class="fw-semibold mb-2"><i class="fas fa-moon text-secondary"></i> Idle / Standby
+                                    State</h6>
+                                <p class="small text-muted mb-2">What the LED does when no trigger is active.</p>
+                                <div class="row g-3">
+                                    <div class="col-12">
+                                        <label class="form-label fw-semibold">Idle LED Mode <?= helpTip('What the LED does when no trigger is active — the standby / ready state.<br><strong>Off</strong> – LED stays dark at rest.<br><strong>On</strong> – LED stays lit at rest, indicating the input is ready to accept a press.<br><strong>Pulsing</strong> – LED blinks continuously at the configured rate. While the input is suppressed after a trigger, the LED is held off regardless of this setting.') ?></label>
+                                        <select class="form-select" id="gpioModalLedIdleMode"
+                                            onchange="updateLEDVisibility()">
+                                            <option value="off">Off (dark at rest)</option>
+                                            <option value="on">On (lit at rest)</option>
+                                            <option value="pulse">Pulsing / blinking</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-12 d-none" id="gpioLEDPulseRateRow">
+                                        <label class="form-label fw-semibold">Pulse half-period (ms) <?= helpTip('Time in milliseconds between each LED on↔off toggle while pulsing. 500 ms gives a 1 Hz blink (on for 500 ms, off for 500 ms). Minimum 50 ms.') ?></label>
+                                        <input class="form-control" type="number" id="gpioModalLedPulseRate" min="50"
+                                            max="5000" value="500">
+                                        <div class="form-text">Time between LED on↔off toggles (e.g. 500 = 1 Hz blink).
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <hr class="my-3">
+                                <h6 class="fw-semibold mb-2"><i class="fas fa-bolt text-warning"></i> Trigger Effect
+                                </h6>
+                                <p class="small text-muted mb-2">What the LED does when the button fires (rising edge).
+                                </p>
+                                <div class="row g-3">
+                                    <div class="col-12">
+                                        <label class="form-label fw-semibold">Trigger Mode <?= helpTip('What the LED does immediately when the button fires (rising edge).<br><strong>None</strong> – idle mode controls the LED; triggers have no extra effect.<br><strong>Follow input</strong> – LED turns on while the button is held and off when released.<br><strong>Flash N times</strong> – LED flashes the set number of times (each flash: 150 ms on, 150 ms off) then returns to idle.<br><strong>Stay on for N ms</strong> – LED lights up for the specified duration then returns to idle.') ?></label>
+                                        <select class="form-select" id="gpioModalLedTriggerMode"
+                                            onchange="updateLEDVisibility()">
+                                            <option value="none">None (idle mode only, ignore trigger)</option>
+                                            <option value="follow_input">Follow input (on while pressed)</option>
+                                            <option value="flash">Flash N times then return to idle</option>
+                                            <option value="timed_on">Stay on for N ms then return to idle</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-12 d-none" id="gpioLEDTriggerParamRow">
+                                        <label class="form-label fw-semibold" id="gpioLEDTriggerParamLabel">Number of
+                                            flashes <span id="gpioLEDTriggerParamTip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="auto" data-bs-container="body" data-bs-title="How many times the LED flashes after the button is pressed. Each flash is 150 ms on followed by 150 ms off."><img src="images/redesign/help-icon.svg" class="icon-help" alt="help icon"></span></label>
+                                        <input class="form-control" type="number" id="gpioModalLedTriggerParam" min="1"
+                                            max="20" value="3">
+                                        <div class="form-text" id="gpioLEDTriggerParamHelp"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                            </div><!-- /.gpio-cmd-group-body -->
+                        </div><!-- /.gpio-cmd-group -->
+                        </div><!-- /.col right -->
+                        </div><!-- /.row master -->
+
+                    </div><!-- .modal-body -->
+
+                    <div class="modal-footer py-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-primary" onclick="saveGPIOModal()">
+                            <i class="fas fa-check"></i> Apply
+                        </button>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+
+        <?php include 'common/footer.inc'; ?>
+    </div>
 </body>
+
 </html>

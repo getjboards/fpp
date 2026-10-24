@@ -1,43 +1,60 @@
+#pragma once
 /*
- *   Media handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _MEDIAOUTPUTSTATUS_H
-#define _MEDIAOUTPUTSTATUS_H
+#include <atomic>
+#include <mutex>
+#include <string>
 
-typedef struct mediaOutputStatus {
-	int status; 
-	int secondsElapsed;
-	int subSecondsElapsed;
-	int secondsRemaining;
-	int subSecondsRemaining;
-	int minutesTotal;
-	int secondsTotal;
-	float mediaSeconds;
-	int speedDelta;
-    int speedDeltaCount;
-} MediaOutputStatus; 
+class MediaOutputStatus {
+public:
+    // The timing fields are written by whoever owns the output -- the
+    // playlist on the main loop, a command's thread -- and read for status by
+    // the API threads, and a resume or a slot's reset writes them from another
+    // thread again.  Writes and those cross-thread reads hold this.  A leaf:
+    // held only to copy or write fields, never across a call.
+    static std::mutex& FieldsLock() {
+        static std::mutex m;
+        return m;
+    }
 
-#endif /* _MEDIAOUTPUT_H */
+    // Set from GStreamer's bus thread when media ends or fails, read by the
+    // playlist on the main loop.
+    std::atomic<int> status{ 0 };
+    int secondsElapsed;
+    int subSecondsElapsed;
+    int secondsRemaining;
+    int subSecondsRemaining;
+    int minutesTotal;
+    int secondsTotal;
+    float mediaSeconds;
+    std::string output;
+    bool mediaLoading = false;
 
+    MediaOutputStatus() = default;
+    // Copyable as it was before status became atomic (slots reset theirs by
+    // assigning a fresh one).
+    MediaOutputStatus(const MediaOutputStatus& o) { *this = o; }
+    MediaOutputStatus& operator=(const MediaOutputStatus& o) {
+        status = o.status.load();
+        secondsElapsed = o.secondsElapsed;
+        subSecondsElapsed = o.subSecondsElapsed;
+        secondsRemaining = o.secondsRemaining;
+        subSecondsRemaining = o.subSecondsRemaining;
+        minutesTotal = o.minutesTotal;
+        secondsTotal = o.secondsTotal;
+        mediaSeconds = o.mediaSeconds;
+        output = o.output;
+        mediaLoading = o.mediaLoading;
+        return *this;
+    }
+};

@@ -1,609 +1,280 @@
 /*
- *   VirtualDisplay Channel Output for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/kd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <cmath>
+#include <fcntl.h>
 
-#include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/predicate.hpp>
+#include "../common.h"
+#include "../log.h"
 
-#include "common.h"
-#include "log.h"
 #include "VirtualDisplay.h"
-#include "Sequence.h"
-#include "settings.h"
+#include "ChannelOutputSetup.h"
+#include "overlays/PixelOverlay.h"
 
-/////////////////////////////////////////////////////////////////////////////
-// To disable interpolated scaling on the GPU, add this to /boot/config.txt:
-// scaling_kernel=8
+#include "Plugin.h"
+class VirtualDisplayPlugin : public FPPPlugins::Plugin, public FPPPlugins::ChannelOutputPlugin {
+public:
+    VirtualDisplayPlugin() :
+        FPPPlugins::Plugin("VirtualDisplay") {
+    }
+    virtual ChannelOutput* createChannelOutput(unsigned int startChannel, unsigned int channelCount) override {
+        return new VirtualDisplayOutput(startChannel, channelCount);
+    }
+};
+
+extern "C" {
+FPPPlugins::Plugin* createPlugin() {
+    return new VirtualDisplayPlugin();
+}
+}
 
 /*
  *
  */
 VirtualDisplayOutput::VirtualDisplayOutput(unsigned int startChannel,
-	unsigned int channelCount)
-  : ThreadedChannelOutputBase(startChannel, channelCount),
-	m_backgroundFilename("virtualdisplaybackground.jpg"),
-	m_backgroundBrightness(0.5),
-	m_width(1280),
-	m_height(1024),
-	m_bytesPerPixel(3),
-	m_bpp(24),
-	m_scale(1.0),
-	m_previewWidth(800),
-	m_previewHeight(600),
-	m_colorOrder("RGB"),
-	m_virtualDisplay(NULL),
-	m_pixelSize(2),
-	m_rgb565map(nullptr)
-{
-	LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::VirtualDisplayOutput(%u, %u)\n",
-		startChannel, channelCount);
-
-	m_maxChannels = FPPD_MAX_CHANNELS;
-	m_useDoubleBuffer = 1;
+                                           unsigned int channelCount) :
+    VirtualDisplayBaseOutput(startChannel, channelCount) {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::VirtualDisplayOutput(%u, %u)\n",
+             startChannel, channelCount);
 }
 
 /*
  *
  */
-VirtualDisplayOutput::~VirtualDisplayOutput()
-{
-	LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::~VirtualDisplayOutput()\n");
+VirtualDisplayOutput::~VirtualDisplayOutput() {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::~VirtualDisplayOutput()\n");
 
-	if (m_rgb565map)
-	{
-		for (int r = 0; r < 32; r++)
-		{
-			for (int g = 0; g < 64; g++)
-			{
-				delete[] m_rgb565map[r][g];
-			}
-
-			delete[] m_rgb565map[r];
-		}
-
-		delete[] m_rgb565map;
-	}
+    Close();
 }
 
 /*
  *
  */
-int VirtualDisplayOutput::Init(Json::Value config)
-{
-	LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::Init()\n");
-
-	m_width = config["width"].asInt();
-	if (!m_width)
-		m_width = 1280;
-
-	m_height = config["height"].asInt();
-	if (!m_height)
-		m_height = 1024;
-
-	m_pixelSize = config["pixelSize"].asInt();
-	if (!m_pixelSize)
-		m_pixelSize = 2;
-
-	if (config.isMember("colorOrder"))
-		m_colorOrder = config["colorOrder"].asString();
-
-	if (config.isMember("backgroundFilename"))
-		m_backgroundFilename = config["backgroundFilename"].asString();
-
-	if (config.isMember("backgroundBrightness"))
-		m_backgroundBrightness = 1.0 * config["backgroundBrightness"].asInt() / 100;
-
-	return ThreadedChannelOutputBase::Init(config);
-}
-
-/*
- *
- */
-int VirtualDisplayOutput::InitializePixelMap(void)
-{
-	std::string virtualDisplayMapFilename(getMediaDirectory());
-	virtualDisplayMapFilename += "/config/virtualdisplaymap";
-
-	if (!FileExists(virtualDisplayMapFilename.c_str()))
-	{
-		LogErr(VB_CHANNELOUT, "Error: %s does not exist\n",
-			virtualDisplayMapFilename.c_str());
-		return 0;
-	}
-
-	FILE *file = fopen(virtualDisplayMapFilename.c_str(), "r");
-
-	if (file == NULL)
-	{
-		LogErr(VB_CHANNELOUT, "Error: unable to open %s: %s\n",
-			virtualDisplayMapFilename.c_str(), strerror(errno));
-		return 0;
-	}
-
-	char * line = NULL;
-	size_t len = 0;
-	ssize_t read;
-
-	std::string pixel;
-	std::vector<std::string> parts;
-	int x = 0;
-	int y = 0;
-	int z = 0;
-	int ch = 0;
-	int s = 0;
-	int r = 0;
-	int g = 0;
-	int b = 0;
-	int rowOffset = 0;
-	int colOffset = 0;
-	int first = 1;
-	int i = 0;
-	int found = 0;
-	unsigned char customR;
-	unsigned char customG;
-	unsigned char customB;
-	VirtualPixelColor vpc = kVPC_RGB;
-
-	while ((read = getline(&line, &len, file)) != -1)
-	{
-		if (( ! line ) || ( ! read ) || ( read == 1 ))
-			continue;
-
-		if (line[0] == '#')
-			continue;
-
-		// Strip the line feed
-		line[strlen(line) - 1] = '\0';
-
-		pixel = line;
-		parts = split(pixel, ',');
-
-		if (first)
-		{
-			if (parts.size() == 2)
-			{
-				m_previewWidth  = atoi(parts[0].c_str());
-				m_previewHeight = atoi(parts[1].c_str());
-
-				if ((m_width == -1) || (m_height == -1))
-				{
-					m_width = m_previewWidth;
-					m_height = m_previewHeight;
-
-					m_virtualDisplay = (unsigned char *)malloc(m_width * m_height * m_bytesPerPixel);
-					if (!m_virtualDisplay)
-					{
-						LogErr(VB_CHANNELOUT, "Unable to malloc buffer\n");
-						return 0;
-					}
-				}
-
-				if ((1.0 * m_width / m_previewWidth) > (1.0 * m_height / m_previewHeight))
-				{
-					// Virtual Display is wider than the preview aspect, so background
-					// image height should equal virtual display height
-					m_scale = 1.0 * m_height / m_previewHeight;
-					rowOffset = 0;
-					colOffset = ((m_width - (m_previewWidth * m_scale)) / 2);
-				}
-				else
-				{
-					// Virtual Display is taller than the preview aspect, so background
-					// image width should equal virtual display width
-					m_scale = 1.0 * m_width / m_previewWidth;
-					colOffset = 0;
-					rowOffset = (m_height - (m_previewHeight * m_scale));
-				}
-			}
-
-			first = 0;
-			continue;
-		}
-
-		if (parts.size() >= 4)
-		{
-			x  = atoi(parts[0].c_str());
-			y  = atoi(parts[1].c_str());
-			z  = atoi(parts[2].c_str());
-			ch = atoi(parts[3].c_str());
-
-			customR = customG = customB = 0;
-
-			s = ((m_height - (int)(y * m_scale) - 1) * m_width
-					+ (int)(x * m_scale + colOffset)) * m_bytesPerPixel;
-
-			if (m_colorOrder == "RGB")
-			{
-				r = s + 0;
-				g = s + 1;
-				b = s + 2;
-			}
-			else if (m_colorOrder == "RBG")
-			{
-				r = s + 0;
-				g = s + 2;
-				b = s + 1;
-			}
-			else if (m_colorOrder == "GRB")
-			{
-				r = s + 1;
-				g = s + 0;
-				b = s + 2;
-			}
-			else if (m_colorOrder == "GBR")
-			{
-				r = s + 2;
-				g = s + 0;
-				b = s + 1;
-			}
-			else if (m_colorOrder == "BRG")
-			{
-				r = s + 1;
-				g = s + 2;
-				b = s + 0;
-			}
-			else if (m_colorOrder == "BGR")
-			{
-				r = s + 2;
-				g = s + 1;
-				b = s + 0;
-			}
-
-			if (parts[5] == "RGB")
-				vpc = kVPC_RGB;
-			else if (parts[5] == "RBG")
-				vpc = kVPC_RBG;
-			else if (parts[5] == "GRB")
-				vpc = kVPC_GRB;
-			else if (parts[5] == "GBR")
-				vpc = kVPC_GBR;
-			else if (parts[5] == "BRG")
-				vpc = kVPC_BRG;
-			else if (parts[5] == "BGR")
-				vpc = kVPC_BGR;
-			else if (parts[5] == "RGBW")
-				vpc = kVPC_RGBW;
-			else if (parts[5] == "Red")
-				vpc = kVPC_Red;
-			else if (parts[5] == "Green")
-				vpc = kVPC_Green;
-			else if (parts[5] == "Blue")
-				vpc = kVPC_Blue;
-			else if (parts[5] == "White")
-				vpc = kVPC_White;
-			else if (boost::starts_with(parts[5], "#"))
-			{
-				std::string colorPart;
-
-				vpc = kVPC_Custom;
-
-				colorPart = parts[5].substr(1,2);
-				customR = std::stoi(colorPart, NULL, 16);
-
-				colorPart = parts[5].substr(3,2);
-				customG = std::stoi(colorPart, NULL, 16);
-
-				colorPart = parts[5].substr(5,2);
-				customB = std::stoi(colorPart, NULL, 16);
-			}
-
-			found = 0;
-			for (i = 0; i < m_pixels.size() && !found; i++)
-			{
-				if ((m_pixels[i].x == x) && (m_pixels[i].y == y) && (m_pixels[i].z == z))
-					found = 1;
-			}
-
-			if (!found)
-				m_pixels.push_back({ x, y, z, ch, r, g, b, atoi(parts[4].c_str()), customR, customG, customB, vpc });
-		}
-	}
-
-	LoadBackgroundImage();
-
-	return 1;
-}
-
-/*
- *
- */
-int VirtualDisplayOutput::ScaleBackgroundImage(std::string &bgFile, std::string &rgbFile)
-{
-	std::string command;
-
-	command = "convert -scale " + std::to_string(m_width) + "x"
-		+ std::to_string(m_height) + " " + bgFile + " " + rgbFile;
-
-	LogDebug(VB_CHANNELOUT, "Generating scaled RGB background image: %s\n", command.c_str());
-	system(command.c_str());
-
-	return 1;
-}
-
-/*
- *
- */
-void VirtualDisplayOutput::LoadBackgroundImage(void)
-{
-	std::string bgFile = "/home/fpp/media/upload/";
-	bgFile += m_backgroundFilename;
-
-	std::string rgbFile = bgFile + ".rgb";
-
-	if (!FileExists(bgFile))
-	{
-		LogErr(VB_CHANNELOUT, "Background image does not exist: %s\n",
-			bgFile.c_str());
-		return;
-	}
-
-	if ((!FileExists(rgbFile)) && (!ScaleBackgroundImage(bgFile, rgbFile)))
-		return;
-
-	struct stat ostat;
-	struct stat sstat;
-
-	stat(bgFile.c_str(), &ostat);
-	stat(rgbFile.c_str(), &sstat);
-
-	// Check if original is newer than scaled version
-	if ((ostat.st_mtim.tv_sec > sstat.st_mtim.tv_sec) && (!ScaleBackgroundImage(bgFile, rgbFile)))
-		return;
-
-	FILE *fd = fopen(rgbFile.c_str(), "rb");
-	if (fd)
-	{
-		unsigned char buf[3072];
-		int bytesRead = -1;
-		int offset = 0;
-		unsigned long RGBx;
-		int imgWidth = 0;
-		int imgHeight = 0;
-
-		if ((1.0 * m_width / m_previewWidth) < (1.0 * m_height / m_previewHeight))
-		{
-			// Virtual Display is taller than the preview aspect, so background
-			// image width should equal virtual display width
-			imgWidth = m_width;
-			imgHeight = sstat.st_size / m_width / 3;
-			offset = (m_height - imgHeight) * m_width * m_bytesPerPixel;
-
-			while (bytesRead != 0)
-			{
-				bytesRead = fread(buf, 1, 3072, fd);
-
-				for (int i = 0; i < bytesRead;)
-				{
-					if ((m_bpp == 24) || (m_bpp == 32))
-					{
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-
-						if (m_bpp == 32)
-							offset++;
-					}
-					else // 16bpp RGB565
-					{
-						RGBx = *(unsigned long *)(buf + i);
-						*(uint16_t*)(m_virtualDisplay + offset) =
-							(((int)((RGBx & 0x000000FF) * m_backgroundBrightness) <<  8) & 0b1111100000000000) |
-							(((int)((RGBx & 0x0000FF00) * m_backgroundBrightness) >>  5) & 0b0000011111100000) |
-							(((int)((RGBx & 0x00FF0000) * m_backgroundBrightness) >> 19)); // & 0b0000000000011111);
-
-						i += 3;
-						offset += 2;
-					}
-				}
-			}
-		}
-		else
-		{
-			// Virtual Display is wider than the preview aspect, so background
-			// image height should equal virtual display height
-			imgHeight = m_height;
-			imgWidth = sstat.st_size / m_height / 3;
-
-			int colOffset = (m_width - imgWidth) / 2;
-			int r = 0;
-			int c = 0;
-
-			while (bytesRead != 0)
-			{
-				bytesRead = fread(buf, 1, 3072, fd);
-
-				for (int i = 0; i < bytesRead;)
-				{
-					if (c == 0)
-					{
-						offset = ((r * m_width) + colOffset) * m_bytesPerPixel;
-					}
-
-					if ((m_bpp == 24) || (m_bpp == 32))
-					{
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-						m_virtualDisplay[offset++] = buf[i++] * m_backgroundBrightness;
-
-						if (m_bpp == 32)
-							offset++;
-					}
-					else
-					{
-						RGBx = *(unsigned long *)(buf + i);
-						*(uint16_t*)(m_virtualDisplay + offset) =
-							(((int)((RGBx & 0x000000FF) * m_backgroundBrightness) <<  8) & 0b1111100000000000) |
-							(((int)((RGBx & 0x0000FF00) * m_backgroundBrightness) >>  5) & 0b0000011111100000) |
-							(((int)((RGBx & 0x00FF0000) * m_backgroundBrightness) >> 19)); // & 0b0000000000011111);
-
-						i += 3;
-						offset += 2;
-					}
-
-					c++;
-
-					if (c >= imgWidth)
-					{
-						c = 0;
-						r++;
-					}
-				}
-			}
-		}
-
-		fclose(fd);
-	}
-}
-
-
-/*
- *
- */
-void VirtualDisplayOutput::DrawPixel(int rOffset, int gOffset, int bOffset,
-	unsigned char r, unsigned char g, unsigned char b)
-{
-	if (m_bpp == 16)
-	{
-		if ((rOffset < gOffset) && (gOffset < bOffset))
-		{
-			*((uint16_t*)(m_virtualDisplay + rOffset)) = m_rgb565map[r >> 3][g >> 2][b >> 3];
-		}
-		else if ((rOffset < gOffset) && (bOffset < gOffset))
-		{
-			*((uint16_t*)(m_virtualDisplay + rOffset)) = m_rgb565map[r >> 3][b >> 2][g >> 3];
-		}
-		else if ((gOffset < rOffset) && (rOffset < bOffset))
-		{
-			*((uint16_t*)(m_virtualDisplay + gOffset)) = m_rgb565map[g >> 3][r >> 2][b >> 3];
-		}
-		else if ((gOffset < rOffset) && (bOffset < rOffset))
-		{
-			*((uint16_t*)(m_virtualDisplay + gOffset)) = m_rgb565map[g >> 3][b >> 2][r >> 3];
-		}
-		else if ((bOffset < gOffset) && (rOffset < gOffset))
-		{
-			*((uint16_t*)(m_virtualDisplay + bOffset)) = m_rgb565map[b >> 3][r >> 2][g >> 3];
-		}
-		else if ((bOffset < gOffset) && (gOffset < rOffset))
-		{
-			*((uint16_t*)(m_virtualDisplay + bOffset)) = m_rgb565map[b >> 3][g >> 2][r >> 3];
-		}
-	}
-	else
-	{
-		m_virtualDisplay[rOffset] = r;
-		m_virtualDisplay[gOffset] = g;
-		m_virtualDisplay[bOffset] = b;
-	}
-}
-
-void VirtualDisplayOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
-    for (auto &pixel : m_pixels) {
-        min = std::min(min, pixel.ch);
-        max = std::max(max, pixel.ch + (pixel.cpp == 4 ? 3 : 2));
+int VirtualDisplayOutput::Init(Json::Value config) {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::Init()\n");
+
+    // Check for old config names
+    if (config.isMember("ModelName"))
+        m_modelName = config["ModelName"].asString();
+    if (config.isMember("PixelSize"))
+        m_pixelSize = config["PixelSize"].asInt();
+
+    // Check for new config names
+    if (config.isMember("modelName"))
+        m_modelName = config["modelName"].asString();
+    if (config.isMember("pixelSize"))
+        m_pixelSize = config["pixelSize"].asInt();
+
+    if (m_modelName == "") {
+        int width = 0;
+        int height = 0;
+        std::string device;
+
+        if ((config.isMember("width")) &&
+            (config.isMember("height")) &&
+            (config.isMember("device"))) {
+            width = config["width"].asInt();
+            height = config["height"].asInt();
+            device = config["device"].asString();
+
+            replaceStart(device, "/dev/");
+            m_modelName = "FB - ";
+            m_modelName += device;
+
+            if (width && height && (device != "") && !PixelOverlayManager::INSTANCE.getModel(m_modelName)) {
+                Json::Value val;
+                val["Name"] = m_modelName;
+                val["Type"] = "FB";
+                val["Width"] = width;
+                val["Height"] = height;
+                val["PixelSize"] = 1;
+                val["Device"] = device;
+                val["autoCreated"] = true;
+
+                PixelOverlayManager::INSTANCE.addModel(val);
+                modelCreated = true;
+            } else {
+                LogErr(VB_CHANNELOUT, "Empty Pixel Overlay Model name\n");
+                AddOutputConfigWarning(35, "Virtual Matrix output has an empty Pixel Overlay Model name");
+                return 0;
+            }
+        } else {
+            LogErr(VB_CHANNELOUT, "Empty Pixel Overlay Model name\n");
+            AddOutputConfigWarning(35, "Virtual Matrix output has an empty Pixel Overlay Model name");
+            return 0;
+        }
     }
-}
 
+    if (m_modelName == "") {
+        LogErr(VB_CHANNELOUT, "Empty Pixel Overlay Model name\n");
+        AddOutputConfigWarning(35, "Virtual Matrix output has an empty Pixel Overlay Model name");
+        return 0;
+    }
+
+    m_model = PixelOverlayManager::INSTANCE.getModel(m_modelName);
+
+    if (!m_model) {
+        LogErr(VB_CHANNELOUT, "Invalid Pixel Overlay Model: '%s'\n", m_modelName.c_str());
+        AddOutputConfigWarning(35, "Invalid Pixel Overlay Model: '" + m_modelName + "'");
+        return 0;
+    }
+
+    // the display is drawn as 3 byte RGB, and setData() below reads the
+    // model's own bytes per pixel from it (4 for an RGBW submodel)
+    if (m_model->getBytesPerPixel() != 3) {
+        LogErr(VB_CHANNELOUT, "Pixel Overlay Model '%s' is not RGB\n", m_modelName.c_str());
+        AddOutputConfigWarning(35, "Virtual Display: model '" + m_modelName + "' is not an RGB model");
+        m_model = nullptr;
+        return 0;
+    }
+
+    m_width = m_model->getWidth();
+    m_height = m_model->getHeight();
+
+    config["width"] = m_width;
+    config["height"] = m_height;
+
+    if (!VirtualDisplayBaseOutput::Init(config))
+        return 0;
+
+    size_t bufBytes = virtualDisplayBufferBytes(m_width, m_height, m_bytesPerPixel);
+    if (bufBytes == 0) {
+        LogErr(VB_CHANNELOUT, "Invalid virtual display dimensions %dx%d\n",
+               m_width, m_height);
+        return 0;
+    }
+    m_virtualDisplay = (unsigned char*)malloc(bufBytes);
+    if (!m_virtualDisplay) {
+        LogErr(VB_CHANNELOUT, "Unable to malloc buffer\n");
+        return 0;
+    }
+
+    memset(m_virtualDisplay, 0, bufBytes);
+
+    int result = InitializePixelMap();
+    if (!result)
+        return 0;
+
+    // Put the background image onto the model and always call doOverlay
+    // to ensure display is enabled (even if model state is not Disabled).
+    // Only for a framebuffer model: doOverlay() writes the model's channels
+    // at its start channel into the buffer it is given, and a submodel
+    // forwards to its parent at the parent's channels - far past the end of
+    // this display-sized buffer.
+    m_model->setData(m_virtualDisplay);
+    if (m_model->getType() == "FB") {
+        m_model->doOverlay(m_virtualDisplay);
+    }
+
+    m_modelListenerName = "VirtualDisplay" + std::to_string((uintptr_t)this);
+    PixelOverlayManager::INSTANCE.addModelListener(m_modelName, m_modelListenerName,
+        [this](PixelOverlayModel* m) {
+            std::lock_guard<std::mutex> lock(m_modelLock);
+            // only follow a replacement this display still fits
+            if (m && (m->getWidth() != m_width || m->getHeight() != m_height || m->getBytesPerPixel() != 3)) {
+                LogWarn(VB_CHANNELOUT, "VirtualDisplay: model '%s' changed shape; detaching\n", m_modelName.c_str());
+                m = nullptr;
+            }
+            m_model = m;
+        });
+    return 1;
+}
 
 /*
  *
  */
-void VirtualDisplayOutput::DrawPixels(unsigned char *channelData)
-{
-	unsigned char r = 0;
-	unsigned char g = 0;
-	unsigned char b = 0;
-	int stride = m_width * m_bytesPerPixel;
-	VirtualDisplayPixel pixel;
+int VirtualDisplayOutput::Close(void) {
+    LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::Close()\n");
+    if (!m_modelListenerName.empty()) {
+        PixelOverlayManager::INSTANCE.removeModelListener(m_modelName, m_modelListenerName);
+        m_modelListenerName.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_modelLock);
+        m_model = nullptr;
+    }
+    if (modelCreated) {
+        PixelOverlayManager::INSTANCE.removeAutoOverlayModel(m_modelName);
+    }
+    if (m_virtualDisplay) {
+        free(m_virtualDisplay);
+        m_virtualDisplay = nullptr;
+    }
 
-	for (int i = 0; i < m_pixels.size(); i++)
-	{
-		pixel = m_pixels[i];
-
-		GetPixelRGB(pixel, channelData, r, g, b);
-
-		if (m_pixelSize == 2)
-		{
-			DrawPixel(pixel.r, pixel.g, pixel.b, r, g, b);
-
-			r /= 2;
-			g /= 2;
-			b /= 2;
-
-			DrawPixel(pixel.r + m_bytesPerPixel,
-					  pixel.g + m_bytesPerPixel,
-					  pixel.b + m_bytesPerPixel,
-					  r, g, b);
-			DrawPixel(pixel.r - m_bytesPerPixel,
-					  pixel.g - m_bytesPerPixel,
-					  pixel.b - m_bytesPerPixel,
-					  r, g, b);
-			DrawPixel(pixel.r + stride,
-					  pixel.g + stride,
-					  pixel.b + stride,
-					  r, g, b);
-			DrawPixel(pixel.r - stride,
-					  pixel.g - stride,
-					  pixel.b - stride,
-					  r, g, b);
-		}
-		else
-		{
-			DrawPixel(pixel.r, pixel.g, pixel.b, r, g, b);
-		}
-	}
+    return VirtualDisplayBaseOutput::Close();
 }
 
+int VirtualDisplayOutput::SendData(unsigned char* channelData) {
+    LogExcess(VB_CHANNELOUT, "VirtualDisplayOutput::SendData(%p)\n",
+              channelData);
+    std::lock_guard<std::mutex> modelLock(m_modelLock);
+    if (!m_model) {
+        return m_channelCount;
+    }
+    unsigned char r = 0;
+    unsigned char g = 0;
+    unsigned char b = 0;
+    int stride = m_width * m_bytesPerPixel;
+    VirtualDisplayPixel pixel;
 
-/*
- *
- */
-void VirtualDisplayOutput::DumpConfig(void)
-{
-	LogDebug(VB_CHANNELOUT, "VirtualDisplayOutput::DumpConfig()\n");
-	LogDebug(VB_CHANNELOUT, "    width         : %d\n", m_width);
-	LogDebug(VB_CHANNELOUT, "    height        : %d\n", m_height);
-	LogDebug(VB_CHANNELOUT, "    scale         : %0.3f\n", m_scale);
-	LogDebug(VB_CHANNELOUT, "    preview width : %d\n", m_previewWidth);
-	LogDebug(VB_CHANNELOUT, "    preview height: %d\n", m_previewHeight);
-	LogDebug(VB_CHANNELOUT, "    color Order   : %s\n", m_colorOrder.c_str());
-	LogDebug(VB_CHANNELOUT, "    pixel count   : %d\n", m_pixels.size());
-	LogDebug(VB_CHANNELOUT, "    pixel size    : %d\n", m_pixelSize);
-    ThreadedChannelOutputBase::DumpConfig();
+    int tx = 0;
+    int ty = 0;
+    int radius = m_pixelSize >= 2 ? m_pixelSize / 2 : 1;
+    
+    // Pre-calculate radius squared to avoid sqrt() in hot loop
+    int radiusSquared = radius * radius;
+
+    for (int i = 0; i < m_pixels.size(); i++) {
+        pixel = m_pixels[i];
+
+        GetPixelRGB(pixel, channelData, r, g, b);
+
+        // Optimize: For single pixel (radius=1), skip the expensive nested loops
+        if (radius == 1) {
+            m_model->setPixelValue(pixel.xs, pixel.ys, r, g, b);
+        } else {
+            for (int xo = 0 - radius; xo < radius; xo++) {
+                for (int yo = 0 - radius; yo < radius; yo++) {
+                    // Replace expensive sqrt() with integer multiplication
+                    if ((xo * xo + yo * yo) > radiusSquared)
+                        continue;
+
+                    tx = pixel.xs + xo;
+                    ty = pixel.ys + yo;
+
+                    if ((tx < 0) || (ty < 0) || (tx > (m_width - 1)) || (ty > (m_height - 1)))
+                        continue;
+
+                    m_model->setPixelValue(tx, ty, r, g, b);
+                }
+            }
+        }
+    }
+    m_model->setBufferIsDirty(true);
+    if (m_model->getState() == 0) {
+        if (m_model->getType() != "FB") {
+            // a submodel's parent writes at its own absolute channels, so it
+            // needs the whole sequence buffer, not a display-sized one
+            m_model->doOverlay(channelData - m_startChannel);
+        } else if (uint8_t* buf = m_model->getOverlayBuffer()) {
+            m_model->doOverlay(buf);
+        }
+    }
+    return m_channelCount;
 }
-

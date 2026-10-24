@@ -1,181 +1,1163 @@
 <?
 
-/////////////////////////////////////////////////////////////////////////////
+/**
+ * Get all playlists
+ *
+ * Get list of playlist names.
+ *
+ * @route GET /api/playlists
+ * @response 200 List of playlist names
+ * ```json
+ * ["Playlist_1", "Playlist_2", "Playlist_3"]
+ * ```
+ */
 function playlist_list()
 {
-	global $settings;
-
-	$result = array();
-	$playlists = array();
-
-	$playlist = array();
-	$playlist['PlaylistName'] = 'Some Playlist Name'; // Give us something to return for testing
-	if ($d = opendir($settings['playlistDirectory']))
-	{
-		while (($file = readdir($d)) !== false)
-		{
-			if (preg_match('/\.json$/', $file))
-			{
-				$file = preg_replace('/\.json$/', '', $file);
-				array_push($playlists, $file);
-			}
-		}
-		closedir($d);
-	}
-
-	$result['Playlists'] = $playlists;
-
-	return json($playlists);
+    global $settings;
+    $playlists = array();
+    if ($d = opendir($settings['playlistDirectory'])) {
+        while (($file = readdir($d)) !== false) {
+            if (preg_match('/\.json$/', $file)) {
+                $file = preg_replace('/\.json$/', '', $file);
+                array_push($playlists, $file);
+            }
+        }
+        closedir($d);
+    }
+    sort($playlists);
+    return json($playlists);
 }
 
-/////////////////////////////////////////////////////////////////////////////
+/**
+ * Updates the `playlistInfo` array with section-level item counts and durations
+ * in v4 format. Handles both v3 (backwards compatible) and v4 formats.
+ *
+ * @param array $playlist Playlist data array, modified in place.
+ * @return void
+ */
+function updatePlaylistInfo(&$playlist)
+{
+    // Initialize playlistInfo if not present
+    if (!isset($playlist['playlistInfo'])) {
+        $playlist['playlistInfo'] = array();
+    }
+
+    // Set version to 4 if not set or if upgrading
+    if (!isset($playlist['version']) || $playlist['version'] < 4) {
+        $playlist['version'] = 4;
+    }
+
+    // Calculate section stats
+    $leadInCount = isset($playlist['leadIn']) ? count($playlist['leadIn']) : 0;
+    $mainCount = isset($playlist['mainPlaylist']) ? count($playlist['mainPlaylist']) : 0;
+    $leadOutCount = isset($playlist['leadOut']) ? count($playlist['leadOut']) : 0;
+
+    // Calculate durations from entries if they have duration field
+    $leadInDuration = 0;
+    if (isset($playlist['leadIn'])) {
+        foreach ($playlist['leadIn'] as $entry) {
+            if (isset($entry['duration']) && is_numeric($entry['duration'])) {
+                $leadInDuration += floatval($entry['duration']);
+            }
+        }
+    }
+
+    $mainDuration = 0;
+    if (isset($playlist['mainPlaylist'])) {
+        foreach ($playlist['mainPlaylist'] as $entry) {
+            if (isset($entry['duration']) && is_numeric($entry['duration'])) {
+                $mainDuration += floatval($entry['duration']);
+            }
+        }
+    }
+
+    $leadOutDuration = 0;
+    if (isset($playlist['leadOut'])) {
+        foreach ($playlist['leadOut'] as $entry) {
+            if (isset($entry['duration']) && is_numeric($entry['duration'])) {
+                $leadOutDuration += floatval($entry['duration']);
+            }
+        }
+    }
+
+    // Update playlistInfo with v4 format
+    $playlist['playlistInfo']['leadIn_items'] = $leadInCount;
+    $playlist['playlistInfo']['leadIn_duration'] = $leadInDuration;
+    $playlist['playlistInfo']['mainPlaylist_items'] = $mainCount;
+    $playlist['playlistInfo']['mainPlaylist_duration'] = $mainDuration;
+    $playlist['playlistInfo']['leadOut_items'] = $leadOutCount;
+    $playlist['playlistInfo']['leadOut_duration'] = $leadOutDuration;
+    $playlist['playlistInfo']['total_items'] = $leadInCount + $mainCount + $leadOutCount;
+    $playlist['playlistInfo']['total_duration'] = $leadInDuration + $mainDuration + $leadOutDuration;
+}
+
+/**
+ * Checks a sub-playlist reference, recursing into the named playlist.
+ *
+ * @return array Problem descriptions for the reference.
+ */
+function validatePlaylistReference($name, $what, &$ctx)
+{
+    if ($name === '') {
+        return array("No $what selected");
+    }
+    if (!isset($ctx['playlists'][$name])) {
+        return array(ucfirst($what) . " '$name' not found");
+    }
+    if (isset($ctx['active'][$name])) {
+        return array(ucfirst($what) . " '$name' leads back to this playlist (a loop)");
+    }
+    $sub = validatePlaylistByName($name, $ctx);
+    if (count($sub['issues']) > 0) {
+        $n = count($sub['issues']);
+        return array(ucfirst($what) . " '$name' has $n problem" . ($n == 1 ? '' : 's'));
+    }
+    return array();
+}
+
+/**
+ * Checks one playlist entry against what fppd needs to play it.
+ *
+ * @param array $e   Playlist entry (decoded as an associative array).
+ * @param array $ctx Validation context.
+ * @return array Problem descriptions; empty when the entry looks playable.
+ */
+function validatePlaylistEntry($e, &$ctx)
+{
+    global $settings;
+    $rc = array();
+    $type = isset($e['type']) ? $e['type'] : '';
+
+    // fppd flattens sub-playlists without looking at "enabled", so they are
+    // always checked; any other disabled entry is skipped at play time.
+    if ($type != 'playlist' && isset($e['enabled']) && !$e['enabled']) {
+        return $rc;
+    }
+
+    $str = function ($key) use ($e) {
+        return (isset($e[$key]) && is_scalar($e[$key])) ? (string) $e[$key] : '';
+    };
+
+    switch ($type) {
+        case 'sequence':
+        case 'both':
+            $seq = $str('sequenceName');
+            if ($seq === '') {
+                $rc[] = "No sequence selected";
+            } else if (!validationFileExists($settings['sequenceDirectory'], $seq)) {
+                $rc[] = "Sequence '$seq' not found";
+            }
+            if ($type == 'sequence') {
+                break;
+            }
+            // fall through for the media half of a "both" entry
+        case 'media':
+            $fileMode = $str('fileMode');
+            if ($type == 'both' || $fileMode === '' || $fileMode == 'single') {
+                $media = $str('mediaName');
+                if ($media === '') {
+                    // A "both" entry without media plays the sequence alone.
+                    if ($type == 'media') {
+                        $rc[] = "No media selected";
+                    }
+                } else if (!validationMediaExists($media)) {
+                    $rc[] = "Media '$media' not found";
+                }
+            }
+            $extra = array();
+            if ($str('extraMediaName') !== '') {
+                $extra[] = $str('extraMediaName');
+            }
+            if (isset($e['extraMedia']) && is_array($e['extraMedia'])) {
+                foreach ($e['extraMedia'] as $x) {
+                    if (is_array($x) && isset($x['mediaName']) && $x['mediaName'] !== '') {
+                        $extra[] = (string) $x['mediaName'];
+                    }
+                }
+            }
+            foreach ($extra as $m) {
+                if (!validationMediaExists($m)) {
+                    $rc[] = "Extra media '$m' not found";
+                }
+            }
+            break;
+        case 'playlist':
+            $rc = validatePlaylistReference($str('name'), 'playlist', $ctx);
+            break;
+        case 'branch':
+            foreach (array('true', 'false') as $b) {
+                if ($str($b . 'NextBranchType') == 'Playlist') {
+                    $rc = array_merge($rc, validatePlaylistReference($str($b . 'BranchPlaylist'), 'branch playlist', $ctx));
+                }
+            }
+            break;
+        case 'image':
+            $img = $str('imagePath');
+            if ($img === '') {
+                $rc[] = "No image selected";
+            } else if (!validationFileExists($settings['imageDirectory'], rtrim($img, '/'), true)) {
+                $rc[] = "Image '$img' not found";
+            }
+            break;
+        case 'script':
+            $script = $str('scriptName');
+            if ($script === '') {
+                $rc[] = "No script selected";
+            } else if (!validationFileExists($settings['scriptDirectory'], $script)) {
+                $rc[] = "Script '$script' not found";
+            }
+            break;
+        case 'command':
+            $rc = validateFPPCommand($e, $ctx);
+            break;
+        case 'dynamic':
+            $sub = $str('subType');
+            if ($sub == 'file') {
+                $f = $str('dataFile');
+                // fppd opens the name as given, so only an absolute path can be checked here.
+                if (substr($f, 0, 1) == '/' && !is_file($f)) {
+                    $rc[] = "Dynamic data file '$f' not found";
+                }
+            } else if ($sub == 'plugin') {
+                $p = $str('pluginName');
+                $host = $str('pluginHost');
+                if ($p !== '' && ($host === '' || $host == 'localhost' || $host == '127.0.0.1') &&
+                    !is_dir($settings['pluginDirectory'] . '/' . $p)) {
+                    $rc[] = "Plugin '$p' is not installed";
+                }
+            }
+            break;
+        case 'pause':
+        case 'remap':
+        case 'url':
+            break;
+        default:
+            $rc[] = "Unknown entry type '$type'";
+            break;
+    }
+    return $rc;
+}
+
+/**
+ * Validates a playlist and, recursively, every playlist it includes.
+ * Results are memoized in the context, so each playlist is read once per pass.
+ *
+ * @param string $name Playlist name (without .json).
+ * @param array  $ctx  Validation context.
+ * @return array `playlist` (decoded object, or "" if unreadable) and `issues`,
+ *               a list of {section, index, message}; `index` is 0-based
+ *               within the section.
+ */
+function validatePlaylistByName($name, &$ctx)
+{
+    if (isset($ctx['results'][$name])) {
+        return $ctx['results'][$name];
+    }
+    $ctx['active'][$name] = true;
+
+    $pl = LoadPlayListDetails($name, false);
+    $issues = array();
+    $depth = 0;
+    if ($pl === "" || !is_object($pl)) {
+        $issues[] = array('section' => '', 'index' => -1, 'message' => "Playlist file could not be read");
+    } else {
+        // Round-trip to associative arrays so entries read uniformly.
+        $data = json_decode(json_encode($pl), true);
+        foreach (array('leadIn', 'mainPlaylist', 'leadOut') as $section) {
+            if (!isset($data[$section]) || !is_array($data[$section])) {
+                continue;
+            }
+            foreach ($data[$section] as $i => $e) {
+                if (!is_array($e)) {
+                    continue;
+                }
+                foreach (validatePlaylistEntry($e, $ctx) as $msg) {
+                    $issues[] = array('section' => $section, 'index' => $i, 'message' => $msg);
+                }
+                if (isset($e['type']) && $e['type'] == 'playlist' && isset($e['name']) &&
+                    isset($ctx['results'][$e['name']])) {
+                    $depth = max($depth, $ctx['results'][$e['name']]['depth'] + 1);
+                }
+            }
+        }
+    }
+
+    // fppd includes sub-playlists at most 4 levels deep and drops anything
+    // below that.  Only reported where it first goes wrong, not on every
+    // playlist above it.
+    if ($depth == 5) {
+        $issues[] = array('section' => '', 'index' => -1,
+            'message' => "Sub-playlists are nested more than 4 levels deep; FPP skips the deepest ones");
+    }
+
+    unset($ctx['active'][$name]);
+    $ctx['results'][$name] = array('playlist' => $pl, 'issues' => $issues, 'depth' => $depth);
+    return $ctx['results'][$name];
+}
+
+/**
+ * Formats an issue's location for the one-line message list.
+ */
+function playlistIssueText($issue)
+{
+    $names = array('leadIn' => 'Lead In', 'mainPlaylist' => 'Main Playlist', 'leadOut' => 'Lead Out');
+    if ($issue['index'] < 0 || !isset($names[$issue['section']])) {
+        return $issue['message'];
+    }
+    return $names[$issue['section']] . ' #' . ($issue['index'] + 1) . ': ' . $issue['message'];
+}
+
+/**
+ * Validate all playlists
+ *
+ * Returns a list of all playlists with any validation errors, total item
+ * counts, and total duration.  Each entry is checked the way fppd will play
+ * it: sequence, media, image and script files must exist; sub-playlists must
+ * exist and be valid themselves (and not include themselves); commands must
+ * still exist in fppd, and command arguments naming a playlist, sequence,
+ * media file, effect, script or command preset must name one that exists.
+ * Disabled entries are not checked, since fppd skips them.
+ *
+ * `messages` is a flat list of human-readable problems; `issues` carries the
+ * same problems with the section and 0-based index of the offending entry
+ * (`index` is -1 for a problem with the playlist as a whole).
+ *
+ * @route GET /api/playlists/validate
+ * @response 200 Validation results for all playlists
+ * ```json
+ * [
+ *   {
+ *     "name": "Test1",
+ *     "description": "User entered playlist description",
+ *     "valid": false,
+ *     "messages": ["Main Playlist #2: Media 'song.mp3' not found"],
+ *     "issues": [{"section": "mainPlaylist", "index": 1, "message": "Media 'song.mp3' not found"}],
+ *     "total_duration": 10,
+ *     "total_items": 3,
+ *     "version": 4,
+ *     "leadIn_items": 0,
+ *     "mainPlaylist_items": 3,
+ *     "leadOut_items": 0
+ *   }
+ * ]
+ * ```
+ */
+function playlist_list_validate()
+{
+    $ctx = validationContext();
+    // PHP turns an all-digit key like "2026" into an int, which
+    // PlaylistFilePath() rejects.
+    $playlists = array_map('strval', array_keys($ctx['playlists']));
+    sort($playlists);
+
+    $rc = array();
+    foreach ($playlists as $plName) {
+        $result = validatePlaylistByName($plName, $ctx);
+        $pl = $result['playlist'];
+        $issues = $result['issues'];
+        $msg = array_map('playlistIssueText', $issues);
+        if (!is_object($pl)) {
+            $pl = new stdClass();
+        }
+
+        //print_r($pl);
+        if (isset($pl->desc)) {
+            $plDesc = $pl->desc;
+        } else {
+            $plDesc = "";
+        }
+        if (isset($pl->playlistInfo->total_duration)) {
+            $plDuration = $pl->playlistInfo->total_duration;
+        } else {
+            $plDuration = "";
+        }
+        if (isset($pl->playlistInfo->total_items)) {
+            $plItems = $pl->playlistInfo->total_items;
+        } else {
+            $plItems = "";
+        }
+
+        // v4 format: include per-section stats
+        $version = isset($pl->version) ? $pl->version : 3;
+        $leadInItems = isset($pl->playlistInfo->leadIn_items) ? $pl->playlistInfo->leadIn_items : 0;
+        $mainItems = isset($pl->playlistInfo->mainPlaylist_items) ? $pl->playlistInfo->mainPlaylist_items : 0;
+        $leadOutItems = isset($pl->playlistInfo->leadOut_items) ? $pl->playlistInfo->leadOut_items : 0;
+
+        array_push(
+            $rc,
+            array(
+                "name" => $plName,
+                "description" => $plDesc,
+                "valid" => count($issues) == 0,
+                "messages" => $msg,
+                "issues" => $issues,
+                "total_duration" => $plDuration,
+                "total_items" => $plItems,
+                "version" => $version,
+                "leadIn_items" => $leadInItems,
+                "mainPlaylist_items" => $mainItems,
+                "leadOut_items" => $leadOutItems
+            )
+        );
+    }
+
+    return json($rc);
+}
+
+/**
+ * Get playable objects
+ *
+ * Get a combined list of playlist names and `*.fseq` sequence filenames that are playable.
+ *
+ * @route GET /api/playlists/playable
+ * @response 200 Playable playlist and sequence names
+ * ```json
+ * ["Playlist_1", "Playlist_2", "MySequence.fseq"]
+ * ```
+ */
+function playlist_playable()
+{
+    global $settings;
+    $playlists = array();
+    if ($d = opendir($settings['playlistDirectory'])) {
+        while (($file = readdir($d)) !== false) {
+            if (preg_match('/\.json$/', $file)) {
+                $file = preg_replace('/\.json$/', '', $file);
+                array_push($playlists, $file);
+            }
+        }
+        closedir($d);
+    }
+    sort($playlists);
+
+    $sequences = array();
+    if ($d = opendir($settings['sequenceDirectory'])) {
+        while (($file = readdir($d)) !== false) {
+            if (preg_match('/\.fseq$/', $file)) {
+                array_push($sequences, $file);
+            }
+        }
+        closedir($d);
+    }
+    sort($sequences);
+    $playlists = array_merge($playlists, $sequences);
+
+    return json($playlists);
+}
+
+/**
+ * Sanitizes media filenames within a playlist section to remove special
+ * characters introduced by xLights fppConnect uploads. The FPP UI only allows
+ * valid names to be selected, so this is less of a concern for normal use.
+ *
+ * @param array  $playlistObj Playlist data array, modified in place.
+ * @param string $section     Section name to clean (e.g. "leadIn", "mainPlaylist").
+ * @return void
+ */
+/**
+ * The file a playlist name refers to, or false if the name is not a single
+ * path component.  Names arrive from request bodies and from URL segments that
+ * are decoded twice (limonade, then rawurldecode() below), so a separator can
+ * reach here even though the router never saw one.
+ */
+function PlaylistFilePath($playlistName)
+{
+    global $settings;
+    if (!is_string($playlistName) || $playlistName === '' || strpbrk($playlistName, "/\\\0") !== false) {
+        return false;
+    }
+    return $settings['playlistDirectory'] . '/' . $playlistName . '.json';
+}
+
+function cleanMedialNamesInPlaylist(&$playlistObj, $section)
+{
+    global $settings;
+    $mapping = array(
+        "sequenceName" => array("sequenceDirectory"),
+        "mediaName" => array("musicDirectory", "videoDirectory"),
+        "imagePath" => array("imageDirectory"),
+    );
+
+    foreach ($mapping as $type => $dirs) {
+        foreach ($dirs as $dir) {
+            if (isset($playlistObj[$section])) {
+                foreach ($playlistObj[$section] as &$rec) {
+                    if (isset($rec[$type])) {
+                        $f = $settings[$dir] . "/" . $rec[$type];
+                        if (!file_exists($f)) {
+                            $f = $settings[$dir] . "/" . sanitizeFilename($rec[$type]);
+                            if (file_exists($f)) {
+                                $rec[$type] = sanitizeFilename($rec[$type]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}
+
+/**
+ * Create playlist
+ *
+ * Insert a new playlist.
+ *
+ * @route POST /api/playlists
+ * @body {"name": "UploadTest", "globalPauseBetweenSequencesMS": 5000, "mainPlaylist": [{"type": "pause", "enabled": 1, "playOnce": 0, "duration": 8}], "playlistInfo": {"total_duration": 8, "total_items": 1}}
+ * @response 200 Newly created playlist
+ * ```json
+ * {
+ *   "name": "UploadTest",
+ *   "globalPauseBetweenSequencesMS": 5000,
+ *   "mainPlaylist": [
+ *     {"type": "pause", "enabled": 1, "playOnce": 0, "duration": 8}
+ *   ],
+ *   "playlistInfo": {
+ *     "total_duration": 8,
+ *     "total_items": 1
+ *   }
+ * }
+ * ```
+ */
 function playlist_insert()
 {
-	global $settings;
+    global $settings;
 
-	$playlist = $GLOBALS['_POST'];
-	$playlistName = $playlist['name'];
+    $playlist = $GLOBALS['_POST'];
+    $playlistName = isset($playlist['name']) ? $playlist['name'] : '';
+    $filename = PlaylistFilePath($playlistName);
+    if ($filename === false) {
+        http_response_code(400);
+        return json(array('Status' => 'Error', 'Message' => 'Invalid playlist name.'));
+    }
 
-	$filename = $settings['playlistDirectory'] . '/' . $playlistName . '.json';
+    cleanMedialNamesInPlaylist($playlist, "leadIn");
+    cleanMedialNamesInPlaylist($playlist, "mainPlaylist");
+    cleanMedialNamesInPlaylist($playlist, "leadOut");
 
-	$json = json_encode($playlist, JSON_PRETTY_PRINT);
+    $json = json_encode($playlist/*, JSON_PRETTY_PRINT*/);
 
-	$f = fopen($filename, "w");
-	if ($f)
-	{
-		fwrite($f, $json);
-		fclose($f);
-	}
-	else
-	{
-		$playlist['Status'] = 'Error';
-		$playlist['Message'] = 'Unable to open file for writing';
-	}
+    $f = file_put_contents($filename, $json, LOCK_EX);
+    if ($f != false) {
 
-	return json($playlist);
+        //Trigger a JSON Configuration Backup
+        GenerateBackupViaAPI('Playlist ' . $playlistName . ' was created.');
+    } else {
+        $playlist['Status'] = 'Error';
+        $playlist['Message'] = 'Unable to open file for writing';
+    }
+
+    return json($playlist);
 }
 
-/////////////////////////////////////////////////////////////////////////////
+/**
+ * Recursively loads and splices a sub-playlist's entries in place of a
+ * `playlist`-type entry within a parent section array.
+ *
+ * @param array  $playlist Playlist section array being built, modified in place.
+ * @param int    $i        Current index of the sub-playlist entry, updated in place.
+ * @param object $plentry  Playlist entry object containing the sub-playlist name.
+ * @return void
+ */
+function LoadSubPlaylist(&$playlist, &$i, $plentry)
+{
+    $data = GetPlaylist($plentry->name);
+
+    $subPlaylist = array();
+
+    if (isset($data->leadIn)) {
+        $subPlaylist = array_merge($subPlaylist, $data->leadIn);
+    }
+
+    if (isset($data->mainPlaylist)) {
+        $subPlaylist = array_merge($subPlaylist, $data->mainPlaylist);
+    }
+
+    if (isset($data->leadOut)) {
+        $subPlaylist = array_merge($subPlaylist, $data->leadOut);
+    }
+
+    $li = 0;
+    foreach ($subPlaylist as $entry) {
+        if ($entry->type == "playlist") {
+            LoadSubPlaylist($subPlaylist, $li, $entry);
+        }
+
+        $li++;
+    }
+
+    array_splice($playlist, $i, 1, $subPlaylist);
+
+    $i += count($subPlaylist) - 1;
+}
+
+/**
+ * Loads a playlist's full details from disk, optionally merging all
+ * sub-playlist entries recursively into the parent sections.
+ *
+ * @param string $file      Playlist name (without .json extension).
+ * @param bool   $mergeSubs When true, recursively merges sub-playlists into parent sections.
+ * @return object|string    Decoded playlist object, or empty string if the file does not exist.
+ */
+function LoadPlayListDetails($file, $mergeSubs)
+{
+    global $settings;
+
+    $playListEntriesLeadIn = null;
+    $playListEntriesMainPlaylist = null;
+    $playListEntriesLeadOut = null;
+    $playlistInfo = null;
+
+    $jsonStr = "";
+
+    $path = PlaylistFilePath($file);
+    if ($path === false || !file_exists($path)) {
+        return "";
+    }
+
+    $data = GetPlaylist($file);
+
+    if (!$mergeSubs) {
+        return $data;
+    }
+
+    if (isset($data->leadIn)) {
+        $i = 0;
+        foreach ($data->leadIn as $entry) {
+            if ($mergeSubs && $entry->type == "playlist") {
+                LoadSubPlaylist($data->leadIn, $i, $entry);
+            }
+            $i++;
+        }
+    }
+
+    if (isset($data->mainPlaylist)) {
+        $i = 0;
+        foreach ($data->mainPlaylist as $entry) {
+            if ($mergeSubs && $entry->type == "playlist") {
+                LoadSubPlaylist($data->mainPlaylist, $i, $entry);
+            }
+            $i++;
+        }
+    }
+
+    if (isset($data->leadOut)) {
+        $i = 0;
+        foreach ($data->leadOut as $entry) {
+            if ($mergeSubs && $entry->type == "playlist") {
+                LoadSubPlaylist($data->leadOut, $i, $entry);
+            }
+            $i++;
+        }
+    }
+
+    return $data;
+}
+
+/**
+ * Reads a playlist `*.json` file from disk and returns the decoded object.
+ *
+ * @param string $playlistName Playlist name (without .json extension).
+ * @return object Decoded playlist object.
+ */
+function GetPlaylist($playlistName)
+{
+    global $settings;
+
+    $path = PlaylistFilePath($playlistName);
+    if ($path === false) {
+        return null;
+    }
+    $jsonStr = file_get_contents($path, LOCK_SH);
+
+    return json_decode($jsonStr);
+}
+
+/**
+ * Get a playlist
+ *
+ * Get the playlist named `{PlaylistName}` in FPP JSON format. If
+ * `?mergeSubs=1` is specified, sub-playlists are recursively merged into
+ * the parent sections.
+ *
+ * @route GET /api/playlist/{PlaylistName}
+ * @param int mergeSubs Merge sub-playlsits recursively
+ * @response 200 Playlist details
+ * ```json
+ * {
+ *   "name": "UploadTest",
+ *   "globalPauseBetweenSequencesMS": 5000,
+ *   "mainPlaylist": [
+ *     {"type": "pause", "enabled": 1, "playOnce": 0, "duration": 8}
+ *   ],
+ *   "playlistInfo": {
+ *     "total_duration": 8,
+ *     "total_items": 1
+ *   }
+ * }
+ * ```
+ * @response 404 No playlist by that name
+ * ```json
+ * {"Status": "Error", "Message": "Playlist not found: UploadTest"}
+ * ```
+ * @response 500 The playlist file is not valid JSON
+ */
 function playlist_get()
 {
-	global $settings;
+    global $settings;
 
-	$playlistName = params('PlaylistName');
-	$filename = $settings['playlistDirectory'] . '/' . $playlistName . '.json';
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $mergeSubs = 0;
+    if ((isset($_GET['mergeSubs'])) && ($_GET['mergeSubs'] == 1)) {
+        $mergeSubs = 1;
+    }
 
-	render_file($filename);
+    $data = LoadPlayListDetails($playlistName, $mergeSubs);
+    if ($data === "") {
+        // A 200 here would hand clients a JSON string where every caller
+        // expects an object.  Plugins ask for the current playlist's name,
+        // which for a sequence started directly has no file behind it.
+        http_response_code(404);
+        return json(array('Status' => 'Error', 'Message' => 'Playlist not found: ' . $playlistName));
+    }
+    if (!is_object($data)) {
+        http_response_code(500);
+        return json(array('Status' => 'Error', 'Message' => 'Playlist could not be read: ' . $playlistName));
+    }
+
+    return json($data);
 }
 
-/////////////////////////////////////////////////////////////////////////////
+/**
+ * Upsert playlist
+ *
+ * Update or Insert (upsert) the playlist named {PlaylistName}.
+ *
+ * @route POST /api/playlist/{PlaylistName}
+ * @body {"name": "UploadTest", "globalPauseBetweenSequencesMS": 5000, "mainPlaylist": [{"type": "pause", "enabled": 1, "playOnce": 0, "duration": 8}], "playlistInfo": {"total_duration": 8, "total_items": 1}}
+ * @response 200 Updated playlist
+ * ```json
+ * {
+ *   "name": "UploadTest",
+ *   "globalPauseBetweenSequencesMS": 5000,
+ *   "mainPlaylist": [
+ *     {"type": "pause", "enabled": 1, "playOnce": 0, "duration": 8}
+ *   ],
+ *   "playlistInfo": {
+ *     "total_duration": 8,
+ *     "total_items": 1
+ *   }
+ * }
+ * ```
+ */
 function playlist_update()
 {
-	global $settings;
+    global $settings;
 
-	$playlist = $GLOBALS['_POST'];
-	$playlistName = params('PlaylistName');
+    $playlist = $GLOBALS['_POST'];
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $filename = PlaylistFilePath($playlistName);
+    if ($filename === false) {
+        http_response_code(400);
+        return json(array('Status' => 'Error', 'Message' => 'Invalid playlist name.'));
+    }
 
-	$filename = $settings['playlistDirectory'] . '/' . $playlistName . '.json';
+    cleanMedialNamesInPlaylist($playlist, "leadIn");
+    cleanMedialNamesInPlaylist($playlist, "mainPlaylist");
+    cleanMedialNamesInPlaylist($playlist, "leadOut");
 
-	$json = json_encode($playlist, JSON_PRETTY_PRINT);
+    // Preserve duration values from existing playlist file ONLY if not provided by frontend
+    if (file_exists($filename)) {
+        $existingJson = file_get_contents($filename, LOCK_SH);
+        $existingPlaylist = json_decode($existingJson, true);
+        if (isset($existingPlaylist['playlistInfo'])) {
+            if (!isset($playlist['playlistInfo'])) {
+                $playlist['playlistInfo'] = array();
+            }
+            // Only preserve if frontend didn't send a value or sent 0
+            if (
+                (!isset($playlist['playlistInfo']['leadIn_duration']) || $playlist['playlistInfo']['leadIn_duration'] == 0)
+                && isset($existingPlaylist['playlistInfo']['leadIn_duration'])
+            ) {
+                $playlist['playlistInfo']['leadIn_duration'] = $existingPlaylist['playlistInfo']['leadIn_duration'];
+            }
+            if (
+                (!isset($playlist['playlistInfo']['mainPlaylist_duration']) || $playlist['playlistInfo']['mainPlaylist_duration'] == 0)
+                && isset($existingPlaylist['playlistInfo']['mainPlaylist_duration'])
+            ) {
+                $playlist['playlistInfo']['mainPlaylist_duration'] = $existingPlaylist['playlistInfo']['mainPlaylist_duration'];
+            }
+            if (
+                (!isset($playlist['playlistInfo']['leadOut_duration']) || $playlist['playlistInfo']['leadOut_duration'] == 0)
+                && isset($existingPlaylist['playlistInfo']['leadOut_duration'])
+            ) {
+                $playlist['playlistInfo']['leadOut_duration'] = $existingPlaylist['playlistInfo']['leadOut_duration'];
+            }
+        }
+    }
 
-	$f = fopen($filename, "w");
-	if ($f)
-	{
-		fwrite($f, $json);
-		fclose($f);
-	}
-	else
-	{
-		$playlist['Status'] = 'Error';
-		$playlist['Message'] = 'Unable to open file for writing';
-	}
+    // Update playlistInfo to maintain v4 format with section-level stats
+    updatePlaylistInfo($playlist);
 
-	return json($playlist);
+    $json = json_encode($playlist, JSON_PRETTY_PRINT);
+    $f = file_put_contents($filename, $json, LOCK_EX);
+    if ($f != false) {
+        //Trigger a JSON Configuration Backup
+        GenerateBackupViaAPI('Playlist ' . $playlistName . ' was updated.');
+    } else {
+        $playlist['Status'] = 'Error';
+        $playlist['Message'] = 'Unable to open file for writing';
+    }
+
+    return json($playlist);
 }
 
-/////////////////////////////////////////////////////////////////////////////
+/**
+ * Delete playlist
+ *
+ * Delete the playlist named {PlaylistName}.
+ *
+ * @route DELETE /api/playlist/{PlaylistName}
+ * @response 200 Playlist deleted
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
 function playlist_delete()
 {
-	global $settings;
+    global $settings;
 
-	$playlistName = params('PlaylistName');
-	$resp = array();
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $resp = array();
 
-	$filename = $settings['playlistDirectory'] . '/' . $playlistName . '.json';
-	if (file_exists($filename))
-	{
-		unlink($filename);
-		if (file_exists($filename))
-		{
-			$resp['Status'] = 'Error';
-			$resp['Message'] = 'Unable to delete Playlist.';
-		}
-		else
-		{
-			$resp['Status'] = 'OK';
-			$resp['Message'] = '';
-		}
-	}
-	else
-	{
-		$resp['Status'] = 'Error';
-		$resp['Message'] = 'Playlist does not exist.';
-	}
+    $filename = PlaylistFilePath($playlistName);
+    if ($filename === false) {
+        http_response_code(400);
+        return json(array('Status' => 'Error', 'Message' => 'Invalid playlist name.'));
+    }
+    if (file_exists($filename)) {
+        unlink($filename);
+        if (file_exists($filename)) {
+            $resp['Status'] = 'Error';
+            $resp['Message'] = 'Unable to delete Playlist.';
+        } else {
+            $resp['Status'] = 'OK';
+            $resp['Message'] = '';
 
-	return json($resp);
+            //Trigger a JSON Configuration Backup
+            GenerateBackupViaAPI('Playlist ' . $playlistName . ' was deleted.');
+        }
+    } else {
+        $resp['Status'] = 'Error';
+        $resp['Message'] = "Playlist '$playlistName' does not exist.";
+    }
+
+    return json($resp);
 }
 
-/////////////////////////////////////////////////////////////////////////////
+/**
+ * Insert section into playlist
+ *
+ * Insert an item into the `{SectionName}` section of playlist `{PlaylistName}`.
+ *
+ * @route POST /api/playlist/{PlaylistName}/{SectionName}/item
+ * @body {"type": "pause", "enabled": 1, "playOnce": 0, "duration": 8}
+ * @response 200 Item inserted
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
 function PlaylistSectionInsertItem()
 {
-	global $settings;
+    global $settings;
 
-	$playlistName = params('PlaylistName');
-	$sectionName = params('SectionName');
-	$entry = $GLOBALS['_POST'];
-	$resp = array();
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $sectionName = urldecode(params('SectionName'));
+    $entry = $GLOBALS['_POST'];
+    $resp = array();
 
-	$filename = $settings['playlistDirectory'] . '/' . $playlistName . '.json';
-	if (file_exists($filename))
-	{
-		$json = file_get_contents($filename);
-		$playlist = json_decode($json, true);
+    $filename = PlaylistFilePath($playlistName);
+    if ($filename === false) {
+        http_response_code(400);
+        return json(array('Status' => 'Error', 'Message' => 'Invalid playlist name.'));
+    }
+    if (file_exists($filename)) {
+        $json = file_get_contents($filename, LOCK_SH);
+        $playlist = json_decode($json, true);
 
-		if (!isset($playlist[$sectionName]))
-		{
-			$section = array();
-			$playlist[$sectionName] = $section;
-		}
+        if (!isset($playlist[$sectionName])) {
+            $section = array();
+            $playlist[$sectionName] = $section;
+        }
 
-		array_push($playlist[$sectionName], $entry);
+        array_push($playlist[$sectionName], $entry);
 
-		$json = json_encode($playlist, JSON_PRETTY_PRINT);
+        // Update playlistInfo for v4 format
+        updatePlaylistInfo($playlist);
 
-		$f = fopen($filename, "w");
-		if ($f)
-		{
-			fwrite($f, $json);
-			fclose($f);
+        $json = json_encode($playlist, JSON_PRETTY_PRINT);
 
-			$resp['Status'] = 'OK';
-			$resp['Message'] = '';
-			$resp['playlistName'] = $playlistName;
-			$resp['sectionName'] = $sectionName;
-		}
-		else
-		{
-			$playlist['Status'] = 'Error';
-			$playlist['Message'] = 'Unable to open file for writing';
-		}
-	}
-	else
-	{
-		$resp['Status'] = 'Error';
-		$resp['Message'] = 'Playlist does not exist.';
-	}
+        $f = file_put_contents($filename, $json, LOCK_EX);
+        if ($f != false) {
+            $resp['Status'] = 'OK';
+            $resp['Message'] = '';
+            $resp['playlistName'] = $playlistName;
+            $resp['sectionName'] = $sectionName;
 
-	return json($resp);
+            //Trigger a JSON Configuration Backup
+            GenerateBackupViaAPI('Playlist ' . $playlistName . ' content was modified.');
+        } else {
+            $playlist['Status'] = 'Error';
+            $playlist['Message'] = 'Unable to open file for writing';
+        }
+    } else {
+        $resp['Status'] = 'Error';
+        $resp['Message'] = 'Playlist does not exist.';
+    }
+
+    return json($resp);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-?>
+/**
+ * Stop playlist
+ *
+ * Immediately stop the currently running playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlists/stop
+ * @route GET /api/playlists/stop deprecated
+ * @response 200 Playlist stopped
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_stop()
+{
+    global $settings;
+    $request_content = FppdCommand('Stop Now');
+    return $request_content;
+}
+
+/**
+ * Gracefully stop playlist
+ *
+ * Gracefully stop the currently running playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlists/stopgracefully
+ * @route GET /api/playlists/stopgracefully deprecated
+ * @response 200 Graceful stop initiated
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_stopgracefully()
+{
+    global $settings;
+
+    $request_content = FppdCommand('Stop Gracefully');
+    return $request_content;
+}
+
+/**
+ * Gracefully stop at end of loop
+ *
+ * Gracefully stop the currently running playlist after completion of the
+ * current loop.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlists/stopgracefullyafterloop
+ * @route GET /api/playlists/stopgracefullyafterloop deprecated
+ * @response 200 Stop after loop initiated
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_stopgracefullyafterloop()
+{
+    global $settings;
+
+    $request_content = FppdCommand('Stop Gracefully', array('true'));
+    return $request_content;
+}
+
+/**
+ * Start playlist
+ *
+ * Start the playlist named `{PlaylistName}`. The optional query parameter
+ * `scheduleProtected` (`true`/`false`) prevents the scheduler from stopping
+ * this playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlist/{PlaylistName}/start
+ * @route GET /api/playlist/{PlaylistName}/start deprecated
+ * @response 200 Playlist started
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_start()
+{
+    global $settings;
+
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $scheduleProtected = isset($_GET['scheduleProtected']) ? $_GET['scheduleProtected'] : 'false';
+
+    $request_content = FppdCommand('Start Playlist', array($playlistName, 'false', 'false', $scheduleProtected));
+    return $request_content;
+}
+
+/**
+ * Start playlist on repeat
+ *
+ * Start the playlist named `{PlaylistName}` with repeat mode. The optional
+ * query parameter `scheduleProtected` (`true`/`false`) prevents the
+ * scheduler from stopping this playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlist/{PlaylistName}/start/{Repeat}
+ * @route GET /api/playlist/{PlaylistName}/start/{Repeat} deprecated
+ * @param bool scheduleProtected Prevent schedule from stopping this playlist
+ * @response 200 Playlist started
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_start_repeat()
+{
+    global $settings;
+
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $repeat = urldecode(params('Repeat'));
+    $scheduleProtected = isset($_GET['scheduleProtected']) ? $_GET['scheduleProtected'] : 'false';
+
+    $request_content = FppdCommand('Start Playlist', array($playlistName, $repeat, 'false', $scheduleProtected));
+    return $request_content;
+}
+
+/**
+ * Start playlist on repeat (alt)
+ *
+ * Start the playlist named `{PlaylistName}` with repeat mode and schedule
+ * protection. When `{ScheduleProtected}` is `true`, the scheduler cannot
+ * stop this playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlist/{PlaylistName}/start/{Repeat}/{ScheduleProtected}
+ * @route GET /api/playlist/{PlaylistName}/start/{Repeat}/{ScheduleProtected} deprecated
+ * @response 200 Playlist started
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_start_repeat_protected()
+{
+    global $settings;
+
+    $playlistName = rawurldecode(params('PlaylistName'));
+    $repeat = urldecode(params('Repeat'));
+    $scheduleProtected = urldecode(params('ScheduleProtected'));
+
+    $request_content = FppdCommand('Start Playlist', array($playlistName, $repeat, 'false', $scheduleProtected));
+    return $request_content;
+}
+
+/**
+ * Set playlist repeat on or off
+ *
+ * Turn repeat on or off for the running playlist without starting, stopping or
+ * restarting it - the API equivalent of the Repeat checkbox in the web UI.
+ * `{Repeat}` may be `true`/`false` or `1`/`0`.  The new setting is read when
+ * the playlist reaches the end of its current loop, and is reflected
+ * immediately in `repeat_mode` from `GET /api/fppd/status`.
+ *
+ * Repeat belongs to a playlist that is actually running, so this returns
+ * `{"Status": "Error"}` when the player is idle, when `{Repeat}` is not one of
+ * `true`/`false`/`1`/`0`, or when fppd cannot be reached; use the repeat flag
+ * on `GET /api/playlist/{PlaylistName}/start/{Repeat}` to start a playlist
+ * repeating.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlist/repeat/{Repeat}
+ * @route GET /api/playlist/repeat/{Repeat} deprecated
+ * @response 200 Repeat state changed, or `Status` is `Error` with the reason in `Message`
+ * ```json
+ * {"Status": "OK", "Message": "Repeat Enabled"}
+ * ```
+ */
+function playlist_repeat()
+{
+    $repeat = strtolower(urldecode(params('Repeat')));
+
+    if ($repeat === 'true' || $repeat === '1') {
+        $repeat = 'true';
+    } elseif ($repeat === 'false' || $repeat === '0') {
+        $repeat = 'false';
+    } else {
+        return json(array(
+            'Status' => 'Error',
+            'Message' => "Repeat must be one of true, false, 1 or 0.",
+        ));
+    }
+
+    // Deliberately no CURLOPT_FAILONERROR here.  fppd answers a refused command
+    // with a 500 carrying the reason, and "no playlist is running" is a routine
+    // answer for this endpoint rather than a fault - FAILONERROR would throw
+    // that body away and hand the caller an empty response instead.
+    $request_content = FppdCommand('Set Playlist Repeat', array($repeat), 200, 0, false, $httpCode);
+
+    if ($request_content === false) {
+        return json(array(
+            'Status' => 'Error',
+            'Message' => 'Unable to contact fppd.',
+        ));
+    }
+
+    return json(array(
+        'Status' => ($httpCode == 200) ? 'OK' : 'Error',
+        'Message' => trim($request_content),
+    ));
+}
+
+/**
+ * Pause currently running playlist
+ *
+ * Pause the currently running playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlists/pause
+ * @route GET /api/playlists/pause deprecated
+ * @response 200 Playlist paused
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_pause()
+{
+    global $settings;
+
+    $request_content = FppdCommand('Pause Playlist');
+    return $request_content;
+}
+
+/**
+ * Resume paused playlist
+ *
+ * Resume a previously paused playlist.
+ *
+ * @badge "FPP REQUIRED" critical
+ * @route POST /api/playlists/resume
+ * @route GET /api/playlists/resume deprecated
+ * @response 200 Playlist resumed
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+function playlist_resume()
+{
+    global $settings;
+
+    $request_content = FppdCommand('Resume Playlist');
+    return $request_content;
+}

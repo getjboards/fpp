@@ -1,60 +1,54 @@
+#pragma once
 /*
- *   USB Relay handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _USBRELAY_H
-#define _USBRELAY_H
-
 #include <string>
+#include <vector>
+#include "fpp-json-fwd.h"
 
-#include "ChannelOutputBase.h"
+#include "ChannelOutput.h"
+#include "SerialChannelOutput.h"
 
-class USBRelayOutput : public ChannelOutputBase {
-  public:
-	USBRelayOutput(unsigned int startChannel, unsigned int channelCount);
-	~USBRelayOutput();
+class USBRelayOutput : public ChannelOutput, public SerialChannelOutput {
+public:
+    USBRelayOutput(unsigned int startChannel, unsigned int channelCount);
+    virtual ~USBRelayOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-	int SendData(unsigned char *channelData);
+    virtual int SendData(unsigned char* channelData) override;
 
-	void DumpConfig(void);
+    virtual void DumpConfig(void) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
 
-  private:
-	enum RelayType {
-		RELAY_DVC_UNKNOWN,
-		RELAY_DVC_BIT,
-		RELAY_DVC_ICSTATION
-	};
+private:
+    enum RelayType {
+        RELAY_DVC_UNKNOWN,
+        RELAY_DVC_BIT,
+        RELAY_DVC_ICSTATION,
+        RELAY_DVC_CH340
+    };
 
-	std::string  m_deviceName;
-	int          m_fd;
-	RelayType    m_subType;
-	int          m_relayCount;
+    RelayType m_subType;
+    int m_relayCount;
+
+    // CH340 only.  -1 means "unknown", so the first frame transmits every relay
+    // even if it is asking for the off state.
+    std::vector<signed char> m_lastState;
+
+    // One frame's worth of commands, sized for the worst case of every relay
+    // changing (4 bytes each), which also covers the bitstream path's 1 byte
+    // per 8 relays.
+    std::vector<unsigned char> m_outputBuffer;
 };
-
-#endif /* _USBRELAY_H */

@@ -1,0 +1,164 @@
+#pragma once
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the CC-BY-ND as described in the
+ * included LICENSE.CC-BY-ND file.  This file may be modified for
+ * personal use, but modified copies MAY NOT be redistributed in any form.
+ */
+
+#include <string>
+#include "fpp-json-fwd.h"
+#include <vector>
+
+#include "channeloutput/ChannelOutput.h"
+#include "channeloutput/PixelString.h"
+#include "framebuffer/FrameBuffer.h"
+
+constexpr int MAX_DPI_PIXEL_LATCHES = 4;
+
+class DPIPixelsOutput : public ChannelOutput {
+public:
+    DPIPixelsOutput(unsigned int startChannel, unsigned int channelCount);
+    virtual ~DPIPixelsOutput();
+
+    virtual std::string GetOutputType() const {
+        return "DPI Pixels";
+    }
+
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
+
+    virtual void PrepData(unsigned char* channelData) override;
+    virtual int SendData(unsigned char* channelData) override;
+
+    virtual void DumpConfig(void) override;
+
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
+
+    virtual void OverlayTestData(unsigned char* channelData, int cycleNum, float percentOfCycle, int testType, const Json::Value& config) override;
+    virtual bool SupportsTesting() const override { return true; }
+
+private:
+    bool LoadStringConfig(const std::string& subType, Json::Value& root, std::string& usedSubType);
+    int GetDPIPinBitPosition(std::string pinName);
+    bool FrameBufferIsConfigured(void);
+    void WriteDataAtPosition(uint8_t *&ptr, const uint32_t value);
+    void WriteLatchedDataAtPosition(uint8_t *&ptr, const uint32_t value, const uint32_t latches);
+
+    bool InitializeWS281x(void);
+    void CopyShadowToAllPages(void);
+    int IdleFpsFromSetting(void);
+
+    std::string device = "DPI-1";
+    std::string protocol = "ws2811";
+    int licensedOutputs = 0;
+    bool usingSmartReceivers = false;
+    bool usingLatches = false;
+    uint8_t* onOffMap = nullptr;
+
+    std::vector<PixelString*> pixelStrings;
+    int bitPos[MAX_DPI_PIXEL_LATCHES * 24];
+
+    FrameBuffer* fb = nullptr;
+    int fbPage = -1;
+
+    // The KMS pages are uncached DMA memory: streaming writes are fine but any
+    // read-back is ~30x slower than RAM, and scattered writes into a page the
+    // DPI is still scanning can tear a bit's middle third.  So the WS bit
+    // stream is built in this ordinary malloc'd copy of a page (template from
+    // InitializeWS281x(), middle thirds from PrepData()) and SendData() copies
+    // the data rows into the free page in one burst once the previous flip has
+    // retired.  Two KMS pages are enough for that; no third buffer in CMA.
+    uint8_t* m_shadow = nullptr;
+    int m_shadowCopyBytes = 0; // data rows only; the reset rows never change
+
+    int latchCount = 0;
+    int longestString = 0;
+    int outputToStringMap[MAX_DPI_PIXEL_LATCHES * 24];
+    int stringToOutputMap[MAX_DPI_PIXEL_LATCHES * 24];
+    int stringLengths[MAX_DPI_PIXEL_LATCHES * 24];
+    uint32_t latchPinMask = 0x000000;
+    uint32_t latchPinMasks[MAX_DPI_PIXEL_LATCHES];
+    uint32_t onOffMask[MAX_DPI_PIXEL_LATCHES][4800]; // Max 1600 pixels * 3 channels each.
+
+    int protoBitsPerLine = 0;
+    int protoBitOnLine = 0;
+    uint8_t* protoDest = nullptr;
+    int protoDestExtra = 0;
+
+    int fbPixelMult = 1;
+
+    // Runtime refresh-rate control.  The framebuffer height is sized once to the
+    // longest string; the DPI output rate is then set per-sequence by varying
+    // only the vertical blanking (see KMSFrameBuffer::SetRefreshRate).
+    int m_configuredMaxFps = 0; // highest rate the longest string allows
+    int m_currentFps = 0;       // last rate applied to the framebuffer
+    int m_idleFps = 20;         // 1000 / E131BridgingInterval, kept current by a settings listener
+    bool m_initialized = false; // gates runtime rate control (off during Init/Close)
+    // GetTime() when output went idle, for the settle window in PrepData().
+    // 0 means "a sequence is running, or none has stopped yet".
+    long long m_idleSinceUS = 0;
+
+    // Track which pins we configured as DPI so we can reset them on close
+    std::vector<std::string> m_configuredDPIPins;
+
+    // output testing data
+    int m_testCycle = -1;
+    int m_testType = 0;
+    float m_testPercent = 0.0f;
+
+    std::list<std::string> m_autoCreatedModelNames;
+};
+
+
+// This function writes out 16 FB pixels at a time as 12 uint32_t.
+// Used by non-latch mode since we need to write out the same data 16 times.
+inline void DPIPixelsOutput::WriteDataAtPosition(uint8_t *&ptr, const uint32_t value) {
+    // value is 24-bit value in a uint32_t
+    // FB uint32_t   value       new uint32_t  fb0 order
+    // v1            0x00abcdef  0xefabcdef    ef cd ab ef
+    // v2            0x00abcdef  0xcdefabcd    cd ab ef cd
+    // v3            0x00abcdef  0xabcdefab    ab ef cd ab
+
+    uint32_t v1 = value | (value << 24);
+    uint32_t v2 = (value << 16) | (value >> 8);
+    uint32_t v3 = (value << 8) | (value >> 16);
+    uint32_t *tptr = (uint32_t*)ptr;
+
+    // 4 FB pixels per 3 words, repeated 4 times.  Written as pure stores (no
+    // read-back of what was just written) so this stays cheap even if the
+    // destination is ever uncached memory.
+    for (int i = 0; i < 4; i++) {
+        *(tptr++) = v1;
+        *(tptr++) = v2;
+        *(tptr++) = v3;
+    }
+
+    ptr += 48; // 12 uint32_t
+}
+
+// This function writes out 4 FB pixels at a time as 3 uint32_t.
+// Used by Latch mode since we write out data for each latch 4 FB pixels at a time.
+inline void DPIPixelsOutput::WriteLatchedDataAtPosition(uint8_t *&ptr, const uint32_t value, const uint32_t latches) {
+    // value and valueWithLatch are each 24-bit values in a uint32_t
+    // FB uint32_t   value       valueWithLatch  new uint32_t  fb0 order
+    // #1            0x00abcdef  0x00ghijkl      0xklabcdef    ef cd ab kl
+    // #2            0x00abcdef  0x00ghijkl      0xijklghij    ij gh kl ij
+    // #3            0x00abcdef  0x00ghijkl      0xabcdefgh    gh ef cd ab
+
+    uint32_t valueWithLatch = value | latches;
+    uint32_t *tptr = (uint32_t*)ptr;
+
+    *(tptr++) = value | (valueWithLatch << 24);
+    *(tptr++) = (valueWithLatch << 16) | (valueWithLatch >> 8);
+    *(tptr++) = (value << 8) | (valueWithLatch >> 16);
+
+    ptr += 12;
+}
+

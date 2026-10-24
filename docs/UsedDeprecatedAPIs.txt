@@ -1,0 +1,31 @@
+This file lists use of older/deprecated libraries.  At some point,
+when we drop support for older OS levels, we can cleanup the code
+to use the newer API's exclusively.   For example, Debian Buster
+user libgpiod 1.4 but Bullseye used 1.6.1.  When we dropped support
+for building on Buster, we should have cleaned up the ifdefs and other
+code that allowed continued building/running on Buster.
+
+
+OpenSSL - Bookworm moved to OpenSSL 3 (from 1.x on Bullseye)
+  - CapeUtils.cpp has ifdef to allow continued building on Bullseye
+
+
+scripts/detect_cape
+  - fppcapedetect systemd service now calls fppcapedetect directly so
+  this script can be removed after OS level updates install the new
+  service file
+
+scripts/piRTC
+  - fpprtc systemdd service now calls fpprtc directly so this script
+  can be removed after OS level updates install the new service file
+
+src/boot/FPPINIT.c
+  - has a couple of conditionals on GCC >12 in order to generate correct
+  config for older FPP7 images.  Can be removed for FPP8 images based on
+  Debian 12
+
+scripts/fpp_init
+scripts/fpp_start
+scripts/fppoled
+  - no longer used, can be eliminated
+

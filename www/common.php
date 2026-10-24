@@ -1,372 +1,2524 @@
 <?php
-require_once("config.php");
+require_once "config.php";
 
 function check($var, $var_name = "", $function_name = "")
 {
-	global $debug;
+    global $debug;
 
-	if ( empty($function_name) )
-	{
-		global $args;
-		$function_name = $args['command'];
-	}
+    if (empty($function_name)) {
+        global $args;
+        $function_name = $args['command'];
+    }
 
-	if ( empty($var) && $debug )
-		error_log("WARNING: Variable '$var_name' in function '$function_name' was empty");
+    if (empty($var) && $debug) {
+        error_log("WARNING: Variable '$var_name' in function '$function_name' was empty");
+    }
+
 }
 
-function ScrubFile($filename, $taboo = Array("emailgpass"))
+/**
+ * Get the numeric uid/gid of the 'fpp' system user.
+ *
+ * The 'fpp' user's uid has not been consistent across FPP's history (500 on
+ * older installs/images, 1000 since commit f8f2f1408 for Trixie compatibility),
+ * so mount options and rsync module configs that need to match it must resolve
+ * it at runtime rather than hardcoding a number.
+ *
+ * @return array ['uid' => int, 'gid' => int]
+ */
+function GetFPPUserIds()
 {
-	if ( !file_exists($filename) )
-		return "";
-
-	$dataStr = "";
-
-	if (preg_match("/.json$/", $filename))
-	{
-		// Need to scrub .json as well at some point
-		$dataStr = file_get_contents($filename);
-	}
-	else
-	{
-		$data = parse_ini_file($filename);
-
-		foreach($taboo as $key)
-			if (array_key_exists($key, $data))
-				$data[$key] = "********";
-
-		foreach ($data as $key => $value)
-			$dataStr .= $key . " = " . $value . "\n";
-	}
-
-	return $dataStr;
+    $pwentry = posix_getpwnam('fpp');
+    if ($pwentry === false) {
+        // Should never happen on a real FPP system; fall back to the historical default.
+        return array('uid' => 500, 'gid' => 500);
+    }
+    return array('uid' => $pwentry['uid'], 'gid' => $pwentry['gid']);
 }
 
+/**
+ * Names of the subdirectories and files that make up an FPP media directory.
+ *
+ * This is deliberately a fixed list rather than a scandir() of the live media
+ * directory: it is used to recognise "this path is a media tree, not a folder of
+ * backups", and that judgement must not change just because a stray folder has
+ * appeared in media/. 'lost+found' is included because a media directory on its
+ * own ext4 partition has one, and it is never a backup.
+ *
+ * @return array Directory/file names, without any leading path.
+ */
+function GetFPPMediaDirNames()
+{
+    return array(
+        'backups',
+        'cache',
+        'config',
+        'crashes',
+        'effects',
+        'events',
+        'exim4',
+        'images',
+        'logs',
+        'lost+found',
+        'music',
+        'playlists',
+        'plugindata',
+        'plugins',
+        'scripts',
+        'sequences',
+        'tmp',
+        'upload',
+        'uploads',
+        'videos',
+        'virtualdisplay_assets',
+    );
+}
+
+function getFileList($dir, $ext)
+{
+    $i = array();
+    if ($handle = opendir($dir)) {
+        while (($file = readdir($handle)) !== false) {
+            if (!in_array($file, array('.', '..')) && !is_dir($dir . $file) && strtolower(substr($file, strrpos($file, '.') + 1)) == $ext) {
+                array_push($i, $file);
+            }
+        }
+    }
+    return $i;
+}
+
+function ScrubFile($filename, $taboo = array("emailpass", "emailgpass", "MQTTPassword", "password", "passwordVerify", "osPassword", "osPasswordVerify"))
+{
+    if (!file_exists($filename)) {
+        return "";
+    }
+
+    $dataStr = "";
+
+    if (preg_match("/.json$/", $filename)) {
+        // Need to scrub .json as well at some point
+        $dataStr = file_get_contents($filename);
+    } else {
+        $data = [];
+        $fd = @fopen($filename, "r");
+        if ($fd) {
+            flock($fd, LOCK_SH);
+            // Not parse_ini_file(): it strips embedded '"' from JSON values and
+            // fails outright (returning nothing) on a quoted JSON array.
+            $data = custom_parse_ini_file($filename);
+            flock($fd, LOCK_UN);
+            fclose($fd);
+        }
+
+        foreach ($taboo as $key) {
+            if (array_key_exists($key, $data)) {
+                $data[$key] = "********";
+            }
+        }
+
+        foreach ($data as $key => $value) {
+            $dataStr .= $key . " = " . $value . "\n";
+        }
+
+    }
+
+    return $dataStr;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Returns true if the active MediaBackend uses the PipeWire/GStreamer stack
+// (either the simple or advanced mode).  Both modes share the same runtime
+// pipeline; only the configuration UI differs.
+function IsPipeWireBackend($settingsArray = null)
+{
+    global $settings;
+    if ($settingsArray === null) {
+        $settingsArray = $settings;
+    }
+    $mb = isset($settingsArray['MediaBackend']) ? strtolower($settingsArray['MediaBackend']) : '';
+    return ($mb === 'pipewire' || $mb === 'pipewire-simple');
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Returns true only when the user has selected the Simple PipeWire UI mode.
+// Used by the auto-config generator that converts the legacy AudioOutput /
+// VideoOutput single-card selections into a one-group PipeWire config.
+function IsSimplePipeWireBackend($settingsArray = null)
+{
+    global $settings;
+    if ($settingsArray === null) {
+        $settingsArray = $settings;
+    }
+    $mb = isset($settingsArray['MediaBackend']) ? strtolower($settingsArray['MediaBackend']) : '';
+    return ($mb === 'pipewire-simple');
+}
+
+/**
+ * Settings the setup wizard must have recorded, which are still missing.
+ *
+ * The jurisdiction plus the consent-bearing privacy settings. Read from the
+ * settings FILE, never $settings: $settings has settings.json defaults merged
+ * in, so every one of these would look answered when nobody had answered it --
+ * which is the whole failure this guards against.
+ *
+ * emailAddress is deliberately not required: it is optional contact detail, and
+ * "finish setup because you have not given an e-mail address" would be false.
+ *
+ * Safe to gate on. The privacy step renders all of these rows on every platform
+ * and Finish writes every one of them whether touched or not, so answering once
+ * always clears this.
+ *
+ * @return array Missing setting names, empty when nothing is outstanding.
+ */
+function MissingSetupSettings()
+{
+    global $settingGroups;
+
+    $required = array('LegalJurisdiction');
+    if (isset($settingGroups['initialSetup-privacy']['settings'])) {
+        foreach ($settingGroups['initialSetup-privacy']['settings'] as $k) {
+            if ($k !== 'emailAddress') {
+                $required[] = $k;
+            }
+        }
+    } else {
+        $required = array_merge($required,
+            array('statsPublish', 'ShareCrashData', 'FetchVendorLogos', 'SendVendorSerial'));
+    }
+
+    $missing = array();
+    foreach ($required as $k) {
+        if (ReadSettingFromFile($k) === false) {
+            $missing[] = $k;
+        }
+    }
+
+    // The consent record. Values alone do not clear this: a value is a value,
+    // and what has to be re-askable is the act behind it.
+    //
+    //   absent/incomplete - never recorded.
+    //   stale-version     - consented to disclosures FPP no longer makes, so the
+    //                       answer is not an answer to what we say now.
+    //   other-device      - the record came from another player in a restored
+    //                       backup. The choices in it were made by somebody, on
+    //                       a screen the owner of THIS device never saw, so they
+    //                       are not this device's consent and it has to ask.
+    require_once __DIR__ . '/privacyConsent.inc';
+    if (PrivacyConsentShortfall() !== '') {
+        $missing[] = 'privacyConsent';
+    }
+
+    return $missing;
+}
+
+// The host the cape pages send the SoC serial, order ID and account password
+// to when signing an EEPROM or redeeming a voucher.  A developer override in
+// the settings file; anything but a plain host[:port] falls back to the real
+// one, because the value is put into URLs and echoed into the page's script.
+function SigningAPIHost()
+{
+    global $settings;
+    $host = isset($settings['SigningAPIHost']) ? trim($settings['SigningAPIHost']) : '';
+    if (preg_match('/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252})(?::[0-9]{1,5})?$/', $host)) {
+        return $host;
+    }
+    return 'api.FalconPlayer.com';
+}
 
 function ReadSettingFromFile($settingName, $plugin = "")
 {
-	global $settingsFile;
-	global $settings;
-	$filename = $settingsFile;
+    global $settingsFile;
+    global $settings;
+    $filename = $settingsFile;
 
-	if (!file_exists($filename))
-		return false;
-
-	if ($plugin != "") {
-		$filename = $settings["configDirectory"] . "/plugin." . $plugin;
-	}
-
-	$settingsStr = file_get_contents($filename);
-  if ( !empty($settingsStr) )
-  {
-		if (preg_match("/^" . $settingName . "/m", $settingsStr))
-		{
-      $result = preg_match("/^" . $settingName . "\s*=(\s*\S*\w*)/m", $settingsStr, $output_array);
-      if($result == 0)
-      {
-//        error_log("The setting " . $settingName . " could not be found in " . $filename);
+    if ($plugin != "") {
+        $filename = $settings["configDirectory"] . "/plugin." . $plugin;
+    }
+    if (!file_exists($filename)) {
         return false;
-      }
-      return trim($output_array[1], " \t\n\r\0\x0B\"");
-		}
-		else
-		{
-//      error_log("The setting " . $settingName . " could not be found in " . $filename);
-			return false;
-		}
-  }
-	else
-	{
-    error_log("The setting file:" . $filename . " could not be found." );
-		return false;
-	}
+    }
+    $fd = @fopen($filename, "r");
+    $settingsStr = "";
+    if ($fd) {
+        flock($fd, LOCK_SH);
+        $settingsStr = file_get_contents($filename);
+        flock($fd, LOCK_UN);
+        fclose($fd);
+    }
+    if (!empty($settingsStr)) {
+        if (preg_match("/^" . $settingName . "/m", $settingsStr)) {
+            $result = preg_match("/^" . $settingName . "\s*=(.+)/m", $settingsStr, $output_array);
+            if ($result == 0) {
+                //        error_log("The setting " . $settingName . " could not be found in " . $filename);
+                return false;
+            }
+            return trim($output_array[1], " \t\n\r\0\x0B\"");
+        } else {
+            //      error_log("The setting " . $settingName . " could not be found in " . $filename);
+            return false;
+        }
+    } else {
+        error_log("The setting file:" . $filename . " could not be found.");
+        return false;
+    }
 }
 
-function WriteSettingToFile($settingName, $setting, $plugin = "")
+function remove_outer_quotes($string)
 {
-	global $settingsFile;
-	global $settings;
-	$filename = $settingsFile;
-
-	if ($plugin != "") {
-		$filename = $settings['configDirectory'] . "/plugin." . $plugin;
-	}
-
-	$settingsStr = "";
-	$tmpSettings = parse_ini_file($filename);
-	$tmpSettings[$settingName] = $setting;
-	foreach ($tmpSettings as $key => $value) {
-		$settingsStr .= $key . " = \"" . $value . "\"\n";
-	}
-	file_put_contents($filename, $settingsStr);
+    // Check if the string starts and ends with double quotes
+    if (substr($string, 0, 1) === '"' && substr($string, -1) === '"') {
+        // Remove the starting and ending double quotes
+        $string = substr($string, 1, -1);
+    }
+    return $string;
 }
 
-function IfSettingEqualPrint($setting, $value, $print, $pluginName = "")
+function custom_parse_ini_file($filename)
 {
-	global $settings;
-	global $pluginSettings;
+    //Custom parse ini file created to work around the limitations of the standard function which doesn't handle embedded " characters well
+    $lines = file($filename);
+    $settings = [];
 
-	if ($pluginName != "") {
-		if ((isset($pluginSettings[$setting])) &&
-			($pluginSettings[$setting] == $value ))
-			echo $print;
-	} else {
-		if ((isset($settings[$setting])) &&
-			($settings[$setting] == $value ))
-			echo $print;
-	}
+    foreach ($lines as $line) {
+        $line = trim($line);
+
+        // Ignore comments and empty lines
+        if ($line === '' || $line[0] === ';') {
+            continue;
+        }
+
+        // A line with no '=' is not a setting.  Without this, a hand-edited '#'
+        // comment or a stray line becomes a key with a null value -- which then
+        // gets written back out by WriteSettingToFile(), and carried into backups.
+        if (strpos($line, '=') === false) {
+            continue;
+        }
+
+        // Split key and value
+        list($key, $value) = explode('=', $line, 2);
+        $key = trim($key);
+        $value = trim($value);
+
+        // Remove leading and trailing quotes
+        if (substr($value, 0, 1) === '"' && substr($value, -1) === '"') {
+            $value = substr($value, 1, -1);
+        }
+
+        $settings[$key] = $value;
+    }
+
+    return $settings;
 }
 
-function PrintSettingCheckbox($title, $setting, $restart = 1, $reboot = 0, $checkedValue, $uncheckedValue, $pluginName = "", $callbackName = "")
+/**
+ * Re-assert fpp ownership on a config file the web user cannot write.
+ *
+ * FPP runs "chown -R fpp:fpp" over the media directory at every boot (see
+ * setFileOwnership() in src/boot/FPPINIT_Config.cpp), so the correct owner is
+ * not a guess.  Anything running as root that replaces one of these files with
+ * a fresh inode - an editor, a shell redirect, a restore run by hand - leaves
+ * it root-owned, and every later write from the web UI fails until the next
+ * boot.  Repair it here so a single stray root write doesn't silently disable
+ * saving for the rest of the uptime.
+ *
+ * Returns true only if the file is writable afterwards.
+ */
+function RepairConfigFileOwnership($filename)
 {
-	global $settings;
-	global $pluginSettings;
+    global $SUDO;
 
-	$plugin = "";
-	$settingsName = "settings";
+    // Nothing to repair if the file isn't there (fopen will create it) and
+    // nothing to repair to on a system with no fpp user, e.g. macOS.
+    if (!file_exists($filename) || posix_getpwnam('fpp') === false) {
+        return false;
+    }
 
-	if ($pluginName != "") {
-		$plugin = "Plugin";
-		$settingsName = "pluginSettings";
-	}
+    $ids = GetFPPUserIds();
+    $file = escapeshellarg($filename);
+    exec($SUDO . " chown " . $ids['uid'] . ":" . $ids['gid'] . " " . $file .
+        " && " . $SUDO . " chmod 664 " . $file, $output, $return_val);
 
-	if ($callbackName != "")
-		$callbackName = $callbackName . "();";
+    if ($return_val != 0 || !is_writable($filename)) {
+        return false;
+    }
 
-	echo "
-<script>
-function " . $setting . "Changed() {
+    error_log("Repaired ownership of '$filename', which was not writable by the web user.");
+    return true;
+}
+
+/**
+ * Whether a setting name supplied over the API is safe to store.
+ *
+ * Names become INI keys (neither reader has an escape mechanism), so refuse
+ * anything that would break that format.  Only API entry points apply this;
+ * internal WriteSettingToFile() callers legitimately use wider alphabets
+ * (e.g. "ip:port", "a|b|c").  Pages must still JSON-encode keys when emitting
+ * them into JS - this is not an output-escaping substitute.
+ */
+function IsValidSettingName($name)
+{
+    return is_string($name) && $name !== '' &&
+        strpbrk($name, "\"'\\\n\r\0=[];#/") === false;
+}
+
+/**
+ * JSON text from a file, re-encoded for a <script> block.  Valid JSON is
+ * also valid JS, but a string value containing "</script>" still ends the
+ * block; the HEX flags encode <, >, &, ' and " inside strings.  Returns
+ * "null" for text that is not JSON.
+ */
+function JsonForScript($jsonText)
+{
+    $v = json_decode((string) $jsonText);
+    if ($v === null && json_last_error() !== JSON_ERROR_NONE) {
+        return 'null';
+    }
+    return json_encode($v, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+}
+
+/**
+ * Whether a caller-supplied host may be contacted as another FPP.
+ *
+ * MultiSync peers are any LAN or VPN address or (mDNS) name, so this does not
+ * restrict to private ranges, nor refuse link-local (two players cabled
+ * together without DHCP talk over it).  It refuses what can only be this
+ * device: loopback, the unspecified address and "localhost" -- through those a
+ * request would reach fppd's internal port or localonly/ pages that trust the
+ * local address.  A name is judged by every address it resolves to, the way
+ * curl will resolve it: inet_aton() reads 127.1, 2130706433, 0x7f000001 and
+ * 0177.0.0.1 as 127.0.0.1, and /etc/hosts maps ip6-localhost and this
+ * player's own HostName to loopback.  Callers must also not follow redirects,
+ * or a peer could send the request back to loopback, and must send the
+ * request to the addresses judged here (RemotePeerPinCurl(),
+ * RemotePeerConnectHost()): a name resolved again could answer differently.
+ */
+function IsRemotePeerHost($host)
+{
+    if (!is_string($host) || $host === '') {
+        return false;
+    }
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        return RemotePeerAddressAllowed($host);
+    }
+    if (strcasecmp($host, 'localhost') == 0 || preg_match('/\.localhost$/i', $host) ||
+        preg_match('/^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$/', $host) !== 1) {
+        return false;
+    }
+    // A name that does not resolve could not be reached anyway.
+    $addrs = RemotePeerResolve($host);
+    if (empty($addrs)) {
+        return false;
+    }
+    foreach ($addrs as $addr) {
+        if (!RemotePeerAddressAllowed($addr)) {
+            return false;
+        }
+    }
+    RemotePeerApprovedAddresses($host, $addrs);
+    return true;
+}
+
+/**
+ * The addresses IsRemotePeerHost() approved for a name earlier in this
+ * request, or null; given $addrs, records them.
+ */
+function RemotePeerApprovedAddresses($host, $addrs = null)
+{
+    static $approved = array();
+    $key = strtolower($host);
+    if ($addrs !== null) {
+        $approved[$key] = array_values($addrs);
+    }
+    return $approved[$key] ?? null;
+}
+
+/**
+ * The approved addresses of a peer name, judging it first if this request
+ * has not; null when it is refused.  A literal address is its own answer.
+ */
+function RemotePeerPinnedAddresses($host)
+{
+    $bare = trim((string) $host, '[]');
+    if (filter_var($bare, FILTER_VALIDATE_IP)) {
+        return RemotePeerAddressAllowed($bare) ? array($bare) : null;
+    }
+    $addrs = RemotePeerApprovedAddresses($host);
+    if ($addrs === null && IsRemotePeerHost($host)) {
+        $addrs = RemotePeerApprovedAddresses($host);
+    }
+    return $addrs;
+}
+
+/**
+ * Point a curl handle for a peer URL at the addresses IsRemotePeerHost()
+ * approved for its host.  Left to itself curl resolves the name again, and a
+ * name with a short TTL can answer a LAN address to the check and loopback
+ * to curl (DNS rebinding).  Returns false, and leaves the handle unpinned,
+ * when the host is refused.
+ */
+function RemotePeerPinCurl($ch, $url)
+{
+    $parts = parse_url($url);
+    $host = isset($parts['host']) ? $parts['host'] : '';
+    $addrs = RemotePeerPinnedAddresses($host);
+    if (empty($addrs)) {
+        return false;
+    }
+    if (filter_var(trim($host, '[]'), FILTER_VALIDATE_IP)) {
+        return true;
+    }
+    $port = isset($parts['port']) ? $parts['port'] : ((($parts['scheme'] ?? 'http') == 'https') ? 443 : 80);
+    $list = array();
+    foreach ($addrs as $addr) {
+        $list[] = (strpos($addr, ':') !== false) ? '[' . $addr . ']' : $addr;
+    }
+    curl_setopt($ch, CURLOPT_RESOLVE, array($host . ':' . $port . ':' . implode(',', $list)));
+    return true;
+}
+
+/**
+ * The host to hand a tool that resolves names itself (rsync): the first
+ * address approved for a peer name, so it connects where the check looked.
+ * Null when the host is refused.
+ */
+function RemotePeerConnectHost($host)
+{
+    $addrs = RemotePeerPinnedAddresses($host);
+    if (empty($addrs)) {
+        return null;
+    }
+    return (strpos($addrs[0], ':') !== false) ? '[' . $addrs[0] . ']' : $addrs[0];
+}
+
+/** An IP address IsRemotePeerHost() accepts: not loopback or unspecified. */
+function RemotePeerAddressAllowed($ip)
+{
+    $packed = @inet_pton($ip);
+    if ($packed === false) {
+        return false;
+    }
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) is judged as the IPv4 address.
+    if (strlen($packed) == 16 && substr($packed, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+        $packed = substr($packed, 12);
+    }
+    if (strlen($packed) == 4) {
+        $b = ord($packed[0]);
+        return !($b == 127 || $b == 0);
+    }
+    return !($packed === str_repeat("\0", 16) || $packed === str_repeat("\0", 15) . "\x01");
+}
+
+define('REMOTE_PEER_RESOLVE_SECONDS', 3);
+
+/**
+ * Every address a host name resolves to through the system resolver
+ * (getaddrinfo, as curl uses), IPv4 and IPv6; empty when it does not resolve.
+ * Bounded: a name whose DNS or mDNS lookup never answers comes back empty
+ * after REMOTE_PEER_RESOLVE_SECONDS, rather than holding the request for the
+ * resolver's own retries, and empty is refused.  getaddrinfo() takes no
+ * timeout, so on Linux the lookup runs in getent under timeout(1); elsewhere
+ * (macOS, a development host) it runs in-process.
+ */
+function RemotePeerResolve($host)
+{
+    $out = array();
+    if (is_executable('/usr/bin/getent') && is_executable('/usr/bin/timeout')) {
+        $lines = array();
+        @exec('/usr/bin/timeout ' . REMOTE_PEER_RESOLVE_SECONDS . ' /usr/bin/getent ahosts ' . escapeshellarg($host) . ' 2>/dev/null', $lines, $rc);
+        if ($rc !== 0) {
+            return array();
+        }
+        // "<address>  STREAM <name>" per address and socket type.
+        foreach ($lines as $line) {
+            $addr = strtok(trim($line), " \t");
+            if ($addr !== false && $addr !== '' && !in_array($addr, $out, true)) {
+                $out[] = $addr;
+            }
+        }
+        return $out;
+    }
+    if (!function_exists('socket_addrinfo_lookup')) {
+        // IPv4 only, through the same resolver.
+        $v4 = @gethostbynamel($host);
+        return is_array($v4) ? $v4 : array();
+    }
+    $infos = @socket_addrinfo_lookup($host, null, array('ai_socktype' => SOCK_STREAM));
+    if (is_array($infos)) {
+        foreach ($infos as $info) {
+            $e = socket_addrinfo_explain($info);
+            if (isset($e['ai_addr']['sin_addr'])) {
+                $out[] = $e['ai_addr']['sin_addr'];
+            } else if (isset($e['ai_addr']['sin6_addr'])) {
+                $out[] = $e['ai_addr']['sin6_addr'];
+            }
+        }
+    }
+    return $out;
+}
+
+/**
+ * Ask another player to act through one of the API routes that change state
+ * (docs/DEPRECATED.md): by POST, which FPP 11 will require, and by GET when
+ * the player is older than 10.3 and answers the POST 404 or 405.  Redirects
+ * are not followed (see IsRemotePeerHost()).
+ *
+ * @param string $url              http://<peer>/api/...
+ * @param int    $connectTimeoutMs
+ * @param int    $httpCode         set to the answer's HTTP status, 0 for none
+ * @return string|false            the body, or false on no answer or an HTTP error
+ */
+function RemotePlayerAction($url, $connectTimeoutMs, &$httpCode = null)
+{
+    foreach (array('POST', 'GET') as $method) {
+        $curl = curl_init($url);
+        if (!RemotePeerPinCurl($curl, $url)) {
+            curl_close($curl);
+            $httpCode = 0;
+            return false;
+        }
+        curl_setopt($curl, CURLOPT_FAILONERROR, true);
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, $connectTimeoutMs);
+        if ($method == 'POST') {
+            curl_setopt($curl, CURLOPT_POST, true);
+            curl_setopt($curl, CURLOPT_POSTFIELDS, '');
+        }
+        $body = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+        curl_close($curl);
+        if ($httpCode != 404 && $httpCode != 405) {
+            break;
+        }
+    }
+    return $body;
+}
+
+/**
+ * Run an fppd command by POST /command/<name>, its arguments a JSON array.
+ * GET /command/<name>/<args> is deprecated (docs/DEPRECATED.md), and needed
+ * every argument URL-encoded besides.
+ *
+ * @param string $command
+ * @param array  $args             strings; fppd takes a bool or number as its text
+ * @param int    $connectTimeoutMs
+ * @param int    $timeout          whole-request limit in seconds, 0 = none
+ * @param bool   $failOnError      false keeps the body of fppd's 500, which
+ *                                 says why it refused the command
+ * @param int    $httpCode         set to the answer's HTTP status, 0 for none
+ * @return string|false            the body, or false on no answer (and on an
+ *                                 HTTP error, with $failOnError)
+ */
+function FppdCommand($command, array $args = array(), $connectTimeoutMs = 200, $timeout = 0, $failOnError = true, &$httpCode = null)
+{
+    $curl = curl_init('http://localhost:32322/command/' . rawurlencode($command));
+    curl_setopt($curl, CURLOPT_POST, true);
+    curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode(array_values($args)));
+    curl_setopt($curl, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+    curl_setopt($curl, CURLOPT_FAILONERROR, $failOnError);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, $connectTimeoutMs);
+    if ($timeout > 0) {
+        curl_setopt($curl, CURLOPT_TIMEOUT, $timeout);
+    }
+    $body = curl_exec($curl);
+    $httpCode = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+    curl_close($curl);
+    return $body;
+}
+
+/**
+ * Whether a string can be a plugin's directory name.
+ *
+ * A plugin name becomes a path component under the plugins directory, so "."
+ * (the plugins directory itself, where a stray file would then load as a
+ * plugin) and ".." must never pass, nor any dot-prefixed name.  Only
+ * [A-Za-z0-9_.-], like the installer (scripts/install_plugin) accepts.
+ */
+function IsValidPluginName($name)
+{
+    return is_string($name) && preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/', $name) === 1 &&
+        strpos($name, '..') === false;
+}
+
+/**
+ * Whether a value may be stored for a setting.
+ *
+ * Every setting is one `key = "value"` line, so a line break would smuggle in
+ * extra settings.  Beyond that, the settings listed here end up in root shell
+ * commands or in config files that are sourced as shell (ApplySetting(),
+ * ApplyEmailConfig(), fppinit at boot), so they are held to the shape their
+ * consumers expect.  Writing an invalid value is refused rather than repaired:
+ * the value would otherwise sit in the settings file, be carried into backups
+ * and be applied again at the next restore or boot.
+ *
+ * The consumers still escape what they use; this is the single gate that keeps
+ * a hostile value from being stored in the first place, whichever path wrote it
+ * (the settings API, a backup restore, the setup wizard).
+ */
+function IsValidSettingValue($name, $value)
+{
+    $value = (string) $value;
+    if (strpbrk($value, "\r\n\0") !== false) {
+        return false;
+    }
+
+    switch ($name) {
+        case 'HostName':
+            return preg_match('/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/', $value) === 1;
+        case 'emailserver':
+            return $value === '' || preg_match('/^[A-Za-z0-9.-]+$/', $value) === 1;
+        case 'emailtoemail':
+            return IsValidEmailList($value);
+        case 'emailfromuser':
+            return IsValidEmailFromUser($value);
+        case 'ForceHDMIResolution':
+        case 'ForceHDMIResolutionPort2':
+            return preg_match('/^[A-Za-z0-9@]+$/', $value) === 1;
+        case 'InstalledCape':
+            return preg_match('/^[A-Za-z0-9][A-Za-z0-9._+-]*$/', $value) === 1 || $value === '--None--';
+        case 'screensaverTimeout':
+            return $value === '' || ctype_digit($value);
+        case 'TimeZone':
+            return $value === '' || IsValidTimeZone($value);
+        // Used unquoted in root commands by fppinit at boot.
+        case 'WifiRegulatoryDomain':
+            return preg_match('/^[A-Za-z0-9]{0,3}$/', $value) === 1;
+        case 'TetherInterface':
+            return preg_match('/^[A-Za-z0-9._-]*$/', $value) === 1;
+        // Spliced into a JSON string in Chromium's managed policy by fppinit.
+        case 'KioskUrl':
+            return strpbrk($value, "\"\\") === false && preg_match('/[\x00-\x1f]/', $value) === 0;
+    }
+    return true;
+}
+
+/**
+ * Empty, or a comma-separated list of plain email addresses.
+ *
+ * These values are written into /etc/aliases and exim's email-addresses file,
+ * where other forms (":include:", "|command", a bare path) mean something else.
+ */
+function IsValidEmailList($value)
+{
+    if (trim($value) === '') {
+        return true;
+    }
+    foreach (explode(',', $value) as $address) {
+        if (filter_var(trim($address), FILTER_VALIDATE_EMAIL) === false) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * The sender address for exim's email-addresses rewrite table.  It falls back
+ * to the SMTP login when unset, which need not be an email address, so only
+ * refuse what changes the meaning of a table entry.
+ */
+function IsValidEmailFromUser($value)
+{
+    return preg_match('/^[^\s,:|"\/]*$/', $value) === 1;
+}
+
+function IsValidTimeZone($tz)
+{
+    return in_array($tz, timezone_identifiers_list(DateTimeZone::ALL_WITH_BC), true);
+}
+
+/**
+ * Write a single setting to the settings file, or to a plugin's config file.
+ *
+ * Returns true once the value is on disk (including when it was already the
+ * stored value), false if it could not be written.  Callers that tell a user
+ * the setting was saved MUST check the return - reporting success on a failed
+ * write shows a "saved" toast for a value that reverts on the next page load.
+ */
+function WriteSettingToFile($settingName, $new_setting_value, $plugin = "")
+{
+    global $settingsFile;
+    global $settings;
+    $filename = $settingsFile;
+
+    if ($plugin != "") {
+        $filename = $settings['configDirectory'] . "/plugin." . $plugin;
+    }
+
+    // A trailing line break (e.g. from command output) is dropped by the reader
+    // anyway; anything else invalid is refused (see IsValidSettingValue()).
+    if (is_string($new_setting_value)) {
+        $new_setting_value = rtrim($new_setting_value, "\r\n");
+    }
+    if (!IsValidSettingValue($plugin == "" ? $settingName : "", $new_setting_value)) {
+        error_log("WriteSettingToFile: refusing invalid value for '$settingName'.");
+        return false;
+    }
+
+    $fd = @fopen($filename, "c+");
+    if ($fd === false) {
+        $fd = RepairConfigFileOwnership($filename) ? @fopen($filename, "c+") : false;
+        if ($fd === false) {
+            error_log("WriteSettingToFile: cannot open '$filename' for writing; '$settingName' was NOT saved.");
+            return false;
+        }
+    }
+    flock($fd, LOCK_EX);
+    $tmpSettings = custom_parse_ini_file($filename);
+    if (!isset($tmpSettings[$settingName]) || $tmpSettings[$settingName] != $new_setting_value) {
+        $tmpSettings[$settingName] = $new_setting_value;
+        $RevisedSettingsStr = "";
+        foreach ($tmpSettings as $key => $value) {
+            if (json_object_validate(($value))) {
+                $value = remove_outer_quotes($value);
+                $RevisedSettingsStr .= $key . " = " . $value . "\n";
+            } else {
+                $RevisedSettingsStr .= $key . " = \"" . $value . "\"\n";
+            }
+        }
+        if (@file_put_contents($filename, $RevisedSettingsStr) === false) {
+            error_log("WriteSettingToFile: write to '$filename' failed; '$settingName' was NOT saved.");
+            flock($fd, LOCK_UN);
+            fclose($fd);
+            return false;
+        }
+    }
+    if ($plugin == "") {
+        $settings[$settingName] = $new_setting_value;
+    }
+    flock($fd, LOCK_UN);
+    fclose($fd);
+    return true;
+}
+
+/**
+ * Atomically write $data to $path.
+ *
+ * Writes to a temp file in the SAME directory, flushes it, then rename()s it over
+ * the destination.  Because rename() is atomic within a single filesystem, any
+ * concurrent reader -- or fppd's inotify-driven config reload -- always sees
+ * either the complete old file or the complete new file, never a truncated or
+ * partially-written one.  This replaces in-place truncate+write (file_put_contents
+ * / ftruncate+fwrite), which exposes a window where the file is empty or partial
+ * and produces intermittent JSON parse errors in readers that fire on the write.
+ *
+ * Returns true on success, false (and logs) on any failure, leaving the existing
+ * destination untouched.
+ *
+ * @param string $path Destination file path.
+ * @param string $data Full contents to write.
+ * @return bool
+ */
+function WriteFileAtomic($path, $data)
+{
+    // The temp file MUST live in the same directory as $path so the rename stays
+    // within one filesystem (a cross-filesystem rename is not atomic).
+    $tmp = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+
+    $f = @fopen($tmp, 'xb'); // exclusive create; never clobber an existing temp
+    if ($f === false) {
+        error_log("WriteFileAtomic: unable to create temp file $tmp");
+        return false;
+    }
+
+    $len = strlen($data);
+    $ok = (@fwrite($f, $data) === $len);
+    if ($ok) {
+        fflush($f);
+        // fsync() (PHP 8.1+) flushes to disk so a crash can't leave a 0-length
+        // file in place after the rename.  Best-effort: skip if unavailable.
+        if (function_exists('fsync')) {
+            @fsync($f);
+        }
+    }
+    fclose($f);
+
+    if (!$ok) {
+        @unlink($tmp);
+        error_log("WriteFileAtomic: failed writing temp file for $path");
+        return false;
+    }
+
+    // fopen() created the temp 0600 (minus umask); match the destination's
+    // existing permissions, or a sane group-writable default for a new file.
+    $perms = @fileperms($path);
+    @chmod($tmp, ($perms !== false) ? ($perms & 0777) : 0664);
+
+    if (!@rename($tmp, $path)) {
+        @unlink($tmp);
+        error_log("WriteFileAtomic: unable to rename temp into place for $path");
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Resolve a stable ALSA card ID (e.g. "S3", "bcm2835ALSA") to its current ALSA
+ * card number by scanning /proc/asound/cards.  Returns the card number as a
+ * string, or '' if no currently-present card matches that ID.
+ *
+ * Inverse of pipewire.php's ResolveAlsaCardNumberToId().  Lives in common.php so
+ * it is available to every page/controller (e.g. backup.php) and not just the
+ * API controllers, which are auto-loaded together.
+ */
+function ResolveAlsaCardIdToNumber($cardId)
+{
+    $cardId = trim((string) $cardId);
+    if ($cardId === '') {
+        return '';
+    }
+    $cardsFile = @file_get_contents('/proc/asound/cards');
+    if ($cardsFile && preg_match_all('/^\s*(\d+)\s*\[([^\]]+)\]/m', $cardsFile, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            if (trim($row[2]) === $cardId) {
+                return $row[1];
+            }
+        }
+    }
+    return '';
+}
+
+/**
+ * The ALSA PCM devices that can play ($stream 'playback') or record
+ * ('capture'), in card then device order: what `aplay -l` / `arecord -l` list,
+ * read from /proc/asound instead.  Those tools translate their output -- under
+ * fr_FR every line starts "carte", not "card" -- so parsing them found no cards
+ * at all on a non-English system.  The kernel's files are never translated,
+ * and need no sudo or subprocess.
+ *
+ * Each entry has cardNum, cardId (the stable ID, e.g. "S3"), cardName (the
+ * bracketed card name aplay prints), deviceNum, deviceId and deviceName.
+ * Empty when there is no ALSA (macOS) or no card.
+ */
+function GetAlsaPcmDevices($stream = 'playback')
+{
+    $cards = array(); // cardNum -> array(id, name)
+    $cardsFile = @file_get_contents('/proc/asound/cards');
+    // " 2 [S3             ]: USB-Audio - Sound Blaster Play! 3" -- the driver
+    // name never contains " - ", so the first one ends it.
+    if ($cardsFile && preg_match_all('/^\s*(\d+)\s*\[([^\]]*)\]:\s*.*? - (.*)$/m', $cardsFile, $m, PREG_SET_ORDER)) {
+        foreach ($m as $row) {
+            $cards[intval($row[1])] = array(trim($row[2]), trim($row[3]));
+        }
+    }
+    $devices = array();
+    $pcmFile = @file_get_contents('/proc/asound/pcm');
+    if (!$pcmFile) {
+        return $devices;
+    }
+    // "02-00: <id> : <name> : playback 1 : capture 1"
+    foreach (explode("\n", $pcmFile) as $line) {
+        if (!preg_match('/^(\d+)-(\d+): (.*?) : (.*?)((?: : (?:playback|capture) \d+)+)$/', $line, $pm)) {
+            continue;
+        }
+        $cardNum = intval($pm[1]);
+        if (!isset($cards[$cardNum]) || !preg_match('/ : ' . $stream . ' \d+/', $pm[5])) {
+            continue;
+        }
+        $devices[] = array(
+            'cardNum' => $cardNum,
+            'cardId' => $cards[$cardNum][0],
+            'cardName' => $cards[$cardNum][1],
+            'deviceNum' => intval($pm[2]),
+            'deviceId' => trim($pm[3]),
+            'deviceName' => trim($pm[4]),
+        );
+    }
+    return $devices;
+}
+
+/**
+ * A GetAlsaPcmDevices() entry as the line `LC_ALL=C aplay -l` prints for it,
+ * for code that matches on that text (channel quirks, Pi onboard audio).
+ */
+function AlsaPcmDeviceLine($d)
+{
+    return sprintf("card %d: %s [%s], device %d: %s [%s]", $d['cardNum'], $d['cardId'], $d['cardName'],
+        $d['deviceNum'], $d['deviceId'], $d['deviceName']);
+}
+
+/**
+ * Sets the Audio Output device
+ *
+ * Lives here, beside ResolveAlsaCardIdToNumber() which it depends on, because
+ * both callers need it and they do not share anything smaller: backup.php (on
+ * restore) and the settings API's AudioOutput branch.  It used to be defined in
+ * backup.php alone, which the API never includes, so every
+ * PUT /api/settings/AudioOutput died on "Call to undefined function
+ * SetAudioOutput()".  The setting had already been written by then, but the
+ * apply that follows it -- in Simple mode, the call that rebuilds the whole
+ * audio graph for the newly chosen card -- never ran, so picking a sound card
+ * persisted the choice and changed nothing.
+ *
+ * @param $card String soundcard
+ * @return  string
+ */
+function SetAudioOutput($card)
+{
+    global $SUDO, $debug, $settings;
+
+    // $card is a stable ALSA card ID (legacy callers may still pass a numeric
+    // index). Resolve to the current ALSA card number for the ALSA tools below.
+    $cardNum = ResolveAlsaCardIdToNumber($card);
+    if ($cardNum === '') {
+        $cardNum = ctype_digit((string) $card) ? (string) $card : '0';
+    }
+
+    if ($cardNum != 0 && file_exists("/proc/asound/card$cardNum")) {
+        exec($SUDO . " sed -i 's/card [0-9]/card " . $cardNum . "/' /root/.asoundrc", $output, $return_val);
+        unset($output);
+        if ($return_val) {
+            error_log("Failed to set audio to card $card ($cardNum)!");
+            return;
+        }
+        if ($debug) {
+            error_log("Setting to audio output $card ($cardNum)");
+        }
+    } else if ($cardNum == 0) {
+        exec($SUDO . " sed -i 's/card [0-9]/card " . $cardNum . "/' /root/.asoundrc", $output, $return_val);
+        unset($output);
+        if ($return_val) {
+            error_log("Failed to set audio back to default!");
+            return;
+        }
+        if ($debug) {
+            error_log("Setting default audio");
+        }
+
+    }
+    // need to also reset mixer device
+    $AudioMixerDevice = exec("sudo amixer -c $cardNum scontrols | head -1 | cut -f2 -d\"'\"", $output, $return_val);
+    unset($output);
+    if ($return_val == 0) {
+        WriteSettingToFile("AudioMixerDevice", $AudioMixerDevice);
+        if ($settings['Platform'] == "Raspberry Pi" && $cardNum == 0) {
+            $type = '';
+            foreach (GetAlsaPcmDevices('playback') as $d) {
+                if ($d['cardNum'] == $cardNum) {
+                    $type = AlsaPcmDeviceLine($d);
+                }
+            }
+            if (strpos($type, '[bcm') !== false) {
+                WriteSettingToFile("AudioCard0Type", "bcm");
+            } else {
+                WriteSettingToFile("AudioCard0Type", "unknown");
+            }
+        } else {
+            WriteSettingToFile("AudioCard0Type", "unknown");
+        }
+    }
+    return $card;
+}
+
+/**
+ * Normalize a stored AudioOutput value to a stable ALSA card ID.  AudioOutput is
+ * persisted as a card ID, but legacy installs (and the brief window before
+ * FPPINIT migrates the value at boot) may still hold a numeric card index, so
+ * readers accept either form.
+ *   - empty       -> the first present card's ID (or '' if no cards)
+ *   - all-numeric -> legacy card index, resolved to that card's ID via
+ *                    /proc/asound/cardN/id ('' if the index is no longer present)
+ *   - otherwise   -> already a card ID, returned as-is
+ */
+function NormalizeAudioOutputToCardId($value)
+{
+    $value = trim((string) $value);
+    if ($value === '') {
+        $cardsFile = @file_get_contents('/proc/asound/cards');
+        if ($cardsFile && preg_match('/^\s*(\d+)\s*\[([^\]]+)\]/m', $cardsFile, $m)) {
+            return trim($m[2]);
+        }
+        return '';
+    }
+    if (ctype_digit($value)) {
+        $idFile = "/proc/asound/card{$value}/id";
+        if (file_exists($idFile)) {
+            $id = trim(@file_get_contents($idFile));
+            if ($id !== '') {
+                return $id;
+            }
+        }
+        return '';
+    }
+    return $value;
+}
+
+/*
+ * The audio card this boot plays on.  Boot (fppinit) falls back to another
+ * card when the selected one is missing or is HDMI with no display, uses it
+ * for this boot only, and records it in /run/fppd/audio-output.json; the
+ * AudioOutput setting keeps the user's choice.  Returns the fallback while
+ * $stored is still what boot saw as the selection, otherwise $stored (the
+ * user has picked something since).  Use it where the card actually playing
+ * matters, not where the user's choice is shown.
+ */
+function EffectiveAudioOutput($stored)
+{
+    $stored = trim((string) $stored);
+    $eff = @json_decode(@file_get_contents('/run/fppd/audio-output.json'), true);
+    if (is_array($eff) && isset($eff['selected'], $eff['effective'])
+        && trim((string) $eff['selected']) === $stored && $eff['effective'] !== '') {
+        return $eff['effective'];
+    }
+    return $stored;
+}
+
+function DeleteSettingFromFile($settingName, $plugin = "")
+{
+    global $settingsFile;
+    global $settings;
+    $filename = $settingsFile;
+
+    if ($plugin != "") {
+        $filename = $settings['configDirectory'] . "/plugin." . $plugin;
+    }
+
+    $fd = @fopen($filename, "c+");
+    if ($fd === false) {
+        $fd = RepairConfigFileOwnership($filename) ? @fopen($filename, "c+") : false;
+        if ($fd === false) {
+            error_log("DeleteSettingFromFile: cannot open '$filename' for writing; '$settingName' was NOT removed.");
+            return false;
+        }
+    }
+    flock($fd, LOCK_EX);
+    // Parse and write exactly as WriteSettingToFile() does: the stock
+    // parse_ini_file() strips embedded '"' and corrupts JSON values.
+    $tmpSettings = custom_parse_ini_file($filename);
+    if (isset($tmpSettings[$settingName])) {
+        unset($tmpSettings[$settingName]);
+        $settingsStr = "";
+        foreach ($tmpSettings as $key => $value) {
+            if (json_object_validate(($value))) {
+                $value = remove_outer_quotes($value);
+                $settingsStr .= $key . " = " . $value . "\n";
+            } else {
+                $settingsStr .= $key . " = \"" . $value . "\"\n";
+            }
+        }
+        if (@file_put_contents($filename, $settingsStr) === false) {
+            error_log("DeleteSettingFromFile: write to '$filename' failed; '$settingName' was NOT removed.");
+            flock($fd, LOCK_UN);
+            fclose($fd);
+            return false;
+        }
+    }
+    if ($plugin == "") {
+        unset($settings[$settingName]);
+    }
+    flock($fd, LOCK_UN);
+    fclose($fd);
+    return true;
+}
+
+function IfSettingEqualPrint($setting, $value, $print, $pluginName = "", $defaultValue = "")
+{
+    global $settings;
+    global $pluginSettings;
+
+    if ($pluginName != "") {
+        if (($defaultValue != "") && !isset($pluginSettings[$setting])) {
+            $pluginSettings[$setting] = $defaultValue;
+        }
+
+        if (
+            (isset($pluginSettings[$setting])) &&
+            ($pluginSettings[$setting] == $value)
+        ) {
+            echo $print;
+        }
+
+    } else {
+        if (($defaultValue != "") && !isset($settings[$setting])) {
+            $settings[$setting] = $defaultValue;
+        }
+
+        if (
+            (isset($settings[$setting])) &&
+            ($settings[$setting] == $value)
+        ) {
+            echo $print;
+        }
+
+    }
+}
+
+function IsInList($value, $list)
+{
+    $values = explode(",", $list);
+    $ret = in_array($value, $values);
+    return $ret;
+}
+function IfSettingInListPrint($setting, $value, $print, $pluginName = "", $defaultValue = "")
+{
+    global $settings;
+    global $pluginSettings;
+
+    if ($pluginName != "") {
+        if (($defaultValue != "") && !isset($pluginSettings[$setting])) {
+            $pluginSettings[$setting] = $defaultValue;
+        }
+
+        if (
+            (isset($pluginSettings[$setting])) &&
+            IsInList($value, $pluginSettings[$setting])
+        ) {
+            echo $print;
+        }
+
+    } else {
+        if (($defaultValue != "") && !isset($settings[$setting])) {
+            $settings[$setting] = $defaultValue;
+        }
+
+        if (
+            (isset($settings[$setting])) &&
+            IsInList($value, $settings[$setting])
+        ) {
+            echo $print;
+        }
+
+    }
+}
+
+function LoadPluginSettingInfos($plugin)
+{
+    global $settings;
+    global $settingInfos;
+    global $settingGroups;
+    global $mediaDirectory;
+    global $pluginSettingInfosLoaded;
+    global $pluginSettingInfos;
+
+    if (empty($settingInfos) || empty($settingGroups)) {
+        LoadSettingInfos();
+    }
+
+    if (!$pluginSettingInfosLoaded) {
+        $file = $mediaDirectory . '/plugins/' . $plugin . '/settings.json';
+
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            $pluginSettingInfos = $data['settings'];
+            $settingInfos = array_merge($settingInfos, $data['settings']);
+            $settingGroups = array_merge($settingGroups, $data['settingGroups']);
+        }
+        $pluginSettingInfosLoaded = 1;
+    }
+}
+
+function filterForPlatformControls($data)
+{
+    $key = "platforms";
+    $filtered_result = $data;
+
+    // check arrays contained in this array.
+    foreach ($data as $element) {
+        //var_dump($element);
+        //var_dump($element);
+        echo "<br><br>";
+        if (is_array($element) && $element[$key] === "all") {
+            $filtered_result = array_merge($filtered_result, $element);
+        }
+    }
+
+    //var_dump($filtered_result);
+    return $filtered_result;
+
+}
+
+function LoadTroubleShootingCommands()
+{
+    global $troubleshootingCommands;
+    global $troubleshootingCommandGroups;
+    global $troubleshootingCommandsLoaded;
+
+    if (!$troubleshootingCommandsLoaded) {
+        $file = '/opt/fpp/www/troubleshoot-commands.json';
+
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            $troubleshootingCommandGroupsRaw = $data["CommandGroups"];
+            //filter for only current platform commands
+            $troubleshootingCommandGroups = $troubleshootingCommandGroupsRaw;
+            //$troubleshootingCommandGroups = filterForPlatformControls($troubleshootingCommandGroupsRaw);
+            $troubleshootingCommandsLoaded = 1;
+        } else {
+            echo "error no troubleshoot-commands.json";
+        }
+    }
+}
+
+// Drop the troubleshooting groups and commands whose "level" is above the UI
+// level.  "level" means what it does in settings.json (0 Basic, 1 Advanced,
+// 2 Experimental, 3 Developer) and only hides an entry from the Troubleshooting
+// page: a Diagnostic Report still runs it.
+function FilterTroubleshootingCommandsByLevel($groups)
+{
+    global $settings;
+    $uiLevel = isset($settings['uiLevel']) ? intval($settings['uiLevel']) : 0;
+
+    $shown = array();
+    foreach ($groups as $grpID => $grp) {
+        if (($grp['level'] ?? 0) > $uiLevel) {
+            continue;
+        }
+        $grp['commands'] = array_filter($grp['commands'], function ($cmd) use ($uiLevel) {
+            return ($cmd['level'] ?? 0) <= $uiLevel;
+        });
+        $shown[$grpID] = $grp;
+    }
+    return $shown;
+}
+
+function MergeDefaultsFromPluginSettings($plugin)
+{
+    global $pluginSettingInfos;
+    global $pluginSettings;
+
+    LoadPluginSettingInfos($plugin);
+    foreach ($pluginSettingInfos as $key => $value) {
+        if (!isset($pluginSettings[$key]) && isset($value["default"])) {
+            $pluginSettings[$key] = $value["default"];
+        }
+    }
+}
+function LoadPluginSettings($pluginName)
+{
+    global $pluginSettings, $settings;
+    $pluginConfigFile = $settings['configDirectory'] . "/plugin." . $pluginName;
+    if (file_exists($pluginConfigFile)) {
+        $pluginSettings = [];
+        $fd = @fopen($pluginConfigFile, "r");
+        if ($fd) {
+            flock($fd, LOCK_SH);
+            // Not parse_ini_file(): it strips embedded '"' from the JSON values
+            // WriteSettingToFile() stores unquoted, and fails the whole file on
+            // a syntax error.
+            $pluginSettings = custom_parse_ini_file($pluginConfigFile);
+            flock($fd, LOCK_UN);
+            fclose($fd);
+        }
+    }
+    MergeDefaultsFromPluginSettings($pluginName);
+}
+function ParseBooleanValue($value)
+{
+    return $value == "1" || $value == "true" || $value == "TRUE" || $value == "ON" || $value == "on";
+}
+
+function PrintPluginSetting($plugin, $setting, $callback = '', $options = array())
+{
+    PrintSetting($setting, $callback, $options, $plugin);
+}
+
+function PrintIcon($level)
+{
+    if ($level == 1) {
+        echo " <i class='fas fa-fw fa-graduation-cap fa-nbsp ui-level-1' title='Advanced Level Setting'></i>";
+    } else if ($level == 2) {
+        echo " <i class='fas fa-fw fa-flask fa-nbsp ui-level-2' title='Experimental Level Setting'></i>";
+    } else if ($level == 3) {
+        echo " <i class='fas fa-fw fa-code fa-nbsp ui-level-3' title='Developer Level Setting'></i>";
+    } else {
+        echo " <i class='fas fa-fw fa-nbsp ui-level-0'></i>";
+    }
+
+}
+
+/**
+ * Scans /sys/class/thermal for thermal zones that have a fan cooling device
+ * bound to them (the Pi5 case/active-cooler fan, or a cape fan wired into a
+ * thermal zone via device tree) and returns the "active" trip points those
+ * fans are bound to.  Passive/critical trips (CPU throttle/shutdown) are
+ * never included, even in zones that also drive a fan.
+ *
+ * The per-trip setting names derived here (FanTrip_<zone type stripped to
+ * alphanumerics>_<trip index>) must match applyThermalSettings() in
+ * src/boot/FPPINIT_Config.cpp, which re-applies the saved values to sysfs at
+ * boot (trip points reset to their device tree defaults on every boot).
+ *
+ * Returns an array of zones:
+ *   [ [ 'zone' => 'thermal_zone2', 'type' => 'K16-Pro-thermal',
+ *       'label' => 'K16-Pro', 'settingBase' => 'FanTrip_K16Prothermal',
+ *       'trips' => [ 0 => 40.0, 1 => 50.0, 2 => 60.0 ] ], ... ]
+ * where trips maps trip index to the current sysfs temperature in C.
+ */
+function GetFanThermalZones()
+{
+    $zones = array();
+    foreach (glob('/sys/class/thermal/thermal_zone*') as $zdir) {
+        if (!preg_match('/thermal_zone\d+$/', $zdir)) {
+            continue;
+        }
+        $ztype = trim(@file_get_contents($zdir . '/type'));
+        if ($ztype == '') {
+            continue;
+        }
+
+        // Collect the trip point indexes that fan cooling devices are bound to
+        $fanTrips = array();
+        foreach (glob($zdir . '/cdev*_trip_point') as $ctp) {
+            $cdevType = trim(@file_get_contents(substr($ctp, 0, -strlen('_trip_point')) . '/type'));
+            if (stripos($cdevType, 'fan') === false) {
+                continue;
+            }
+            $trip = trim(@file_get_contents($ctp));
+            if (is_numeric($trip) && $trip >= 0) {
+                $fanTrips[intval($trip)] = true;
+            }
+        }
+        if (empty($fanTrips)) {
+            continue;
+        }
+
+        $trips = array();
+        ksort($fanTrips);
+        foreach (array_keys($fanTrips) as $t) {
+            $tripType = trim(@file_get_contents($zdir . '/trip_point_' . $t . '_type'));
+            if ($tripType != 'active') {
+                continue;
+            }
+            $temp = trim(@file_get_contents($zdir . '/trip_point_' . $t . '_temp'));
+            if (!is_numeric($temp)) {
+                continue;
+            }
+            $trips[$t] = intval($temp) / 1000.0;
+        }
+        if (empty($trips)) {
+            continue;
+        }
+
+        $label = preg_replace('/[-_]?thermal$/i', '', $ztype);
+        if ($label == '') {
+            $label = $ztype;
+        }
+        if (strtolower($label) == 'cpu') {
+            $label = 'CPU';
+        }
+
+        $zones[] = array(
+            'zone' => basename($zdir),
+            'type' => $ztype,
+            'label' => $label,
+            'settingBase' => 'FanTrip_' . preg_replace('/[^a-zA-Z0-9]/', '', $ztype),
+            'trips' => $trips,
+        );
+    }
+    return $zones;
+}
+
+/**
+ * Renders the dynamic fan trip temperature settings for any thermal zones
+ * with a fan bound to them.  Emits nothing when the hardware has no fan.
+ * Setting names are dynamic (per zone/trip), so these are synthesized into
+ * $settingInfos here rather than declared in settings.json.
+ */
+function PrintFanThermalSettings()
+{
+    global $settingInfos;
+
+    $zones = GetFanThermalZones();
+    if (empty($zones)) {
+        return;
+    }
+
+    LoadSettingInfos();
+
+    echo "<h2>Fan Temperatures</h2>\n";
+    echo "<div class='container-fluid settingsTable settingsGroupTable'>\n";
+    echo "<div class='row'><div class='col-md'>Temperatures at which the cooling fan turns on and speeds up.  Changes are applied immediately and re-applied on every boot.</div></div>\n";
+    foreach ($zones as $zone) {
+        if (count($zones) > 1) {
+            echo "<div class='row'><div class='col-md'><b>" . htmlspecialchars($zone['label']) . "</b></div></div>\n";
+        }
+        $numTrips = count($zone['trips']);
+        $speed = 1;
+        foreach ($zone['trips'] as $tripIndex => $currentTemp) {
+            $name = $zone['settingBase'] . '_' . $tripIndex;
+            if ($numTrips == 1) {
+                $desc = 'Fan On Temperature';
+                $tip = 'Temperature above which the ' . $zone['label'] . ' fan turns on.';
+            } else if ($speed == 1) {
+                $desc = 'Fan On (Speed 1) Temperature';
+                $tip = 'Temperature above which the ' . $zone['label'] . ' fan turns on at its lowest speed.';
+            } else {
+                $desc = 'Fan Speed ' . $speed . ' Temperature';
+                $tip = 'Temperature above which the ' . $zone['label'] . ' fan increases to speed ' . $speed . ' of ' . $numTrips . '.';
+            }
+            $settingInfos[$name] = array(
+                'name' => $name,
+                'description' => $desc,
+                'tip' => $tip,
+                'type' => 'number',
+                'default' => round($currentTemp, 1),
+                'min' => 20,
+                'max' => 95,
+                'step' => 1,
+                'suffix' => ' C',
+            );
+            PrintSetting($name);
+            $speed++;
+        }
+    }
+    echo "<div class='row'><div class='printSettingLabelCol col-md-4 col-lg-3 col-xxxl-2'></div><div class='printSettingFieldCol col-md'>";
+    echo "<input type='button' class='buttons' value='Reset to Defaults' onClick='ResetFanTripsToDefaults();'>";
+    echo "</div></div>\n";
+    echo "</div>\n";
+    echo "<script>\n";
+    echo "function ResetFanTripsToDefaults() {\n";
+    echo "    if (!confirm('Reset all fan temperatures to the hardware defaults?'))\n";
+    echo "        return;\n";
+    echo "    var result = Post('api/settings/fanThermal/reset', false, '');\n";
+    echo "    if (result.status == 'OK') {\n";
+    echo "        location.reload();\n";
+    echo "    } else {\n";
+    echo "        DialogError('Fan Temperatures', 'Failed to reset fan temperatures: ' + result.status);\n";
+    echo "    }\n";
+    echo "}\n";
+    echo "</script>\n";
+}
+
+function ShouldPrintSetting($s)
+{
+    global $settings;
+    $level = isset($s['level']) ? $s['level'] : 0;
+
+    if ($settings['uiLevel'] < $level) {
+        return false;
+    }
+    if (isset($s['checkFile'])) {
+        $checkFileOK = 0;
+        foreach ($s['checkFile'] as $f) {
+            $invertCheck = false;
+            if ($f[0] == '!') {
+                $f = substr($f, 1);
+                $invertCheck = true;
+            }
+            if (file_exists($f)) {
+                if (!$invertCheck) {
+                    $checkFileOK = 1;
+                }
+            } else if ($invertCheck) {
+                $checkFileOK = 1;
+            }
+        }
+        if ($checkFileOK == 0) {
+            return false;
+        }
+    }
+    if (isset($s['fppModes'])) {
+        if (
+            !in_array('ALL', $s['fppModes']) &&
+            !in_array($settings['fppMode'], $s['fppModes'])
+        ) {
+            return false;
+        }
+    }
+    if (isset($s['platforms'])) {
+        $hasNonExclusion = false;
+        $hasAll = false;
+        $hasPlatform = false;
+        foreach ($s['platforms'] as $platform) {
+            if (("!" . $settings['Platform']) == $platform) {
+                return false;
+            }
+            if ($platform[0] != "!") {
+                $hasNonExclusion = true;
+            }
+            if ($platform == "ALL") {
+                $hasAll = true;
+            }
+            if ($platform == $settings['Platform']) {
+                $hasPlatform = true;
+            }
+        }
+        if (!$hasAll && !$hasPlatform && $hasNonExclusion) {
+            return false;
+        }
+    }
+    if (isset($s['variants']) && isset($s['variants'][$settings['Platform']])) {
+        $hasNonExclusion = false;
+        $hasAll = false;
+        $hasVariant = false;
+        foreach ($s['variants'][$settings['Platform']] as $variant) {
+            if (("!" . $settings['Variant']) == $variant) {
+                return false;
+            }
+            if ($variant[0] != "!") {
+                $hasNonExclusion = true;
+            }
+            if ($variant == "ALL") {
+                $hasAll = true;
+            }
+            if ($variant == $settings['Variant']) {
+                $hasVariant = true;
+            }
+        }
+        if (!$hasAll && !$hasVariant && $hasNonExclusion) {
+            return false;
+        }
+    }
+    if (isset($s['settingValues'])) {
+        foreach ($s['settingValues'] as $key => $value) {
+            if (!isset($settings[$key]) || ($settings[$key] != $value)) {
+                return false;
+            }
+        }
+    }
+    if (!isset($settings['showAllOptions']) || $settings['showAllOptions'] == 0) {
+        if (isset($settings["cape-info"]["hide"]["settings"])) {
+            if (in_array($s['name'], $settings["cape-info"]["hide"]["settings"])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function PrintSetting($setting, $callback = '', $options = array(), $plugin = '')
+{
+    global $settings;
+    global $settingInfos;
+    global $pluginSettingInfos;
+
+    LoadSettingInfos();
+
+    if ($plugin != '') {
+        LoadPluginSettingInfos($plugin);
+    }
+
+    if (!isset($settingInfos[$setting])) {
+        echo "<div class='row'><div class='col td-colspan-2' colspan='2'><b>Invalid Setting: $setting</b></div></div>\n";
+        return;
+    }
+
+    if ($plugin == '') {
+        $s = $settingInfos[$setting];
+    } else {
+        $s = $pluginSettingInfos[$setting];
+    }
+
+    $level = isset($s['level']) ? $s['level'] : 0;
+    $reloadUI = isset($s['reloadUI']) ? $s['reloadUI'] : 0;
+    $textOnRight = isset($s['textOnRight']) ? $s['textOnRight'] : 0;
+
+    if (($callback == '') && ($reloadUI == 1)) {
+        $callback = 'reloadSettingsPage';
+    }
+
+    if (ShouldPrintSetting($s)) {
+        $restart = isset($s['restart']) ? $s['restart'] : 0;
+        $reboot = isset($s['reboot']) ? $s['reboot'] : 0;
+        $suffix = isset($s['suffix']) ? $s['suffix'] : '';
+        $labelClass = isset($s['labelClass']) ? $s['labelClass'] : 'col-md-4 col-lg-3 col-xxxl-2';
+        $fieldClass = isset($s['fieldClass']) ? $s['fieldClass'] : 'col-md';
+
+        if ($textOnRight) {
+            echo "<div class='row' id='" . $setting . "Row'><div class='printSettingLabelCol " . $labelClass . "'>";
+        } else {
+            echo "<div class='row' id='" . $setting . "Row'><div class='printSettingLabelCol " . $labelClass . "'><div class='description'>";
+            PrintIcon($level);
+            echo $s['description'] . "</div></div><div class='printSettingFieldCol " . $fieldClass . "'>";
+        }
+
+        switch ($s['type']) {
+            case 'datalist':
+            case 'select':
+                if (empty($options)) {
+                    if (isset($s['optionsURL'])) {
+                        $json = "";
+                        $url = $s['optionsURL'];
+                        if (!preg_match('/^\//', $s['optionsURL'])) {
+                            $url = "http://127.0.0.1/" . $s['optionsURL'];
+                        }
+                        $json = file_get_contents($url);
+                        $options = json_decode($json, true);
+                        if (!(array_keys($options) !== range(0, count($options) - 1))) {
+                            $tmp = $options;
+                            $options = array();
+                            if (isset($s['optionCanBeBlank']) && $s['optionCanBeBlank']) {
+                                $options[""] = "";
+                            }
+                            foreach ($tmp as $item) {
+                                if (isset($s['optionsKey'])) {
+                                    $options[$item[$s['optionsKey']]] = $item[$s['optionsKey']];
+                                } else {
+                                    $options[$item] = $item;
+                                }
+                            }
+                        } else if (isset($s['optionCanBeBlank']) && $s['optionCanBeBlank']) {
+                            $options = array("" => "") + $options;
+                        }
+                    } else if (isset($s['optionsCommand'])) {
+                        $optionsRaw = explode("\n", trim(shell_exec($s['optionsCommand'])));
+                        foreach ($optionsRaw as $line) {
+                            $parts = preg_split("/,/", trim($line));
+                            if (count($parts) > 1) {
+                                $options[$parts[0]] = $parts[1];
+                            } else {
+                                $options[$parts[0]] = $parts[0];
+                            }
+
+                        }
+                    } else if (isset($s['options'])) {
+                        $options = $s['options'];
+                    }
+                }
+
+                $default = isset($s['default']) ? $s['default'] : "";
+
+                if ($s['type'] == "select") {
+                    PrintSettingSelect($s['description'], $setting, $restart, $reboot, $default, $options, $plugin, $callback, '', $s);
+                } else {
+                    $news = $s;
+                    $news['options'] = $options;
+                    $size = isset($s['size']) ? $s['size'] : 32;
+                    $maxlength = isset($s['maxlength']) ? $s['maxlength'] : 32;
+                    PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $plugin, $default, $callback, '', 'datalist', $news);
+                }
+                break;
+            case 'checkbox':
+                $checkedValue = isset($s['checkedValue']) ? $s['checkedValue'] : "1";
+                $uncheckedValue = isset($s['uncheckedValue']) ? $s['uncheckedValue'] : "0";
+                $default = isset($s['default']) ? $s['default'] : "0";
+
+                PrintSettingCheckbox($s['description'], $setting, $restart, $reboot, $checkedValue, $uncheckedValue, $plugin, $callback, $default, '', $s);
+                break;
+            case 'time':
+                $size = 8;
+                $maxlength = 8;
+                $default = isset($s['default']) ? $s['default'] : '';
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $plugin, $default, $callback, '', 'text', $s);
+                break;
+            case 'date':
+                $size = 10;
+                $maxlength = 10;
+                $default = isset($s['default']) ? $s['default'] : '';
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $plugin, $default, $callback, '', 'text', $s);
+                break;
+            case 'text':
+                $size = isset($s['size']) ? $s['size'] : 32;
+                $maxlength = isset($s['maxlength']) ? $s['maxlength'] : 32;
+                $default = isset($s['default']) ? $s['default'] : "";
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $plugin, $default, $callback, '', 'text', $s);
+                break;
+            case 'color':
+                $size = 7;
+                $maxlength = 7;
+                $default = isset($s['default']) ? $s['default'] : "800000";
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $plugin, $default, $callback, '', 'color', $s);
+                break;
+            case 'password':
+                $size = isset($s['size']) ? $s['size'] : 32;
+                $maxlength = isset($s['maxlength']) ? $s['maxlength'] : 32;
+                $default = isset($s['default']) ? $s['default'] : "";
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $plugin, $default, $callback, '', "password", $s);
+
+                echo "<i class='fas fa-eye' id='$setting" . "HideShow' onClick='TogglePasswordHideShow(\"" . $setting . "\");'></i>";
+                break;
+            case 'number':
+                $min = isset($s['min']) ? $s['min'] : 0;
+                $max = isset($s['max']) ? $s['max'] : 99;
+                $step = isset($s['step']) ? $s['step'] : 1;
+                $default = isset($s['default']) ? $s['default'] : "0";
+
+                // Temperature settings are always stored in C because that is what the
+                // kernel wants, but may be entered and displayed in F.  A whole number
+                // of C cannot represent every whole number of F, so the stored value is
+                // allowed a decimal (see PutSetting()); without it 60 of the 136 usable
+                // F values come back a degree lower after a save/reload round trip.
+                if ($setting == 'GPIOFanTemperature' || str_starts_with($setting, 'FanTrip_')) {
+                    if (isset($settings['temperatureInF']) && $settings['temperatureInF'] == 1) {
+                        $origVal = isset($settings[$setting]) ? $settings[$setting] : $default;
+                        $settings[$setting] = round(($origVal * 9 / 5) + 32);
+                        $min = round(($min * 9 / 5) + 32);
+                        $max = round(($max * 9 / 5) + 32);
+                        $default = round(($default * 9 / 5) + 32);
+                        $suffix = ' F';
+                    } else {
+                        // Displaying C: the value may carry the tenth left behind by an
+                        // earlier entry in F, which a step of 1 would flag as invalid.
+                        // "any" still steps the spinner arrows by 1.
+                        $s['step'] = 'any';
+                    }
+                }
+
+                PrintSettingTextSaved($setting, $restart, $reboot, $max, $min, $plugin, $default, $callback, '', 'number', $s);
+                break;
+            case 'modal':
+                // Renders a button that opens a fullscreen modal dialog with an iframe
+                // settings.json properties:
+                //   modalUrl      - URL to load in the modal iframe (required)
+                //   icon          - FontAwesome icon class (e.g. "fas fa-layer-group")
+                //   buttonText    - Text for the button (defaults to description)
+                //   modalTitle    - Title for the modal dialog (defaults to description)
+                //   modalId       - HTML id for the modal (defaults to setting name + "Dlg")
+                $modalUrl = isset($s['modalUrl']) ? $s['modalUrl'] : '';
+                $icon = isset($s['icon']) ? $s['icon'] : '';
+                $buttonText = isset($s['buttonText']) ? $s['buttonText'] : $s['description'];
+                $modalTitle = isset($s['modalTitle']) ? $s['modalTitle'] : $s['description'];
+                $modalId = isset($s['modalId']) ? $s['modalId'] : $setting . 'Dlg';
+                $modalOnClose = isset($s['modalOnClose']) ? $s['modalOnClose'] : '';
+                $iconHtml = $icon ? "<i class='" . htmlspecialchars($icon) . "'></i> " : '';
+
+                echo "<button class='buttons' onclick='OpenSettingModal_" . $setting . "()'>";
+                echo $iconHtml . htmlspecialchars($buttonText);
+                echo "</button>";
+
+                echo "<script>\n";
+                echo "function OpenSettingModal_" . $setting . "() {\n";
+                echo "    DoModalDialog({\n";
+                echo "        id: '" . $modalId . "',\n";
+                echo "        title: '" . addslashes($iconHtml . $modalTitle) . "',\n";
+                echo "        body: '<iframe src=\"" . addslashes($modalUrl) . "\" style=\"width:100%;height:100%;border:none;\"></iframe>',\n";
+                echo "        open: function () {\n";
+                echo "            var dlg = $('#" . $modalId . "');\n";
+                echo "            dlg.find('.modal-dialog').addClass('modal-fullscreen');\n";
+                echo "            dlg.find('.modal-body').css({ 'padding': '0', 'overflow': 'hidden' });\n";
+                if ($modalOnClose) {
+                    echo "            dlg.one('hidden.bs.modal', function() { " . $modalOnClose . "(); });\n";
+                }
+                echo "        },\n";
+                echo "        buttons: {\n";
+                echo "            Close: function () {\n";
+                echo "                bootstrap.Modal.getInstance(document.getElementById('" . $modalId . "')).hide();\n";
+                echo "            }\n";
+                echo "        }\n";
+                echo "    });\n";
+                echo "}\n";
+                echo "</script>\n";
+                break;
+            case 'link':
+                // Renders a button that navigates to a URL in the same window
+                // settings.json properties:
+                //   linkUrl       - URL to navigate to (required)
+                //   icon          - FontAwesome icon class (e.g. "fas fa-project-diagram")
+                //   buttonText    - Text for the button (defaults to description)
+                $linkUrl = isset($s['linkUrl']) ? $s['linkUrl'] : '';
+                $icon = isset($s['icon']) ? $s['icon'] : '';
+                $buttonText = isset($s['buttonText']) ? $s['buttonText'] : $s['description'];
+                $iconHtml = $icon ? "<i class='" . htmlspecialchars($icon) . "'></i> " : '';
+
+                echo "<a class='buttons' href='" . htmlspecialchars($linkUrl) . "'>";
+                echo $iconHtml . htmlspecialchars($buttonText);
+                echo "</a>";
+                break;
+            default:
+                printf("FIXME, handle %s setting type for %s\n", $s['type'], $setting);
+                break;
+        }
+
+        if ($suffix != '') {
+            echo $suffix . ' ';
+        }
+
+        if ($textOnRight) {
+            echo "</div><div class='col-md-auto'><span>" . $s['description'] . "</span> ";
+            PrintIcon($level);
+        }
+
+        PrintToolTip($setting);
+
+        if ($textOnRight) {
+            echo "</div></div>\n";
+        } else {
+            echo "</div></div>\n";
+        }
+
+    }
+}
+
+function PrintPluginSettingGroup($plugin, $group, $appendData = "", $prependData = "", $indent = 1)
+{
+    PrintSettingGroup($group, $appendData, $prependData, $indent, $plugin);
+}
+
+function PrintSettingGroup($group, $appendData = "", $prependData = "", $indent = 1, $plugin = "", $callback = "", $heading = true)
+{
+    global $settings;
+    global $settingGroups;
+
+    LoadSettingInfos();
+
+    if ($plugin != '') {
+        LoadPluginSettingInfos($plugin);
+    }
+
+    if (!isset($settingGroups[$group])) {
+        echo "<b>ERROR: Invalid Setting Group: $group</b><br>\n";
+        return;
+    }
+
+    $g = $settingGroups[$group];
+    $level = isset($g['level']) ? $g['level'] : 0;
+
+    if (
+        ($settings['uiLevel'] >= $level) &&
+        ((!isset($g['fppModes'])) ||
+            (in_array('ALL', $g['fppModes'])) ||
+            (in_array($settings['fppMode'], $g['fppModes']))) &&
+        ((!isset($g['platforms'])) ||
+            (in_array('ALL', $g['platforms'])) ||
+            (in_array($settings['Platform'], $g['platforms'])))
+    ) {
+        if ($heading == true) {
+            echo "<h2>" . $g['description'] . "</h2>\n";
+        }
+        echo "<div class='container-fluid settingsTable ";
+
+        if ($indent) {
+            echo "settingsGroupTable'>\n";
+        } else {
+            echo "'>\n";
+        }
+
+        if ($prependData != "") {
+            if (preg_match("/<div class=row>/", $prependData)) {
+                echo $prependData;
+            } else {
+                echo "<div class=row><div class='col-md' colspan=2>$prependData</div></div>\n";
+            }
+
+        }
+
+        foreach ($g['settings'] as $setting) {
+            if ($plugin != "") {
+                PrintPluginSetting($plugin, $setting, $callback);
+            } else {
+                PrintSetting($setting, $callback);
+            }
+
+        }
+
+        if ($appendData != "") {
+            if (preg_match("/<div class=row>/", $appendData)) {
+                echo $appendData;
+            } else {
+                echo "<div class=row><div class='col-md' colspan=2>$appendData</div></div>\n";
+            }
+
+        }
+
+        echo "</div><br>\n";
+    }
+}
+
+function PrintPluginSettingGroupTable($plugin, $group, $appendData = "", $prependData = "", $indent = 1)
+{
+    PrintSettingGroupTable($group, $appendData, $prependData, $indent, $plugin);
+}
+
+function PrintSettingGroupTable($group, $appendData = "", $prependData = "", $indent = 1, $plugin = "")
+{
+    echo "<div class='settingsTable " . $group . "SettingsTable'>\n";
+    PrintSettingGroup($group, $appendData, $prependData, $indent, $plugin);
+    echo "</div>\n";
+}
+
+// Emits the Update<setting>Children(mode) JS function.
+//
+// $conditions is an ordered map of JS boolean expression => array of child
+// setting names to show when that expression is true.  A child may appear
+// under more than one condition (e.g. Compile Hosts under both 'distcc' and
+// 'nocc'); the show set is computed first and only children not in it are
+// hidden, otherwise a non-matching branch would mark a child hidden and the
+// two-pass UpdateChildSettingsVisibility() would never show it again.
+//
+// mode: 0 = show/hide immediately, 1 = show pass only, 2 = hide pass only
+function PrintSettingChildrenFunction($setting, $conditions, $preamble = "")
+{
+    $names = array();
+    foreach ($conditions as $v) {
+        foreach ($v as $name) {
+            $names[$name] = 1;
+        }
+    }
+
+    echo "function Update$setting" . "Children(mode) {\n";
+    echo $preamble;
+    echo "    var show = {};\n";
+    foreach ($conditions as $cond => $v) {
+        echo "    if ($cond) {\n";
+        foreach ($v as $name) {
+            echo "        show['$name'] = 1;\n";
+        }
+        echo "    }\n";
+    }
+    echo "    var kids = " . json_encode(array_keys($names)) . ";\n";
+    echo "    for (var i = 0; i < kids.length; i++) {\n";
+    echo "        var kid = kids[i];\n";
+    echo "        var row = \$('#' + kid.replace(/\\./g, '\\\\.') + 'Row');\n";
+    echo "        if (show[kid]) {\n";
+    echo "            if ((mode != 2) && ((mode == 0) || (hiddenChildren[kid] != 1)))\n";
+    echo "                row.show();\n";
+    echo "        } else if (mode != 1) {\n";
+    echo "            row.hide();\n";
+    echo "            hiddenChildren[kid] = 1;\n";
+    echo "        }\n";
+    echo "    }\n";
+    echo "}\n\n";
+}
+
+function PrintSettingCheckbox($title, $setting, $restart, $reboot, $checkedValue, $uncheckedValue, $pluginName = "", $callbackName = "", $defaultValue = 0, $desc = "", $sData = array())
+{
+    global $settings;
+    global $pluginSettings;
+
+    $plugin = "";
+    $settingsName = "settings";
+
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
+
+    if ($pluginName != "") {
+        $plugin = "Plugin";
+        $settingsName = "pluginSettings";
+    }
+
+    if ($callbackName != "" && ($callbackName[strlen($callbackName) - 1] != ")")) {
+        $callbackName = $callbackName . "('$setting');";
+    }
+
+    $changedFunction = preg_replace('/\./', '', $setting . "Changed");
+
+    echo "<script>\n";
+    if (isset($sData['children'])) {
+        $preamble = "    var checked = 0;
+    if ($('#$escSetting').is(':checked')) {
+        checked = 1;
+    }
+
+    if (checked)
+        $('.$escSetting' + 'Child').show();
+    else
+        $('.$escSetting' + 'Child').hide();
+
+";
+        $conditions = array();
+        foreach ($sData['children'] as $k => $v) {
+            if ($k == "1") {
+                $conditions["checked"] = $v;
+            }
+        }
+        PrintSettingChildrenFunction($setting, $conditions, $preamble);
+    }
+
+    echo "
+function " . $changedFunction . "() {
 	var value = '$uncheckedValue';
 	var checked = 0;
-	if ($('#$setting').is(':checked')) {
+	if ($('#$escSetting').is(':checked')) {
 		checked = 1;
 		value = '$checkedValue';
 	}
-
-	$.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
-		.done(function() {
-			if (checked)
-				$.jGrowl('$title Enabled');
-			else
-				$.jGrowl('$title Disabled');
-			$settingsName" . "['$setting'] = value;
 ";
+    if ($pluginName !== "") {
+        echo "SetPluginSetting('$pluginName', '$setting', value, $restart, $reboot, checked, function() {
+            $settingsName" . "['$setting'] = value;
+            ";
+    } else {
+        echo "SetSetting('$setting', value, $restart, $reboot, false, checked, function() {";
+    }
+    echo "$settingsName" . "['$setting'] = value;";
+    if (isset($sData['children'])) {
+        echo "Update$setting" . "Children(0);\n";
+    }
 
-if ($restart)
-	echo "SetRestartFlag();\n";
-if ($reboot)
-	echo "SetRebootFlag();\n";
-
-echo "
+    echo "
 			$callbackName
-			CheckRestartRebootFlags();
-		}).fail(function() {
+            if (checked)
+                $('.$escSetting' + 'Child').show();
+            else
+                $('.$escSetting' + 'Child').hide();
+		},
+        function() {
 			if (checked) {
-				DialogError('$title', 'Failed to Enable $title');
-				$('#$setting').prop('checked', false);
+				$('#$escSetting').prop('checked', false);
 			} else {
-				DialogError('$title', 'Failed to Disable $title');
-				$('#$setting').prop('checked', true);
+				$('#$escSetting').prop('checked', true);
 			}
 		});
 }
 </script>
 
-<input type='checkbox' id='$setting' ";
+<input type='checkbox' id='$setting' aria-label='$setting'";
 
-	IfSettingEqualPrint($setting, $checkedValue, "checked", $pluginName);
+    if (isset($sData['children'])) {
+        echo "class='parentSetting' ";
+    }
 
-	echo " onChange='" . $setting . "Changed();'>\n";
+    IfSettingEqualPrint($setting, $checkedValue, "checked", $pluginName, $defaultValue);
+
+    if (isset($sData['onChange'])) {
+        echo " onChange='" . $sData['onChange'] . "();'";
+    } else {
+        echo " onChange='" . $changedFunction . "();'";
+    }
+
+    if ($desc != "") {
+        echo '>' . $desc . "</input>\n";
+    } else {
+        echo " >\n";
+    }
+
 }
 
-function PrintSettingSelect($title, $setting, $restart = 1, $reboot = 0, $defaultValue, $values, $pluginName = "", $callbackName = "", $changedFunction = "")
+function PrintSettingSelectInternal($title, $setting, $restart, $reboot, $defaultValue, $values, $pluginName = "", $callbackName = "", $changedFunction = "", $sData = array(), $multiple = false)
 {
-	global $settings;
-	global $pluginSettings;
+    global $settings;
+    global $pluginSettings;
 
-	$plugin = "";
-	$settingsName = "settings";
+    $plugin = "";
+    $settingsName = "settings";
 
-	if ($pluginName != "") {
-		$plugin = "Plugin";
-		$settingsName = "pluginSettings";
-	}
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
 
-	if ($callbackName != "")
-		$callbackName = $callbackName . "();";
+    if ($pluginName != "") {
+        $plugin = "Plugin";
+        $settingsName = "pluginSettings";
+    }
 
-    if ($changedFunction == "")
-        $changedFunction = $setting . "Changed";
+    if ($callbackName != "" && ($callbackName[strlen($callbackName) - 1] != ")")) {
+        $callbackName = $callbackName . "('$setting');";
+    }
 
-	echo "
-<script>
-function " . $setting . "Changed() {
-	var value = $('#$setting').val();
+    if ($changedFunction == "") {
+        $changedFunction = preg_replace('/\./', '', $setting . "Changed");
+    }
 
-	$.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
-		.done(function() {
-			$.jGrowl('$title saved');
-			$settingsName" . "['$setting'] = value;
-			$callbackName
+    echo "<script>\n";
+
+    if (isset($sData['children'])) {
+        $preamble = "    var val = $('#$escSetting').val();\n";
+        $conditions = array();
+        foreach ($sData['children'] as $k => $v) {
+            $conditions["val == '" . $k . "'"] = $v;
+        }
+        PrintSettingChildrenFunction($setting, $conditions, $preamble);
+    }
+
+    if (isset($sData['reloadOther'])) {
+        echo "function ReloadOther$setting" . "() {
 ";
+        foreach ($sData['reloadOther'] as $sname) {
+            echo "    ReloadSettingOptions('$sname');\n";
+        }
 
-if ($restart)
-	echo "SetRestartFlag();\n";
-if ($reboot)
-	echo "SetRebootFlag();\n";
-
-echo "
-		}).fail(function() {
-			DialogError('$title', 'Failed to save $title');
-		});
-}
-</script>
-
-<select id='$setting' onChange='" . $changedFunction . "();'>\n";
-
-	foreach ( $values as $key => $value )
-	{
-		echo "<option value='$value'";
-
-		
-		if (isset($pluginSettings[$setting]) || isset($settings[$setting]))
-			IfSettingEqualPrint($setting, $value, " selected", $pluginName);
-        else if ($value == $defaultValue)
-            echo " selected";
-		echo ">$key</option>\n";
-	}
-
-	echo "</select>\n";
-}
-
-function PrintSettingText($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "")
-{
-	global $settings;
-	global $pluginSettings;
-
-	$plugin = "";
-	$settingsName = "settings";
-
-	if ($pluginName != "") {
-		$plugin = "Plugin";
-		$settingsName = "pluginSettings";
-	}
-
-	echo "
-<input type='text' id='$setting' maxlength='$maxlength' size='$size' value=\"";
-
-	if (isset($settings[$setting]))
-		echo $settings[$setting];
-	elseif (isset($pluginSettings[$setting]))
-		echo $pluginSettings[$setting];
-	else
-		echo $defaultValue;
-
-	echo "\">\n";
-}
-function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "", $callbackName = "", $changedFunction = "", $inputType = "text")
-{ 
-	global $settings;
-	global $pluginSettings;
-
-	$plugin = "";
-	$settingsName = "settings";
-
-	if ($pluginName != "") {
-		$plugin = "Plugin";
-		$settingsName = "pluginSettings";
-	}
-
-    
-    if ($callbackName != "")
-        $callbackName = $callbackName . "();";
-    if ($changedFunction == "")
-        $changedFunction = $setting . "Changed";
+        echo "}\n\n";
+    }
 
     echo "
-    <script>
-    function " . $setting . "Changed() {
-        var value = $('#$setting').val();
-        $.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
-        .done(function() {
-              $.jGrowl('$setting Saved');
-              $settingsName" . "['$setting'] = value;
-              ";
-              
-              if ($restart)
-                echo "SetRestartFlag();\n";
-              if ($reboot)
-                echo "SetRebootFlag();\n";
-              
-              echo "
+function " . $changedFunction . "() {
+	var value = $('#$escSetting').val();
+";
+
+    if ($pluginName !== "") {
+        echo "SetPluginSetting('$pluginName', '$setting', value, $restart, $reboot, null, function() {
+            $settingsName" . "['$setting'] = value;
+        ";
+    } else {
+        echo "SetSetting('$setting', value, $restart, $reboot, false, null, function() {";
+    }
+    echo "
+        	$callbackName ";
+
+    if (isset($sData['children'])) {
+        echo "Update$setting" . "Children(0);\n";
+    }
+
+    if (isset($sData['reloadOther'])) {
+        echo "ReloadOther$setting" . "();\n";
+    }
+
+    echo "});
+}
+</script>
+";
+
+    if (isset($sData['onChange'])) {
+        echo "<select id='$setting' onChange='" . $sData['onChange'] . "();' ";
+    } else {
+        echo "<select id='$setting' onChange='" . $changedFunction . "();' ";
+    }
+
+    $classList = "class='form-select col-auto mw-100 ";
+
+    if ($multiple) {
+        if (isset($sData['children'])) {
+            echo "multiple ";
+            $classList .= "parentSetting multiSelect ";
+        } else {
+            echo "multiple class='multiSelect' ";
+            $classList .= "multiSelect ";
+        }
+    } else if (isset($sData['children'])) {
+        $classList .= "parentSetting ";
+    }
+
+    $classList .= "'";
+    echo "$classList";
+
+    echo ">\n";
+
+    // Check if the current setting value exists in the available options
+    $currentValue = null;
+    $valueExists = false;
+    if ($pluginName != "") {
+        if (isset($pluginSettings[$setting])) {
+            $currentValue = $pluginSettings[$setting];
+            $valueExists = in_array($currentValue, $values);
+        }
+    } else {
+        if (isset($settings[$setting])) {
+            $currentValue = $settings[$setting];
+            $valueExists = in_array($currentValue, $values);
+        }
+    }
+
+    // If the current value doesn't exist in options and this is not a multiple select,
+    // we need to either select the first option or the default
+    $firstOption = !empty($values) ? reset($values) : null;
+    $shouldAutoSelect = false;
+    if (!$multiple && $currentValue !== null && !$valueExists && $firstOption !== null) {
+        // The saved value no longer exists in the options list
+        // We'll auto-select either the default or the first available option
+        $shouldAutoSelect = true;
+        $newValue = ($defaultValue !== "" && in_array($defaultValue, $values)) ? $defaultValue : $firstOption;
+    }
+
+    $optionsLevel = isset($sData['optionsLevel']) ? $sData['optionsLevel'] : array();
+
+    foreach ($values as $key => $value) {
+        // Skip options that require a higher UI level than the current user has,
+        // unless this option is the currently-saved value (always show what's active).
+        if (isset($optionsLevel[$value]) && $settings['uiLevel'] < $optionsLevel[$value] && $value !== $currentValue) {
+            continue;
+        }
+
+        echo "<option value='$value'";
+
+        if (isset($pluginSettings[$setting]) || isset($settings[$setting])) {
+            if ($multiple) {
+                IfSettingInListPrint($setting, $value, " selected", $pluginName);
+            } else {
+                if ($shouldAutoSelect && $value == $newValue) {
+                    // Auto-select this option since the saved value doesn't exist
+                    echo " selected";
+                } else {
+                    IfSettingEqualPrint($setting, $value, " selected", $pluginName);
+                }
+            }
+        } else if ($value == $defaultValue) {
+            echo " selected";
+        }
+
+        echo ">$key</option>\n";
+    }
+
+    echo "</select>\n";
+
+    // If we auto-selected a different value, output JavaScript to update the setting.
+    // Use restart=0, reboot=0 since the system was already running with the mismatched
+    // value — silently correcting it on page load should not trigger a restart/reboot banner.
+    if ($shouldAutoSelect && $newValue != $currentValue) {
+        echo "<script>\n";
+        echo "$(document).ready(function() {\n";
+        echo "    // The saved value '$currentValue' is no longer available. Auto-updating to '$newValue'.\n";
+        if ($pluginName !== "") {
+            echo "    SetPluginSetting('$pluginName', '$setting', '$newValue', 0, 0, true);\n";
+        } else {
+            echo "    SetSetting('$setting', '$newValue', 0, 0, true);\n";
+        }
+        echo "});\n";
+        echo "</script>\n";
+    }
+}
+function PrintSettingMultiSelect($title, $setting, $restart, $reboot, $defaultValue, $values, $pluginName = "", $callbackName = "", $changedFunction = "", $sData = array())
+{
+    PrintSettingSelectInternal($title, $setting, $restart, $reboot, $defaultValue, $values, $pluginName, $callbackName, $changedFunction, $sData, true);
+}
+function PrintSettingSelect($title, $setting, $restart, $reboot, $defaultValue, $values, $pluginName = "", $callbackName = "", $changedFunction = "", $sData = array())
+{
+    PrintSettingSelectInternal($title, $setting, $restart, $reboot, $defaultValue, $values, $pluginName, $callbackName, $changedFunction, $sData, false);
+}
+function PrintSettingText($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "")
+{
+    global $settings;
+    global $pluginSettings;
+
+    $plugin = "";
+    $settingsName = "settings";
+
+    if ($pluginName != "") {
+        $plugin = "Plugin";
+        $settingsName = "pluginSettings";
+    }
+
+    echo "
+<input type='text' id='$setting' class='mw-100' maxlength='$maxlength' size='$size' value=\"";
+
+    // Escaped: inside value="...", a saved value holding a quote ended the
+    // attribute, and with markup after it ran as part of the page.
+    if (($pluginName == "") && isset($settings[$setting])) {
+        echo htmlspecialchars((string)$settings[$setting], ENT_QUOTES);
+    } elseif (isset($pluginSettings[$setting])) {
+        echo htmlspecialchars((string)$pluginSettings[$setting], ENT_QUOTES);
+    } else {
+        echo htmlspecialchars((string)$defaultValue, ENT_QUOTES);
+    }
+
+    echo "\">\n";
+}
+
+function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "", $callbackName = "", $changedFunction = "", $inputType = "text", $sData = [], $identType = "id")
+{
+    global $settings;
+    global $pluginSettings;
+
+    $subType = $inputType;
+    if ($inputType == 'color') {
+        $inputType = 'text';
+    }
+    if ($inputType == 'datalist') {
+        $inputType = 'text';
+    }
+
+    $plugin = "";
+    $settingsName = "settings";
+
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
+
+    if ($pluginName != "") {
+        $plugin = "Plugin";
+        $settingsName = "pluginSettings";
+    }
+
+    if ($callbackName != "" && ($callbackName[strlen($callbackName) - 1] != ")")) {
+        $callbackName = $callbackName . "('$setting');";
+    }
+
+    if ($changedFunction == "") {
+        $changedFunction = preg_replace('/\./', '', $setting . "Changed");
+    }
+
+    $maxTag = 'maxlength';
+    $sizeTag = 'size';
+    if ($inputType == 'number') {
+        $maxTag = 'max';
+        $sizeTag = 'min';
+    }
+
+    echo "<script>\n";
+    if (isset($sData['children'])) {
+        $preamble = "    var val = $('#$escSetting').val();\n";
+        $conditions = array();
+        foreach ($sData['children'] as $k => $v) {
+            $conditions["val != ''"] = array_merge(isset($conditions["val != ''"]) ? $conditions["val != ''"] : array(), $v);
+        }
+        PrintSettingChildrenFunction($setting, $conditions, $preamble);
+    }
+
+    echo "
+    function " . $changedFunction . "() {
+        var value = $('#$escSetting').val();
+";
+
+    if (isset($sData['regex']) && isset($sData['regexDesc'])) {
+        echo "
+        if (!RegexCheckData(\"" . $sData['regex'] . "\", value, \"" . $sData['regexDesc'] . "\", '$inputType' == 'password')) {
+            $('#" . $escSetting . "').on(\"focus\");
+            return;
+        }
+";
+    }
+
+    if ($pluginName !== "") {
+        echo "SetPluginSetting('$pluginName', '$setting', value, $restart, $reboot, null, function() {
+            $settingsName" . "['$setting'] = value;
+            ";
+    } else {
+        echo "SetSetting('$setting', value, $restart, $reboot, false, null, function() {";
+    }
+    if (isset($sData['children'])) {
+        echo "Update$setting" . "Children(0);\n";
+    }
+    echo "
               $callbackName
-              CheckRestartRebootFlags();
-              }).fail(function() {
-                      DialogError('$setting', 'Failed to save $setting');
-              });
+        });
     }
     </script>
+";
 
-    
-    <input type='$inputType' id='$setting' maxlength='$maxlength' size='$size' onChange='" . $changedFunction . "();' value=\"";
+    echo "<input type='$inputType'";
+    if ($identType === "id") {
+        echo " id='$setting'";
+    }
+    echo " class='mw-100";
+    if ($identType === "class") {
+        echo " $setting'";
+    } else {
+        echo "' ";
+    }
 
-	if (isset($settings[$setting]))
-		echo $settings[$setting];
-	elseif (isset($pluginSettings[$setting]))
-		echo $pluginSettings[$setting];
-	else
-		echo $defaultValue;
 
-	echo "\">\n";
+    echo " $maxTag='$maxlength' $sizeTag='$size' ";
+
+    if (isset($sData['step']) && $sData['step'] != 1) {
+        echo "step='" . $sData['step'] . "' ";
+    }
+
+    if (isset($sData['onChange'])) {
+        echo "onChange='" . $sData['onChange'] . "();' value=\"";
+    } else {
+        echo "onChange='" . $changedFunction . "();' value=\"";
+    }
+
+    $curValue = "";
+    if ((isset($sData['alwaysReset'])) && ($sData['alwaysReset'] == 1)) {
+        $curValue = $defaultValue;
+    } else {
+        if (($pluginName == "") && isset($settings[$setting])) {
+            $curValue = $settings[$setting];
+        } elseif (isset($pluginSettings[$setting])) {
+            $curValue = $pluginSettings[$setting];
+        } else {
+            $curValue = $defaultValue;
+        }
+
+    }
+    // escaped, as in PrintSettingText()
+    echo htmlspecialchars((string)$curValue, ENT_QUOTES);
+
+    echo "\" \n";
+
+    if (isset($sData['children'])) {
+        echo "class='parentSetting' ";
+    }
+    if (isset($sData['type'])) {
+        if ($sData['type'] == 'time') {
+            echo "class='time' autocomplete='off' ";
+        }
+        if ($sData['type'] == 'date') {
+            echo "class='date' autocomplete='off' ";
+        }
+        if ($sData['type'] == 'datalist') {
+            echo "list='" . $setting . "_list'";
+        }
+    }
+    echo ">\n";
+    if ($subType == 'datalist') {
+        $options = $sData["options"];
+        echo "<datalist id='" . $setting . "_list'>\n";
+        foreach ($options as $option => $value) {
+            echo "<option value='" . $option . "'>" . $value . "</option>\n";
+        }
+        echo "</datalist>\n";
+    }
+    if ($subType == 'color') {
+        // Also into a style attribute and a JS string below, where the
+        // escaping above doesn't reach: only a bare hex color goes there.
+        $curValue = (string)$curValue;
+        if (!preg_match('/^[0-9A-Fa-f]{6}$/', $curValue)) {
+            $curValue = preg_match('/^[0-9A-Fa-f]{6}$/', (string)$defaultValue) ? (string)$defaultValue : "000000";
+        }
+        echo "<span id='$setting" . "_colorBox' class='color-box' style='background-color: #" . $curValue . ";'></span>";
+        echo "<script>";
+        echo "var $setting" . "SaveTimer = null;\n";
+        echo "$('#$setting" . "_colorBox').colpick({ layout: 'rgbhex', color: '" . $curValue . "', submit: false, onChange: function(hsb,hex,rgb,el,bySetColor) { clearTimeout($setting" . "SaveTimer); $(el).css('background-color', '#'+hex); $('#$setting').val(hex); $setting" . "SaveTimer = setTimeout( function() { " . $changedFunction . "(); }, 500)}}).css('background-color', '#" . $curValue . "');";
+        echo "</script>";
+    }
 }
+
 function PrintSettingPasswordSaved($setting, $restart = 1, $reboot = 0, $maxlength = 32, $size = 32, $pluginName = "", $defaultValue = "", $callbackName = "", $changedFunction = "")
 {
-	PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $pluginName, $defaultValue, $callbackName, $changedFunction, "password");
-}
+    $sData = array();
+    PrintSettingTextSaved($setting, $restart, $reboot, $maxlength, $size, $pluginName, $defaultValue, $callbackName, $changedFunction, "password", $sData);
+    echo "&nbsp;<input id='" . $setting . "_showHideButton' type='button' class='buttons' value='Show' onclick='" . $setting . "_showHidePassword()'>";
 
+    ?>
+    <script>
+        function <?= $setting ?>_showHidePassword() {
+            var x = document.getElementById("<?= $setting ?>");
+            var b = document.getElementById("<?= $setting ?>_showHideButton");
+            if (x.type === "password") {
+                x.type = "text";
+                b.value = "Hide";
+            } else {
+                x.type = "password";
+                b.value = "Show";
+            }
+        }
+    </script>
+    <?php
+}
 
 function PrintSettingSave($title, $setting, $restart = 1, $reboot = 0, $pluginName = "", $callbackName = "")
 {
-	global $settings;
-	global $pluginSettings;
+    global $settings;
+    global $pluginSettings;
 
-	$plugin = "";
-	$settingsName = "settings";
+    $plugin = "";
+    $settingsName = "settings";
 
-	if ($pluginName != "") {
-		$plugin = "Plugin";
-		$settingsName = "pluginSettings";
-	}
+    $escSetting = preg_replace('/\./', '\\\\\\\\.', $setting);
 
-	if ($callbackName != "")
-		$callbackName = $callbackName . "();";
+    if ($pluginName != "") {
+        $plugin = "Plugin";
+        $settingsName = "pluginSettings";
+    }
 
-	echo "
+    if ($callbackName != "" && ($callbackName[strlen($callbackName) - 1] != ")")) {
+        $callbackName = $callbackName . "('$setting');";
+    }
+
+    $saveFunction = preg_replace('/\./', '', $setting . "Changed");
+
+    echo "
 <script>
-function save" . $setting . "() {
-	var value = $('#$setting').val();
-
-	$.get('fppjson.php?command=set" . $plugin . "Setting&plugin=$pluginName&key=$setting&value=' + value)
-		.done(function() {
-			$.jGrowl('$title saved');
-			$settingsName" . "['$setting'] = value;
-			$callbackName
+function " . $saveFunction . "() {
+	var value = $('#$escSetting').val();
 ";
-
-if ($restart)
-	echo "SetRestartFlag();\n";
-if ($reboot)
-	echo "SetRebootFlag();\n";
-
-echo "
-		}).fail(function() {
-			DialogError('$title', 'Failed to save $title');
-			$('#$setting').prop('checked', false);
+    if ($pluginName !== "") {
+        echo "SetPluginSetting('$pluginName', '$setting', value, $restart, $reboot, null, function() {
+            $settingsName" . "['$setting'] = value;
+        ";
+    } else {
+        echo "SetSetting('$setting', value, $restart, $reboot, false, null, function() {";
+    }
+    echo "
+			$callbackName
 		});
 }
 </script>
 
-<input type='button' class='buttons' id='save$setting' onClick='save" . $setting . "();' value='Save'>\n";
+<input type='button' class='buttons' id='save$setting' onClick='" . $saveFunction . "();' value='Save'>\n";
+}
+
+/**
+ * Returns the filesize for the given filename
+ *
+ * NORMALLY will return an int, but if the file is greater than 2G on a 32bit
+ * system, the return will be a string.  If making calculations with the return,
+ * make sure to use the "bcmath" functions so they can handle the string
+ * version on the 32bit systems
+ */
+function real_filesize($fileFullName)
+{
+    if (PHP_INT_SIZE === 4) {
+        //32 bit system, cannot use built in filesize call as files larger than 2G will
+        //cause problems and not report the proper size
+        $filesize = exec("stat --format=\"%s\" " . escapeshellarg($fileFullName));
+        if (intval($filesize) < PHP_INT_MAX) {
+            $filesize = intval($filesize);
+        }
+        return $filesize;
+    }
+    clearstatcache(true, $fileFullName);
+    return filesize($fileFullName);
 }
 
 /**
@@ -375,152 +2527,153 @@ echo "
  * @param $mediaName
  * @return array
  */
-function get_sequence_file_info($mediaName){
-	global $settings;
+function get_sequence_file_info($mediaName)
+{
+    global $settings;
 
-	$total_duration=0;
-	$media_filesize = 0;
-	$filename = $settings['sequenceDirectory'] . "/" . $mediaName;
+    $total_duration = 0;
+    $media_filesize = 0;
+    $filename = $settings['sequenceDirectory'] . "/" . $mediaName;
 
-	$all_data = array(
-		'seqFormatID' => null,
-		'seqChanDataOffset' => null,
-		'seqMinorVersion' => null,
-		'seqMajorVersion' => null,
-		'seqVersion' => null,
-		'seqFixedHeaderSize' => null,
-		'seqStepSize' => null,
-		'seqNumPeriods' => null,
-		'seqStepTime' => null,
-		'seqNumUniverses' => null,
-		'seqUniverseSize' => null,
-		'seqGamma' => null,
-		'seqColorEncoding' => null,
-		'seqDuration' => null,
-		'seqMSRemaining' => null,
-		'seqMediaName' => null
-	);
-	//Make sure it exists first
-	if (!empty($mediaName) & file_exists($filename)) {
-		//Get the filesize
-		$media_filesize = filesize($filename);
-		//Read the sequence
-		$file_handle = fopen($filename, "r");
-		//Read the first 28 bytes for the header
-		while (($data = fread($file_handle, 28)) !== FALSE && strlen($data) == 28) {
+    $all_data = array(
+        'seqFormatID' => null,
+        'seqChanDataOffset' => null,
+        'seqMinorVersion' => null,
+        'seqMajorVersion' => null,
+        'seqVersion' => null,
+        'seqFixedHeaderSize' => null,
+        'seqStepSize' => null,
+        'seqNumPeriods' => null,
+        'seqStepTime' => null,
+        'seqNumUniverses' => null,
+        'seqUniverseSize' => null,
+        'seqGamma' => null,
+        'seqColorEncoding' => null,
+        'seqDuration' => null,
+        'seqMSRemaining' => null,
+        'seqMediaName' => null,
+    );
+    //Make sure it exists first
+    if (!empty($mediaName) & file_exists($filename)) {
+        //Get the filesize
+        $media_filesize = real_filesize($filename);
+        //Read the sequence
+        $file_handle = fopen($filename, "r");
+        //Read the first 28 bytes for the header
+        while (($data = fread($file_handle, 28)) !== false && strlen($data) == 28) {
 
-			//Break data down and split out the bits, ignore my horrible decoding method lol
-			$all_data['seqFormatID'] = unpack("A*", substr($data, 0, 4))[1]; //uint32 - magic cookie -- Results in FSEQ
-			$all_data['seqChanDataOffset'] = unpack("S*", substr($data, 4, 2))[1]; //uint32 - DataOffset -- only 2 bytes so really uint16 -- checks out on test sequence (1040) & FPPD log output
-			$all_data['seqMinorVersion'] = unpack("C*", substr($data, 6, 1))[1]; //uint8 - Minor Version -- May not be correct decoding - results in 0
-			$all_data['seqMajorVersion'] = unpack("C*", substr($data, 7, 1))[1]; //uint8 - Major version -- -- May not be correct decoding - results in 1... Version 1.0? seems correct
-			//build version
-			$all_data['seqVersion'] = $all_data['seqMajorVersion'] . "." . $all_data['seqMinorVersion'];
+            //Break data down and split out the bits, ignore my horrible decoding method lol
+            $all_data['seqFormatID'] = unpack("A*", substr($data, 0, 4))[1]; //uint32 - magic cookie -- Results in FSEQ
+            $all_data['seqChanDataOffset'] = unpack("S*", substr($data, 4, 2))[1]; //uint32 - DataOffset -- only 2 bytes so really uint16 -- checks out on test sequence (1040) & FPPD log output
+            $all_data['seqMinorVersion'] = unpack("C*", substr($data, 6, 1))[1]; //uint8 - Minor Version -- May not be correct decoding - results in 0
+            $all_data['seqMajorVersion'] = unpack("C*", substr($data, 7, 1))[1]; //uint8 - Major version -- -- May not be correct decoding - results in 1... Version 1.0? seems correct
+            //build version
+            $all_data['seqVersion'] = $all_data['seqMajorVersion'] . "." . $all_data['seqMinorVersion'];
 
-			$all_data['seqFixedHeaderSize'] = unpack("S*", substr($data, 8, 2))[1];  //uint16 - FixedHeader: 28 - checks out with FPPD log output
-			$all_data['seqStepSize'] = unpack("L*", substr($data, 10, 4))[1]; //uint32 - StepSize
-			$all_data['seqNumPeriods'] = unpack("L*", substr($data, 14, 4))[1]; //uint32 - NumSteps
-			$all_data['seqStepTime'] = unpack("S*", substr($data, 18, 2))[1]; //uint16 - StepTime (eg 50ms)
-			$all_data['seqNumUniverses'] = unpack("S*", substr($data, 20, 2))[1]; //uint16 - Number of Universes -- Def: 0 //Ignored by Pi Player
-			$all_data['seqUniverseSize'] = unpack("S*", substr($data, 22, 2))[1]; //uint16 - Size of Universes -- Def: 0 //Ignored by Pi Player
-			$all_data['seqGamma'] = unpack("C*", substr($data, 24, 1))[1]; //uint8 - Gamma -- Def: 1?
-			$all_data['seqColorEncoding'] = unpack("C*", substr($data, 25, 1))[1]; //uint8 - Type  -- Def: 2? -- RGB Channels //0=encoded, 1=linear, 2=RGB
-//			$all_data['seqUnusedField'] = unpack("S*", substr($data, 26, 2))[1]; //uint16 - unused
+            $all_data['seqFixedHeaderSize'] = unpack("S*", substr($data, 8, 2))[1]; //uint16 - FixedHeader: 28 - checks out with FPPD log output
+            $all_data['seqStepSize'] = unpack("L*", substr($data, 10, 4))[1]; //uint32 - StepSize
+            $all_data['seqNumPeriods'] = unpack("L*", substr($data, 14, 4))[1]; //uint32 - NumSteps
+            $all_data['seqStepTime'] = unpack("S*", substr($data, 18, 2))[1]; //uint16 - StepTime (eg 50ms)
+            $all_data['seqNumUniverses'] = unpack("S*", substr($data, 20, 2))[1]; //uint16 - Number of Universes -- Def: 0 //Ignored by Pi Player
+            $all_data['seqUniverseSize'] = unpack("S*", substr($data, 22, 2))[1]; //uint16 - Size of Universes -- Def: 0 //Ignored by Pi Player
+            $all_data['seqGamma'] = unpack("C*", substr($data, 24, 1))[1]; //uint8 - Gamma -- Def: 1?
+            $all_data['seqColorEncoding'] = unpack("C*", substr($data, 25, 1))[1]; //uint8 - Type  -- Def: 2? -- RGB Channels //0=encoded, 1=linear, 2=RGB
+            //            $all_data['seqUnusedField'] = unpack("S*", substr($data, 26, 2))[1]; //uint16 - unused
 
-			//VARIABLE HEADER
-			//to read the variable header, seek to offset 28, then read data between 28 and seqChanDataOffset..
-			fseek($file_handle, 28);
-			//only read first 128 bytes just to catch everything, shouldn't need more than this for our purpose
-			$seek_data = fread($file_handle, 128); //$all_data['seqChanDataOffset'] - 28
-			//make sure we have data
-			if ($seek_data !== FALSE && strlen($seek_data) == 128) {
-				//Variable header structures start with:
-				//uint16_t: length of structure (including self)
-				//uint16_t: type code for structure
-				//(Other data in structure)
+            //VARIABLE HEADER
+            //to read the variable header, seek to offset 28, then read data between 28 and seqChanDataOffset..
+            fseek($file_handle, 28);
+            //only read first 128 bytes just to catch everything, shouldn't need more than this for our purpose
+            $seek_data = fread($file_handle, 128); //$all_data['seqChanDataOffset'] - 28
+            //make sure we have data
+            if ($seek_data !== false && strlen($seek_data) == 128) {
+                //Variable header structures start with:
+                //uint16_t: length of structure (including self)
+                //uint16_t: type code for structure
+                //(Other data in structure)
 
-				//Get the length and type of code
-				$variable_header_len = unpack("S*", substr($seek_data, 0, 2))[1]; //uint16 - header len decodes correct
-				//Vixen 3 and xLights have the next 16 bits identified as 'mf' presumably for 'media  filename'
-				$variable_header_type_of_code = unpack("A*", substr($seek_data, 2, 2))[1]; //uint16 - unsure if decodes correct - treat as string
+                //Get the length and type of code
+                $variable_header_len = unpack("S*", substr($seek_data, 0, 2))[1]; //uint16 - header len decodes correct
+                //Vixen 3 and xLights have the next 16 bits identified as 'mf' presumably for 'media  filename'
+                $variable_header_type_of_code = unpack("A*", substr($seek_data, 2, 2))[1]; //uint16 - unsure if decodes correct - treat as string
 
-				//Filename offset starts at 5(Vixen) and 4(xLights) after the header stuff,
-				//this is set correctly with a dirty fix around Vixen
-				$media_filename_data_offset = 5;
-				//is mf or media file then continue else fail so we don't read a non media file variable header
-				if (!empty($variable_header_type_of_code) && ($variable_header_type_of_code == "mf" || strtolower($variable_header_type_of_code) == "mf")) {
-					//In Vixen FSEQ files there is there length value preceding the actual media filename
-					//it's easy to forward the offset by one and this works except there's no wait to tell if we're reading a
-					$fn_length_ident = unpack("C*", substr($seek_data, 4, 1))[1];
+                //Filename offset starts at 5(Vixen) and 4(xLights) after the header stuff,
+                //this is set correctly with a dirty fix around Vixen
+                $media_filename_data_offset = 5;
+                //is mf or media file then continue else fail so we don't read a non media file variable header
+                if (!empty($variable_header_type_of_code) && ($variable_header_type_of_code == "mf" || strtolower($variable_header_type_of_code) == "mf")) {
+                    //In Vixen FSEQ files there is there length value preceding the actual media filename
+                    //it's easy to forward the offset by one and this works except there's no wait to tell if we're reading a
+                    $fn_length_ident = unpack("C*", substr($seek_data, 4, 1))[1];
 
-					//Get the filename
-					//media filename should start at offset 4, in vixen it's offset 5 due to the length value in offset 4 being the filename length
-					//Length of the substring is the header len - the offset... just so we don't read into the next bit or outside the header
-					$remaining_header_len = ($variable_header_len - $media_filename_data_offset);
-					//For Vixen this is just the media filename
-					//For xLights this is the full path to the media at the time of export
-					$sequenceMediaName = unpack("A*", substr($seek_data, $media_filename_data_offset, $remaining_header_len))[1]; //decode as string
+                    //Get the filename
+                    //media filename should start at offset 4, in vixen it's offset 5 due to the length value in offset 4 being the filename length
+                    //Length of the substring is the header len - the offset... just so we don't read into the next bit or outside the header
+                    $remaining_header_len = ($variable_header_len - $media_filename_data_offset);
+                    //For Vixen this is just the media filename
+                    //For xLights this is the full path to the media at the time of export
+                    $sequenceMediaName = unpack("A*", substr($seek_data, $media_filename_data_offset, $remaining_header_len))[1]; //decode as string
 
-					//dirty fix for Vixen FSEQ files
-					//In vixen the length of filename string is at offset 4 (then the filename follows)
-					//because we can't tell if the sequence is from Vixen, check the value in offset 4
-					//if we're processing a Vixen sequence then it will match the length of the filename (starting at offset 5)
-					if (strlen($sequenceMediaName) == $fn_length_ident) {
-						//Vixen - do nothing, if we end up here it's likely that we're reading a FSEQ from Vixen
-					} else {
-						//xLights, then move the offset back to 4 (since there is no filename length and we just read the whole lot)
-						//for xLights file names it's the entire path to the media file, so it's going to be unlikely that the integer value of the first character "C" (C:\ - Windows) or "/" (Linux or Mac)
-						//will match the length of the filename so we're safe in stepping back the offset
-						$media_filename_data_offset = 4;
-						$remaining_header_len = ($variable_header_len - $media_filename_data_offset);
-						$sequenceMediaName = unpack("A*", substr($seek_data, $media_filename_data_offset, $remaining_header_len))[1]; //decode as string
-					}
+                    //dirty fix for Vixen FSEQ files
+                    //In vixen the length of filename string is at offset 4 (then the filename follows)
+                    //because we can't tell if the sequence is from Vixen, check the value in offset 4
+                    //if we're processing a Vixen sequence then it will match the length of the filename (starting at offset 5)
+                    if (strlen($sequenceMediaName) == $fn_length_ident) {
+                        //Vixen - do nothing, if we end up here it's likely that we're reading a FSEQ from Vixen
+                    } else {
+                        //xLights, then move the offset back to 4 (since there is no filename length and we just read the whole lot)
+                        //for xLights file names it's the entire path to the media file, so it's going to be unlikely that the integer value of the first character "C" (C:\ - Windows) or "/" (Linux or Mac)
+                        //will match the length of the filename so we're safe in stepping back the offset
+                        $media_filename_data_offset = 4;
+                        $remaining_header_len = ($variable_header_len - $media_filename_data_offset);
+                        $sequenceMediaName = unpack("A*", substr($seek_data, $media_filename_data_offset, $remaining_header_len))[1]; //decode as string
+                    }
 
-//					$all_data['variable_header_len'] = $variable_header_len;
-//					$all_data['variable_header_type_of_code'] = $variable_header_type_of_code;
-//					$all_data['variable_header_media_filename'] = unpack("A*", substr($seek_data, $media_filename_data_offset, $remaining_header_len));
-//					$all_data['variable_header_media_offset'] = $media_filename_data_offset;
-//					$all_data['variable_header_filename_len'] = $gs_ident;
-//					$all_data['variable_header_filename_actual_len'] = strlen($sequenceMediaName);
+                    //                    $all_data['variable_header_len'] = $variable_header_len;
+                    //                    $all_data['variable_header_type_of_code'] = $variable_header_type_of_code;
+                    //                    $all_data['variable_header_media_filename'] = unpack("A*", substr($seek_data, $media_filename_data_offset, $remaining_header_len));
+                    //                    $all_data['variable_header_media_offset'] = $media_filename_data_offset;
+                    //                    $all_data['variable_header_filename_len'] = $gs_ident;
+                    //                    $all_data['variable_header_filename_actual_len'] = strlen($sequenceMediaName);
 
-					//Fix up the string by replacing escaped backward slash
-					//then check to see if we can breakdown the string for path info
-					$sequenceMediaName_pathinfo = pathinfo(str_replace("\\", "/", $sequenceMediaName));
+                    //Fix up the string by replacing escaped backward slash
+                    //then check to see if we can breakdown the string for path info
+                    $sequenceMediaName_pathinfo = pathinfo(str_replace("\\", "/", $sequenceMediaName));
 
-					//Get Basename (final filename)
-					if (array_key_exists('basename', $sequenceMediaName_pathinfo) && !empty($sequenceMediaName_pathinfo['basename'])) {
-						//For some reason some xLights sequences
-						$all_data['seqMediaName'] = $sequenceMediaName_pathinfo['basename'];
-					} else {
-						$all_data['seqMediaName'] = "";
-					}
-				} else {
-					error_log("get_sequence_file_info:: Unable to read sequence variable header :: " . $mediaName);
-				}
-			} else {
-				error_log("get_sequence_file_info:: Unable to seek to offset 28 for variable header :: " . $mediaName);
-			}
+                    //Get Basename (final filename)
+                    if (array_key_exists('basename', $sequenceMediaName_pathinfo) && !empty($sequenceMediaName_pathinfo['basename'])) {
+                        //For some reason some xLights sequences
+                        $all_data['seqMediaName'] = $sequenceMediaName_pathinfo['basename'];
+                    } else {
+                        $all_data['seqMediaName'] = "";
+                    }
+                } else {
+                    error_log("get_sequence_file_info:: Unable to read sequence variable header :: " . $mediaName);
+                }
+            } else {
+                error_log("get_sequence_file_info:: Unable to seek to offset 28 for variable header :: " . $mediaName);
+            }
 
-			//Workout the duration
-			//Time duration: ((NumSteps) * (StepTime) / 1000) seconds
-			$all_data['seqDuration'] = (($all_data['seqNumPeriods']) * ($all_data['seqStepTime']) / 1000);
-			$all_data['seqMSRemaining'] = (($all_data['seqNumPeriods']) * ($all_data['seqStepTime']));
-			$all_data['seqFileSize'] = $media_filesize; //filesize
+            //Workout the duration
+            //Time duration: ((NumSteps) * (StepTime) / 1000) seconds
+            $all_data['seqDuration'] = (($all_data['seqNumPeriods']) * ($all_data['seqStepTime']) / 1000);
+            $all_data['seqMSRemaining'] = (($all_data['seqNumPeriods']) * ($all_data['seqStepTime']));
+            $all_data['seqFileSize'] = $media_filesize; //filesize
 
-			//Break the loop, because we don't want to process any further
-			break;
-		}
-		if ($file_handle === FALSE) {
-			error_log("get_sequence_file_info:: Unable to read sequence info for :: " . $mediaName);
-		}
-		fclose($file_handle);
-		unset($data);
-		unset($seek_data);
-	} else {
-		error_log("get_sequence_file_info:: Cannot find sequence :: " . $mediaName);
-	}
+            //Break the loop, because we don't want to process any further
+            break;
+        }
+        if ($file_handle === false) {
+            error_log("get_sequence_file_info:: Unable to read sequence info for :: " . $mediaName);
+        }
+        fclose($file_handle);
+        unset($data);
+        unset($seek_data);
+    } else {
+        error_log("get_sequence_file_info:: Cannot find sequence :: " . $mediaName);
+    }
 
-	return $all_data;
+    return $all_data;
 }
 
 /**
@@ -530,48 +2683,118 @@ function get_sequence_file_info($mediaName){
  * If the the media duration exists in the cache then it's returned, else the returned value is null
  *
  * @param $media
- * @param null $duration_seconds
+ * @param $duration_seconds
  * @return null
  */
 function media_duration_cache($media, $duration_seconds = null, $filesize = null)
 {
-	global $settings;
-	$config_dir = $settings['configDirectory'];
-	$cache_file = "media_durations.cache";
-	$file_path = $config_dir . "/" .$cache_file ;
-	$time = 86400 * 30; //seconds - cache for 24hrs * 30days
-	$duration_cache = array();
-	$return_duration = null;
+    global $settings;
+    $file_path = $settings['configDirectory'] . "/media_durations.cache";
+    $time = 86400 * 30; //seconds - cache for 24hrs * 30days
 
-	if (!file_exists($file_path) ||  ( time() - filemtime( $file_path ) > $time)) {
-		// cache doesn't exist or expired so lets create it and insert our media entry
-		if ($duration_seconds !== null) {
-			//put the media duration into the cache, but only if it isn't null
-			$duration_cache[$media] = array('filesize' => $filesize, 'duration' => $duration_seconds);
+    $decode = function ($raw) {
+        if ($raw === false || $raw === '') {
+            return array();
+        }
+        $cache = json_decode($raw, true);
+        return is_array($cache) ? $cache : array();
+    };
 
-			$return_duration = $duration_seconds;
-			file_put_contents($file_path, json_encode($duration_cache, JSON_PRETTY_PRINT));
-		}
-	} else {
-		//else cache exists and is valid, replaces/append duration to it
-		$duration_cache = file_get_contents($file_path);
-		if ($duration_cache !== FALSE && !empty($duration_cache)) {
-			$duration_cache = json_decode($duration_cache, true);
-			//if file hashes are the same - then it's the same file
-			if (array_key_exists($media, $duration_cache) && $duration_cache[$media]['filesize'] == $filesize) {
-				//Key exists, then return the cached duration
-				$return_duration = $duration_cache[$media]['duration'];
-			} else if ($duration_seconds !== null) {
-				//put the media duration into the cache, but only if it isn't null
-				$duration_cache[$media] = array('filesize' => $filesize, 'duration' => $duration_seconds);;
-				$return_duration = $duration_seconds;
+    if ($duration_seconds === null) {
+        // Lookup only. No lock: a torn read fails to decode and reads as a
+        // miss, which the caller handles by probing.
+        if (!file_exists($file_path) || (time() - filemtime($file_path) > $time)) {
+            return null;
+        }
+        $cache = $decode(file_get_contents($file_path));
+        //if file sizes are the same - then it's the same file
+        if (array_key_exists($media, $cache) && $cache[$media]['filesize'] == $filesize) {
+            return $cache[$media]['duration'];
+        }
+        return null;
+    }
 
-				file_put_contents($file_path, json_encode($duration_cache, JSON_PRETTY_PRINT));
-			}
-		}
-	}
+    // Store. Read-modify-write under an exclusive lock. Concurrent callers
+    // (two browsers on the file manager, the playlist editor) each did an
+    // unlocked read/write and clobbered each other's entries: 70 files
+    // probed 3 at a time left 13 in the cache.
+    $fp = fopen($file_path, 'c+');
+    if ($fp === false) {
+        return $duration_seconds;
+    }
+    if (flock($fp, LOCK_EX)) {
+        $expired = (time() - filemtime($file_path) > $time);
+        $cache = $expired ? array() : $decode(stream_get_contents($fp));
+        $cache[$media] = array('filesize' => $filesize, 'duration' => $duration_seconds);
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, json_encode($cache, JSON_PRETTY_PRINT));
+        fflush($fp);
+        flock($fp, LOCK_UN);
+    }
+    fclose($fp);
 
-	return $return_duration;
+    return $duration_seconds;
+}
+
+/**
+ * Caches the frame rate (fps) of sequence (.fseq) files so the file manager
+ * doesn't have to shell out to fsequtils for every sequence on every listing.
+ *
+ * Mirrors media_duration_cache(): keyed on the relative filename and validated
+ * against the file size so a re-rendered/replaced sequence of a different size
+ * is recomputed rather than returning a stale value.
+ *
+ * If the fps for the file exists in the cache it's returned, otherwise null is
+ * returned (or, when $fps is supplied, the value is stored and returned).
+ *
+ * @param string $sequence relative sequence filename (cache key)
+ * @param int|float|null $fps fps to store, or null to only query
+ * @param int|string|null $filesize file size used to validate the cache entry
+ * @return int|float|null cached/stored fps, or null on a miss with nothing to store
+ */
+function sequence_fps_cache($sequence, $fps = null, $filesize = null)
+{
+    global $settings;
+    $config_dir = $settings['configDirectory'];
+    $file_path = $config_dir . "/sequence_fps.cache";
+    $time = 86400 * 30; //seconds - cache for 24hrs * 30days
+    $fps_cache = array();
+    $return_fps = null;
+
+    if (!file_exists($file_path) || (time() - filemtime($file_path) > $time)) {
+        // cache doesn't exist or expired so lets create it and insert our entry
+        if ($fps !== null) {
+            $fps_cache[$sequence] = array('filesize' => $filesize, 'fps' => $fps);
+            $return_fps = $fps;
+            file_put_contents($file_path, json_encode($fps_cache, JSON_PRETTY_PRINT), LOCK_EX);
+        }
+    } else {
+        //else cache exists and is valid, replace/append our entry to it
+        $fps_cache = file_get_contents($file_path);
+        if ($fps_cache !== false && !empty($fps_cache)) {
+            $fps_cache = json_decode($fps_cache, true);
+            if ($fps_cache === null) {
+                //failed to decode json, reset the cache
+                $fps_cache = array();
+                unlink($file_path);
+            }
+        } else {
+            // file exists but failed to read it or it's empty, reset the cache
+            $fps_cache = array();
+            unlink($file_path);
+        }
+        //if the file size matches then it's the same file
+        if (array_key_exists($sequence, $fps_cache) && $fps_cache[$sequence]['filesize'] == $filesize) {
+            $return_fps = $fps_cache[$sequence]['fps'];
+        } else if ($fps !== null) {
+            $fps_cache[$sequence] = array('filesize' => $filesize, 'fps' => $fps);
+            $return_fps = $fps;
+            file_put_contents($file_path, json_encode($fps_cache, JSON_PRETTY_PRINT), LOCK_EX);
+        }
+    }
+
+    return $return_fps;
 }
 
 /**
@@ -580,20 +2803,20 @@ function media_duration_cache($media, $duration_seconds = null, $filesize = null
  * @param int $decimals
  * @return string
  */
-function human_filesize($path) {
-    // cannot use filesize($path) as that returns a signed 32bit number so maxes out at 2GB
-    $kbytes = trim(shell_exec("du -k \"" . $path . "\" | cut -f1 "));
-    if (strlen($kbytes) < 3) {
-        $bytes = filesize($path);
-        $sz = 'BKMGTP';
-        $factor = floor((strlen($bytes) - 1) / 3);
-		if ($factor)
-	        return sprintf("%.2f", $bytes / pow(1024, $factor)) . @$sz[$factor] . ($factor > 0 ?  "B" : "");
-        return sprintf("%d", $bytes / pow(1024, $factor)) . @$sz[$factor] . ($factor > 0 ?  "B" : "");
-    }
-	$sz = 'KMGTP';
-	$factor = floor((strlen($kbytes) - 1) / 3);
-	return sprintf("%.2f", $kbytes / pow(1024, $factor)) . @$sz[$factor] . "B";
+function human_filesize($path, $decimals = 2)
+{
+    // cannot use PHP's filesize($path) as that returns a signed 32bit number so maxes out at 2GB
+    // Using du -bs to return one human readable file size (or total directory size) even if subdirs are present
+    // Additional shell ternary is to keep prior number formatting
+    // return trim(shell_exec("tsz=$(du -bs \"" . $path . "\" | cut -f1); [ \$tsz -ge 1024 ] && numfmt --to=iec --format=%.2f \$tsz || echo \$tsz")) . "B";
+    // Alternative for 1000 bytes to 1KB
+    //return trim(shell_exec("tsz=$(du -bs \"" . $path . "\" | cut -f1); [ \$tsz -ge 1000 ] && numfmt --to=si --format=%.2f \$tsz || echo \$tsz")) . "B";
+
+    $bytes = intval(shell_exec("du -bs " . escapeshellarg($path) . " | cut -f1"));
+    $sz = ' kMGTP';
+    $factor = floor((strlen($bytes) - 1) / 3);
+    return preg_replace('/\s+/', '', sprintf("%.{$decimals}f", $bytes / pow(1024, $factor)) . @$sz[$factor] . "B");
+
 }
 
 /**
@@ -601,44 +2824,123 @@ function human_filesize($path) {
  * @param $total_duration
  * @return string
  */
-function human_playtime($total_duration){
-	$hour_return = "";
-	//So we can leave the hours out if it duration isn't long enough
-	if (floor($total_duration / 3600) > 0) {
-		$hour_return = sprintf("%'02d", floor($total_duration / 3600)) . "h:";
-	}
+function human_playtime($total_duration)
+{
+    $hour_return = "";
+    //So we can leave the hours out if it duration isn't long enough
+    if (floor($total_duration / 3600) > 0) {
+        $hour_return = sprintf("%'02d", floor($total_duration / 3600)) . "h:";
+    }
 
-	return $hour_return . sprintf("%'02d", floor($total_duration / 60) % 60) . "m:" . sprintf("%'02d", $total_duration % 60) . "s";
+    return $hour_return . sprintf("%'02d", floor($total_duration / 60) % 60) . "m:" . sprintf("%'02d", $total_duration % 60) . "s";
 }
 
 /**
- * Returns current memory usage
+ * Returns the supplied size in bytes ina human readable form
+ * @param $bytes
+ * @return string
+ */
+function humanFileSize($bytes)
+{
+    if ($bytes > 0) {
+        $base = floor(log($bytes) / log(1024));
+        $units = array("B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"); //units of measurement
+        return number_format(($bytes / pow(1024, floor($base))), 2) . "$units[$base]";
+    } else
+        return "0B";
+}
+
+/**
+ * Returns memory information: used, free, buffer/cache breakdown
+ * All sizes are in bytes.
+ *
+ * @return array {
+ *   'total'              => int,   Total physical memory
+ *   'free'               => int,   Free (unused) memory
+ *   'used'               => int,   Used memory excluding buffers/cache
+ *   'buffers'            => int,   Kernel buffer memory
+ *   'cached'             => int,   Page cache memory
+ *   'buffer_cache'       => int,   Combined buffers + cached
+ *   'usage_percent'      => float, Used memory as % of total
+ *   'buffer_percent'     => float, Buffer/cache as % of total
+ *   'free_percent'       => float, Free memory as % of total
+ *   'total_used_percent' => float, (Used + buffer/cache) as % of total
+ * }
+ */
+function get_server_memory_info()
+{
+    global $settings;
+
+    $info = [
+        'total' => 0,
+        'free' => 0,
+        'used' => 0,
+        'buffers' => 0,
+        'cached' => 0,
+        'buffer_cache' => 0,
+        'usage_percent' => 0,
+        'buffer_percent' => 0,
+        'free_percent' => 0,
+        'total_used_percent' => 0,
+    ];
+
+    if (file_exists("/proc/meminfo")) {
+        $fh = fopen('/proc/meminfo', 'r');
+        $total = 0;
+        $free = 0;
+        $buffers = 0;
+        $cached = 0;
+        while ($line = fgets($fh)) {
+            if (preg_match('/^MemTotal:\s+(\d+)\skB$/', $line, $m)) {
+                $total = $m[1] * 1024;
+            } else if (preg_match('/^MemFree:\s+(\d+)\skB$/', $line, $m)) {
+                $free = $m[1] * 1024;
+            } else if (preg_match('/^Buffers:\s+(\d+)\skB$/', $line, $m)) {
+                $buffers = $m[1] * 1024;
+            } else if (preg_match('/^Cached:\s+(\d+)\skB$/', $line, $m)) {
+                $cached = $m[1] * 1024;
+            }
+        }
+        fclose($fh);
+
+        $buffer_cache = $buffers + $cached;
+        $used = $total - $free - $buffers - $cached;
+
+        $info['total'] = $total;
+        $info['free'] = $free;
+        $info['used'] = $used;
+        $info['buffers'] = $buffers;
+        $info['cached'] = $cached;
+        $info['buffer_cache'] = $buffer_cache;
+
+        if ($total > 0) {
+            $info['usage_percent'] = $used / $total * 100;
+            $info['buffer_percent'] = $buffer_cache / $total * 100;
+            $info['free_percent'] = $free / $total * 100;
+            $info['total_used_percent'] = ($used + $buffer_cache) / $total * 100;
+        }
+    } else if ($settings["Platform"] == "MacOS") {
+        $output = exec("memory_pressure | grep System-wide");
+        $array = explode(":", $output);
+        $pct = 100 - trim(rtrim($array[1], "%"));
+        $info['usage_percent'] = $pct;
+        $info['total_used_percent'] = $pct;
+    }
+
+    return $info;
+}
+
+/**
+ * Returns current memory usage as a percentage for about.php 
+ *
+ * @deprecated Use get_server_memory_info() for detailed memory breakdown
+ *             including used, free, buffer/cache, and percentages.
  * @return float|int
  */
-function get_server_memory_usage(){
-	$fh = fopen('/proc/meminfo','r');
-	$total = 0;
-	$free = 0;
-	$buffers = 0;
-	$cached = 0;
-	while ($line = fgets($fh)) {
-		$pieces = array();
-		if (preg_match('/^MemTotal:\s+(\d+)\skB$/', $line, $pieces)) {
-			$total = $pieces[1];
-		} else if (preg_match('/^MemFree:\s+(\d+)\skB$/', $line, $pieces)) {
-			$free = $pieces[1];
-		} else if (preg_match('/^Buffers:\s+(\d+)\skB$/', $line, $pieces)) {
-			$buffers = $pieces[1];
-		} else if (preg_match('/^Cached:\s+(\d+)\skB$/', $line, $pieces)) {
-			$cached = $pieces[1];
-		}
-	}
-	fclose($fh);
-
-	$used = $total - $free - $buffers - $cached;
-	$memory_usage = 1.0 * $used / $total * 100;
-
-	return $memory_usage;
+function get_server_memory_usage()
+{
+    $info = get_server_memory_info();
+    return $info['usage_percent'];
 }
 
 /**
@@ -649,75 +2951,293 @@ function get_server_memory_usage(){
  * @param int $cache_age
  * @return mixed|string
  */
-function file_cache($cache_name, $data_to_cache, $cache_age = 90)
+function file_cache_internal($cache_name, $data_to_cache, $cache_age = 90)
 {
-	$file_path = "/tmp/cache_" . $cache_name . ".cache";
-	$cache_time = $cache_age; //seconds
+    $file_path = "/tmp/cache_" . $cache_name . ".cache";
+    $cache_time = $cache_age; //seconds
 
-	$cache_data_return = null;
-	$cache_data = array();
+    $cache_data_return = null;
+    $cache_data = array();
 
-	if (!file_exists($file_path) || (time() - filemtime($file_path) > $cache_time)) {
-		// cache doesn't exist or expired so lets create it and insert our data
-		if ($data_to_cache !== null || $data_to_cache !== "") {
-			//put the supplied data into the cache, but only if it isn't null
-//			$cache_data[$cache_name] = array('data' => $data_to_cache);
-			$cache_data_return = $data_to_cache;
+    if (!file_exists($file_path) || (time() - filemtime($file_path) > $cache_time)) {
+        // cache doesn't exist or expired so lets create it and insert our data
+        if ($data_to_cache !== null || $data_to_cache !== "") {
+            //put the supplied data into the cache, but only if it isn't null
+            //            $cache_data[$cache_name] = array('data' => $data_to_cache);
+            $cache_data_return = $data_to_cache;
 
-//			exec("echo \"$data_to_cache\" | sudo tee $file_path", $output, $return_val);
-			file_put_contents($file_path, $data_to_cache);
-		}
-	} else {
-		//else cache exists and is valid, replaces/append duration to it
-		$cache_data_contents = file_get_contents($file_path);
+            //            exec("echo \"$data_to_cache\" | sudo tee $file_path", $output, $return_val);
+            file_put_contents($file_path, $data_to_cache, LOCK_EX);
+        }
+    } else {
+        //else cache exists and is valid, replaces/append duration to it
+        $cache_data_contents = file_get_contents($file_path);
 
-//		$handle = fopen($file_path, 'r');
-//		$cache_data_contents = trim(fread($handle,filesize($file_path)));
-//		fclose($handle);
+        //        $handle = fopen($file_path, 'r');
+        //        $cache_data_contents = trim(fread($handle,filesize($file_path)));
+        //        fclose($handle);
 
-		if ($cache_data_contents !== FALSE && !empty($cache_data_contents)) {
-//			$cache_data = json_decode($cache_data, true);
-			//if file hashes are the same - then it's the same file
-			//if (array_key_exists($cache_name, $cache_data)) {
-			//Key exists, then return the cached duration
-//			$cache_data_return = $cache_data[$cache_name]['data'];
-			$cache_data_return = $cache_data_contents;
-		} else if ($data_to_cache !== null || $data_to_cache !== "") {
-			//put the supplied data into the cache
-//			$cache_data[$cache_name] = array('data' => $data_to_cache);
-			$cache_data_return = $data_to_cache;
+        if ($cache_data_contents !== false && !empty($cache_data_contents)) {
+            //            $cache_data = json_decode($cache_data, true);
+            //if file hashes are the same - then it's the same file
+            //if (array_key_exists($cache_name, $cache_data)) {
+            //Key exists, then return the cached duration
+            //            $cache_data_return = $cache_data[$cache_name]['data'];
+            $cache_data_return = $cache_data_contents;
+        } else if ($data_to_cache !== null || $data_to_cache !== "") {
+            //put the supplied data into the cache
+            //            $cache_data[$cache_name] = array('data' => $data_to_cache);
+            $cache_data_return = $data_to_cache;
 
-//			exec("echo \"$data_to_cache\" | sudo tee $file_path", $output, $return_val);
-			file_put_contents($file_path, $data_to_cache);
-		}
-	}
-	return $cache_data_return;
+            //            exec("echo \"$data_to_cache\" | sudo tee $file_path", $output, $return_val);
+            file_put_contents($file_path, $data_to_cache, LOCK_EX);
+        }
+    }
+    return $cache_data_return;
+}
+// $cache_dir defaults to /tmp, which on most FPP platforms is tmpfs -- so the
+// cache is volatile and every reboot starts cold.  That is the right default:
+// almost everything cached here is cheap to recompute and some of it (kernel
+// version, git state) SHOULD be re-read after a reboot.  Pass a persistent
+// directory only for a value whose absence has a visible consequence rather
+// than just a slower first request -- see file_cache_dir_persistent().
+/**
+ * Run a command without a shell, like exec(): returns the exit status and puts
+ * stdout's lines in $output.  exec() always goes through `/bin/sh -c`, which is
+ * an extra fork and exec per call -- a real cost on a single-core board for the
+ * commands the status polls run.  The command is an argv array, so there is no
+ * quoting to get wrong.  A bare program name is looked up in the sbin and bin
+ * directories, since php-fpm's environment may carry no PATH.  stderr is
+ * discarded.
+ */
+function fpp_exec_argv(array $argv, &$output = null)
+{
+    $output = array();
+    if (strpos($argv[0], '/') === false) {
+        foreach (array('/usr/sbin', '/usr/bin', '/sbin', '/bin') as $dir) {
+            if (is_executable($dir . '/' . $argv[0])) {
+                $argv[0] = $dir . '/' . $argv[0];
+                break;
+            }
+        }
+    }
+    $proc = @proc_open($argv, array(
+        0 => array('file', '/dev/null', 'r'),
+        1 => array('pipe', 'w'),
+        2 => array('file', '/dev/null', 'w'),
+    ), $pipes);
+    if (!is_resource($proc)) {
+        return -1;
+    }
+    $out = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $rc = proc_close($proc);
+    if ($out !== false && $out !== '') {
+        $output = explode("\n", rtrim($out, "\n"));
+    }
+    return $rc;
 }
 
-function get_kernel_version(){
-	$kernel_version = "";
-	$cachefile_name = "kernel_version";
-	$cache_age = 86400;
+// Newest mtime among the files a commit, checkout or pull rewrites: HEAD, the
+// branch ref it names, and packed-refs.  Anything derived from the checked-out
+// commit stays valid until this moves.
+function fpp_git_state_mtime()
+{
+    $gitDir = dirname(dirname(__FILE__)) . "/.git";
+    $mtime = @filemtime($gitDir . "/HEAD") ?: 0;
+    $head = @file_get_contents($gitDir . "/HEAD");
+    if ($head !== false && strncmp($head, "ref: ", 5) == 0) {
+        $mtime = max($mtime, @filemtime($gitDir . "/" . trim(substr($head, 5))) ?: 0);
+    }
+    return max($mtime, @filemtime($gitDir . "/packed-refs") ?: 0);
+}
 
-	$cached_data = file_cache($cachefile_name, NULL, $cache_age);
-	if ($cached_data == NULL) {
-		$kernel_version = exec("uname -r");
-		//cache result
-		file_cache($cachefile_name, $kernel_version, $cache_age);
-	} else {
-		$kernel_version = $cached_data;
-	}
+// file_cache() for a value that only changes when the checkout does.  A short
+// TTL meant forking git every few seconds for every page load and status poll;
+// this keeps the value until the repository's state is newer than the cache.
+function git_state_file_cache($cache_name, $data_function)
+{
+    $path = "/tmp/cache_" . $cache_name . ".cache";
+    if (file_exists($path) && filemtime($path) <= fpp_git_state_mtime()) {
+        @unlink($path);
+    }
+    return file_cache($cache_name, $data_function, 86400);
+}
 
-	return $kernel_version;
+function file_cache($cache_name, $data_function, $cache_time = 90, $grace_time = 10, $cache_dir = "/tmp")
+{
+    $file_path = $cache_dir . "/cache_" . $cache_name . ".cache";
+    $file_path_lock = $cache_dir . "/cache_" . $cache_name . ".cache_recalc";
+    $exists = file_exists($file_path);
+    $recache = true;
+    $inGrace = false;
+    if ($exists) {
+        $mtime = filemtime($file_path);
+        $inGrace = (time() - $mtime > $cache_time);
+        $recache = (time() - $mtime > ($cache_time + $grace_time));
+    }
+    if ($recache) {
+        $fdLock = @fopen($file_path_lock, "c");
+        $flags = LOCK_EX;
+        if ($inGrace) {
+            // if we are in the grace time, we'll ATTEMPT to recreate by
+            // grabbing the lock, but if it fails, we'll use the existing
+            // data.   Thus, if it takes a while to recreate, other requests
+            // will get the older data during the re-create process
+            $flags = LOCK_EX | LOCK_NB;
+        }
+        if ($fdLock !== false && flock($fdLock, $flags)) {
+            $data = $data_function();
+            // Only persist a usable result.  A null/false return signals the
+            // computation failed (e.g. a network timeout) -- in that case we
+            // leave the existing cache intact and fall through to the read
+            // path below to serve the last-known-good value, rather than
+            // poisoning the cache with a failure sentinel for the rest of the
+            // cache window.
+            if ($data !== null && $data !== false) {
+                $fd = @fopen($file_path, "c+");
+                if ($fd !== false) {
+                    flock($fd, LOCK_EX);
+                    ftruncate($fd, 0);
+                    fputs($fd, $data);
+                    flock($fd, LOCK_UN);
+                    fclose($fd);
+                }
+                flock($fdLock, LOCK_UN);
+                fclose($fdLock);
+                unlink($file_path_lock);
+                return $data;
+            }
+            flock($fdLock, LOCK_UN);
+            unlink($file_path_lock);
+        }
+        if ($fdLock !== false) {
+            fclose($fdLock);
+        }
+    }
+    $fd = @fopen($file_path, "r");
+    if ($fd === false) {
+        return '';
+    }
+    flock($fd, LOCK_SH);
+    // Read the entire cached payload.  fgets() returns only the first line,
+    // which silently truncates multi-line cached values (e.g. JSON responses)
+    // and breaks json_decode().
+    $data = trim(stream_get_contents($fd));
+    flock($fd, LOCK_UN);
+    fclose($fd);
+    return $data;
+}
+
+// Cache directory that survives a reboot, for file_cache()'s $cache_dir.
+// media/cache, not media/tmp: fppinit empties media/tmp at every boot on
+// cape-detect builds. Cleared by Reset Caches (resetConfig.php's 'cache/*').
+function file_cache_dir_persistent()
+{
+    global $settings;
+    $dir = $settings['mediaDirectory'] . '/cache';
+    return is_dir($dir) ? $dir : '/tmp';
+}
+
+
+function get_kernel_version()
+{
+    $kernel_version = "";
+    $cachefile_name = "kernel_version";
+    $cache_age = 86400;
+
+    $kernel_version = file_cache($cachefile_name, function () {
+        return trim(exec("uname -r"));
+    }, $cache_age);
+    return $kernel_version;
+}
+
+function get_cpu_stats()
+{
+    $stats = @file_get_contents("/proc/stat");
+    if ($stats !== false) {
+        // Remove double spaces to make it easier to extract values with explode()
+        $stats = preg_replace("/[[:blank:]]+/", " ", $stats);
+
+        // Separate lines
+        $stats = str_replace(array("\r\n", "\n\r", "\r"), "\n", $stats);
+        $stats = explode("\n", $stats);
+        foreach ($stats as $statLine) {
+            $statLineData = explode(" ", trim($statLine));
+            // Found!
+            if (
+                (count($statLineData) >= 5)
+                && ($statLineData[0] == "cpu")
+            ) {
+                return array(
+                    $statLineData[1],
+                    $statLineData[2],
+                    $statLineData[3],
+                    $statLineData[4],
+                    $statLineData[5],
+                    $statLineData[6],
+                    $statLineData[7],
+                );
+            }
+        }
+    }
+    return array(0, 0, 0, 0, 0, 0, 0);
+}
+
+/**
+ * Returns raw cumulative CPU counters from /proc/stat,
+ */
+function get_cpu_stats_raw()
+{
+    global $settings;
+    if ($settings["Platform"] == "MacOS") {
+        $output = exec("ps -A -o %cpu | awk '{s+=$1} END {print s}'");
+        return array('mac' => floatval($output));
+    }
+    return get_cpu_stats();
 }
 
 /**
  * Returns average CPU usage
+ * Still used by GetSystemInfoJsonInternal() which feeds api/system/info
  * @return mixed
  */
-function get_server_cpu_usage(){
-	$load = sys_getloadavg();
-	return $load[0];
+function get_server_cpu_usage()
+{
+    global $settings;
+    if ($settings["Platform"] == "MacOS") {
+        $output = exec("ps -A -o %cpu | awk '{s+=$1} END {print s}'");
+        return floatval($output);
+    }
+    if (!file_exists("/tmp/cpustats.txt")) {
+        $ostats = get_cpu_stats();
+        $vs = sprintf("%d %d %d %d %d %d %d", $ostats[0], $ostats[1], $ostats[2], $ostats[3], $ostats[4], $ostats[5], $ostats[6]);
+        @file_put_contents("/tmp/cpustats.txt", $vs, LOCK_EX);
+        usleep(10000);
+    } else {
+        $statLine = @file_get_contents("/tmp/cpustats.txt");
+        $ostats = explode(" ", trim($statLine));
+    }
+    $stats = get_cpu_stats();
+    $vs = sprintf("%d %d %d %d %d %d %d", $stats[0], $stats[1], $stats[2], $stats[3], $stats[4], $stats[5], $stats[6]);
+    @file_put_contents("/tmp/cpustats.txt", $vs, LOCK_EX);
+
+    $user = (int) $stats[0] - (int) $ostats[0];
+    $nice = (int) $stats[1] - (int) $ostats[1];
+    $system = (int) $stats[2] - (int) $ostats[2];
+    $idle = (int) $stats[3] - (int) $ostats[3];
+    $iowait = (int) $stats[4] - (int) $ostats[4];
+    $irq = (int) $stats[5] - (int) $ostats[5];
+    $softirq = (int) $stats[6] - (int) $ostats[6];
+
+    $total = $user + $nice + $system + $idle + $iowait + $irq + $softirq;
+    $val = $idle * 100.0;
+    // 100 - the percent idle
+    if ($total > 0) {
+        $val = 100.0 - ($val / $total);
+    }
+
+    return $val;
 }
 
 /**
@@ -725,19 +3245,41 @@ function get_server_cpu_usage(){
  * @param bool $uptime_value_only
  * @return null|string|string[]
  */
-function get_server_uptime($uptime_value_only=false){
-	$uptime = exec("uptime", $output, $return_val);
-	if ($return_val != 0)
-		$uptime = "";
-	unset($output);
-	$uptime = preg_replace('/[0-9]+ users?, /', '', $uptime);
-	if ($uptime_value_only) {
-		$uptime_portion = explode(",", $uptime,2)[0];
-		if (!empty($uptime_portion) && stripos($uptime_portion, "up") !== false) {
-			$uptime = trim(explode("up", $uptime_portion, 2)[1]);
-		}
-	}
-	return $uptime;
+function get_server_uptime($uptime_value_only = false)
+{
+    global $settings;
+
+    if (!$uptime_value_only || $settings["Platform"] == "MacOS") {
+        $uptime = exec("uptime", $output, $return_val);
+        if ($return_val != 0) {
+            $uptime = "";
+        }
+
+        unset($output);
+        $uptime = preg_replace('/[0-9]+ users?, /', '', $uptime);
+        if ($uptime_value_only) {
+            $uptime_portion = explode(",", $uptime, 2)[0];
+            if (!empty($uptime_portion) && stripos($uptime_portion, "up") !== false) {
+                $uptime = trim(explode("up", $uptime_portion, 2)[1]);
+            }
+        }
+    } else {
+        $str = @file_get_contents('/proc/uptime');
+        $num = floatval($str);
+        $secs = $num % 60;
+        $num = (int) ($num / 60);
+        $mins = $num % 60;
+        $num = (int) ($num / 60);
+        $hours = $num % 24;
+        $num = (int) ($num / 24);
+        $days = $num;
+        $uptime = "";
+        if ($days) {
+            $uptime = "" . $days . " days ";
+        }
+        $uptime .= $hours . ":" . $mins;
+    }
+    return $uptime;
 }
 
 /**
@@ -745,341 +3287,2971 @@ function get_server_uptime($uptime_value_only=false){
  *
  * @return mixed|string
  */
-function get_fpp_head_version(){
-	$fpp_head_version = "Unknown";
-	$cachefile_name = "git_fpp_head_version";
-	$cache_age = 90;
+function get_fpp_head_version()
+{
+    $cachefile_name = "git_fpp_head_version";
+    $cache_age = 90;
 
-	$cached_data = file_cache($cachefile_name, NULL, $cache_age);
-	if ($cached_data == NULL) {
-		$fpp_head_version = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ describe --tags", $output, $return_val);
-		if ($return_val != 0)
-			$fpp_head_version = "Unknown";
-		unset($output);
-		//cache result
-		file_cache($cachefile_name, $fpp_head_version, $cache_age);
-	} else {
-		$fpp_head_version = $cached_data;
-	}
+    $fpp_head_version = file_cache($cachefile_name, function () {
+        $fpp_head_version = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ describe", $output, $return_val);
+        if ($return_val != 0) {
+            $fpp_head_version = "Unknown";
+        }
+        unset($output);
+        return trim($fpp_head_version);
+    }, $cache_age);
 
-	return $fpp_head_version;
+    return $fpp_head_version;
 }
 
 /**
  * Returns the current system Git branch
  * @return string
  */
-function get_git_branch(){
-	$git_branch = "";
-	$cachefile_name = "git_branch";
-	$cache_age = 90;
+function get_git_branch()
+{
+    $git_branch = "";
+    $cachefile_name = "git_branch";
+    $cache_age = 90;
 
-	$cached_data = file_cache($cachefile_name,NULL,$cache_age);
-	if ($cached_data == NULL) {
-		$git_branch = exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ branch --list | grep '\\*' | awk '{print \$2}'", $output, $return_val);
-		if ( $return_val != 0 )
-			$git_branch = "Unknown";
-		unset($output);
-		//cache result
-		file_cache($cachefile_name, $git_branch, $cache_age);
-	}else{
-		$git_branch = $cached_data;
-	}
+    $git_branch = file_cache($cachefile_name, function () {
+        $git_branch = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ branch --list | grep '\\*' | awk '{print \$2}'", $output, $return_val);
+        if ($return_val != 0) {
+            $git_branch = "Unknown";
+        }
 
-	return $git_branch;
+        unset($output);
+        //cache result
+        return trim($git_branch);
+    }, $cache_age);
+
+    return $git_branch;
 }
 
 /**
  * Returns the version of the local Git branch
  * @return string
  */
-function get_local_git_version(){
-	$git_version = "Unknown";
-	$cachefile_name = "local_git_version";
-	$cache_age = 90;
+function get_local_git_version()
+{
+    $git_version = "Unknown";
+    $cachefile_name = "local_git_version";
 
-	$cached_data = file_cache($cachefile_name,NULL,$cache_age);
-	if ($cached_data == NULL) {
-		$git_version = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ rev-parse --short=7 HEAD", $output, $return_val);
-		if ( $return_val != 0 )
-			$git_version = "Unknown";
-		unset($output);
-		//cache result
-		file_cache($cachefile_name, $git_version, $cache_age);
-	}else{
-		$git_version = $cached_data;
-	}
+    $git_version = git_state_file_cache($cachefile_name, function () {
+        $git_version = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ rev-parse --short=9 HEAD", $output, $return_val);
+        if ($return_val != 0) {
+            $git_version = "Unknown";
+        }
+        unset($output);
+        return trim($git_version);
+    });
 
-	return $git_version;
+    return $git_version;
 }
 
 /**
- * Returns version of the remote Git branch for the supplied branch
+ * Returns the commit timestamp (unix epoch) of the local Git HEAD
+ * @return int 0 if unavailable
+ */
+function get_local_git_commit_date()
+{
+    $cachefile_name = "local_git_commit_date";
+
+    $epoch = git_state_file_cache($cachefile_name, function () {
+        $epoch = exec("git --git-dir=" . dirname(dirname(__FILE__)) . "/.git/ log -1 --format=%ct HEAD", $output, $return_val);
+        if ($return_val != 0) {
+            $epoch = "0";
+        }
+        unset($output);
+        return trim($epoch);
+    });
+
+    return intval($epoch);
+}
+
+/**
+ * Returns version of the remote Git branch for the current branch
  * @return string
  */
-function get_remote_git_version($git_branch){
-	$git_remote_version = "Unknown";
+function get_remote_git_version()
+{
+    global $settings;
 
+    $git_remote_version = "Unknown";
+    $git_branch = getFPPBranch();
+    $origin = "github.com";
+    if (isset($settings['UpgradeSource'])) {
+        $origin = $settings['UpgradeSource'];
+    }
 
-	if (!empty($git_branch) || strtolower($git_branch) != "unknown") {
-		$cachefile_name = "git_" . $git_branch;
-		$cache_age = 90;
-		$git_remote_version = "Unknown";
+    if (!empty($git_branch) || strtolower($git_branch) != "unknown") {
+        $cachefile_name = "git_" . $git_branch;
+        // A check is a TLS connection to the upgrade source -- about a second
+        // of CPU on a BeagleBone -- and every full status poll from every open
+        // page lands here.  Its main consumer, the MultiSync page's per-host
+        // update marker, doesn't need it fresher than this.
+        $cache_age = 900;
+        $git_remote_version = "Unknown";
 
-		//Check the cache for git_<branch>, if null is returned no cache file exists or it's expired, so then off to github
-		$cached_data = file_cache($cachefile_name, NULL, $cache_age);
-		if ($cached_data == NULL) {
-			//if for some reason name resolution fails ping will take roughly 10 seconds to return (Default DNS Timeout 5 seconds x 2 retries)
-			//to try work around this ping the google public DNS @ 8.8.8.8 (to skip DNS) waiting for a reply for max 1 second, if that's ok we have a route to the internet, then it's highly likely DNS will also work
-			$google_dns_ping = exec("ping -q -c 1 -W 1 8.8.8.8 > /dev/null", $output, $return_val);
-			unset($output);
-			if ($return_val == 0){
-				//Google DNS Ping success
-				// this can take a couple seconds to complete so we'll cache it
-				$git_remote_version = exec("ping -q -c 1 github.com > /dev/null && (git --git-dir=/opt/fpp/.git/ ls-remote -q -h origin $git_branch | awk '$1 > 0 { print substr($1,1,7)}')", $output, $return_val);
-				if ($return_val != 0)
-					$git_remote_version = "Unknown";
-				unset($output);
-			}else{
-				//Google DNS Ping fail - return unknown
-				$git_remote_version = "Unknown";
-			}
+        // A failed check is not cached (see below), so without this every
+        // status poll would pay for it again -- up to the whole timeout of an
+        // unreachable source, or of a ping that gets no reply.  Hold off
+        // re-checking for a minute after one fails.
+        $fail_marker = "/tmp/cache_" . $cachefile_name . ".failed";
+        if (file_exists($fail_marker) && time() - filemtime($fail_marker) < 60) {
+            $cached = @file_get_contents("/tmp/cache_" . $cachefile_name . ".cache");
+            return ($cached !== false && trim($cached) !== "") ? trim($cached) : "Unknown";
+        }
 
-			//cache result
-			file_cache($cachefile_name, $git_remote_version, $cache_age);
-		} else {
-			//return the cached version
-			$git_remote_version = $cached_data;
-		}
+        //Check the cache for git_<branch>, if null is returned no cache file exists or it's expired, so then off to github
+        $git_remote_version = file_cache($cachefile_name, function () use ($origin, $fail_marker) {
+            global $settings;
 
-//        if( ! file_exists( $file )  ||  ( time() - filemtime( $file ) > $time)) {
-//            // this can take a couple seconds to complete so we'll cache it
-//            $ver = exec("ping -q -c 1 github.com > /dev/null && (git --git-dir=/opt/fpp/.git/ ls-remote -q -h origin $git_branch | awk '$1 > 0 { print substr($1,1,7)}')", $output, $return_val);
-//            if ( $return_val != 0 )
-//                $ver = "Unknown";
-//            unset($output);
-//
-//            exec("echo \"$ver\" | sudo tee $file", $output, $return_val);
-//            unset($output);
-//        } else {
-//            $handle = fopen($file, 'r');
-//            $ver = trim(fread($handle,filesize($file)));
-//            fclose($handle);
-//        }
-	}
+            $git_branch = getFPPBranch();
 
-	return $git_remote_version;
+            //if for some reason name resolution fails ping will take roughly 10 seconds to return (Default DNS Timeout 5 seconds x 2 retries)
+            //to try work around this ping the google public DNS @ 8.8.8.8 (to skip DNS) waiting for a reply for max 1 second, if that's ok we have a route to the internet, then it's highly likely DNS will also work
+            $return_val = 0;
+            if ($origin == 'github.com') {
+                $google_dns_ping = exec("ping -q -c 1 -W 1 8.8.8.8 > /dev/null", $output, $return_val);
+                unset($output);
+            }
+            if ($return_val == 0) {
+                //Google DNS Ping success
+
+                // First, try to get the upstream tracking branch
+                $upstream = exec("git --git-dir=" . $settings["fppDir"] . "/.git/ rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null", $output, $return_val);
+                unset($output);
+
+                $remote_name = "origin";
+                $remote_branch = $git_branch;
+
+                // If we have an upstream tracking branch, parse it (format: remote/branch)
+                if ($return_val == 0 && !empty($upstream) && strpos($upstream, '/') !== false) {
+                    list($remote_name, $remote_branch) = explode('/', $upstream, 2);
+                }
+
+                // Try to get remote version from the tracking branch
+                $git_remote_version = exec("git --git-dir=" . $settings["fppDir"] . "/.git/ ls-remote -q -h $remote_name $remote_branch 2>/dev/null | awk '$1 > 0 { print substr(\$1,1,9)}'", $output, $return_val);
+                // PR branches track pull/<n>/head which is not under refs/heads/* – retry without -h
+                if ((empty($git_remote_version) || $return_val != 0) && (preg_match('/^(pr-\d+|pull\/\d+\/head)$/', $git_branch) || preg_match('/^pull\/\d+\/head$/', $remote_branch))) {
+                    $prRef = $remote_branch;
+                    if (preg_match('/^pr-(\d+)$/', $git_branch, $m)) {
+                        $prRef = "pull/" . $m[1] . "/head";
+                    }
+                    $git_remote_version = exec("git --git-dir=" . $settings["fppDir"] . "/.git/ ls-remote -q " . escapeshellarg($remote_name) . " " . escapeshellarg($prRef) . " 2>/dev/null | awk '$1 > 0 { print substr(\$1,1,9)}'", $output, $return_val);
+                }
+                if ($return_val != 0 || empty($git_remote_version)) {
+                    // Fallback to origin
+                    $git_remote_version = exec("git --git-dir=" . $settings["fppDir"] . "/.git/ ls-remote -q -h origin $git_branch 2>/dev/null | awk '$1 > 0 { print substr(\$1,1,9)}'", $output, $return_val);
+                    if ($return_val != 0) {
+                        $git_remote_version = "Unknown";
+                    }
+                }
+
+                unset($output);
+
+                // If we get back a blank version, this clone may be setup to
+                // use ssh to access github, so fallback and check for a
+                // 'github' origin which can be setup to use https://
+                if ($git_remote_version == "") {
+                    $git_remote_version = exec("ping -q -c 1 -W 1 github.com > /dev/null && (git --git-dir=" . $settings["fppDir"] . "/.git/ ls-remote -q -h github $git_branch 2>/dev/null | awk '$1 > 0 { print substr(\$1,1,9)}')", $output, $return_val);
+                    if ($return_val != 0) {
+                        $git_remote_version = "Unknown";
+                    }
+
+                    unset($output);
+                }
+            } else {
+                //Google DNS Ping fail - return unknown
+                $git_remote_version = "Unknown";
+            }
+            // A failed lookup returns null so file_cache() keeps the previous
+            // cached value rather than persisting the failure for the cache
+            // window.  The "Unknown" default is re-applied below when no cached
+            // value exists yet.
+            if ($git_remote_version === "Unknown" || $git_remote_version === "") {
+                @touch($fail_marker);
+                return null;
+            }
+            @unlink($fail_marker);
+            return $git_remote_version;
+        }, $cache_age, 30);
+        if ($git_remote_version === "") {
+            $git_remote_version = "Unknown";
+        }
+    }
+    return $git_remote_version;
+}
+
+/**
+ * Checks whether a release asset filename matches the current device's platform and architecture.
+ *
+ * @param string $name     Asset filename to test (e.g. "Pi-7.0.fppos").
+ * @param array  $settings Global FPP settings array providing OSImagePrefix and Is64Bit.
+ * @return bool True if the filename matches this device; false otherwise.
+ */
+function MatchesDeviceOSImage($name, $settings)
+{
+    if (!str_ends_with($name, ".fppos") || !isset($settings['OSImagePrefix']) || $settings['OSImagePrefix'] == "") {
+        return false;
+    }
+
+    $prefix = $settings['OSImagePrefix'];
+    $is64Bit = !empty($settings['Is64Bit']);
+
+    if ($prefix == "Pi" || $prefix == "Pi64") {
+        if (!(str_starts_with($name, "Pi-") || str_starts_with($name, "Pi64-"))) {
+            return false;
+        }
+    } else if ($prefix == "BBB" || $prefix == "BB64") {
+        if (!(str_starts_with($name, "BBB-") || str_starts_with($name, "BB64-"))) {
+            return false;
+        }
+    } else if (!str_starts_with($name, $prefix . "-")) {
+        return false;
+    }
+
+    // Match explicit architecture markers when they are present.
+    $has64Marker = preg_match('/(^|[-_])(64|64bit|aarch64|arm64)([-_.]|$)/i', $name) === 1;
+    $has32Marker = preg_match('/(^|[-_])(32|32bit|armv7|armv7l|armhf|arm32)([-_.]|$)/i', $name) === 1;
+
+    if ($has64Marker && !$is64Bit) {
+        return false;
+    }
+    if ($has32Marker && $is64Bit) {
+        return false;
+    }
+
+    // Preserve legacy behavior if marker isn't present.
+    if (!$has64Marker && !$has32Marker) {
+        if ($is64Bit && ($prefix == "Pi64" || $prefix == "BB64")) {
+            return str_starts_with($name, $prefix . "-");
+        }
+        if (!$is64Bit && ($prefix == "Pi" || $prefix == "BBB")) {
+            return str_starts_with($name, $prefix . "-");
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Built binaries start with an ELF/Mach-O header; a power loss after a build can
+ * leave them zero-filled (#3120).  Mirrors fppdBinaryValid() in scripts/common.
+ * @return bool
+ */
+function fppdBinaryValid()
+{
+    global $settings;
+
+    $binDir = $settings['fppBinDir'];
+    if (!is_executable($binDir . '/fppd')) {
+        return false;
+    }
+    $validMagic = array("\x7fELF", "\xcf\xfa\xed\xfe", "\xce\xfa\xed\xfe", "\xca\xfe\xba\xbe");
+    foreach (array('fppd', 'fppinit', 'libfpp.so', 'libfpp.dylib') as $name) {
+        $path = $binDir . '/' . $name;
+        if (!file_exists($path)) {
+            continue;
+        }
+        $magic = @file_get_contents($path, false, null, 0, 4);
+        if (!in_array($magic, $validMagic, true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Check for FPP updates via fppstats API
+ * Returns unified update status for both branch upgrades and commit updates
+ * @param string $latestReleaseVersion Optional pre-fetched latest release version (from GitHub API)
+ * @return array Update status with branchUpgradeAvailable, commitUpdateAvailable, etc.
+ */
+function check_fppstats_updates($latestReleaseVersion = null, $latestReleaseHasDeviceAsset = true)
+{
+    global $settings;
+
+    $currentBranch = getFPPBranch();
+    $localCommit = get_local_git_version();
+    $fppVersion = getFPPVersion();
+
+    $fppVersionFloat = 0;
+    if (preg_match('/^v?(\d+\.\d+)/', $currentBranch, $matches)) {
+        $fppVersionFloat = floatval($matches[1]);
+    } elseif (preg_match('/^(\d+)\./', $fppVersion, $matches)) {
+        $fppVersionFloat = floatval($matches[1]);
+    }
+
+    // A tree that has never been built -- or that has been cleaned -- has no
+    // generated www/fppversion.php, so version and branch both resolve to
+    // "Unknown" (see fppunknown_versions.php).  Nothing can be compared in that
+    // state: the branch matches no remote branch, and every release branch looks
+    // newer than a version we cannot read, which previously produced a bogus
+    // "FPP vX.Y is available for install" offer.  Report no updates at all and
+    // let the UI offer a rebuild instead.  A damaged build (#3120) does too.
+    $versionUnknown = ($fppVersion === '' || $fppVersion === 'Unknown' ||
+        $currentBranch === '' || $currentBranch === 'Unknown' ||
+        !fppdBinaryValid());
+
+    $result = [
+        'branchUpgradeAvailable' => false,
+        'branchUpgradeTarget' => '',
+        'branchUpgradeVersion' => '',
+        'commitUpdateAvailable' => false,
+        'remoteCommit' => '',
+        'currentBranch' => $currentBranch,
+        'localCommit' => $localCommit,
+        'fppVersionFloat' => $fppVersionFloat,
+        'versionUnknown' => $versionUnknown,
+        // Whether an update source actually answered.  false means neither
+        // fppstats nor the git remote could be reached (typically the first
+        // request after a reboot or an upgrade, when the /tmp cache is cold and
+        // the fetch timed out), so the "no update" fields above are unknown,
+        // not a verdict -- the UI must not present them as "up to date".
+        'checked' => true
+    ];
+
+    if ($versionUnknown) {
+        return $result;
+    }
+
+    // Skip branch upgrade detection for master branch users
+    $checkBranchUpgrade = ($currentBranch !== 'master' && $currentBranch !== 'main');
+
+    $fppstatsData = file_cache('fppstats_commits', function () {
+        $ch = curl_init('https://fppstats.falconchristmas.com/api/fpp_commits');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'FPP');
+        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($response && $httpCode === 200) {
+            return $response;
+        }
+        // Signal failure with null so file_cache() preserves the last good
+        // response instead of caching an empty failure for the cache window.
+        return null;
+    }, 90, 30);
+
+    if (!empty($fppstatsData)) {
+        $data = json_decode($fppstatsData, true);
+
+        if (!isset($data['branches']) || !is_array($data['branches'])) {
+            $result['checked'] = false;
+        } else {
+            $latestNonMaster = '';
+            $latestNonMasterVersion = 0;
+
+            foreach ($data['branches'] as $branch) {
+                // Check for remote commit on current branch
+                if ($branch['name'] === $currentBranch) {
+                    $remoteCommit = $branch['commit']['sha'] ?? '';
+                    $result['remoteCommit'] = $remoteCommit;
+
+                    // Check if local is behind remote (commit update available).
+                    // A sha mismatch alone isn't proof we're behind: fpp-stats-server
+                    // only rescrapes GitHub every 5 minutes (server/index.js), so right
+                    // after any push -- ours via upgrade_FPP or someone else's -- it can
+                    // still report the previous branch tip. Comparing commit timestamps
+                    // instead of just the sha means we only flag an update when the
+                    // remote commit is actually newer than what's installed; a same-or-
+                    // older remote timestamp means fppstats just hasn't caught up yet.
+                    if (
+                        !empty($remoteCommit) && !empty($localCommit) &&
+                        strpos($remoteCommit, $localCommit) !== 0 &&
+                        strpos($localCommit, $remoteCommit) !== 0
+                    ) {
+                        $remoteCommitEpoch = intval($branch['commit']['date_epoch'] ?? 0);
+                        $localCommitEpoch = get_local_git_commit_date();
+                        if ($remoteCommitEpoch > 0 && $localCommitEpoch > 0 && $remoteCommitEpoch > $localCommitEpoch) {
+                            $result['commitUpdateAvailable'] = true;
+                        }
+                    }
+                }
+
+                // Check for newer release branches (only for non-master users)
+                if ($checkBranchUpgrade && $branch['name'] !== 'master') {
+                    // Only consider plain release branches (vX.Y). Suffixed ones
+                    // such as v10.0-beta or v8.5-bb64 are never an upgrade target.
+                    if (preg_match('/^v(\d+\.\d+)$/', $branch['name'], $matches)) {
+                        $branchVersion = floatval($matches[1]);
+
+                        // Pick the highest version, not the most recently committed
+                        // branch: a fix backported to an older release branch makes
+                        // it the newest commit and would otherwise hide every newer
+                        // release from the players on it.
+                        if ($branchVersion >= $fppVersionFloat && $branchVersion > $latestNonMasterVersion) {
+                            $latestNonMaster = $branch['name'];
+                            $latestNonMasterVersion = $branchVersion;
+                        }
+                    }
+                }
+            }
+
+            // Check if a newer branch is available
+            if ($checkBranchUpgrade && !empty($latestNonMaster) && $latestNonMaster !== $currentBranch) {
+                $result['branchUpgradeAvailable'] = true;
+                $result['branchUpgradeTarget'] = $latestNonMaster;
+                // Strip 'v' prefix for GitHub API
+                $result['branchUpgradeVersion'] = ltrim($latestNonMaster, 'v');
+            }
+        }
+    } else {
+        // Fallback: fppstats unreachable
+        $remoteGitVersion = get_remote_git_version();
+        $result['remoteCommit'] = $remoteGitVersion;
+        $result['checked'] = (!empty($remoteGitVersion) && $remoteGitVersion !== 'Unknown');
+
+        if (
+            !empty($remoteGitVersion) && $remoteGitVersion !== 'Unknown' &&
+            !empty($localCommit) && $localCommit !== 'Unknown' &&
+            $remoteGitVersion !== $localCommit
+        ) {
+            $result['commitUpdateAvailable'] = true;
+        }
+    }
+
+    // Only notify about a branch upgrade once a full release actually exists.
+    // GitHub's releases/latest endpoint (the source of $latestReleaseVersion)
+    // excludes prereleases and drafts, so it is the newest version that has
+    // published artifacts. fppstats, by contrast, lists git branches, so a
+    // release branch (e.g. v10.0) shows up there before any release is cut.
+    // $latestReleaseHasDeviceAsset additionally confirms that release ships a
+    // downloadable OS image (.fppos) for this specific device.
+    if ($result['branchUpgradeAvailable']) {
+        if (preg_match('/^v?(\d+\.\d+)/', (string) $latestReleaseVersion, $rm)) {
+            $latestReleaseMajorMinor = $rm[1];
+            $latestVersionFloat = floatval($latestReleaseMajorMinor);
+
+            if ($latestVersionFloat > $fppVersionFloat && $latestReleaseHasDeviceAsset) {
+                // Point users at the newest released version, even if a newer
+                // (release-less) branch was detected on fppstats.
+                $result['branchUpgradeTarget'] = 'v' . $latestReleaseMajorMinor;
+                $result['branchUpgradeVersion'] = $latestReleaseMajorMinor;
+            } else {
+                // Either the latest published release is not newer than what we
+                // run, or it has no OS image for this device yet, so the
+                // detected branch has nothing to upgrade to.
+                $result['branchUpgradeAvailable'] = false;
+                $result['branchUpgradeTarget'] = '';
+                $result['branchUpgradeVersion'] = '';
+            }
+        }
+        // else: could not determine the latest release (e.g. offline); leave
+        // the branch-based detection as-is so notifications still work when
+        // GitHub is unreachable.
+    }
+
+    return $result;
+}
+
+/**
+ * Returns a user-friendly version string for display to standard users
+ * For master/main branch: "FPP 9.x"
+ * For release branches (v9.3): "FPP 9.3"
+ * For other branches: "FPP 9.x (branch-name)"
+ * @return string
+ */
+function getFPPVersionDisplay()
+{
+    $major = getFPPMajorVersion();
+    $branch = getFPPBranch();
+
+    // For master/main branch, show "FPP 9.x" format
+    if ($branch == 'master' || $branch == 'main') {
+        return "FPP " . $major . ".x";
+    }
+    // For release branches (e.g., "v9.3"), show clean version
+    if (preg_match('/^v?(\d+\.\d+)/', $branch, $matches)) {
+        return "FPP " . $matches[1];
+    }
+    // Fallback: use major version with branch name
+    return "FPP " . $major . ".x (" . $branch . ")";
 }
 
 function ReplaceIllegalCharacters($input_string)
 {
-	// Removes any of the following characters from the supplied name, can be used to cleanse playlist names, event names etc
-	// Current needed for example it the case of the scheduler since it is still CSV and commas in a playlist name cause issues
-	// Everything is currently replaced with a hyphen ( - )
+    // Removes any of the following characters from the supplied name, can be used to cleanse playlist names, event names etc
+    // Current needed for example it the case of the scheduler since it is still CSV and commas in a playlist name cause issues
+    // Everything is currently replaced with a hyphen ( - )
 
-	// , (comma)
-	// < (less than)
-	// > (greater than)
-	// : (colon)
-	// " (double quote)
-	// / (forward slash)
-	// \ (backslash)
-	// | (vertical bar or pipe)
-	// ? (question mark)
-	// * (asterisk)
+    // , (comma)
+    // < (less than)
+    // > (greater than)
+    // : (colon)
+    // " (double quote)
+    // / (forward slash)
+    // \ (backslash)
+    // | (vertical bar or pipe)
+    // ? (question mark)
+    // * (asterisk)
 
-	$illegalChars = [',', '<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    $illegalChars = [',', '<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
-	if (!empty($input_string)) {
+    if (!empty($input_string)) {
 
-		for ($ill_index = 0; $ill_index < count($illegalChars); $ill_index++) {
-			$input_string = str_replace($illegalChars[$ill_index], '-', $input_string);
-		}
+        for ($ill_index = 0; $ill_index < count($illegalChars); $ill_index++) {
+            $input_string = str_replace($illegalChars[$ill_index], '-', $input_string);
+        }
 
-	}
-
-	return $input_string;
-}
-
-/**
- * Restarts the ntp server service
- */
-function NtpServiceRestart(){
-	global $SUDO;
-
-	exec($SUDO . " service ntp restart", $output, $return_val);
-	unset($output);
-	//TODO: check return
-}
-
-/**
- * Sets the NTP server source to the supplied NTP server, if nothing is supplied default to the debian pool
- * @param $ntp_server String DNS or IP address of a NTP server
- */
-function SetNtpServer($ntp_server){
-	global $SUDO;
-
-	WriteSettingToFile("ntpServer",$ntp_server);
-	$settings['ntpServer'] = $ntp_server;
-	if ($ntp_server != "")
-	{
-		exec($SUDO . " sed -i '/^server.*/d' /etc/ntp.conf ; " . $SUDO . " sed -i '\$s/\$/\\nserver " . $ntp_server . " iburst/' /etc/ntp.conf");
-	}
-	else
-	{
-		exec($SUDO . " sed -i '/^server.*/d' /etc/ntp.conf ; " . $SUDO . " sed -i '\$s/\$/\\nserver 0.debian.pool.ntp.org iburst\\nserver 1.debian.pool.ntp.org iburst\\nserver 2.debian.pool.ntp.org iburst\\nserver 3.debian.pool.ntp.org iburst\\n/' /etc/ntp.conf");
-	}
-}
-
-/**
- * Toggles NTP service state
- * @param $state int 1 to Enable, 0 to Disable
- */
-function SetNtpState($state){
-	global $SUDO;
-
-    WriteSettingToFile("NTP",$state);
-
-    if($state == true){
-        error_log("Enabling NTP because it's disabled and we were told to enable it.");
-        exec($SUDO . " update-rc.d ntp defaults", $output, $return_val);
-        unset($output);
-        //TODO: check return
-        exec($SUDO . " service ntp start", $output, $return_val);
-        unset($output);
-        //TODO: check return
-    }else if ($state == false){
-        error_log("Disabling NTP because it's enabled and we were told to disable it.");
-        exec($SUDO . " service ntp stop", $output, $return_val);
-        unset($output);
-        //TODO: check return
-        exec($SUDO . " update-rc.d ntp remove", $output, $return_val);
-        unset($output);
-        //TODO: check return
     }
+
+    return $input_string;
 }
 
 /**
  * Generates appropriate files and settings for exim4
- * @param $emailguser String Gmail Username
- * @param $emailgpass String Gmail Password
- * @param $emailfromtext String Mail From address (eg. fpp01@example.com)
- * @param $emailtoemail String Destination email address
  */
-function SaveEmailConfig($emailguser, $emailgpass, $emailfromtext, $emailtoemail){
+function ApplyEmailConfig()
+{
     global $exim4Directory;
+    global $settings;
+
+    if (isset($settings['HostName'])) {
+        $hostname = $settings['HostName'];
+    } else {
+        $hostname = 'FPP';
+    }
+
+    if (isset($settings['emailserver'])) {
+        $emailserver = $settings['emailserver'];
+    } else {
+        $emailserver = 'smtp.gmail.com';
+    }
+
+    if (isset($settings['emailport'])) {
+        $emailport = $settings['emailport'];
+    } else {
+        $emailport = 587;
+    }
+
+    if (isset($settings['emailuser'])) {
+        $emailuser = $settings['emailuser'];
+    } else {
+        $emailuser = '';
+    }
+
+    if (isset($settings['emailpass'])) {
+        $emailpass = $settings['emailpass'];
+    } else {
+        $emailpass = '';
+    }
+
+    if (isset($settings['emailfromuser'])) {
+        $emailfromuser = $settings['emailfromuser'];
+    } else {
+        $emailfromuser = $emailuser;
+    }
+
+    if (isset($settings['emailfromtext'])) {
+        $emailfromtext = $settings['emailfromtext'];
+    } else {
+        $emailfromtext = 'FPP - ' . $hostname;
+    }
+
+    if (isset($settings['emailtoemail'])) {
+        $emailtoemail = $settings['emailtoemail'];
+    } else {
+        $emailtoemail = '';
+    }
+
+    if ($emailtoemail == '') {
+        return;
+    }
+
+    // update-exim4.conf runs as root and sources update-exim4.conf.conf as
+    // shell, and the address files below are exim alias/rewrite tables, so
+    // nothing outside the expected shape may reach them.  Values are also
+    // checked when stored (IsValidSettingValue()); this covers anything that
+    // was stored before that check existed.
+    $hostname = preg_replace('/[^A-Za-z0-9-]/', '', $hostname);
+    if (!preg_match('/^[A-Za-z0-9.-]+$/', $emailserver) ||
+        !IsValidEmailList($emailtoemail) || !IsValidEmailFromUser($emailfromuser) ||
+        strpbrk($emailuser . $emailpass, "\r\n\0") !== false) {
+        error_log("ApplyEmailConfig: email settings are not valid; mail configuration NOT updated.");
+        return;
+    }
+    $emailport = (int) $emailport;
+    // chfn rejects ':' ',' '=' and control characters in a GECOS name.
+    $emailfromtext = preg_replace('/[\x00-\x1f\x7f:,=]/', '', $emailfromtext);
+
+    // Debian Trixie split-config: transport 30_exim4-config_remote_smtp_smarthost
+    // honors .ifdef REMOTE_SMTP_SMARTHOST_PROTOCOL but ::465 no longer auto-defines it.
+    // FPP must set protocol = smtps for implicit-TLS on 465, and ensure 587/25 use plain smtp.
+    // Use dedicated conf.d/main/99_fpp_smarthost so we never clobber user's 00_local_macros.
+    $emailportInt = (int) $emailport;
+    $fppMacroStaged = $exim4Directory . '/99_fpp_smarthost';
+    $fppMacroLive = '/etc/exim4/conf.d/main/99_fpp_smarthost';
+    if ($emailportInt === 465) {
+        file_put_contents($fppMacroStaged, "REMOTE_SMTP_SMARTHOST_PROTOCOL=smtps\n");
+        exec("sudo mkdir -p /etc/exim4/conf.d/main && sudo cp " . escapeshellarg($fppMacroStaged) . " " . escapeshellarg($fppMacroLive));
+    } else {
+        @unlink($fppMacroStaged);
+        exec("sudo rm -f " . escapeshellarg($fppMacroLive));
+    }
+
+    $exim4Conf = sprintf(
+        "dc_eximconfig_configtype='smarthost'\n" .
+        "dc_other_hostnames='%s'\n" .
+        "dc_local_interfaces='127.0.0.1'\n" .
+        "dc_readhost=''\n" .
+        "dc_relay_domains=''\n" .
+        "dc_minimaldns='false'\n" .
+        "dc_relay_nets=''\n" .
+        "dc_smarthost='%s::%d'\n" .
+        "CFILEMODE='644'\n" .
+        "dc_use_split_config='true'\n" .
+        "dc_hide_mailname='false'\n" .
+        "dc_mailname_in_oh='true'\n" .
+        "dc_localdelivery='mail_spool'\n",
+        $hostname,
+        $emailserver,
+        $emailport
+    );
+
+    $fp = fopen($exim4Directory . '/update-exim4.conf.conf', 'w');
+    fwrite($fp, $exim4Conf);
+    fclose($fp);
 
     $fp = fopen($exim4Directory . '/passwd.client', 'w');
     fwrite($fp, "# password file used when the local exim is authenticating to a remote host as a client.\n");
     fwrite($fp, "#\n");
-    fwrite($fp, "*.google.com:" . $emailguser . ":" . $emailgpass . "\n");
-    fwrite($fp, "smtp.gmail.com:" . $emailguser . ":" . $emailgpass . "\n");
-    fclose($fp);
-    exec("sudo cp " . $exim4Directory . "/passwd.client /etc/exim4/");
-    exec("sudo update-exim4.conf");
-    exec ("sudo /etc/init.d/exim4 restart");
-    exec ("sudo systemctl restart exim4.service");
-    $cmd="sudo chfn -f \"" . $emailfromtext . "\" fpp";
-    exec($cmd);
-    $fp = fopen($exim4Directory . '/aliases', 'w');
-    fwrite($fp, "mailer-daemon: postmaster\npostmaster: root\nnobody: root\nhostmaster: root\nusenet: root\nnews: root\nwebmaster: root\nwww: root\nftp: root\nabuse: root\nnoc: root\nsecurity: root\nroot: pi\n");
-    fwrite($fp, "pi: " . $emailtoemail . "\n");
-    fclose($fp);
-    exec("sudo cp " . $exim4Directory . "/aliases /etc/");
-}
+    if (($emailuser != '') && ($emailpass != '')) {
+        fwrite($fp, $emailserver . ":" . $emailuser . ":" . $emailpass . "\n");
 
+        $v = dns_get_record($emailserver, DNS_CNAME);
+        foreach ($v as $cname) {
+            if (isset($cname["target"])) {
+                fwrite($fp, $cname["target"] . ":" . $emailuser . ":" . $emailpass . "\n");
+            }
+        }
+    }
+    fclose($fp);
+
+    $fp = fopen($exim4Directory . '/aliases', 'w');
+    fwrite($fp, "mailer-daemon: postmaster\npostmaster: root\nnobody: root\nhostmaster: root\nusenet: root\nnews: root\nwebmaster: root\nwww: root\nftp: root\nabuse: root\nnoc: root\nsecurity: root\nroot: fpp\n");
+    fwrite($fp, "pi: " . $emailtoemail . "\n");
+    fwrite($fp, "fpp: " . $emailtoemail . "\n");
+    fclose($fp);
+
+    $fp = fopen($exim4Directory . '/email-addresses', 'w');
+    fwrite($fp, "fpp: " . $emailfromuser . "\n");
+    fwrite($fp, "root: " . $emailfromuser . "\n");
+    fclose($fp);
+
+    # copy our conf files into place
+    exec("sudo cp " . $exim4Directory . "/update-exim4.conf.conf /etc/exim4/");
+    exec("sudo cp " . $exim4Directory . "/passwd.client /etc/exim4/");
+    exec("sudo cp " . $exim4Directory . "/aliases /etc/");
+    exec("sudo cp " . $exim4Directory . "/email-addresses /etc/");
+
+    # update exim4 config using our generated conf files
+    exec("sudo update-exim4.conf");
+
+    # set the fpp user GECOS field
+    $cmd = "sudo chfn -f " . escapeshellarg($emailfromtext) . " fpp";
+    exec($cmd);
+
+    if (file_exists("/etc/fpp/container")) {
+        exec("sudo /etc/init.d/exim4 restart");
+    } else {
+        // FPP disables the exim daemon (sendmail delivers on its own), so only
+        // restart it if an admin has it running; restart would start it.
+        exec("sudo systemctl try-restart exim4.service");
+    }
+}
 
 // This function is from:
 // http://stackoverflow.com/questions/6054033/pretty-printing-json-with-php
-function prettyPrintJSON( $json )
+function prettyPrintJSON($json)
 {
-	$result = '';
-	$level = 0;
-	$in_quotes = false;
-	$in_escape = false;
-	$ends_line_level = NULL;
-	$json_length = strlen( $json );
+    $result = '';
+    $level = 0;
+    $in_quotes = false;
+    $in_escape = false;
+    $ends_line_level = null;
+    $json_length = strlen($json);
 
-	for( $i = 0; $i < $json_length; $i++ ) {
-		$char = $json[$i];
-		$new_line_level = NULL;
-		$post = "";
-		if( $ends_line_level !== NULL ) {
-			$new_line_level = $ends_line_level;
-			$ends_line_level = NULL;
-		}
-		if ( $in_escape ) {
-			$in_escape = false;
-		} else if( $char === '"' ) {
-			$in_quotes = !$in_quotes;
-		} else if( ! $in_quotes ) {
-			switch( $char ) {
-				case '}': case ']':
-					$level--;
-					$ends_line_level = NULL;
-					$new_line_level = $level;
-					break;
+    for ($i = 0; $i < $json_length; $i++) {
+        $char = $json[$i];
+        $new_line_level = null;
+        $post = "";
+        if ($ends_line_level !== null) {
+            $new_line_level = $ends_line_level;
+            $ends_line_level = null;
+        }
+        if ($in_escape) {
+            $in_escape = false;
+        } else if ($char === '"') {
+            $in_quotes = !$in_quotes;
+        } else if (!$in_quotes) {
+            switch ($char) {
+                case '}':
+                case ']':
+                    $level--;
+                    $ends_line_level = null;
+                    $new_line_level = $level;
+                    break;
 
-				case '{': case '[':
-					$level++;
-				case ',':
-					$ends_line_level = $level;
-					break;
+                case '{':
+                case '[':
+                    $level++;
+                case ',':
+                    $ends_line_level = $level;
+                    break;
 
-				case ':':
-					$post = " ";
-					break;
+                case ':':
+                    $post = " ";
+                    break;
 
-				case " ": case "\t": case "\n": case "\r":
-					$char = "";
-					$ends_line_level = $new_line_level;
-					$new_line_level = NULL;
-					break;
-			}
-		} else if ( $char === '\\' ) {
-			$in_escape = true;
-		}
-		if( $new_line_level !== NULL ) {
-			$result .= "\n".str_repeat( "\t", $new_line_level );
-		}
-		$result .= $char.$post;
-	}
+                case " ":
+                case "\t":
+                case "\n":
+                case "\r":
+                    $char = "";
+                    $ends_line_level = $new_line_level;
+                    $new_line_level = null;
+                    break;
+            }
+        } else if ($char === '\\') {
+            $in_escape = true;
+        }
+        if ($new_line_level !== null) {
+            $result .= "\n" . str_repeat("\t", $new_line_level);
+        }
+        $result .= $char . $post;
+    }
 
-	return $result;
+    return $result;
 }
 
-function DisableOutputBuffering() {
-	// for NGINX, set the X-Accel-Buffering header
-	header('X-Accel-Buffering: no');
+function DisableOutputBuffering()
+{
+    // for NGINX, set the X-Accel-Buffering header
+    header('X-Accel-Buffering: no');
 
-	// Turn off output buffering
-	ini_set('output_buffering', 'off');
+    // Turn off output buffering
+    ini_set('output_buffering', 'off');
 
-	// Turn off PHP output compression
-	ini_set('zlib.output_compression', false);
+    // Turn off PHP output compression
+    ini_set('zlib.output_compression', false);
 
-	// Implicitly flush the buffer(s)
-	ini_set('implicit_flush', true);
-	ob_implicit_flush(true);
+    // Implicitly flush the buffer(s)
+    ini_set('implicit_flush', true);
+    ob_implicit_flush(true);
 
-	// Clear, and turn off output buffering
-	while (ob_get_level() > 0) {
-		// Get the curent level
-		$level = ob_get_level();
-		// End the buffering
-		ob_end_clean();
-		// If the current level has not changed, abort
-		if (ob_get_level() == $level) break;
-	}
+    // Clear, and turn off output buffering
+    while (ob_get_level() > 0) {
+        // Get the curent level
+        $level = ob_get_level();
+        // End the buffering
+        ob_end_clean();
+        // If the current level has not changed, abort
+        if (ob_get_level() == $level) {
+            break;
+        }
 
-	// Disable apache output buffering/compression
-	if (function_exists('apache_setenv')) {
-		apache_setenv('no-gzip', '1');
-		apache_setenv('dont-vary', '1');
-	}
+    }
 
-	ob_implicit_flush(true);
-	flush();
+    // Disable apache output buffering/compression
+    if (function_exists('apache_setenv')) {
+        apache_setenv('no-gzip', '1');
+        apache_setenv('dont-vary', '1');
+    }
+
+    ob_implicit_flush(true);
+    flush();
 }
+
+function PrintToolTip($setting)
+{
+    global $settingInfos;
+    if (empty($settingInfos)) {
+        LoadSettingInfos();
+    }
+
+    if (
+        (isset($settingInfos[$setting])) &&
+        (isset($settingInfos[$setting]['tip']))
+    ) {
+        $tip = htmlentities($settingInfos[$setting]['tip']);
+        echo "<span id='" . $setting . "_tip' data-bs-toggle='tooltip' data-bs-html='true' data-bs-placement='auto' data-bs-title='" . $tip . "'>";
+        echo "<img id='$setting" . "_img' src='images/redesign/help-icon.svg' class='icon-help' alt='$setting" . "help icon'>";
+        echo "</span>";
+    }
+}
+
+function PrintAwesomeFree($code, $isLink = 0)
+{
+    echo "<span class='AwesomeFree";
+    if ($isLink) {
+        echo " AwesomeFreeLink";
+    }
+
+    echo "'>&#x$code;</span>";
+}
+
+#############
+# Returns a PHP Array of Objects for each wifi interface describing strength
+#############
+function network_wifi_strength_obj()
+{
+    global $settings;
+    // finalizeStatusJson() asks for this directly and again through
+    // network_list_interfaces_obj(); one answer per request is plenty.
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $rc = array();
+    if ($settings["Platform"] == "MacOS") {
+        exec("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I", $status);
+        $obj = new \stdClass();
+        $obj->level = 100;
+        foreach ($status as $line) {
+            // do stuff with $line
+            $line = trim($line);
+            $array = explode(':', $line);
+            $key = trim($array[0]);
+            $value = trim($array[1]);
+            if ($key == "agrCtlRSSI") {
+                $obj->level = $value;
+                $obj->unit = "dBm";
+            }
+            if ($key == "agrCtlNoise") {
+                $obj->noise = $value;
+            }
+            if ($key == "lastTxRate") {
+                $obj->rate = $value;
+            }
+        }
+        if ($obj->level > -50) {
+            $obj->desc = "excellent";
+        } elseif ($obj->level > -60) {
+            $obj->desc = "good";
+        } elseif ($obj->level > -70) {
+            $obj->desc = "fair";
+        } else {
+            $obj->desc = "weak";
+        }
+        array_push($rc, $obj);
+    } else {
+        // Enumerate wireless interfaces via iw (nl80211). The old path
+        // read /proc/net/wireless, which on modern kernels routes through
+        // the WEXT handlers and produces a "uses wireless extensions
+        // which will stop working for Wi-Fi 7 hardware" dmesg warning on
+        // every status page load.
+        // Every nl80211 interface has a phy80211 link in sysfs, so list them
+        // from there rather than forking `iw dev`.
+        $interfaces = [];
+        foreach (glob('/sys/class/net/*/phy80211') ?: array() as $phy) {
+            $interfaces[] = basename(dirname($phy));
+        }
+
+        foreach ($interfaces as $iface) {
+            $obj = new \stdClass();
+            $obj->interface = $iface;
+            $obj->link = 0;
+            $obj->level = 0;
+            $obj->unit = "dBm";
+            $obj->noise = 0;
+            $obj->desc = '';
+
+            $link_out = [];
+            fpp_exec_argv(array('iw', 'dev', $iface, 'link'), $link_out);
+            $joined = implode("\n", $link_out);
+
+            if ($joined === '' || strpos($joined, 'Not connected') !== false) {
+                $obj->desc = 'weak';
+                array_push($rc, $obj);
+                continue;
+            }
+
+            if (preg_match('/signal:\s*(-?\d+)/', $joined, $m)) {
+                $obj->level = intval($m[1]);
+                // Convert dBm to percent: 2*(dBm+100) clamped to 0-100
+                $pct = max(0, min(100, intval(2 * ($obj->level + 100))));
+                $obj->pct = $pct;
+                $obj->link = $pct;
+            }
+
+            if ($obj->level > -50) {
+                $obj->desc = "excellent";
+            } elseif ($obj->level > -60) {
+                $obj->desc = "good";
+            } elseif ($obj->level > -70) {
+                $obj->desc = "fair";
+            } else {
+                $obj->desc = "weak";
+            }
+
+            array_push($rc, $obj);
+        }
+    }
+    $memo = $rc;
+    return $rc;
+}
+
+#############
+# Returns an array of just the network interface names
+#############
+function network_list_interfaces_array()
+{
+    global $settings;
+    if ($settings["Platform"] == "MacOS") {
+        $output = exec("ipconfig getiflist");
+        $parts = preg_split("/\s+/", trim($output));
+        return $parts;
+    }
+    // Enumerate via sysfs rather than ifconfig: ifconfig on wireless
+    // interfaces calls SIOCGIWNAME (WEXT), producing a dmesg deprecation
+    // warning on every call.
+    $interfaces = array();
+    foreach (@scandir('/sys/class/net') ?: array() as $name) {
+        if ($name[0] == '.' || $name == 'lo' || strpos($name, 'SoftAp') !== false ||
+            preg_match('/^(usb|can|tether)/', $name)) {
+            continue;
+        }
+        $interfaces[] = $name;
+    }
+    return $interfaces;
+}
+
+/**
+ * True when $interface is backed by real hardware that is plugged in right now.
+ *
+ * A "device" symlink under /sys/class/net exists only for a hardware-backed
+ * interface: virtual devices (dummy, bridge, veth, tun) have none, and an
+ * interface that isn't present has no sysfs directory at all. Deliberately makes
+ * no attempt to separate onboard from USB -- on a Pi 3 / Pi Zero the *built-in*
+ * ethernet is itself a USB device, so a bus test would call the only NIC on the
+ * board removable.
+ *
+ * Used to decide whether an interface's FPP config may be deleted: deleting the
+ * config of a NIC that exists doesn't remove the NIC, it just stops FPP managing
+ * it, leaving it with no address after the next setupNetwork.
+ */
+function network_interface_is_hardware($interface)
+{
+    if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$/', $interface)) {
+        return false;
+    }
+    $dev = "/sys/class/net/" . $interface . "/device";
+    return is_link($dev) || file_exists($dev);
+}
+
+/**
+ * A saved interface config as the API reports it: WiFi keys replaced by
+ * PSKSet/BACKUPPSKSet flags.  /api answers any origin and system/info is read
+ * by other players, so a key returned here would be readable well beyond this
+ * device.  The network page leaves a saved key out of its save request to keep
+ * it (network_set_interface() fills it back in).
+ */
+function network_redact_interface_config($cfg)
+{
+    foreach (array('PSK', 'BACKUPPSK') as $k) {
+        if (array_key_exists($k, $cfg)) {
+            $cfg[$k . 'Set'] = ($cfg[$k] !== '');
+            unset($cfg[$k]);
+        }
+    }
+    return $cfg;
+}
+
+/**
+ * A config directory file that holds a credential: a dotfile (.htpasswd holds
+ * the UI password hash) or a saved interface (interface.* holds the WiFi
+ * keys).  The generic file routes -- /api/configfile and /api/file -- refuse
+ * these for read, write and delete alike, because /api can answer other
+ * origins.  Their own routes manage them without ever returning the secret:
+ * the UI password setting and /api/network/interface
+ * (network_redact_interface_config()).  $path is absolute; a path outside the
+ * config directory is never one.
+ */
+function ConfigPathIsCredential($path)
+{
+    global $settings;
+    $base = realpath($settings['configDirectory']);
+    if ($base === false || !is_string($path)) {
+        return false;
+    }
+    // The path as asked for and as resolved, so a link cannot name either.
+    foreach (array($path, realpath($path)) as $p) {
+        if (!is_string($p) || $p === $base || !PathIsWithin($p, $base)) {
+            continue;
+        }
+        $rel = substr($p, strlen($base) + 1);
+        foreach (explode('/', $rel) as $part) {
+            if ($part !== '' && $part[0] === '.') {
+                return true;
+            }
+        }
+        if (strpos($rel, '/') === false && stripos($rel, 'interface.') === 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function network_list_interfaces_obj()
+{
+    global $settings;
+
+    $output = array();
+    global $settings;
+    $rc = array();
+
+    $wifiObj = network_wifi_strength_obj();
+    if ($settings["Platform"] == "MacOS") {
+        $output = exec("ipconfig getiflist");
+        $parts = preg_split("/\s+/", trim($output));
+        foreach ($parts as $cnt => $int) {
+            exec("ipconfig getsummary " . $int, $config);
+            $obj = new \stdClass();
+            $obj->ifindex = $cnt;
+            $obj->ifname = $int;
+            $obj->addr_info = array();
+            $obj->flags = array();
+            array_push($obj->addr_info, new \stdClass());
+            $lastKey = "";
+            foreach ($config as $line) {
+                // do stuff with $line
+                $line = trim($line);
+                $array = explode(':', $line);
+                $key = trim($array[0]);
+                if (count($array) > 1) {
+                    $value = trim($array[1]);
+                } else {
+                    $value = "";
+                }
+                if ($key == "0" && $lastKey == "Addresses") {
+                    $obj->addr_info[0]->family = "inet";
+                    $obj->addr_info[0]->local = $value;
+                    $obj->addr_info[0]->label = $int;
+                    array_push($rc, $obj);
+                } else if ($key == "InterfaceType" && $value == "WiFi") {
+                    $wifiObj[0]->interface = $int;
+                    $obj->wifi = $wifiObj[0];
+                } else if ($key == "ConfigMethod" && $value == "DHCP") {
+                    $obj->flags[] = "DYNAMIC";
+                } else {
+                    $lastKey = $key;
+                }
+            }
+            unset($config);
+        }
+    } else {
+        fpp_exec_argv(array('ip', '--json', 'address', 'show'), $output);
+        $rc = json_decode(join(" ", $output), true);
+
+        foreach ($rc as &$rec) {
+            // Keep IPv4 (inet) and IPv6 (inet6) addresses, drop any other
+            // families. Consumers that only want IPv4 already filter on
+            // $ai['family'] == 'inet' themselves (networkconfig.php, fpp.js,
+            // wled_common.inc.php); multisync.php uses the IPv6 entries to mark
+            // the wifi icon on a wireless interface's IPv6 address.
+            $addrInfo = $rec['addr_info'];
+            $newAddrInfo = array();
+            foreach ($addrInfo as $ai) {
+                if ($ai['family'] == 'inet' || $ai['family'] == 'inet6') {
+                    array_push($newAddrInfo, $ai);
+                }
+
+            }
+            $rec['addr_info'] = $newAddrInfo;
+
+            // Merge two objects
+            foreach ($wifiObj as $wifi) {
+                if ($rec["ifname"] == $wifi->interface) {
+                    $rec["wifi"] = $wifi;
+                }
+            }
+            $ifname = $rec["ifname"];
+            $add = isset($rec["address"]) ? $rec["address"] : "";
+            if ($ifname == "lo" || $ifname == "usb0" || $ifname == "usb1" || $ifname == "SoftAp0" || $add == "0.0.0.0" || $add == "::") {
+                unset($rc[array_search($rec, $rc)]);
+            }
+            $cfgFile = $settings['configDirectory'] . "/interface." . $ifname;
+            if (file_exists($cfgFile)) {
+                $result = parse_ini_file($cfgFile);
+                $rec["config"] = network_redact_interface_config($result);
+            }
+        }
+    }
+    return array_values($rc);
+}
+
+// Return array of FPP Only systems
+function getKnownFPPSystems()
+{
+    $backupHosts = array();
+    $data = file_get_contents('http://localhost/api/fppd/multiSyncSystems');
+    if (false === $data) {
+        return $backupHosts;
+    }
+    $arr = json_decode($data, true);
+
+    if (array_key_exists("systems", $arr)) {
+        // De-duplicate by hostname: one device can advertise several addresses
+        // (IPv4 + IPv6, multiple NICs), and without this each shows as its own
+        // entry. Keep a single entry per host, preferring a routable IPv4. Skip
+        // addresses that aren't reachable from a browser -- loopback (127.x /
+        // ::1) and link-local (169.254/16 APIPA, fe80::/10 whose zone id is
+        // host-specific) -- matching the filtering multisync.php applies to the
+        // same multiSyncSystems data. (Hostname is used rather than UUID by
+        // preference; two distinct devices sharing a hostname will collapse to
+        // one entry, which is an accepted trade-off here.)
+        $chosen = array(); // lowercased hostname => ['address'=>, 'hostname'=>, 'isIPv4'=>]
+        foreach ($arr["systems"] as $i) {
+            // FPP Systems are 0x01 to 0x80
+            if (!($i["typeId"] >= 1 && $i["typeId"] < 128)) {
+                continue;
+            }
+            $addr = $i["address"];
+            $addrl = strtolower($addr);
+            if (strpos($addr, '169.254') === 0 || strpos($addrl, 'fe80') === 0
+                || strpos($addr, '127.') === 0 || $addrl === '::1') {
+                continue;
+            }
+            $key = strtolower($i["hostname"]);
+            $isIPv4 = (strpos($addr, ':') === false);
+            // First sighting of this host, or upgrade an IPv6 pick to an IPv4 one.
+            if (!isset($chosen[$key]) || ($isIPv4 && !$chosen[$key]['isIPv4'])) {
+                $chosen[$key] = array('address' => $addr, 'hostname' => $i["hostname"], 'isIPv4' => $isIPv4);
+            }
+        }
+        foreach ($chosen as $c) {
+            $desc = $c['address'] . " - " . $c['hostname'];
+            $backupHosts[$desc] = $c['address'];
+        }
+        ksort($backupHosts);
+    }
+    return $backupHosts;
+}
+
+// Removes dangerious characters from file names
+// Original idea from https://stackoverflow.com/questions/2021624/string-sanitizer-for-filename
+function sanitizeFilename($file)
+{
+    $file = preg_replace("([^\w\s\d\-_~,;\[\]\(\).])", '', $file);
+    // Replace ".." with "." to provent problems
+    $file = preg_replace("([\.]{2,})", '.', $file);
+
+    return $file;
+}
+
+// Reduce a filename to a value that is safe inside a Content-Disposition
+// response header. Strips directory components, CR/LF (response splitting)
+// and double quotes (quoted-string breakout); single quotes are legal in
+// filenames and harmless inside a double-quoted header value, so they are
+// kept and names keep round-tripping. Only the suggested save-as name is
+// affected, never the file on disk.
+function SanitizeDownloadFilename($name)
+{
+    $name = basename(str_replace("\\", "/", (string) $name));
+    $name = str_replace(array("\r", "\n", '"'), '', $name);
+    if ($name === '' || $name === '.' || $name === '..') {
+        $name = 'download';
+    }
+    return $name;
+}
+
+function is_valid_domain_name($domain_name)
+{
+    return (preg_match("/^([a-z\d](-*[a-z\d])*)(\.([a-z\d](-*[a-z\d])*))*$/i", $domain_name) //valid chars check
+        && preg_match("/^.{1,253}$/", $domain_name) //overall length check
+        && preg_match("/^[^\.]{1,63}(\.[^\.]{1,63})*$/", $domain_name)); //length of each label
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+// Returns the base directory of the git repo
+// normally /opt/fpp
+function gitBaseDirectory()
+{
+    return dirname(dirname(__FILE__));
+}
+
+/**
+ * The two URLs the UI may hand to a cape vendor: the landing page behind the
+ * logo, and the logo image itself.  Both pages that draw a vendor logo
+ * (menu.inc on every page, cape-info.php) used to build these separately and
+ * drifted: the link carried the serial on SendVendorSerial alone while the
+ * image needed FetchVendorLogos too, so the privacy text ("denying the logo
+ * denies this too") was false for the link.  One builder, one rule:
+ *
+ *   - nothing is built unless FetchVendorLogos == 1;
+ *   - the serial, cape id and cs go on both URLs only when SendVendorSerial
+ *     is also 1, url-encoded -- every value here comes from the EEPROM;
+ *   - hideExternalURLs blanks the link (nothing to click); the image is
+ *     still fetched by the browser from the vendor on every page that shows
+ *     it, which is what the privacy text says.
+ *
+ * $forHeader selects the image: the page header uses header_cape_image when the
+ * EEPROM declares one (a separate, header-sized image -- 1fe9c75ef), falling
+ * back to vendor.image; Cape Info always shows vendor.image.
+ *
+ * Returns array('landing' => href or '', 'image' => remote image URL or '',
+ * 'sendSerial' => bool).  Callers must still escape for their context.
+ */
+function CapeVendorUrls($capeInfo, $settings, $forHeader = false)
+{
+    $out = array('landing' => '', 'image' => '', 'sendSerial' => false);
+    if (!is_array($capeInfo) || !isset($capeInfo['vendor']) || !is_array($capeInfo['vendor'])) {
+        return $out;
+    }
+    if (!isset($settings['FetchVendorLogos']) || $settings['FetchVendorLogos'] != 1) {
+        return $out;
+    }
+    $vendor = $capeInfo['vendor'];
+
+    $landing = isset($vendor['landingPage']) ? $vendor['landingPage'] : (isset($vendor['url']) ? $vendor['url'] : '');
+    $image = isset($vendor['image']) ? $vendor['image'] : '';
+    if ($forHeader && isset($capeInfo['header_cape_image'])) {
+        $image = $capeInfo['header_cape_image'];
+    }
+
+    // Only http(s) leaves the box.  A javascript: or data: URL from a hostile
+    // EEPROM must not reach an href or the fetcher.
+    $isWeb = function ($u) {
+        return is_string($u) && preg_match('#^https?://#i', $u) === 1;
+    };
+    if (!$isWeb($landing)) {
+        $landing = '';
+    }
+    if (!$isWeb($image)) {
+        $image = '';
+    }
+
+    $out['sendSerial'] = isset($settings['SendVendorSerial']) && $settings['SendVendorSerial'] == 1;
+    if ($out['sendSerial']) {
+        $q = 'sn=' . urlencode(isset($capeInfo['serialNumber']) ? $capeInfo['serialNumber'] : '')
+            . '&id=' . urlencode(isset($capeInfo['id']) ? $capeInfo['id'] : '');
+        if (isset($capeInfo['cs']) && $capeInfo['cs'] != '') {
+            $q .= '&cs=' . urlencode($capeInfo['cs']);
+        }
+        if ($landing != '') {
+            $landing .= (strpos($landing, '?') === false ? '?' : '&') . $q;
+        }
+        if ($image != '') {
+            $image .= (strpos($image, '?') === false ? '?' : '&') . $q;
+        }
+    }
+    if (!empty($settings['hideExternalURLs'])) {
+        $landing = '';
+    }
+    $out['landing'] = $landing;
+    $out['image'] = $image;
+    return $out;
+}
+
+function getSystemUUID()
+{
+    global $fppDir;
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $cacheFile = "/tmp/fpp_uuid";
+    $uuid = file_exists($cacheFile) ? trim(file_get_contents($cacheFile)) : "";
+
+    // Do not trust the cache without checking it.  It is written once per boot,
+    // and an upgrade can replace scripts/get_uuid underneath a cache an older
+    // one wrote -- so a value this version rejects, such as a duplicated or
+    // truncated serial, would otherwise stay live until the next reboot.
+    if (!isValidSystemUUID($uuid)) {
+        $output = array();
+        exec($fppDir . "/scripts/get_uuid", $output);
+        $uuid = isset($output[0]) ? trim($output[0]) : "";
+        if (!isValidSystemUUID($uuid)) {
+            // "Unknown" is a placeholder, not an identity, so it is never
+            // cached -- the box has to be able to recover within this boot.
+            $memo = "Unknown";
+            return $memo;
+        }
+        cacheSystemIdentity($cacheFile, $uuid);
+    }
+    $memo = $uuid;
+    return $memo;
+}
+
+/**
+ * Best-effort write of an identity cache file under /tmp.
+ *
+ * The write genuinely cannot be relied on.  /tmp is sticky and the kernel runs
+ * with fs.protected_regular set, so whichever user creates one of these files
+ * owns it and NO other user -- root included -- can reopen it for writing.  The
+ * web request path runs as fpp while fppd and the boot scripts run as root, so
+ * which of them got there first decides who can refresh it afterwards.
+ *
+ * The cache is therefore an optimisation only.  Callers must already hold a
+ * correct value before calling this, and must not care whether it succeeds.
+ *
+ * @param string $file cache path
+ * @param string $value validated value to store
+ * @return void
+ */
+function cacheSystemIdentity($file, $value)
+{
+    @file_put_contents($file, $value);
+}
+
+/**
+ * Returns a token naming which method produced the system UUID:
+ * setting, cpuinfo, device-tree, board-eeprom, dmidecode, machine-id,
+ * generated, container, ioreg or none -- plus "unknown", which this function
+ * substitutes when the script cannot be asked (one too old to support the
+ * flag).  "unknown" is deliberately NOT in the accepted set below: it must
+ * never be cached, or a box would keep reporting it after the scripts catch
+ * up.  "container" is a generated UUID from
+ * a containerised install, where every hardware source describes the host and
+ * machine-id comes from the image layer -- worth counting separately.  Lets a consumer weight or exclude by
+ * identity quality without having to reverse-engineer the M<n>- prefix.
+ *
+ * @return string source token
+ */
+function getSystemUUIDSource()
+{
+    global $fppDir;
+    // Every token scripts/get_uuid can emit for --source.  "unknown" is not
+    // one of them on purpose -- see the note above.
+    $valid = array(
+        "setting", "cpuinfo", "device-tree", "board-eeprom", "dmidecode",
+        "machine-id", "generated", "container", "ioreg", "none",
+    );
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $cacheFile = "/tmp/fpp_uuid_source";
+    $source = file_exists($cacheFile) ? trim(file_get_contents($cacheFile)) : "";
+
+    // A get_uuid that predates --source ignores the argument and prints the
+    // UUID, so during an upgrade -- new www files, old scripts, in either order
+    // -- this cache gets an identity written into it instead of a source.  It
+    // then never corrects itself, and the field silently becomes a duplicate of
+    // uuid.  Since the whole point of it is to monitor identity quality after a
+    // rollout, being wrong in exactly that window makes it worthless.  Check
+    // the value against the known set rather than trusting what is on disk.
+    if (!in_array($source, $valid)) {
+        $output = array();
+        exec($fppDir . "/scripts/get_uuid --source", $output);
+        $source = isset($output[0]) ? trim($output[0]) : "";
+        if (!in_array($source, $valid)) {
+            // Deliberately not cached, so the box heals as soon as the scripts
+            // catch up rather than staying wrong until it reboots.
+            $memo = "unknown";
+            return $memo;
+        }
+        cacheSystemIdentity($cacheFile, $source);
+    }
+    $memo = $source;
+    return $memo;
+}
+
+/**
+ * Mirrors the uuid_valid() check in scripts/get_uuid so that identifiers
+ * arriving from remote peers get the same scrutiny as locally derived ones.
+ * A value that fails this must never be stored in an identity field: a
+ * token shared by many unrelated hosts silently merges them into one.
+ *
+ * @param string $uuid candidate identifier, with or without an M<n>- prefix
+ * @return bool true if the value is usable as an identity
+ */
+function isValidSystemUUID($uuid)
+{
+    if (!is_string($uuid)) {
+        return false;
+    }
+    $uuid = trim($uuid);
+
+    // "MAC:" marks an identity MultiSync synthesised from a device's hardware
+    // address because the device reported none of its own.  It is good enough
+    // to key a UI row on, but it is not an identity the device chose and it is
+    // a hardware address, so it must not pass as a real UUID.  Rejecting it
+    // here keeps the statistics collector doing what it did before this
+    // stand-in existed: ask the controller for its real identity, and fall back
+    // to a salted local hash rather than reporting the MAC upstream.
+    if (stripos($uuid, 'MAC:') === 0) {
+        return false;
+    }
+
+    // Strip the method prefix so the denylist compares bare values
+    $bare = preg_replace('/^M[0-9]+-/', '', $uuid);
+
+    if ($bare === '' || preg_match('/\s/', $bare) || strlen($bare) < 6) {
+        return false;
+    }
+    $stripped = strtolower(str_replace(array('-', ':', '_'), '', $bare));
+    if (preg_match('/^0+$/', $stripped) || preg_match('/^f+$/', $stripped)) {
+        return false;
+    }
+    //
+    // Per-family shape check, mirroring uuid_valid() in scripts/get_uuid.
+    // BeagleBoard-family serials are <4-digit date code><board code><sequence>.
+    // A serial truncated by the flashing tool keeps a valid-looking prefix and
+    // loses the tail, which is how a handful of values end up shared by
+    // hundreds of unrelated hosts.  A real sequence is at least four
+    // characters, and exactly five digits in the GPB (PocketBeagle) family.
+    // Peers report these too, so a peer UUID gets the same scrutiny.
+    //
+    if (preg_match('/^[0-9]{4}([A-Z]+)([0-9A-Z]*)$/', strtoupper($bare), $m)) {
+        if (strlen($m[2]) < 4) {
+            return false;
+        }
+        if ($m[1] === 'GPB' && !preg_match('/^[0-9]{5}$/', $m[2])) {
+            return false;
+        }
+    }
+
+    // Already rejected by the shape check above; listed so the specific
+    // values known to be catastrophically shared cannot come back if the
+    // shape rules are ever relaxed.
+    $denylist = array(
+        '1741gpb4', '1741gpb2', '123456789', '1234567890', '0123456789',
+        'serial', 'serialnumber', 'systemserialnumber',
+        'notspecified', 'not', 'specified', 'none', 'null', 'nil',
+        'unknown', 'default', 'defaultstring', 'tobefilledbyoem',
+        'n/a', 'na', 'invalid', 'failed', 'notset',
+    );
+    if (in_array(strtolower($bare), $denylist)) {
+        return false;
+    }
+    if (in_array(str_replace(' ', '', strtolower($uuid)), $denylist)) {
+        return false;
+    }
+    return true;
+}
+
+function GetSystemInfoJsonInternal($simple = false, $network = true)
+{
+    global $settings;
+
+    //close the session before we start, this removes the session lock and lets other scripts run
+    session_write_close();
+
+    //Default json to be returned
+    $result = array();
+    $result['HostName'] = $settings['HostName'];
+    $result['HostDescription'] = !empty($settings['HostDescription']) ? $settings['HostDescription'] : "";
+    $result['Platform'] = $settings['Platform'];
+    $result['Variant'] = isset($settings['Variant']) ? $settings['Variant'] : '';
+    if (isset($settings['SubPlatform'])) {
+        $result['SubPlatform'] = $settings['SubPlatform'];
+    }
+    $result['backgroundColor'] = $settings['backgroundColor'];
+    $result['Mode'] = $settings['fppMode'];
+    $result['Logo'] = $settings['Logo'];
+    $result['Version'] = getFPPVersion();
+    $result['Branch'] = getFPPBranch();
+    $result['multisync'] = isset($settings['MultiSyncEnabled']) ? ($settings['MultiSyncEnabled'] == '1') : false;
+    if ($result['Mode'] == "master") {
+        $result['Mode'] = "player";
+        $result['multisync'] = true;
+    }
+    if ($settings["Platform"] == "MacOS") {
+        $result['OSRelease'] = trim(shell_exec("sw_vers -productVersion"));
+        $result['OSVersion'] = $result['OSRelease'];
+    } else {
+        if (file_exists('/etc/fpp/rfs_version')) {
+            $result['OSVersion'] = trim(file_get_contents('/etc/fpp/rfs_version'))
+                . ((PHP_INT_SIZE === 8) ? ' (64bit)' : ' (32bit)');
+        }
+
+        $os_release = "Unknown";
+        if (file_exists("/etc/os-release")) {
+            $info = parse_ini_file("/etc/os-release");
+            if (isset($info["PRETTY_NAME"])) {
+                $os_release = $info["PRETTY_NAME"];
+            }
+
+            unset($output);
+        }
+        $result['OSRelease'] = $os_release;
+    }
+    if (file_exists($settings['mediaDirectory'] . "/fpp-info.json")) {
+        $content = file_get_contents($settings['mediaDirectory'] . "/fpp-info.json");
+        $json = json_decode($content, true);
+        $result['channelRanges'] = $json['channelRanges'];
+        $result['majorVersion'] = $json['majorVersion'];
+        $result['minorVersion'] = $json['minorVersion'];
+        $result['typeId'] = $json['typeId'];
+        if (isset($json['channelInputsEnabled'])) {
+            $result['channelInputsEnabled'] = $json['channelInputsEnabled'];
+        }
+        if (isset($json['channelOutputsEnabled'])) {
+            $result['channelOutputsEnabled'] = $json['channelOutputsEnabled'];
+        }
+    }
+    $result['uuid'] = getSystemUUID();
+    if (isset($settings['cape-info'])) {
+        $capeInfo = $settings['cape-info'];
+        $result['capeInfo']['name'] = $capeInfo['name'];
+        $result['capeInfo']['id'] = $capeInfo['id'];
+        $result['capeInfo']['version'] = $capeInfo['version'];
+    }
+    if (!$simple) {
+        //Get CPU & memory usage before any heavy processing to try get relatively accurate stat
+        $result['Utilization']['CPU'] = get_server_cpu_usage();
+        $result['Utilization']['Memory'] = get_server_memory_usage();
+        $result['Utilization']['Uptime'] = get_server_uptime(true);
+
+        $result['Kernel'] = get_kernel_version();
+        $result['LocalGitVersion'] = get_local_git_version();
+        $result['RemoteGitVersion'] = get_remote_git_version();
+
+        $uploadDir = GetDirSetting("uploads"); // directory under media
+        $result['Utilization']['Disk']["Media"]['Free'] = disk_free_space($uploadDir);
+        $result['Utilization']['Disk']["Media"]['Total'] = disk_total_space($uploadDir);
+        $result['Utilization']['Disk']["Root"]['Free'] = disk_free_space("/");
+        $result['Utilization']['Disk']["Root"]['Total'] = disk_total_space("/");
+
+        if (isset($settings['UpgradeSource'])) {
+            $result['UpgradeSource'] = $settings['UpgradeSource'];
+        } else {
+            $result['UpgradeSource'] = 'github.com';
+        }
+
+        if ($network) {
+            if ($settings["Platform"] != "MacOS") {
+                // The IPv4 addresses of every interface but lo and usb*, from
+                // getifaddrs() rather than a forked `ip`.  Family 2 is AF_INET.
+                $IPs = array();
+                foreach (net_get_interfaces() ?: array() as $ifname => $iface) {
+                    if ($ifname == "lo" || strpos($ifname, 'usb') !== false) {
+                        continue;
+                    }
+                    foreach ($iface['unicast'] ?? array() as $addr) {
+                        if (($addr['family'] ?? 0) == 2 && isset($addr['address'])) {
+                            $IPs[] = $addr['address'];
+                        }
+                    }
+                }
+
+                $result['IPs'] = $IPs;
+            } else {
+                $IPs = array();
+                $output = exec("ipconfig getiflist");
+                $parts = preg_split("/\s+/", trim($output));
+                foreach ($parts as $cnt => $int) {
+                    exec("ipconfig getsummary " . $int, $config);
+                    $lastKey = "";
+                    foreach ($config as $line) {
+                        // do stuff with $line
+                        $line = trim($line);
+                        $array = explode(':', $line);
+                        $key = trim($array[0]);
+                        if (count($array) > 1) {
+                            $value = trim($array[1]);
+                        } else {
+                            $value = "";
+                        }
+                        if ($key == "0" && $lastKey == "Addresses") {
+                            $IPs[] = $value;
+                        } else {
+                            $lastKey = $key;
+                        }
+                    }
+                    unset($config);
+                }
+                $result['IPs'] = $IPs;
+            }
+        }
+    }
+    return $result;
+}
+
+/**
+ * Looks in a directory and reads file contents of files within it
+ * @param $directory String directory to search in
+ * @param $return_data Boolean switch to include file data
+ * @param $sort_by_date bool Boolean sort results by date
+ * @param $sort_order string Order to sort the dates by, DEFAULT is  oldest to newest
+ * @return array Array of file names and respective data
+ */
+function read_directory_files($directory, $return_data = true, $sort_by_date = false, $sort_order = 'desc')
+{
+    $file_list = array();
+    $file_data = false;
+
+    if ($handle = @opendir($directory)) {
+        while (false !== ($file = readdir($handle))) {
+            // do something with the file
+            // note that '.' and '..' is returned even
+            // if file isn't this directory or its parent, add it to the results
+            // also must include ._* files as binary files that OSX may create
+            if ($file[0] != "." || (strlen($file) > 1 && $file[1] != "." && $file[1] != "_")) {
+                // collect the filenames & data
+                if ($return_data == true) {
+                    $file_data = explode("\n", file_get_contents($directory . '/' . $file));
+                }
+
+                $file_list[$file] = $file_data;
+            }
+        }
+        closedir($handle);
+        unset($handle);
+        unset($file);
+        unset($file_data);
+    }
+
+    //Sort the results if sort flag  is true
+    if ($sort_by_date == true) {
+        //Modified version of https://stackoverflow.com/questions/2667065/sort-files-by-date-in-php
+        //newest to  oldest
+        if ($sort_order === 'asc') {
+            //uksort to sort by key & insert our directory variable
+            uksort($file_list, function ($a, $b) use ($directory) {
+                return filemtime($directory . "/" . $b) - filemtime($directory . "/" . $a);
+            });
+        }
+
+        //oldest to newest
+        if ($sort_order === 'desc') {
+
+            //uksort to sort by key & insert our directory variable
+            uksort($file_list, function ($a, $b) use ($directory) {
+                return filemtime($directory . "/" . $a) - filemtime($directory . "/" . $b);
+            });
+        }
+    }
+
+    return $file_list;
+}
+
+/**
+ * Configuration backup blob store.
+ *
+ * A backup is a snapshot of every config file on the box, and on a configured
+ * show a handful of those files dwarf everything else - an xLights model group
+ * export, the virtual display map.  They also change very rarely.  Writing a
+ * backup on every settings change therefore stored the same tens of megabytes
+ * again and again: on the box this was written for, 59 backups held exactly one
+ * distinct version of each of the three big areas, 750MB of byte-identical
+ * duplication in a 1.16GB directory, and every checkbox tick wrote another 13MB
+ * to the SD card.
+ *
+ * So anything big is written once, to a file named after the SHA-256 of its
+ * contents, and the backup carries a reference in its place.  Backups that share
+ * an unchanged area share the one blob.
+ *
+ * The store lives in 'blobs' inside the backups directory rather than beside it,
+ * because copying backups to a USB device is an rsync of that whole directory -
+ * the blobs go along with them, and a backup restored from the device resolves
+ * against the copy sitting next to it.
+ *
+ * A backup that leaves the box is always made whole again first: downloads are
+ * inlined on the way out (see DownloadJsonBackup) so what a user downloads is a
+ * self-contained file that restores anywhere, exactly as it was before.
+ *
+ * @param string $backup_dir Directory holding the backup files.
+ * @return string Blob directory for that backup directory, no trailing slash.
+ */
+function GetBackupBlobDir($backup_dir)
+{
+    return rtrim($backup_dir, '/') . '/blobs';
+}
+
+/**
+ * Sub-trees at or above this many encoded bytes are worth storing out of line.
+ * Well above any ordinary config file (the next largest on the box this was
+ * written for is 25KB) so a normal backup is untouched and still readable as
+ * plain JSON.
+ */
+define('FPP_BACKUP_BLOB_MIN_BYTES', 262144);
+
+/**
+ * True if $value is a blob reference produced by ExtractBackupBlobs().
+ *
+ * Deliberately strict - a single key, and a well-formed hash - so a config file
+ * that happens to contain a '__fppBlob' key cannot be mistaken for one.
+ *
+ * @param mixed $value
+ * @return bool
+ */
+function IsBackupBlobRef($value)
+{
+    return is_array($value)
+        && count($value) === 1
+        && isset($value['__fppBlob']['sha256'])
+        && is_string($value['__fppBlob']['sha256'])
+        && preg_match('/^[0-9a-f]{64}$/', $value['__fppBlob']['sha256']) === 1;
+}
+
+/**
+ * Replaces the large sub-trees of an assembled backup with blob references,
+ * writing each one to the blob store.
+ *
+ * Walks down to file granularity and no further: it recurses through the
+ * containers that group areas and filenames, but not into the contents of a file
+ * (a 160,000 line display map is one blob, not 160,000 of them).  Hence the depth
+ * limit and the element-count limit - a short array is a wrapper, a long one is
+ * data.
+ *
+ * Storing a blob is best effort.  If the store cannot be written the sub-tree is
+ * simply left where it is: a bigger backup is a cost, a backup that references a
+ * blob that was never written is a corrupt one.
+ *
+ * @param mixed $node        Backup data (modified in place through the return value).
+ * @param string $blob_dir   Blob directory, from GetBackupBlobDir().
+ * @param array $written     Collects the hashes this backup references.
+ * @param int $depth         Recursion depth, callers pass 0.
+ * @return mixed The node with large sub-trees replaced by references.
+ */
+function ExtractBackupBlobs($node, $blob_dir, &$written, $depth = 0)
+{
+    if (!is_array($node)) {
+        return $node;
+    }
+
+    //A short array is a container to walk through; a long one is a file's worth
+    //of data and is a blob candidate in its own right.  The depth limit stops the
+    //walk at file granularity: deep enough to reach a single file inside the
+    //misc-configs bundle (area -> 'configs' -> [0] -> filename), so that changing
+    //one small config file there does not give every large one a new hash and
+    //rewrite the lot; not so deep that a file's own contents get split up.
+    if ($depth < 4 && count($node) <= 256) {
+        foreach ($node as $key => $value) {
+            $node[$key] = ExtractBackupBlobs($value, $blob_dir, $written, $depth + 1);
+        }
+
+        return $node;
+    }
+
+    $encoded = json_encode($node);
+    if ($encoded === false || strlen($encoded) < FPP_BACKUP_BLOB_MIN_BYTES) {
+        return $node;
+    }
+
+    $hash = hash('sha256', $encoded);
+    $blob_path = $blob_dir . '/' . $hash . '.json';
+
+    if (!file_exists($blob_path)) {
+        if (!is_dir($blob_dir) && @mkdir($blob_dir, 0775, true) === false) {
+            error_log("ExtractBackupBlobs: cannot create '$blob_dir'; storing this data inline instead.");
+            return $node;
+        }
+
+        //Named after its own contents, so a blob is either absent or complete -
+        //write it somewhere else first and move it into place.
+        if (!WriteFileAtomic($blob_path, $encoded)) {
+            error_log("ExtractBackupBlobs: cannot write '$blob_path'; storing this data inline instead.");
+            return $node;
+        }
+    }
+
+    $written[$hash] = $hash;
+
+    return array('__fppBlob' => array(
+        'sha256' => $hash,
+        'bytes' => strlen($encoded),
+        'note' => 'Large unchanged config stored once in backups/blobs and shared by every backup that contains it. Download this backup through the FPP web UI to get a self-contained copy.',
+    ));
+}
+
+/**
+ * Returns every blob hash referenced by an encoded backup.
+ *
+ * Reads the encoded form rather than a decoded one: this is called while
+ * listing the backups, where decoding each file is the very cost the blob store
+ * exists to avoid.
+ *
+ * @param string $json Encoded backup.
+ * @return array Hashes, values and keys both the hash.
+ */
+function BackupBlobRefsInJson($json)
+{
+    $refs = array();
+
+    if (preg_match_all('/"__fppBlob":\{[^{}]*"sha256":"([0-9a-f]{64})"/', (string) $json, $matches)) {
+        foreach ($matches[1] as $hash) {
+            $refs[$hash] = $hash;
+        }
+    }
+
+    return $refs;
+}
+
+/**
+ * Puts the blobs back, returning a backup that stands on its own.
+ *
+ * Works on the encoded backup rather than a decoded one so that making a 20MB
+ * backup whole does not first cost the ~60MB a decoded copy of it occupies -
+ * php-fpm here is capped at 128MB.  A blob holds exactly the json_encode() of
+ * the sub-tree it replaced, so splicing it back in reproduces, byte for byte,
+ * the file that would have been written with no blob store at all.
+ *
+ * A reference that cannot be resolved fails the whole thing.  Restoring a
+ * backup with a hole in it would write a placeholder over a live config file.
+ *
+ * @param string $json      Encoded backup, possibly containing references.
+ * @param string $blob_dir  Where that backup's blobs live.
+ * @param string $error     Set to a description when this returns false.
+ * @return string|false     The backup with every reference resolved, or false.
+ */
+function InlineBackupBlobs($json, $blob_dir, &$error = '')
+{
+    $json = (string) $json;
+
+    //Overwhelmingly the common case, including every backup written before the
+    //blob store existed and every backup a user uploads.
+    if (strpos($json, '"__fppBlob"') === false) {
+        return $json;
+    }
+
+    $fallback_dir = '';
+    if (function_exists('GetDirSetting')) {
+        $fallback_dir = GetBackupBlobDir(GetDirSetting('JsonBackups'));
+    }
+
+    $failed = '';
+    $resolved = preg_replace_callback(
+        '/\{"__fppBlob":\{[^{}]*"sha256":"([0-9a-f]{64})"[^{}]*\}\}/',
+        function ($m) use ($blob_dir, $fallback_dir, &$failed) {
+            $hash = $m[1];
+
+            foreach (array($blob_dir, $fallback_dir) as $dir) {
+                if ($dir === '') {
+                    continue;
+                }
+
+                $path = $dir . '/' . $hash . '.json';
+                if (!file_exists($path)) {
+                    continue;
+                }
+
+                $blob = @file_get_contents($path);
+                //The name is the hash of the contents, so a damaged blob is
+                //detectable rather than something we splice in regardless.
+                if ($blob !== false && hash('sha256', $blob) === $hash) {
+                    return $blob;
+                }
+
+                $failed = "blob $hash in $dir is damaged";
+                return $m[0];
+            }
+
+            $failed = "blob $hash is missing";
+            return $m[0];
+        },
+        $json
+    );
+
+    if ($resolved === null) {
+        $error = 'failed to scan the backup for blob references';
+        return false;
+    }
+
+    if ($failed !== '') {
+        $error = $failed . '. A backup copied off the box by hand does not bring its blobs with it - ' .
+            'download it through the FPP web UI instead, which writes out a self-contained file.';
+        return false;
+    }
+
+    return $resolved;
+}
+
+/**
+ * Deletes blobs that no backup refers to any more.
+ *
+ * $referenced has to be the complete set for the directory, so this is only
+ * safe to call from somewhere that has just listed every backup in it - see
+ * pruneOrRemoveAgedBackupFiles().  Given an incomplete set it would delete data
+ * that is still in use, so it declines to do anything when handed nothing.
+ *
+ * @param string $backup_dir
+ * @param array $referenced Hashes still in use, as keys.
+ * @return int Number of blobs removed.
+ */
+function CollectUnreferencedBackupBlobs($backup_dir, $referenced)
+{
+    $blob_dir = GetBackupBlobDir($backup_dir);
+    if (!is_dir($blob_dir)) {
+        return 0;
+    }
+
+    $blobs = @scandir($blob_dir);
+    if ($blobs === false) {
+        return 0;
+    }
+
+    $removed = 0;
+    foreach ($blobs as $blob) {
+        if (!preg_match('/^([0-9a-f]{64})\.json$/', $blob, $m)) {
+            continue;
+        }
+
+        if (isset($referenced[$m[1]])) {
+            continue;
+        }
+
+        if (@unlink($blob_dir . '/' . $blob)) {
+            $removed++;
+        }
+    }
+
+    return $removed;
+}
+
+/**
+ * Which backups reference which blobs.
+ *
+ * Answers from the metadata cache wherever its recorded size and mtime still
+ * describe the file on disk, and only opens the ones it does not cover, so in
+ * the steady state this reads the small cache file and nothing else.  It is
+ * still authoritative: an entry that no longer matches is not trusted, it is
+ * re-read.
+ *
+ * @param string $backup_dir Directory holding the backup files.
+ * @return array Blob hash => array of backup filenames that reference it.
+ */
+function GetBackupBlobReferenceMap($backup_dir)
+{
+    $map = array();
+    $cache = LoadBackupMetadataCache();
+    $names = @scandir($backup_dir);
+
+    if ($names === false) {
+        return $map;
+    }
+
+    foreach ($names as $name) {
+        if (!str_ends_with(strtolower($name), '.json')) {
+            continue;
+        }
+
+        $path = $backup_dir . '/' . $name;
+        if (!is_file($path)) {
+            continue;
+        }
+
+        clearstatcache(true, $path);
+        $size = @filesize($path);
+        $mtime = @filemtime($path);
+
+        if (isset($cache[$path]['blob_refs']) &&
+            isset($cache[$path]['size']) && $cache[$path]['size'] === $size &&
+            isset($cache[$path]['mtime']) && $cache[$path]['mtime'] === $mtime) {
+            $refs = $cache[$path]['blob_refs'];
+        } else {
+            $refs = array_values(BackupBlobRefsInJson(@file_get_contents($path)));
+        }
+
+        foreach ($refs as $hash) {
+            $map[$hash][] = $name;
+        }
+    }
+
+    return $map;
+}
+
+/**
+ * Explains why a path must not be deleted, for the blob store's sake.
+ *
+ * A blob is not a file in its own right - it is a piece of config that several
+ * backups share, held once instead of copied into each of them.  Deleting one by
+ * hand does not free anything a user would recognise, and it quietly makes every
+ * backup holding a reference to it unrestorable.  The right way to get rid of a
+ * blob is to delete the backups that use it, after which pruning drops it on its
+ * own (see CollectUnreferencedBackupBlobs).
+ *
+ * A blob nothing references is fair game - pruning would have removed it anyway.
+ *
+ * This lives behind the delete API rather than in a confirmation dialog on the
+ * file manager, so that it holds for anything that can reach the API and not
+ * just for the one page that happens to ask first.
+ *
+ * @param string $full_path Resolved path the caller is about to delete.
+ * @return string Reason to refuse, or '' to allow the delete.
+ */
+function DescribeBackupBlobDeletion($full_path)
+{
+    if (!function_exists('GetDirSetting')) {
+        return '';
+    }
+
+    $backup_dir = @realpath(GetDirSetting('JsonBackups'));
+    if ($backup_dir === false) {
+        return '';
+    }
+
+    $blob_dir = @realpath(GetBackupBlobDir($backup_dir));
+    if ($blob_dir === false) {
+        return '';
+    }
+
+    $full_path = (string) $full_path;
+    $is_blob_dir = ($full_path === $blob_dir);
+    $is_blob_file = (strpos($full_path, $blob_dir . '/') === 0)
+        && preg_match('/^([0-9a-f]{64})\.json$/', basename($full_path), $m) === 1;
+
+    if (!$is_blob_dir && !$is_blob_file) {
+        return '';
+    }
+
+    $references = GetBackupBlobReferenceMap($backup_dir);
+
+    if ($is_blob_file) {
+        $users = isset($references[$m[1]]) ? $references[$m[1]] : array();
+        if (empty($users)) {
+            //Nothing points at it; pruning would have removed it anyway
+            return '';
+        }
+
+        return 'this is not a file of its own - it is configuration that '
+            . DescribeBackupList($users)
+            . ' share a single copy of. Deleting it leaves '
+            . (count($users) == 1 ? 'that backup' : 'those backups')
+            . ' unrestorable. To reclaim the space, delete the backups themselves and this is removed automatically.';
+    }
+
+    //The whole store.  Everything referenced anywhere would go at once.
+    $used_by = array();
+    foreach ($references as $users) {
+        foreach ($users as $user) {
+            $used_by[$user] = true;
+        }
+    }
+
+    if (empty($used_by)) {
+        return '';
+    }
+
+    return 'this folder holds configuration shared by ' . count($used_by)
+        . ' backups rather than files of its own, and emptying it leaves all of them unrestorable.'
+        . ' To reclaim the space, delete the backups themselves and this empties automatically.';
+}
+
+/**
+ * Renders a list of backup filenames for a message, without running to pages.
+ *
+ * @param array $names
+ * @return string
+ */
+function DescribeBackupList($names)
+{
+    $shown = array_slice($names, 0, 3);
+    $rest = count($names) - count($shown);
+
+    return implode(', ', $shown) . ($rest > 0 ? ' and ' . $rest . ' other backup' . ($rest == 1 ? '' : 's') : '');
+}
+
+/**
+ * Backup metadata cache.
+ *
+ * Listing the configuration backups needs exactly two things out of each backup
+ * file - the comment and the trigger source.  Everything else on a listing row
+ * comes from the filename or a stat().  Reading those two fields out of the
+ * files themselves means json_decode()ing every backup on every listing, and a
+ * backup of a configured show is tens of megabytes: with the default of 60 kept
+ * backups that is a gigabyte of JSON parsed to recover a few hundred bytes.
+ *
+ * That cost was not confined to the Backups page.  Every settings change writes
+ * a backup, and writing one prunes the old ones through the same listing, so a
+ * single checkbox on the settings page paid for a full re-read of every backup
+ * on the box - several seconds of it.
+ *
+ * The cache maps a backup's full path to those two fields plus the size and
+ * mtime they were read at, so an unchanged file is never opened twice.  It is
+ * only ever a cache: a miss (or a missing/corrupt cache file) falls back to
+ * reading the backup, so deleting it costs one slow listing and nothing else.
+ *
+ * It lives in media/cache rather than the config directory because anything
+ * ending in .json under config/ is swept into the "misc configs" area of the
+ * backups, and anything in config/backups/ is itself listed as a backup.
+ *
+ * @return string Full path of the cache file.
+ */
+function GetBackupMetadataCachePath()
+{
+    global $settings;
+    return $settings['mediaDirectory'] . '/cache/backupMetadata.json';
+}
+
+/**
+ * Reads the backup metadata cache.
+ *
+ * @return array Map of backup path => array('size', 'mtime', 'backup_comment', 'backup_trigger_source').
+ */
+function LoadBackupMetadataCache()
+{
+    $path = GetBackupMetadataCachePath();
+    if (!file_exists($path)) {
+        return array();
+    }
+
+    $cache = json_decode(@file_get_contents($path), true);
+
+    return is_array($cache) ? $cache : array();
+}
+
+/**
+ * Writes the backup metadata cache.
+ *
+ * Concurrent writers can lose each other's entries here.  That is harmless: a
+ * lost entry is re-read from the backup file on the next listing, and a stale
+ * one is rejected by the size/mtime check before it is ever used.
+ *
+ * @param array $cache
+ * @return bool
+ */
+function SaveBackupMetadataCache($cache)
+{
+    $path = GetBackupMetadataCachePath();
+    $dir = dirname($path);
+
+    if (!is_dir($dir) && @mkdir($dir, 0775, true) === false) {
+        return false;
+    }
+
+    return WriteFileAtomic($path, json_encode($cache));
+}
+
+/**
+ * Builds a cache entry for a backup file that has just been written, so the
+ * next listing never has to open it.  Called by doBackupDownload().
+ *
+ * @param string $backup_file_path Full path of the backup that was written.
+ * @param string $backup_comment
+ * @param string|null $backup_trigger_source
+ * @param array $blob_refs Blob hashes the backup references, as keys.
+ * @param int|null $backup_taken The backup's own backup_taken (UNIX time).
+ * @return bool
+ */
+function RememberBackupMetadata($backup_file_path, $backup_comment, $backup_trigger_source, $blob_refs = array(), $backup_taken = null)
+{
+    clearstatcache(true, $backup_file_path);
+    $size = @filesize($backup_file_path);
+    $mtime = @filemtime($backup_file_path);
+
+    if ($size === false || $mtime === false) {
+        return false;
+    }
+
+    $cache = LoadBackupMetadataCache();
+    $cache[$backup_file_path] = array(
+        'size' => $size,
+        'mtime' => $mtime,
+        'backup_comment' => $backup_comment,
+        'backup_trigger_source' => $backup_trigger_source,
+        'blob_refs' => array_values($blob_refs),
+        'backup_taken' => $backup_taken,
+    );
+
+    return SaveBackupMetadataCache($cache);
+}
+
+/**
+ * Makes a POST Call to the api/backups/configuration to generate a JSON Configuration backup with a option comment
+ * @param $backup_comment string Optional Comment that will be inserted into the JSON backup file
+ * @param $trigger_source string Optional Source that triggered the backup,
+ * @return bool
+ */
+function GenerateBackupViaAPI($backup_comment = "Created via API", $trigger_source = null)
+{
+    $url = 'http://localhost/api/backups/configuration';
+    $data = $backup_comment;
+
+    if (!is_null($trigger_source)) {
+        $data = json_encode(array('backup_comment' => $backup_comment, 'trigger_source' => $trigger_source));
+    }
+
+    //https://stackoverflow.com/questions/5647461/how-do-i-send-a-post-request-with-php
+    // use key 'http' even if you send the request to https://...
+    $options = array(
+        'http' => array(
+            'header' => "Content-type: text/plain",
+            'method' => 'POST',
+            'content' => $data,
+        ),
+    );
+    $context = stream_context_create($options);
+
+    if (file_get_contents($url, false, $context) !== false) {
+        //API now does this directly itself, so all we have to do is call it and let it do it's thing
+        //it still calls this same function
+        //        DoJsonBackupToUSB();
+
+        return true;
+    } else {
+        /* Handle error */
+        error_log('GenerateBackupViaAPI: Something went wrong trying to call backups API to make a settings backup. (' . json_encode(['url' => $url, 'options' => $options]));
+        return false;
+    }
+}
+
+/**
+ * Copy JSON Settings backups to the specified alternate location if set.
+ * @return bool
+ */
+function DoJsonBackupToUSB()
+{
+    global $settings;
+    //Gather some setting that will assist in making a copy of the backups
+    if (isset($settings['jsonConfigBackupUSBLocation'])) {
+        $selected_jsonConfigBackupUSBLocation = $settings['jsonConfigBackupUSBLocation'];
+    } else {
+        $selected_jsonConfigBackupUSBLocation = "";
+    }
+    //Folder under which the backups will be stored on the selected storeage device
+    $fileCopy_BackupPath = 'Automatic_Backups';
+    $result = false;
+
+    //first check if the jsonConfigBackupUSBLocation setting is valid
+    if (
+        (isset($selected_jsonConfigBackupUSBLocation) && !empty($selected_jsonConfigBackupUSBLocation) && strtolower($selected_jsonConfigBackupUSBLocation) !== 'none')
+        &&
+        (isset($fileCopy_BackupPath))
+    ) {
+        //Make a call to the copystorage.php page (i.e the File Copy Backup page)
+
+        //Build up the URL, include the necessary params so we can call it and have JSON Backups copied across
+        $url = 'http://localhost/copystorage.php?wrapped=1&direction=TOUSB&path=' . urlencode($fileCopy_BackupPath) . '&storageLocation=' . $selected_jsonConfigBackupUSBLocation . '&flags=JsonBackups&delete=no';
+
+        $ctx = stream_context_create(array('http' => array('method' => 'POST')));
+        if (file_get_contents($url, false, $ctx) === false) {
+            /* Handle error */
+            error_log(
+                'DoJsonBackupToUSB: Something went wrong trying to call filecopy endpoint to copy JSON Backups to the specified device. (' . json_encode(
+                    [
+                        'url' => $url,
+                        'jsonConfigBackupUSBLocation' => $selected_jsonConfigBackupUSBLocation,
+                        'fileCopy_BackupPath' => $fileCopy_BackupPath,
+                    ]
+                )
+            );
+        } else {
+            $result = true;
+        }
+    } else {
+        $result = false;
+    }
+
+    return $result;
+}
+
+/**
+ * Helper function used to generate a nice string about what the setting is, which can be used for the comment of what the backup is
+ * @param $setting_name
+ * @param $setting_value
+ * @return string
+ */
+function GenerateBackupComment($setting_name, $setting_value)
+{
+    $backup_comment = "FPP Settings - ";
+    //Read in the setting JSON file to assist with generating backup comment in relation to what setting was changed
+    $settings_json = json_decode(file_get_contents("./settings.json"), true);
+    //Try find  the setting name passed via Params in this array
+    if (is_array($settings_json) && array_key_exists($setting_name, $settings_json['settings'])) {
+        if (array_key_exists('description', $settings_json['settings'][$setting_name])) {
+            $settings_description = $settings_json['settings'][$setting_name]['description'];
+
+            $backup_comment .= $settings_description . " setting was set to ( " . $setting_value . " ).";
+
+        } else {
+            $backup_comment .= "Setting " . $setting_name . " was set to (" . $setting_value . ").";
+        }
+    } else {
+        $backup_comment .= "Setting " . $setting_name . " was set to (" . $setting_value . ").";
+    }
+
+    return $backup_comment;
+}
+
+/**
+ * Returns available USB devices attached to the system
+ *
+ * @param $all bool Optional - If set to true then both usable and unusable devices are returned
+ * @return array
+ */
+function GetAvailableBackupsDevices($all = false)
+{
+    global $SUDO;
+    $devices = array();
+
+    foreach (scandir("/dev/") as $deviceName) {
+        if (!preg_match('/^(sd[a-z][0-9]+|mmcblk[0-9]+p[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$/', $deviceName)) {
+            continue;
+        }
+        // Use lsblk for size so it works for sd, mmcblk and nvme alike.
+        // sfdisk -s is sd-specific and reports in 1K blocks; lsblk reports bytes.
+        $sizeBytes = trim(shell_exec($SUDO . " lsblk -bno SIZE " . escapeshellarg("/dev/" . $deviceName) . " 2>/dev/null | head -1"));
+        $GB = 0;
+        if ($sizeBytes !== '' && is_numeric($sizeBytes)) {
+            $GB = round(intval($sizeBytes) / 1024.0 / 1024.0 / 1024.0, 1);
+        } else {
+            // Fallback to previous sfdisk method for older kernels/types
+            exec($SUDO . " sfdisk -s " . escapeshellarg("/dev/" . $deviceName), $output, $return_val);
+            if (isset($output[0])) {
+                $GB = round(intval($output[0]) / 1024.0 / 1024.0, 1);
+            }
+            unset($output);
+        }
+
+        if ($GB <= 0.1) {
+            continue;
+        }
+
+        if (!$all) {
+            $unusable = CheckIfDeviceIsUsable($deviceName);
+            if ($unusable != '') {
+                continue;
+            }
+
+        }
+
+        // Derive base block device for model/vendor lookup:
+        // sda1 -> sda, mmcblk0p1 -> mmcblk0, nvme0n1p1 -> nvme0n1
+        $baseDevice = $deviceName;
+        if (preg_match('/^(sd[a-z])[0-9]+$/', $deviceName, $m)) {
+            $baseDevice = $m[1];
+        } elseif (preg_match('/^(mmcblk[0-9]+)p[0-9]+$/', $deviceName, $m)) {
+            $baseDevice = $m[1];
+        } elseif (preg_match('/^(nvme[0-9]+n[0-9]+)p[0-9]+$/', $deviceName, $m)) {
+            $baseDevice = $m[1];
+        }
+
+        $device = array();
+        $device['name'] = $deviceName;
+        $device['size'] = $GB;
+        $device['model'] = exec("cat /sys/block/$baseDevice/device/model 2>/dev/null");
+        if ($device['model'] == '') {
+            // mmcblk and nvme expose model elsewhere; try lsblk as fallback
+            $device['model'] = trim(shell_exec("lsblk -dno MODEL " . escapeshellarg("/dev/" . $baseDevice) . " 2>/dev/null"));
+        }
+        $device['vendor'] = exec("cat /sys/block/$baseDevice/device/vendor 2>/dev/null");
+        if ($device['vendor'] == '') {
+            $device['vendor'] = trim(shell_exec("lsblk -dno VENDOR " . escapeshellarg("/dev/" . $baseDevice) . " 2>/dev/null"));
+        }
+
+        array_push($devices, $device);
+    }
+
+    return $devices;
+}
+
+/**
+ * Checks if supplied device name is usable e.g not mounted or in use at all
+ *
+ * @param $deviceName
+ * @return string
+ */
+function CheckIfDeviceIsUsable($deviceName)
+{
+    global $SUDO;
+
+    // Use lsblk MOUNTPOINTS / findmnt for a reliable, column-aware check.
+    // The old code did `lsblk /dev/X` + regex on TYPE words, which breaks with
+    // multi-device lsblk tree output and with newer MOUNTPOINTS column.
+    $mountPoint = trim(shell_exec($SUDO . " lsblk -nro MOUNTPOINTS " . escapeshellarg("/dev/" . $deviceName) . " 2>/dev/null | head -1"));
+    // lsblk may return multiple mountpoints space-separated for bind mounts; check first entry
+    if ($mountPoint !== '') {
+        $firstMount = preg_split('/\s+/', $mountPoint)[0];
+        if ($firstMount !== '' && $firstMount !== '0') {
+            return "ERROR: Partition is mounted on: $firstMount";
+        }
+    }
+    // Fallback to findmnt if lsblk not available or empty but still mounted
+    $findmnt = trim(shell_exec($SUDO . " findmnt -n -o TARGET -- " . escapeshellarg("/dev/" . $deviceName) . " 2>/dev/null | head -1"));
+    if ($findmnt !== '') {
+        return "ERROR: Partition is mounted on: $findmnt";
+    }
+
+    $isSwap = exec("grep -F " . escapeshellarg("/dev/" . $deviceName) . " /proc/swaps 2>/dev/null");
+    if ($isSwap != "") {
+        return "ERROR: $deviceName is a swap partition";
+    }
+
+    return "";
+}
+
+/**
+ * Enumerate the whole disks that a copy of FPP can be flashed onto.
+ *
+ * Every platform is treated the same way: any real disk that is neither the one we
+ * booted from nor the one holding the media directory is a candidate. That is what
+ * lets a Pi with both a USB stick and an NVMe offer both -- the old hardcoded
+ * if/else chain showed USB *or* NVMe and could never reach the NVMe when a USB
+ * device happened to be plugged in.
+ *
+ * @return array of ['name', 'kind', 'size', 'model', 'desc']
+ */
+function GetFlashTargetDevices()
+{
+    $devices = array();
+
+    // The disk we booted from is never a candidate.
+    $bootedDisk = '';
+    $rootSource = trim(shell_exec("findmnt -no SOURCE / 2>/dev/null"));
+    if ($rootSource != '') {
+        $bootedDisk = trim(shell_exec("lsblk -no PKNAME " . escapeshellarg($rootSource) . " 2>/dev/null | head -1"));
+        if ($bootedDisk == '') {
+            // root directly on a whole disk, or lsblk could not resolve it
+            $bootedDisk = preg_replace('/p?[0-9]*$/', '', basename($rootSource));
+        }
+    }
+
+    // Neither is the disk currently holding the media directory.
+    $storageDisk = '';
+    $mediaDir = GetSettingValue('mediaDirectory');
+    if ($mediaDir != '') {
+        $storageSource = trim(shell_exec("findmnt -no SOURCE -T " . escapeshellarg($mediaDir) . " 2>/dev/null | head -1"));
+        if ($storageSource != '' && strpos($storageSource, '/dev/') === 0) {
+            $storageDisk = trim(shell_exec("lsblk -no PKNAME " . escapeshellarg($storageSource) . " 2>/dev/null | head -1"));
+        }
+    }
+
+    $names = array();
+    exec("lsblk -dno NAME 2>/dev/null", $names);
+
+    foreach ($names as $name) {
+        $name = trim($name);
+        if ($name == '') {
+            continue;
+        }
+        // Virtual devices, and the eMMC boot/rpmb areas a BeagleBone exposes as disks.
+        if (preg_match('/^(loop|ram|zram|dm-|md|sr|fd)/', $name)) {
+            continue;
+        }
+        if (preg_match('/(boot[0-9]+|rpmb)$/', $name)) {
+            continue;
+        }
+        if ($name === $bootedDisk || ($storageDisk != '' && $name === $storageDisk)) {
+            continue;
+        }
+
+        $dev = escapeshellarg("/dev/" . $name);
+        $size = trim(shell_exec("lsblk -dno SIZE $dev 2>/dev/null"));
+        $tran = trim(shell_exec("lsblk -dno TRAN $dev 2>/dev/null"));
+        $model = trim(shell_exec("lsblk -dno MODEL $dev 2>/dev/null"));
+        $removable = trim(@file_get_contents("/sys/block/$name/removable"));
+
+        if (preg_match('/^nvme/', $name)) {
+            $kind = 'NVMe';
+        } else if (preg_match('/^mmcblk/', $name)) {
+            // An eMMC is soldered down and reports non-removable; an SD card does not.
+            $kind = ($removable === '1') ? 'SD Card' : 'eMMC';
+        } else if ($tran == 'usb') {
+            $kind = 'USB';
+        } else if ($tran == 'sata' || $tran == 'ata') {
+            $kind = 'SATA';
+        } else {
+            $kind = 'Disk';
+        }
+
+        $desc = $kind;
+        if ($model != '') {
+            $desc .= ' - ' . $model;
+        }
+        if ($size != '') {
+            $desc .= ' (' . $size . ')';
+        }
+
+        $devices[] = array(
+            'name' => $name,
+            'kind' => $kind,
+            'size' => $size,
+            'model' => $model,
+            'desc' => $desc,
+        );
+    }
+
+    return $devices;
+}
+
+//additional function
+if (!function_exists('json_validate')) {
+    /**
+     * Validates a JSON string. This is standard in php >= 8.3
+     * 
+     * @param string $json The JSON string to validate.
+     * @param int $depth Maximum depth. Must be greater than zero.
+     * @param int $flags Bitmask of JSON decode options.
+     * @return bool Returns true if the string is a valid JSON, otherwise false.
+     */
+    function json_validate($json, $depth = 512, $flags = 0)
+    {
+        if (!is_string($json)) {
+            return false;
+        }
+
+        try {
+            json_decode($json, false, $depth, $flags | JSON_THROW_ON_ERROR);
+            return true;
+        } catch (\JsonException $e) {
+            return false;
+        }
+    }
+}
+
+function json_object_validate($json, $depth = 512, $flags = 0)
+{
+    if (!is_string($json)) {
+        return false;
+    }
+
+    try {
+        $decoded = json_decode($json, false, $depth, $flags | JSON_THROW_ON_ERROR);
+        return is_object($decoded);
+    } catch (\JsonException $e) {
+        return false;
+    }
+}
+
+function json_array_validate($json, $depth = 512, $flags = 0)
+{
+    if (!is_string($json)) {
+        return false;
+    }
+
+    try {
+        $decoded = json_decode($json, false, $depth, $flags | JSON_THROW_ON_ERROR);
+        return is_array($decoded);
+    } catch (\JsonException $e) {
+        return false;
+    }
+}
+
+/**
+ * Fetches a REST API via GET, but only if the response size is within a given limit.
+ *
+ * @param string $url The URL of the API endpoint.
+ * @param int $max_size_bytes The maximum allowed response size in bytes.
+ * @return string|false The API response body as a string if successful and within size limit, otherwise false.
+ */
+function fetch_api_with_limit(string $url, int $max_size_bytes = 1024 * 50): string|false
+{
+    // Initialize a cURL session to check the Content-Length header.
+    $ch_head = curl_init($url);
+
+    // Set cURL options for a HEAD request.
+    curl_setopt($ch_head, CURLOPT_RETURNTRANSFER, true); // Return the transfer as a string
+    curl_setopt($ch_head, CURLOPT_HEADER, true);       // Include header in output
+    curl_setopt($ch_head, CURLOPT_NOBODY, true);       // Exclude the body from the output
+    curl_setopt($ch_head, CURLOPT_FOLLOWLOCATION, true); // Follow any redirects
+
+    // Execute the HEAD request.
+    $response_headers = curl_exec($ch_head);
+
+    // Check for cURL errors.
+    if (curl_errno($ch_head)) {
+        curl_close($ch_head);
+        return false;
+    }
+
+    // Close the cURL session.
+    curl_close($ch_head);
+
+    // Extract the content length from the response headers.
+    $content_length = -1;
+    if (preg_match('/Content-Length: (\d+)/i', $response_headers, $matches)) {
+        $content_length = (int) $matches[1];
+    }
+
+    // If Content-Length is unavailable or exceeds the max size, return false.
+    // Some APIs may not provide a Content-Length header. Don't handle this.
+    if ($content_length > -1 && $content_length > $max_size_bytes) {
+        return false;
+    }
+
+    return file_get_contents($url);
+}
+
+/**
+ * Returns a host suitable for embedding in a URL.
+ *
+ * MultiSync discovery reports every address a remote advertises, which on
+ * residential networks includes globally-routable IPv6 addresses (e.g.
+ * 2a06:61c1:4b2a:0:da3a:ddff:fe34:f1be). Concatenating one of those straight
+ * into "http://$ip/..." produces a URL neither curl nor a browser can parse,
+ * since the address colons are indistinguishable from a port separator, so the
+ * literal has to be bracketed. IPv4 addresses and hostnames pass through
+ * unchanged, as do hosts that are already bracketed.
+ *
+ * @param string $host An IP address or hostname.
+ * @return string The host, bracketed if it is an IPv6 literal.
+ */
+function fppUrlHost(string $host): string
+{
+    if ($host === "" || $host[0] === '[') {
+        return $host;
+    }
+
+    // A zone id (fe80::1%eth0) isn't usable in a URL, but validate the address
+    // portion so such a host is still bracketed rather than mangled.
+    $address = $host;
+    $percent = strpos($address, '%');
+    if ($percent !== false) {
+        $address = substr($address, 0, $percent);
+    }
+
+    if (filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        return '[' . $host . ']';
+    }
+
+    return $host;
+}
+
+/**
+ * Send cache validators for a response, and answer 304 if the client already
+ * has this version.
+ *
+ * Two things make this worth doing in PHP rather than leaving it to Apache.
+ * Apache does apply the conditional itself once a handler has set an ETag or
+ * Last-Modified -- it will turn the response into a 304 on its own -- but by
+ * then PHP has already produced the body it is about to throw away. Returning
+ * early here skips that work. And for a file, the validator can be derived
+ * from a stat() alone, so a repeat request never reads the file at all.
+ *
+ * Matching is on the bare tag appearing anywhere in If-None-Match rather than
+ * on equality: the header may carry a list, and a cache that compressed the
+ * response on the way past can echo the tag back with a "-gzip" suffix.
+ *
+ * The response also states its own cache policy, and must: a browser copies a
+ * 304's headers onto the response it has stored, so whatever freshness the 304
+ * carries is what the stored copy gets from then on. Leaving that to Apache
+ * does not work. mod_expires picks a lifetime by Content-Type, a 304 from here
+ * reaches it with none, and it falls through to the vhost's one-year
+ * ExpiresDefault -- so a single unchanged refetch left the browser serving the
+ * config from cache for a year without asking, and a Save from that page wrote
+ * the stale copy back. Any Expires header already on the response makes
+ * mod_expires leave it alone, so one is sent that agrees with the policy, and
+ * the Cache-Control below is then the only policy on both the 200 and the 304.
+ * no-cache rather than max-age=0 because it forbids reusing the stored copy
+ * without asking in every case, including the ones where max-age=0 would allow
+ * a stale copy.
+ *
+ * @param string $etag  Bare validator, no quotes.
+ * @param int    $mtime Unix mtime for Last-Modified, or 0 to omit it.
+ * @return bool True if a 304 was sent and the caller should stop.
+ */
+function fppSendCacheValidators($etag, $mtime = 0)
+{
+    if (headers_sent()) {
+        return false;
+    }
+
+    header('Cache-Control: no-cache');
+    header('Expires: ' . gmdate('D, d M Y H:i:s') . ' GMT');
+    header('ETag: "' . $etag . '"');
+    if ($mtime > 0) {
+        header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $mtime) . ' GMT');
+    }
+
+    $inm = isset($_SERVER['HTTP_IF_NONE_MATCH']) ? $_SERVER['HTTP_IF_NONE_MATCH'] : '';
+    if ($inm !== '' && strpos($inm, $etag) !== false) {
+        http_response_code(304);
+        return true;
+    }
+
+    // Only consulted when the client sent no ETag at all. If-None-Match wins
+    // outright per RFC 9110: a client that holds a tag has already been told
+    // above that it does not match, and a second opinion from a timestamp --
+    // which has only one-second resolution -- must not override that.
+    if ($inm === '' && $mtime > 0 && isset($_SERVER['HTTP_IF_MODIFIED_SINCE'])) {
+        $since = strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']);
+        if ($since !== false && $mtime <= $since) {
+            http_response_code(304);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Validators for a file on disk, derived from a stat() rather than its content.
+ *
+ * size-mtime-inode changes whenever the file does, without reading a byte of
+ * it, so a client that already has the file costs one stat and no I/O.
+ *
+ * Except while the timestamp is still racy. st_mtime has one-second
+ * resolution, so two writes inside the same second produce the same mtime, and
+ * if they also leave the size and inode alone -- an in-place rewrite of the
+ * same number of bytes -- the validator repeats for different content. A
+ * client that read between the two writes then holds a tag that still matches,
+ * and gets a 304 carrying the older file. Worse, it stays wrong: nothing
+ * changes the tag again until some later write alters the size or the mtime.
+ * FPP's own config writers go through WriteFileAtomic(), whose rename() gives
+ * the file a new inode and so happens to avoid this -- but that is a property
+ * of one writer, not of the validator, and anything editing a config in place
+ * (a script, an editor, a plugin, an rsync) reintroduces it.
+ *
+ * So a stat is only trusted once its mtime is safely in the past; inside that
+ * window the content is hashed instead. Once now is more than a second past
+ * the mtime, no later write can land on that same mtime value again -- time
+ * only moves forward -- so a stat-derived tag handed out after the window can
+ * never be reused for different content. The `>=` also covers a clock that
+ * steps backwards, which on these boards happens every boot before NTP
+ * settles: mtime then reads as being in the future, and the conservative path
+ * is the one that gets taken.
+ *
+ * The cost is a read and a hash of a file that was just written, which is
+ * exactly when a page is reloading its config anyway. Beyond a few megabytes
+ * that is no longer worth it, so an oversized file in the racy window is sent
+ * with no validator at all -- always a 200, never a wrong 304.
+ *
+ * @return bool True if a 304 was sent and the caller should stop.
+ */
+function fppSendFileCacheValidators($path)
+{
+    // Callers reach here after their own file_exists()/is_dir() checks, which
+    // populate PHP's per-request stat cache. Read the file's real current
+    // state rather than whatever those left behind.
+    clearstatcache(true, $path);
+
+    $st = @stat($path);
+    if ($st === false) {
+        return false;
+    }
+
+    if ($st['mtime'] >= time() - 1) {
+        if ($st['size'] > 4 * 1024 * 1024) {
+            return false;
+        }
+        $content = @file_get_contents($path);
+        if ($content === false) {
+            return false;
+        }
+
+        return fppSendContentCacheValidators($content);
+    }
+
+    return fppSendCacheValidators(
+        sprintf('%x-%x-%x', $st['size'], $st['mtime'], $st['ino']),
+        $st['mtime']
+    );
+}
+
+/**
+ * Validators for a body PHP has already built. Falls back to hashing the bytes
+ * because there is nothing cheaper to key on; use fppSendFileCacheValidators()
+ * instead wherever the answer is a file.
+ *
+ * @return bool True if a 304 was sent and the caller should stop.
+ */
+function fppSendContentCacheValidators($body)
+{
+    return fppSendCacheValidators(sprintf('%x-%s', strlen($body), substr(md5($body), 0, 16)));
+}
+
+/**
+ * Whether the gpiochip/line numbers behind a header pin are stable enough to show.
+ *
+ * They only mean something on the Pi, where the 40-pin header maps to a fixed set of
+ * SoC lines.  Everywhere else -- the BeagleBone family, and anything behind an i2c
+ * GPIO expander on any platform -- the chip index comes out of an asynchronous
+ * boot-time probe and can differ from one boot to the next, so a number in the UI is
+ * noise the user cannot act on.  Pin-by-pin filtering lives in GPIOPinLabel() and in
+ * fppPinHasGpioNumbers() on the JS side; this is just the platform half.
+ */
+function GPIOPlatformHasStablePinNumbers()
+{
+    global $settings;
+
+    return isset($settings['Platform']) && $settings['Platform'] == "Raspberry Pi";
+}
+
+/**
+ * Label a GPIO header pin for a dropdown, annotated with the chip/line it drives
+ * where that is meaningful (see GPIOPlatformHasStablePinNumbers()) and left as the
+ * bare pin name where it is not.
+ */
+function GPIOPinLabel($pin, $chip, $line)
+{
+    if (!GPIOPlatformHasStablePinNumbers() || !str_starts_with($pin, 'P1-') ||
+        $chip === null || $line === null) {
+        return $pin;
+    }
+
+    return $pin . " (GPIO " . $chip . "/" . $line . ")";
+}
+
+/**
+ * The serial devices on this system, as a list of arrays with:
+ *   device      - the tty under /dev, e.g. "ttyUSB0"
+ *   stable      - a name for it under /dev that survives a reboot, or the tty itself
+ *                 where there is none; see below
+ *   byId/byPath - its /dev/serial/by-id and by-path links, "" where it has none
+ *   usbSerial   - the USB serial number of the adapter it is on, "" if none
+ *   description - manufacturer and product of the USB adapter, "" if not USB
+ *
+ * USB adapters are numbered in the order they are found, so ttyUSB0 can be a
+ * different adapter after a reboot.  An adapter with a USB serial number has a
+ * by-id link unique to it; one without shares its by-id link with any other adapter
+ * of the same make, so its stable name is the by-path link, which follows the USB
+ * socket it is plugged into.
+ */
+function SerialStableName($tty, $byId, $byPath, $usbSerial)
+{
+    if ($byId != "" && $usbSerial != "") {
+        return $byId;
+    }
+    if ($byPath != "") {
+        return $byPath;
+    }
+    if ($byId != "") {
+        return $byId;
+    }
+    return $tty;
+}
+
+function GetSerialDevices()
+{
+    $links = array("by-id" => array(), "by-path" => array());
+    foreach (array_keys($links) as $kind) {
+        $dir = "/dev/serial/" . $kind;
+        if (!is_dir($dir)) {
+            continue;
+        }
+        foreach (scandir($dir) as $name) {
+            if ($name == "." || $name == "..") {
+                continue;
+            }
+            $target = basename((string) readlink($dir . "/" . $name));
+            // udev makes a "usbv2" by-path link beside each "usb" one; keep the first
+            if ($target != "" && !isset($links[$kind][$target])) {
+                $links[$kind][$target] = "serial/" . $kind . "/" . $name;
+            }
+        }
+    }
+
+    $devices = array();
+    foreach (scandir("/dev/") as $tty) {
+        if (!preg_match("/^tty(SC?[0-9]+|ACM[0-9]+|O[0-9]+|AMA[0-9]+|USB[0-9]+)$/", $tty)) {
+            continue;
+        }
+        $usbSerial = "";
+        $description = "";
+        // the USB device is a few levels up from the tty's interface
+        $dir = realpath("/sys/class/tty/" . $tty . "/device");
+        for ($i = 0; $dir !== false && $i < 4; $i++) {
+            if (file_exists($dir . "/idVendor")) {
+                if (file_exists($dir . "/serial")) {
+                    $usbSerial = trim(file_get_contents($dir . "/serial"));
+                }
+                $parts = array();
+                foreach (array("manufacturer", "product") as $f) {
+                    if (file_exists($dir . "/" . $f)) {
+                        $parts[] = trim(file_get_contents($dir . "/" . $f));
+                    }
+                }
+                $description = implode(" ", $parts);
+                break;
+            }
+            $dir = dirname($dir);
+        }
+        $byId = isset($links["by-id"][$tty]) ? $links["by-id"][$tty] : "";
+        $byPath = isset($links["by-path"][$tty]) ? $links["by-path"][$tty] : "";
+        $devices[] = array(
+            "device" => $tty,
+            "stable" => SerialStableName($tty, $byId, $byPath, $usbSerial),
+            "byId" => $byId,
+            "byPath" => $byPath,
+            "usbSerial" => $usbSerial,
+            "description" => $description,
+        );
+    }
+    return $devices;
+}
+
+/**
+ * Whether resolved path $path is $base itself or lies under it.  A bare
+ * prefix test also let a sibling through: /home/fpp/media/config-old
+ * starts with /home/fpp/media/config.
+ *
+ * @param string $path a realpath()ed path
+ * @param string $base a realpath()ed directory
+ * @return bool
+ */
+function PathIsWithin($path, $base)
+{
+    if (!is_string($path) || !is_string($base) || $base === '') {
+        return false;
+    }
+    $base = rtrim($base, '/');
+    return $path === $base || strncmp($path, $base . '/', strlen($base) + 1) === 0;
+}
+
+/**
+ * The state-changing route this GET request is for, or '' if it is none.
+ *
+ * These routes (docs/DEPRECATED.md, "HTTP API: routes that change state but
+ * answer GET") will require POST in FPP 11: over plain HTTP any web page can
+ * make a browser send them a GET.  Until then they keep working by GET and
+ * are only marked.  Keep this list in step with rule 2 of the cross-site gate
+ * in etc/apache2.site.  GET /api/command/... is fppd's and is marked there.
+ *
+ * @return string
+ */
+function DeprecatedStateChangingGetRoute()
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
+        return '';
+    }
+    static $pages = array('changebranch', 'copystorage', 'disableKiosk', 'flash-storage', 'formatstorage',
+        'gitCheckoutVersion', 'growsd', 'installKiosk', 'manualUpdate', 'newpartitionsd', 'packagesHelper',
+        'rebootRemoteFPP', 'rebuildfpp', 'resetConfig', 'restartRemoteFPPD', 'run_mp3gain', 'runEventScript',
+        'shutdownRemoteFPP', 'upgradeCapeFirmware', 'upgradefpp', 'upgradeOS');
+    $script = basename($_SERVER['SCRIPT_NAME'] ?? '', '.php');
+    if (in_array($script, $pages, true)) {
+        return $script . '.php';
+    }
+    $path = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+    // remoteAction also serves reads (listUpgrades, updateLog) to the
+    // MultiSync page; only the actions that change the remote are marked.
+    if (is_string($path) && preg_match('#^/api/remoteAction$#i', $path) &&
+        in_array($_GET['action'] ?? '', array('reboot', 'restartFppd'), true)) {
+        return '/api/remoteAction?action=' . $_GET['action'];
+    }
+    if (is_string($path) && preg_match('#^/api/(events/[^/]+/trigger|file/move/|git/reset$|network/interface/add/|playlists/(stop|pause|resume|stopgracefully|stopgracefullyafterloop)$|playlist/[^/]+/start|playlist/repeat/|plugin/[^/]+/upgrade$|sequence/current/(stop|togglePause)$|sequence/[^/]+/start/|scripts/[^/]+/run$|system/(reboot|shutdown)$|system/fppd/(start|stop|restart)$)#i', $path, $m)) {
+        return '/api/' . $m[1];
+    }
+    return '';
+}
+
+/**
+ * Mark a GET to a state-changing route as deprecated: a Deprecation response
+ * header every time, and a line in fppd.log at most once an hour per route and
+ * client, so whoever still calls it by GET can be found before FPP 11.
+ *
+ * @return void
+ */
+function NoteDeprecatedStateChangingGet()
+{
+    $route = DeprecatedStateChangingGetRoute();
+    if ($route === '') {
+        return;
+    }
+    if (!headers_sent()) {
+        header('Deprecation: true');
+    }
+    $client = $_SERVER['REMOTE_ADDR'] ?? '?';
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $client .= ' for ' . $_SERVER['HTTP_X_FORWARDED_FOR'];
+    }
+    $client = substr(preg_replace('/[^\x20-\x7e]/', '', $client), 0, 100);
+    $agent = substr(preg_replace('/[^\x20-\x7e]/', '', $_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 100);
+
+    $dir = sys_get_temp_dir() . '/fpp-deprecated-get';
+    $stamp = $dir . '/' . md5($route . '|' . $client);
+    $last = @filemtime($stamp);
+    if ($last !== false && $last > time() - 3600) {
+        return;
+    }
+    @mkdir($dir, 0775, true);
+    @touch($stamp);
+    require_once __DIR__ . '/common/oplog.inc.php';
+    FppdLogLine('apache', 'General', 'Deprecated: GET ' . $route . ' from ' . $client .
+        ($agent !== '' ? ' (' . $agent . ')' : '') .
+        ' changes state; FPP 11 will require POST for it (docs/DEPRECATED.md)');
+}
+
+NoteDeprecatedStateChangingGet();
 
 ?>

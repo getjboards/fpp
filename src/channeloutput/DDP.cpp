@@ -1,29 +1,16 @@
 /*
- *   DDP Channel Output driver for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
- *
- *   ***********************************************************************
- *
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
+ */
+
+/*
  *   This Channel Output implements the data packet portion of the DDP
  *   protocol.  Discovery is not currently supported. Data packets are
  *   sent to port 4048 UDP or TCP. This implementation uses UDP.
@@ -59,7 +46,7 @@
  *               x:      reserved for future use (set to zero)
  *               ttt:    type, 0 = greyscale, 1 = rgb, 2 = hsl?
  *               bbb:    bits per pixel:
- *                       0=1, 1=4, 2=8, 3=16, 4=24, 5=32, 6=48, 7=64
+ *                       0=undefined, 1=1, 2=4, 3=8, 4=16, 5=24, 6=32
  *
  *   byte  3:    Source or Destination ID
  *               0 = reserved
@@ -90,104 +77,90 @@
  *
  */
 
-#include <sys/types.h>
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <signal.h>
-#include <arpa/inet.h>
+#include <sys/types.h>
 #include <ctype.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
 
-#include "common.h"
+#include "../Warnings.h"
+#include "ChannelOutputSetup.h"
+#include "../log.h"
+
 #include "DDP.h"
-#include "log.h"
-#include "Sequence.h"
-#include "settings.h"
-
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <cstring>
-
-#include <jsoncpp/json/json.h>
-#include <strings.h>
-
 
 #define DDP_HEADER_LEN 10
 #define DDP_SYNCPACKET_LEN 10
 
-#define DDP_FLAGS1_VER     0xc0   // version mask
-#define DDP_FLAGS1_VER1    0x40   // version=1
-#define DDP_FLAGS1_PUSH    0x01
-#define DDP_FLAGS1_QUERY   0x02
-#define DDP_FLAGS1_REPLY   0x04
+#define DDP_FLAGS1_VER 0xc0  // version mask
+#define DDP_FLAGS1_VER1 0x40 // version=1
+#define DDP_FLAGS1_PUSH 0x01
+#define DDP_FLAGS1_QUERY 0x02
+#define DDP_FLAGS1_REPLY 0x04
 #define DDP_FLAGS1_STORAGE 0x08
-#define DDP_FLAGS1_TIME    0x10
+#define DDP_FLAGS1_TIME 0x10
 
-#define DDP_ID_DISPLAY       1
-#define DDP_ID_CONFIG      250
-#define DDP_ID_STATUS      251
+#define DDP_ID_DISPLAY 1
+#define DDP_ID_CONFIG 250
+#define DDP_ID_STATUS 251
 
 //1440 channels per packet
 #define DDP_CHANNELS_PER_PACKET 1440
 
 #define DDP_PACKET_LEN (DDP_HEADER_LEN + DDP_CHANNELS_PER_PACKET)
 
-DDPOutputData::DDPOutputData(const Json::Value &config) : UDPOutputData(config), sequenceNumber(1) {
-    memset((char *) &ddpAddress, 0, sizeof(sockaddr_in));
+static const std::string DDPTYPE = "DDP";
+
+const std::string& DDPOutputData::GetOutputTypeString() const {
+    return DDPTYPE;
+}
+
+DDPOutputData::DDPOutputData(const Json::Value& config) :
+    UDPOutputData(config),
+    sequenceNumber(1) {
+    memset((char*)&ddpAddress, 0, sizeof(sockaddr_in));
     ddpAddress.sin_family = AF_INET;
     ddpAddress.sin_port = htons(DDP_PORT);
-    
-    ipAddress = config["address"].asString();
-    bool isAlpha = false;
-    for (int x = 0; x < ipAddress.length(); x++) {
-        isAlpha |= isalpha(ipAddress[x]);
-    }
-    
-    if (isAlpha) {
-        struct hostent* uhost = gethostbyname(ipAddress.c_str());
-        if (!uhost) {
-            LogErr(VB_CHANNELOUT,
-                   "Error looking up DDP hostname: %s\n",
-                   ipAddress.c_str());
-            valid = false;
-        } else {
-            ddpAddress.sin_addr.s_addr = *((unsigned long*)uhost->h_addr);
+    if (active) {
+        ddpAddress.sin_addr.s_addr = toInetAddr(ipAddress, valid);
+        if (!valid) {
+            AddOutputConfigWarning(14, "Could not resolve host name " + ipAddress + " - disabling output");
+            active = false;
         }
-    } else {
-        ddpAddress.sin_addr.s_addr = inet_addr(ipAddress.c_str());
     }
-    
-    
+
     pktCount = channelCount / DDP_CHANNELS_PER_PACKET;
     if (channelCount % DDP_CHANNELS_PER_PACKET) {
         pktCount++;
     }
-    
-    ddpIovecs = (struct iovec *)calloc(pktCount * 2, sizeof(struct iovec));
-    ddpBuffers = (unsigned char **)calloc(pktCount, sizeof(unsigned char*));
-    
+
+    ddpIovecs = (struct iovec*)calloc(pktCount * 2, sizeof(struct iovec));
+    ddpBuffers = (unsigned char**)calloc(pktCount, sizeof(unsigned char*));
+
     int chan = startChannel - 1;
     if (type == 5) {
         chan = 0;
     }
     for (int x = 0; x < pktCount; x++) {
-        ddpBuffers[x] = (unsigned char *)calloc(1, DDP_HEADER_LEN);
-        
+        ddpBuffers[x] = (unsigned char*)calloc(1, DDP_HEADER_LEN);
+
         // use scatter/gather for the packet.   One IOV will contain
         // the header, the second will point into the raw channel data
         // and will be set at output time.   This avoids any memcpy.
         ddpIovecs[x * 2].iov_base = ddpBuffers[x];
         ddpIovecs[x * 2].iov_len = DDP_HEADER_LEN;
         ddpIovecs[x * 2 + 1].iov_base = nullptr;
-        
+
         ddpBuffers[x][0] = DDP_FLAGS1_VER1;
-        ddpBuffers[x][2] = 1;
+        ddpBuffers[x][2] = 0;
         ddpBuffers[x][3] = DDP_ID_DISPLAY;
         int pktSize = DDP_CHANNELS_PER_PACKET;
         if (x == (pktCount - 1)) {
@@ -198,17 +171,17 @@ DDPOutputData::DDPOutputData(const Json::Value &config) : UDPOutputData(config),
             }
         }
         ddpIovecs[x * 2 + 1].iov_len = pktSize;
-        
+
         //offset
         ddpBuffers[x][4] = (chan & 0xFF000000) >> 24;
         ddpBuffers[x][5] = (chan & 0xFF0000) >> 16;
         ddpBuffers[x][6] = (chan & 0xFF00) >> 8;
         ddpBuffers[x][7] = (chan & 0xFF);
-        
+
         //size
         ddpBuffers[x][8] = (pktSize & 0xFF00) >> 8;
         ddpBuffers[x][9] = pktSize & 0xFF;
-        
+
         chan += pktSize;
     }
 }
@@ -216,43 +189,65 @@ DDPOutputData::~DDPOutputData() {
     for (int x = 0; x < pktCount; x++) {
         free(ddpBuffers[x]);
     }
+    free(ddpBuffers);
     free(ddpIovecs);
 }
 
-void DDPOutputData::PrepareData(unsigned char *channelData) {
+void DDPOutputData::PrepareData(unsigned char* channelData, UDPOutputMessages& msgs) {
+    sequencePending = false;
     if (valid && active) {
-        int start = startChannel - 1;
-        if (type == 5) {
-            start = 0;
-        }
+        int start = 0;
+        // numbered from the last frame sent, not the last one prepared
+        char seq = sequenceNumber;
+        struct mmsghdr msg;
+        memset(&msg, 0, sizeof(msg));
+
+        msg.msg_hdr.msg_name = &ddpAddress;
+        msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
+        bool anySkipped = false;
+        bool allSkipped = true;
         for (int p = 0; p < pktCount; p++) {
-            unsigned char *header = ddpBuffers[p];
-            header[1] = sequenceNumber & 0xF;
-            if (sequenceNumber == 15) {
-                sequenceNumber = 1;
-            } else {
-                ++sequenceNumber;
+            bool nto = NeedToOutputFrame(channelData, startChannel - 1, start, ddpIovecs[p * 2 + 1].iov_len);
+            if (!nto && (p == (pktCount - 1)) && !allSkipped) {
+                // at least one packet is not a duplicate, we need to send the last
+                // packet so that the sync flag is sent
+                nto = true;
             }
-            
-            // set the pointer to the channelData for the universe
-            ddpIovecs[p * 2 + 1].iov_base = (void*)(channelData + start);
+            if (nto) {
+                msg.msg_hdr.msg_iov = &ddpIovecs[p * 2];
+                msg.msg_hdr.msg_iovlen = 2;
+                msg.msg_len = ddpIovecs[p * 2 + 1].iov_len + DDP_HEADER_LEN;
+
+                msgs[ddpAddress.sin_addr.s_addr].push_back(msg);
+
+                unsigned char* header = ddpBuffers[p];
+                header[1] = seq & 0xF;
+                seq = seq == 15 ? 1 : seq + 1;
+
+                // set the pointer to the channelData for the universe
+                ddpIovecs[p * 2 + 1].iov_base = (void*)(&channelData[startChannel - 1 + start]);
+                allSkipped = false;
+            } else {
+                anySkipped = true;
+            }
             start += ddpIovecs[p * 2 + 1].iov_len;
+        }
+        pendingSequenceNumber = seq;
+        sequencePending = true;
+        if (anySkipped) {
+            skippedFrames++;
+        } else {
+            skippedFrames = 0;
+        }
+        if (!allSkipped) {
+            SaveFrame(&channelData[startChannel - 1], start);
         }
     }
 }
-void DDPOutputData::CreateMessages(std::vector<struct mmsghdr> &ipMsgs) {
-    if (valid && active) {
-        struct mmsghdr msg;
-        memset(&msg, 0, sizeof(msg));
-        
-        msg.msg_hdr.msg_name = &ddpAddress;
-        msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
-        for (int x = 0; x < pktCount; x++) {
-            msg.msg_hdr.msg_iov = &ddpIovecs[x * 2];
-            msg.msg_hdr.msg_iovlen = 2;
-            msg.msg_len = ddpIovecs[x * 2 + 1].iov_len + DDP_HEADER_LEN;
-            ipMsgs.push_back(msg);
-        }
+void DDPOutputData::FrameSent() {
+    if (sequencePending) {
+        sequenceNumber = pendingSequenceNumber;
+        sequencePending = false;
     }
 }
 void DDPOutputData::DumpConfig() {

@@ -1,93 +1,86 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <?php
-require_once('config.php');
+require_once 'config.php';
+require_once 'common.php';
 
-$a = session_id();
-
-if(empty($a))
-{
-  session_start();
-}
-$_SESSION['session_id'] = session_id();
-//ini_set('display_errors', 'On');
 error_reporting(E_ALL);
-
-$fpp_version = "v" . exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ describe --tags", $output, $return_val);
-if ( $return_val != 0 )
-	$fpp_version = "Unknown";
-unset($output);
+$fpp_version = "v" . getFPPVersion();
 
 ?>
 
 <head>
-<?php include 'common/menuHead.inc'; ?>
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-<title>Credits</title>
-<style>
-.pl_title {
-  font-size: larger;
-}
-h4, h3 {
-  padding: 0;
-  margin: 0;
-}
-a:active {
-  color: none;
-}
-a:visited {
-  color: blue;
-}
-.time {
-  width: 100%;
-}
-.center {
-  text-align: center;
-}
-</style>
+  <?php
+  include 'common/htmlMeta.inc';
+  include 'common/menuHead.inc'; ?>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Credits</title>
+
 </head>
 
 <body>
-<div id="bodyWrapper">
-  <?php include 'menu.inc'; ?>
-  <div style="margin:0 auto;"> <br />
-    <fieldset style="padding: 10px; border: 2px solid #000;">
-      <legend>Credits</legend>
-      <div style="overflow: hidden; padding: 10px;">
-    <div>
-      <div id='credits'>
-        <b>FPP Developed By:</b><br />
-		<br />
-        David Pitts<br />
-        Tony Mace (MyKroFt)<br />
-        Mathew Mrosko (Materdaddy)<br />
-        Chris Pinkham (CaptainMurdoch)<br />
-        Dan Kulp (dkulp)<br />
-        Stephane Legargeant (ihbar)<br />
-		<br />
-        <hr width=300 />
-		<br />
-        <b>Video Tutorials by:</b><br />
-		<br />
-        Alan Dahl (bajadahl)<br />
-		<br />
-        <hr width=300 />
-		<br />
-        <b>3rd Party Libraries used by FPP for some Channel Outputs:</b><br />
-		<br />
-		<a href='https://github.com/jgarff/rpi_ws281x'>rpi_ws281x</a> by Jeremy Garff.  Used for driving WS281x pixels directly off the Pi's GPIO header.<br />
-		<a href='https://github.com/hzeller/rpi-rgb-led-matrix'>rpi-rgb-led-matrix</a> by Henner Zeller.  Used for driving HUB75 panels directly off the Pi's GPIO header.<br />
-		<a href='https://github.com/TMRh20/RF24'>RF24</a>. Used for driving nRF24L01 output for Komby.<br />
-		<a href='https://www.openlighting.org/'>OLA</a> by the Open Lighting Project (not currently in FPP UI).<br />
-		<br />
-        <hr width=180 />
-		<br />
-        Copyright &copy; 2013-2018
+  <div id="bodyWrapper">
+    <?php
+    $activeParentMenuItem = 'help';
+    include 'menu.inc'; ?>
+    <div class="container">
+      <div class="title">Credits</div>
+      <div class="pageContent">
+
+        <div style="margin:0 auto;">
+
+          <div>
+            <div>
+
+              <div id='credits'>
+                <h2>FPP Developers:</h2>
+                <div class="backdrop">
+                  Chris Pinkham (CaptainMurdoch)<br />
+                  Dan Kulp (dkulp)<br />
+                  Greg Hormann (ghormann)<br />
+                  Scott Hanson (computergeek1507/scooter_seh)<br />
+                  Daryl Collins (darylc)<br />
+                  Stuart Ledingham (OnlineDynamic)<br />
+                  Andrew Ayton (drew8n) - UI<br />
+                  Adam Coulombe (wzadz1) - UI<br />
+                  Justin J. Novack - UI<br />
+                  Pat Delaney (patdelaney) - QA<br />
+                  Rick Harris (Poporacer) - Manual/QA<br />
+                  Mark Amber (pixelpuppy) - Manual/QA<br />
+                  Ron Armstrong (bloojoop) - QA<br />
+                  <br />
+                  For a full list of code contributors, visit the <a
+                    href='https://github.com/FalconChristmas/fpp/graphs/contributors' target='_blank'>contributors
+                    page</a> on github.<br />
+                </div>
+                <br>
+
+                <h2>FPP Created by:</h2>
+                <div class="backdrop">
+                  David Pitts <br />
+                  Tony Mace (MyKroFt)<br />
+                  Mathew Mrosko (Materdaddy)<br />
+                  Chris Pinkham (CaptainMurdoch)<br />
+                </div>
+                <br>
+
+                <h2>3rd Party Libraries used by FPP for some Channel Outputs:</h2>
+                <div class="backdrop">
+                  <a href='https://github.com/hzeller/rpi-rgb-led-matrix'>rpi-rgb-led-matrix</a> by Henner Zeller<br />
+                  <a href='https://github.com/hzeller/spixels'>spixels</a> by Henner Zeller<br />
+                  <a href='https://github.com/TMRh20/RF24'>RF24</a> (nRF24L01)<br />
+                </div>
+                <br>
+
+                <small>Copyright &copy; 2013-<? echo (new DateTime())->format("Y"); ?></small>
+              </div>
+            </div>
+
+          </div>
+        </div>
       </div>
+      <?php include 'common/footer.inc'; ?>
     </div>
-    </fieldset>
-  </div>
-  <?php include 'common/footer.inc'; ?>
-</div>
 </body>
+
 </html>

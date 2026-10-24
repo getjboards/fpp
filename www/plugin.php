@@ -1,150 +1,312 @@
 <?php
-
-if ( !isset($_GET['nopage']) ):
-
-require_once("config.php");
-require_once("common.php");
-
-$pluginSettings = array();
-
-if (isset($_GET['plugin']))
+/**
+ * Resolve a plugin-relative path to a real path inside the plugin directory,
+ * or null if it is not one.
+ *
+ * Both callers below need the same answer, and they need it to mean the same
+ * thing: a page and a file are equally allowed to live in a subdirectory. The
+ * `page` branch used basename(), which does not reject a bad path -- it
+ * silently rewrites a good one, so a plugin whose help lives in help/ asked
+ * for help/help.php and was told help.php does not exist.
+ *
+ * Traversal is refused component by component. Note that "\x2e\x2e" survives an
+ * [A-Za-z0-9_.-] allow-list, since a dot is a legal filename character, so it
+ * has to be rejected by name rather than by character class.
+ */
+function pluginRealPath($pluginDirectory, $pluginName, $rawPath)
 {
-	$pluginConfigFile = $settings['configDirectory'] . "/plugin." . $_GET['plugin'];
-	if (file_exists($pluginConfigFile))
-		$pluginSettings = parse_ini_file($pluginConfigFile);
+    if (!is_string($rawPath) || strpos($rawPath, "\0") !== false) {
+        return null;
+    }
+    $parts = explode('/', str_replace('\\', '/', $rawPath));
+    $clean = array();
+    foreach ($parts as $part) {
+        if ($part === '' || $part === '.') {
+            continue;
+        }
+        // ".." escapes; any other dot-prefixed name is a dotfile or dot
+        // directory (.git/config holds a clone's remote URL), never content.
+        if ($part[0] === '.') {
+            return null;
+        }
+        if (preg_replace('/[^A-Za-z0-9_.-]/', '', $part) !== $part) {
+            return null;
+        }
+        $clean[] = $part;
+    }
+    if (empty($clean)) {
+        return null;
+    }
+    // Contained in THIS plugin's directory, not merely the plugins directory:
+    // otherwise one plugin's page could name another's files.
+    $realBase = realpath($pluginDirectory . '/' . $pluginName);
+    $realPath = realpath($pluginDirectory . '/' . $pluginName . '/' . implode('/', $clean));
+    if ($realBase === false || $realPath === false) {
+        return null;
+    }
+    // The separator is part of the test on purpose: a plain prefix comparison
+    // also accepts a sibling whose name merely starts with the base, so
+    // ".../pluginOther" would count as being inside ".../plugin".
+    if (strpos($realPath, rtrim($realBase, '/') . '/') !== 0) {
+        return null;
+    }
+    return $realPath;
 }
-
 ?>
-
-<!DOCTYPE html>
-<html>
-<head>
-<?php include 'common/menuHead.inc'; ?>
-<title><? echo $pageTitle; ?></title>
-<script type="text/javascript">
-	var pluginSettings = new Array();
-<?
-	foreach ($pluginSettings as $key => $value) {
-		printf("	pluginSettings['%s'] = \"%s\";\n", $key, $value);
-	}
-?>
-</script>
-
-<?
-
-$jsDir = $pluginDirectory . "/" . $_GET['plugin'] . "/js/";
-if ( file_exists($jsDir))
-{
-	if ($handle = opendir($jsDir))
-	{
-		while (($file = readdir($handle)) !== false)
-		{
-			if (!in_array($file, array('.', '..')) && !is_dir($jsDir . $file))
-			{
-				printf( "<script type='text/javascript' src='/plugin.php?plugin=%s&file=js/%s&nopage=1'></script>\n",
-					$_GET['plugin'], $file);
-			}
-		}
-	}
-}
-
-$cssDir = $pluginDirectory . "/" . $_GET['plugin'] . "/css/";
-if ( file_exists($cssDir))
-{
-	if ($handle = opendir($cssDir))
-	{
-		while (($file = readdir($handle)) !== false)
-		{
-			if (!in_array($file, array('.', '..')) && !is_dir($cssDir . $file))
-			{
-				printf( "<link rel='stylesheet' type='text/css' href='/plugin.php?plugin=%s&file=css/%s&nopage=1'>\n",
-					$_GET['plugin'], $file);
-			}
-		}
-	}
-}
-
-?>
-</head>
-<body>
-<div id="bodyWrapper">
-  <?php include 'menu.inc'; ?>
-  <br/>
-
 <?php
+$pluginName = "";
+$activeParentMenuItem = "status";
+if (!isset($_GET['nopage'])):
+    // The DOCTYPE has to be the first thing on the wire: config.php emits the
+    // "Falcon Player - FPP" discovery comment and the settings <script> block as
+    // soon as it is required, and any markup ahead of the DOCTYPE puts the
+    // browser into Quirks Mode. Open the document first and pull the includes in
+    // from inside <head>, the same way index.php and the other core pages do.
+    ?>
+    <!DOCTYPE html>
+    <html lang="en">
+
+    <head>
+        <?php
+        require_once "config.php";
+        require_once "common.php";
+
+    $pluginSettings = array();
+    $pluginSettingInfos = array();
+
+    if (isset($_GET['_menu'])) {
+        $activeParentMenuItem = htmlspecialchars($_GET['_menu'], ENT_QUOTES, 'UTF-8');
+    }
+
+    if (isset($_GET['plugin'])) {
+        $pluginName = $_GET['plugin'];
+        if (!IsValidPluginName($pluginName) || !is_dir($pluginDirectory . '/' . $pluginName)) {
+            $pluginName = '';
+        } else {
+            LoadPluginSettings($pluginName);
+        }
+    }
+
+    $infoFile = $pluginDirectory . '/' . $pluginName . '/pluginInfo.json';
+    if (file_exists($infoFile)) {
+        $json = file_get_contents($infoFile);
+        $pluginInfo = json_decode($json, true);
+    } else {
+        $pluginInfo = array();
+        $pluginInfo["name"] = "Unknown";
+    }
+
+        include 'common/htmlMeta.inc';
+        include 'common/menuHead.inc'; ?>
+        <title><? echo $pageTitle; ?></title>
+        <script type="text/javascript">
+            function bindSettingsVisibilityListener() {
+                var visProp = getHiddenProp();
+                if (visProp) {
+                    var evtname = visProp.replace(/[H|h]idden/, '') + 'visibilitychange';
+                    document.addEventListener(evtname, handleSettingsVisibilityChange);
+                }
+            }
+
+            function handleSettingsVisibilityChange() {
+                if (isHidden() && statusTimeout != null) {
+                    clearTimeout(statusTimeout);
+                    statusTimeout = null;
+                }
+            }
+            var hiddenChildren = {};
+            function UpdateChildSettingsVisibility() {
+                hiddenChildren = {};
+                $('.parentSetting').each(function () {
+                    var fn = 'Update' + $(this).attr('id') + 'Children';
+                    window[fn](2); // Hide if necessary
+                });
+                $('.parentSetting').each(function () {
+                    var fn = 'Update' + $(this).attr('id') + 'Children';
+                    window[fn](1); // Show if not hidden
+                });
+            }
+            $(document).ready(function () {
+                UpdateChildSettingsVisibility();
+                bindSettingsVisibilityListener();
+            });
+
+            var pluginSettings = new Array();
+
+            <?
+            foreach ($pluginSettings as $key => $value) {
+                printf("	pluginSettings[%s] = %s;\n", json_encode((string) $key), json_encode((string) $value));
+            }
+            ?>
+        </script>
+
+        <?
+
+        $jsDir = $pluginDirectory . "/" . $pluginName . "/js/";
+        if (file_exists($jsDir)) {
+            if ($handle = opendir($jsDir)) {
+                while (($file = readdir($handle)) !== false) {
+                    // Only emit files the file-serving branch below can actually
+                    // serve (pluginRealPath's allow-list): anything else 404s on
+                    // fetch, so linking it only hands a raw filesystem name to
+                    // the src attribute, where quote characters break out into
+                    // markup. $pluginName is already allow-listed above.
+                    if (!in_array($file, array('.', '..')) && !is_dir($jsDir . $file) && preg_replace('/[^A-Za-z0-9_.-]/', '', $file) === $file) {
+                        printf(
+                            "<script type='text/javascript' src='plugin.php?plugin=%s&file=js/%s&nopage=1'></script>\n",
+                            $pluginName,
+                            $file
+                        );
+                    }
+                }
+            }
+        }
+
+        $cssDir = $pluginDirectory . "/" . $pluginName . "/css/";
+        if (file_exists($cssDir)) {
+            if ($handle = opendir($cssDir)) {
+                while (($file = readdir($handle)) !== false) {
+                    if (!in_array($file, array('.', '..')) && !is_dir($cssDir . $file) && preg_replace('/[^A-Za-z0-9_.-]/', '', $file) === $file) {
+                        printf(
+                            "<link rel='stylesheet' type='text/css' href='/plugin.php?plugin=%s&file=css/%s&nopage=1'>\n",
+                            $pluginName,
+                            $file
+                        );
+                    }
+                }
+            }
+        }
+
+        ?>
+    </head>
+
+    <body>
+        <div id="bodyWrapper">
+            <?php include 'menu.inc'; ?>
+            <div class="mainContainer">
+                <?php
+                $pluginIconUrl = 'api/plugin/' . $pluginName . '/icon';
+                $pluginIconFile = $pluginDirectory . '/' . $pluginName . '/icon.png';
+                $pluginHasIcon = file_exists($pluginIconFile) || !empty($pluginInfo['iconURL']);
+                if ($pluginHasIcon) {
+                    if (file_exists($pluginIconFile)) {
+                        $pluginIconUrl .= '?t=' . filemtime($pluginIconFile);
+                    } else {
+                        $pluginIconUrl .= '?t=' . time();
+                    }
+                }
+                ?>
+                <h1 class="title d-flex align-items-center gap-2">
+                    <?php if ($pluginHasIcon): ?>
+                    <div class="pluginIconWrap" style="width:2rem;height:2rem;border-radius:0.4rem;flex-shrink:0;">
+                        <img class="pluginIcon" src="<?= $pluginIconUrl ?>" alt="">
+                    </div>
+                    <?php endif; ?>
+                    <?= htmlspecialchars((string) $pluginInfo['name'], ENT_QUOTES, 'UTF-8') ?>
+                </h1>
+                <div class="pageContent">
+
+
+                    <?php
 else:
-$skipJSsettings = 1;
-require_once("config.php");
+    $skipJSsettings = 1;
+    require_once "config.php";
 endif;
 
-if ( !isset($_GET['plugin']) )
-{
-	echo "Please don't access this page directly";
-}
-elseif ( empty($_GET['plugin']) )
-{
-	echo "Plugin variable empty, please don't access this page directly";
-}
-elseif ( isset($_GET['page']) && !empty($_GET['page']) )
-{
-	if ( file_exists($pluginDirectory."/".$_GET['plugin']."/".$_GET['page']) )
-	{
-		-include_once($pluginDirectory."/".$_GET['plugin']."/".$_GET['page']);
-	}
-	else
-	{
-		echo "Error with plugin, requesting a page that doesn't exist";
-	}
-}
-elseif ( isset($_GET['file']) && !empty($_GET['file']) )
-{
-	$file = $pluginDirectory . "/" . $_GET['plugin'] . "/" . $_GET['file'];
-
-	if (file_exists($file))
-	{
-		$filename = basename($file);
-		$file_extension = strtolower(substr(strrchr($filename,"."),1));
-
-		switch( $file_extension ) {
-			case "gif": $ctype="image/gif;"; break;
-			case "png": $ctype="image/png;"; break;
-			case "jpeg":
-			case "jpg": $ctype="image/jpg;"; break;
-			case "js":  $ctype="text/javascript;"; break;
-			case "json":$ctype="application/json;"; break;
-			case "css": $ctype="text/css;"; break;
-			default:    $ctype="text/plain;"; break;
-		}
-
-		header('Content-type: ' . $ctype);
-
-		// Without the clean/flush we send two extra bytes that
-		// cause the image to be corrupt.  This is similar to the
-		// bug we had with an extra 2 bytes in our log zip
-		ob_clean();
-		flush();
-		readfile($file);
-		exit();
-	}
-	else
-	{
-		error_log("Error, could not find file $file");
-		echo "Error with plugin, requesting a file that doesn't exist";
-	}
-}
-elseif ( file_exists($pluginDirectory."/".$_GET['plugin']."/plugin.php") )
-{
-	-include_once($pluginDirectory."/".$_GET['plugin']."/plugin.php");
-}
-else
-{
-	echo "Plugin invalid, no main page exists";
+if (isset($_GET['plugin'])) {
+    $pluginName = $_GET['plugin'];
+    // Must name an installed plugin.  "." passed the old character check and
+    // made the plugins directory itself count as a plugin.
+    if (!IsValidPluginName($pluginName) || !is_dir($pluginDirectory . '/' . $pluginName)) {
+        $pluginName = '';
+    }
 }
 
-if ( !isset($_GET['nopage']) ): ?>
+if (!isset($_GET['plugin'])) {
+    echo "Please don't access this page directly";
+} elseif (empty($_GET['plugin']) || $pluginName === '') {
+    // Names no installed plugin: a 404, as for a missing file of an installed
+    // one, so a page loading a removed plugin's script or stylesheet gets an
+    // error rather than this text as its content.
+    http_response_code(404);
+    echo "Plugin variable empty, please don't access this page directly";
+} elseif (isset($_GET['page']) && !empty($_GET['page'])) {
+    $pageName = $_GET['page'];
+    $realPath = pluginRealPath($pluginDirectory, $pluginName, $pageName);
+    if ($realPath !== null && is_file($realPath)) {
+        include_once $realPath;
+    } else {
+        http_response_code(404);
+        echo "Error with plugin, requesting a page that doesn't exist: $pluginName/" .
+            htmlspecialchars($pageName, ENT_QUOTES, 'UTF-8');
+    }
+} elseif (isset($_GET['file']) && !empty($_GET['file'])) {
+    $realPath = pluginRealPath($pluginDirectory, $pluginName, $_GET['file']);
+    if ($realPath === null || !is_file($realPath)) {
+        http_response_code(404);
+        echo "Error with plugin, requesting a file that doesn't exist";
+        return;
+    }
+    $file = $realPath;
+    if (file_exists($file)) {
+        $filename = basename($file);
+        $file_extension = strtolower(substr(strrchr($filename, "."), 1));
 
-<?php	include 'common/footer.inc'; ?>
-</div>
-</body>
-</html>
+        switch ($file_extension) {
+            case "gif":
+                $ctype = "image/gif;";
+                break;
+            case "png":
+                $ctype = "image/png;";
+                break;
+            case "svg":
+                $ctype = "image/svg;";
+                break;
+            case "jpeg":
+            case "jpg":
+                $ctype = "image/jpg;";
+                break;
+            case "js":
+                $ctype = "text/javascript;";
+                break;
+            case "json":
+                $ctype = "application/json;";
+                break;
+            case "css":
+                $ctype = "text/css;";
+                break;
+            default:
+                $ctype = "text/plain;";
+                break;
+        }
+
+        header('Content-type: ' . $ctype);
+
+        // Without the clean/flush we send two extra bytes that
+        // cause the image to be corrupt.  This is similar to the
+        // bug we had with an extra 2 bytes in our log zip
+        ob_clean();
+        flush();
+        readfile($file);
+        exit();
+    } else {
+        error_log("Error, could not find file $file");
+        http_response_code(404);
+        echo "Error with plugin, requesting a file that doesn't exist";
+    }
+} elseif (file_exists($pluginDirectory . "/" . $pluginName . "/plugin.php")) {
+    -include_once $pluginDirectory . "/" . $pluginName . "/plugin.php";
+} else {
+    http_response_code(404);
+    echo "Plugin invalid, no main page exists";
+}
+
+if (!isset($_GET['nopage'])): ?>
+                </div>
+            </div>
+            <?php include 'common/footer.inc'; ?>
+        </div>
+    </body>
+
+    </html>
 <?php endif; ?>

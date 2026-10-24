@@ -1,0 +1,669 @@
+<?
+
+/**
+ * Returns the name of the currently selected audio output card.
+ *
+ * @return string Card name or card number string.
+ */
+function GetAudioCurrentCard()
+{
+    global $SUDO, $settings;
+
+    if ($settings["Platform"] == "MacOS") {
+        exec("system_profiler SPAudioDataType", $output);
+        $cards = array();
+        $curCard = "";
+        foreach ($output as $line) {
+            $tline = trim($line);
+            if ($tline != "" && $tline != "Audio:" && $tline != "Device:") {
+                if (str_ends_with($tline, ":")) {
+                    $curCard = rtrim($tline, ":");
+                } else {
+                    $values = explode(':', $tline);
+                    $key = trim($values[0]);
+                    if ($key == "Default Output Device") {
+                        return $curCard;
+                    }
+                }
+            }
+        }
+    } else {
+        // AudioOutput is persisted as a stable ALSA card ID. Normalize so a
+        // legacy numeric value still resolves to the matching card ID, and an
+        // empty value resolves to the first present card.
+        $stored = isset($settings['AudioOutput']) ? $settings['AudioOutput'] : '';
+        $CurrentCard = NormalizeAudioOutputToCardId($stored);
+        if ($CurrentCard === '') {
+            $CurrentCard = "0";
+        }
+    }
+
+    return $CurrentCard;
+}
+
+/**
+ * Returns the available audio mixer device options for the current card.
+ *
+ * @return string JSON object mapping mixer device names to themselves.
+ */
+function GetOptions_AudioMixerDevice()
+{
+    global $SUDO;
+    global $settings;
+
+    $CurrentCard = GetAudioCurrentCard();
+    $MixerDevices = array();
+    if ($settings["Platform"] == "MacOS") {
+        $MixerDevices[$CurrentCard] = $CurrentCard;
+    } else {
+        // GetAudioCurrentCard() returns a stable ALSA card ID; amixer needs the
+        // numeric index, so resolve it (fall back to the value if already numeric).
+        $cardNum = ResolveAlsaCardIdToNumber($CurrentCard);
+        if ($cardNum === '') {
+            $cardNum = ctype_digit((string) $CurrentCard) ? $CurrentCard : '0';
+        }
+        exec($SUDO . " amixer -c $cardNum scontrols | cut -f2 -d\"'\"", $output, $return_val);
+        if ($return_val || strpos($output[0], "Usage:") === 0) {
+            error_log("Error getting mixer devices!");
+            $AudioMixerDevice = "PCM";
+        } else {
+            foreach ($output as $device) {
+                $MixerDevices[$device] = $device;
+            }
+        }
+        unset($output);
+    }
+
+    return json($MixerDevices);
+}
+
+/**
+ * Enumerates PipeWire nodes of a given media.class as a label => value map.
+ *
+ * $valueKey decides which identifier is stored in the setting, and getting it
+ * wrong is a silent failure - the consumer simply never finds the device:
+ *
+ *   'node.name'        The stable PipeWire identifier.  Use it for consumers
+ *                      that address the node through PipeWire itself:
+ *                      GStreamer pipewiresrc/pipewiresink target-object,
+ *                      pw-link, module-loopback node.target.
+ *
+ *   'node.description' The human readable description.  Use it for consumers
+ *                      that reach the node through SDL.  fppd forces SDL onto
+ *                      the PulseAudio backend whenever the PipeWire backend is
+ *                      active (SDL_AUDIODRIVER=pulse, written to
+ *                      /run/fppd/fpp-audio.env by FPPINIT_Audio), and SDL's
+ *                      PulseAudio driver names devices by the PulseAudio
+ *                      description - which pipewire-pulse populates from
+ *                      node.description.  node.name never matches there.
+ *
+ * @param string $mediaClass PipeWire media.class to list, e.g. 'Audio/Sink'.
+ * @param string $valueKey   'node.name' or 'node.description', per above.
+ * @return array Map of display label => stored value.
+ */
+function GetOptions_PipeWireNodes($mediaClass, $valueKey)
+{
+    global $SUDO;
+
+    // FPP's own internal plumbing shows up as Audio/Sink but is never something
+    // a user should pick as a device: the null-sink tees that fan one fppd
+    // stream out to several input groups, and the per-output delay/EQ filter
+    // chains that sit in front of a card.  Pick the card or the output group
+    // instead - the filter chain is already in that path.
+    static $internalPrefixes = array('fpp_tee_', 'fpp_fx_');
+
+    $nodes = array();
+
+    $pwCmd = $SUDO . ' PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp pw-dump 2>/dev/null';
+    $pwJson = shell_exec($pwCmd);
+    if (!$pwJson) {
+        return $nodes;
+    }
+
+    $objects = json_decode($pwJson, true);
+    if (!is_array($objects)) {
+        return $nodes;
+    }
+
+    // User-defined sound card aliases (issue #2586)
+    $aliases = LoadAudioCardAliases();
+
+    foreach ($objects as $obj) {
+        if (!isset($obj['type']) || $obj['type'] !== 'PipeWire:Interface:Node') {
+            continue;
+        }
+        $props = isset($obj['info']['props']) ? $obj['info']['props'] : null;
+        if (
+            !$props ||
+            !isset($props['media.class']) || $props['media.class'] !== $mediaClass ||
+            !isset($props['node.name'])
+        ) {
+            continue;
+        }
+
+        $nodeName = $props['node.name'];
+        foreach ($internalPrefixes as $prefix) {
+            if (strpos($nodeName, $prefix) === 0) {
+                continue 2;
+            }
+        }
+
+        $nodeDesc = isset($props['node.description']) ? $props['node.description'] : $nodeName;
+        $nodeNick = isset($props['node.nick']) ? $props['node.nick'] : '';
+
+        $value = ($valueKey === 'node.description') ? $nodeDesc : $nodeName;
+        if ($value === '') {
+            continue;
+        }
+
+        // Build the label: always append the nick (the ALSA card ID) so users
+        // can tell identical hardware apart across different naming sources
+        // (WirePlumber SPA database vs USB product string).
+        $label = $nodeDesc;
+        if ($nodeNick && strpos($label, $nodeNick) === false) {
+            $label .= ' (' . $nodeNick . ')';
+        }
+        // Apply user-defined alias (issue #2586). The PipeWire node.nick is
+        // the ALSA card ID, which is our alias key.
+        if ($nodeNick) {
+            $label = ApplyAudioCardAlias($nodeNick, $label, $aliases);
+        }
+
+        $nodes[$label] = $value;
+    }
+
+    return $nodes;
+}
+
+/**
+ * Returns the available audio output device options.
+ *
+ * @param bool $fulllist When true, returns detailed card/subdevice list; otherwise returns unique card names.
+ * @return string JSON object or array of available audio output devices.
+ */
+function GetOptions_AudioOutputDevice($fulllist = false)
+{
+    global $GET, $settings;
+
+    // In PipeWire mode with fulllist, enumerate PipeWire Audio/Sink nodes.
+    //
+    // The aplay-derived list below names cards the way ALSA does
+    // ("<card long name>, <device name>"); PipeWire names the very same card
+    // "<usb product> (<alsa card id>)" - see getAlsaCardProductName() in
+    // src/boot/FPPINIT_Audio.cpp.  Consumers of this list open the device
+    // through SDL, which fppd pins to the PulseAudio backend on a PipeWire
+    // system, so an ALSA-shaped name matches nothing and the device is simply
+    // never found (issue #2754).  Store node.description, which is exactly
+    // what SDL reports back.
+    if ($fulllist && IsPipeWireBackend($settings)) {
+        return json(GetOptions_PipeWireNodes('Audio/Sink', 'node.description'));
+    }
+
+    if ($settings["Platform"] == "MacOS") {
+        exec("system_profiler SPAudioDataType", $output);
+        $cards = array();
+        $cards["--System Default--"] = "--System Default--";
+        $curCard = "";
+        foreach ($output as $line) {
+            $tline = trim($line);
+            if ($tline != "" && $tline != "Audio:" && $tline != "Device:") {
+                if (str_ends_with($tline, ":")) {
+                    $curCard = rtrim($tline, ":");
+                } else {
+                    $values = explode(':', $tline);
+                    $key = trim($values[0]);
+                    if ($key == "Output Source") {
+                        $cards[$curCard] = $curCard;
+                    } else if ($key == "Default Output Device") {
+
+                    }
+                }
+            }
+        }
+        unset($output);
+        return json($cards);
+    } else {
+        $CurrentCard = GetAudioCurrentCard();
+        $AlsaCards = array();
+        $devices = GetAlsaPcmDevices('playback');
+        if ($fulllist) {
+            // One entry per device: "<card name>, <device name>"
+            foreach ($devices as $d) {
+                $AlsaCards[] = $d['cardName'] . ', ' . $d['deviceName'];
+            }
+            return json($AlsaCards);
+        }
+        // One entry per card
+        $cards = array(); // cardNum -> device entry
+        foreach ($devices as $d) {
+            if (!isset($cards[$d['cardNum']])) {
+                $cards[$d['cardNum']] = $d;
+            }
+        }
+        if (empty($cards)) {
+            error_log("No ALSA cards for output!");
+        } else {
+            $foundOurCard = 0;
+            // First pass: collect all card names to detect duplicates
+            $cardNameCounts = array();
+            foreach ($cards as $d) {
+                $name = $d['cardName'];
+                if (!isset($cardNameCounts[$name])) {
+                    $cardNameCounts[$name] = 0;
+                }
+                $cardNameCounts[$name]++;
+            }
+
+            // User-defined sound card aliases (issue #2586)
+            $audioCardAliases = LoadAudioCardAliases();
+
+            foreach ($cards as $cardNum => $d) {
+                // The stable ALSA card ID is the persisted/selected value now,
+                // so identify "our card" by ID rather than the volatile number.
+                $thisCardId = $d['cardId'];
+
+                if (($thisCardId !== '' && $thisCardId == $CurrentCard) || $cardNum == $CurrentCard) {
+                    $foundOurCard = 1;
+                }
+
+                $cardName = $d['cardName'];
+                // Disambiguate duplicate names by appending ALSA card ID
+                $displayName = $cardName;
+                if (isset($cardNameCounts[$cardName]) && $cardNameCounts[$cardName] > 1) {
+                    $cardId = $thisCardId !== '' ? $thisCardId : $cardNum;
+                    $displayName = $cardName . ' [' . $cardId . ']';
+                }
+                if ($cardName == "bcm2835 ALSA") {
+                    $displayName = $cardName . " (Pi Onboard Audio)";
+                } else if ($cardName == "CD002") {
+                    $displayName = $cardName . " (FM Transmitter)";
+                }
+                // Apply user-defined alias (issue #2586) keyed by ALSA card ID
+                $displayName = ApplyAudioCardAlias($thisCardId, $displayName, $audioCardAliases);
+                // Store the stable card ID as the value so the selection
+                // survives card-number reordering (fall back to the number
+                // only when the ID can't be resolved).
+                $AlsaCards[$displayName] = $thisCardId !== '' ? $thisCardId : strval($cardNum);
+            }
+
+            if (!$foundOurCard) {
+                $AlsaCards['-- Select an Audio Device --'] = $CurrentCard;
+            }
+        }
+
+        return json($AlsaCards);
+    }
+}
+
+/**
+ * Returns the available audio input device options.
+ *
+ * @param bool   $fulllist   When true, returns detailed card/subdevice list; otherwise returns unique card names.
+ * @param bool   $allowMedia When true, prepends a "Playing Media" pseudo-device to the list.
+ * @param string $valueKey   In PipeWire mode, which identifier to store:
+ *                           'node.name' for consumers that address the node
+ *                           through PipeWire (GStreamer), 'node.description'
+ *                           for consumers that go through SDL.  See
+ *                           GetOptions_PipeWireNodes().
+ * @return string JSON array or object of available audio input devices.
+ */
+function GetOptions_AudioInputDevice($fulllist = false, $allowMedia = false, $valueKey = 'node.name')
+{
+
+    global $settings;
+
+    $AlsaCards = array();
+
+    // In PipeWire mode with fulllist, enumerate PipeWire Audio/Source nodes.
+    // $valueKey decides whether the caller gets node.name or node.description
+    // back -- see GetOptions_PipeWireNodes() for why that choice matters.
+    if ($fulllist && IsPipeWireBackend($settings)) {
+        if ($allowMedia) {
+            $AlsaCards['-- Playing Media --'] = '-- Playing Media --';
+        }
+        foreach (GetOptions_PipeWireNodes('Audio/Source', $valueKey) as $label => $value) {
+            $AlsaCards[$label] = $value;
+        }
+        return json($AlsaCards);
+    }
+
+    // ALSA mode (or non-fulllist)
+    if ($allowMedia) {
+        if ($fulllist) {
+            $AlsaCards[] = '-- Playing Media --';
+        } else {
+            $AlsaCards[] = '-- Playing Media --';
+            $AlsaCards['-- Playing Media --'] = '-- Playing Media --';
+        }
+    }
+
+    $devices = GetAlsaPcmDevices('capture');
+    if ($fulllist) {
+        // ALSA card ID + device name.  The card ID rather than the card's
+        // name means identical-model cards are distinguished (e.g.
+        // ICUSBAUDIO7D vs ICUSBAUDIO7D_1) via ALSA's own dedup suffix, which
+        // is more stable than volatile card numbers.
+        foreach ($devices as $d) {
+            $AlsaCards[] = $d['cardId'] . ', ' . $d['deviceName'];
+        }
+    } else {
+        // User-defined sound card aliases (issue #2586) keyed by ALSA card ID
+        $audioCardAliases = LoadAudioCardAliases();
+        $seenCards = array();
+        foreach ($devices as $d) {
+            // One entry per card
+            if (isset($seenCards[$d['cardNum']])) {
+                continue;
+            }
+            $seenCards[$d['cardNum']] = true;
+            $cardNum = strval($d['cardNum']);
+            $cardName = ApplyAudioCardAlias($d['cardId'], $d['cardName'], $audioCardAliases);
+            if (isset($AlsaCards[$cardName])) {
+                // Duplicate name — rename the existing entry to include its card number
+                $existingNum = $AlsaCards[$cardName];
+                unset($AlsaCards[$cardName]);
+                $AlsaCards[$cardName . ' (Card ' . $existingNum . ')'] = $existingNum;
+                $AlsaCards[$cardName . ' (Card ' . $cardNum . ')'] = $cardNum;
+            } else {
+                $AlsaCards[$cardName] = $cardNum;
+            }
+        }
+    }
+
+    return json($AlsaCards);
+}
+
+/**
+ * Returns the available framebuffer device options from `fppd`.
+ *
+ * @return string Raw output string from the fpp -FB command.
+ */
+function GetOptions_FrameBuffer()
+{
+    global $settings, $SUDO;
+
+    exec($SUDO . " " . $settings["fppBinDir"] . "/fpp -FB", $output, $return_val);
+    return $output[0];
+}
+
+/**
+ * Returns the available locale options from the FPP `etc/locale` directory.
+ *
+ * @return string JSON object mapping locale names to themselves, sorted alphabetically.
+ */
+function GetOptions_Locale()
+{
+    global $settings;
+
+    $locales = array();
+    foreach (scandir($settings['fppDir'] . '/etc/locale') as $file) {
+        if (preg_match('/.json$/', $file)) {
+            $file = preg_replace('/.json$/', '', $file);
+            $locales[$file] = $file;
+        }
+    }
+    ksort($locales);
+
+    return json($locales);
+}
+
+/**
+ * Returns the available real-time clock (RTC) module options.
+ *
+ * @return string JSON object mapping RTC chip names to their driver identifiers.
+ */
+/**
+ * Returns the legal-jurisdiction options, from etc/jurisdictions.json.
+ *
+ * Adding a region is a data change, not a code change -- which is the point of
+ * the policy living in one file that both this and CapeUtils read.
+ *
+ * @return string JSON object mapping region description to jurisdiction code.
+ */
+function GetOptions_LegalJurisdiction()
+{
+    require_once __DIR__ . '/../../jurisdiction.inc';
+    return json(jurisdictionOptions());
+}
+
+function GetOptions_RTC()
+{
+    global $settings;
+    $rtcOptions = array();
+
+    $rtcOptions['None/Built In'] = 'N';
+    $rtcOptions['DS1305 / DS1307 / DS3231 (PiCap)'] = '2';
+    $rtcOptions['pcf8523 (Kulp / Adafruit PiRTC)'] = '4';
+    $rtcOptions['pcf85363 (Kulp)'] = '5';
+    $rtcOptions['mcp7941x (PiFace)'] = '3';
+    $rtcOptions['pcf2127 (RasClock)'] = '1';
+    $rtcOptions['pcf8563'] = '6';
+
+    return json($rtcOptions);
+}
+
+/**
+ * Returns all available timezone strings from `/usr/share/zoneinfo`.
+ *
+ * @return string JSON array of timezone name strings.
+ */
+function GetOptions_TimeZone()
+{
+    global $settings;
+    $zones = array();
+
+    exec("find /usr/share/zoneinfo ! -type d | sed 's/\/usr\/share\/zoneinfo\///' | grep -v ^right | grep -v ^posix | grep -v ^\\/ | grep -v \\\\. | sort", $output, $return_val);
+
+    if ($return_val != 0) {
+        return json($zones);
+    }
+
+    foreach ($output as $zone) {
+        array_push($zones, $zone);
+    }
+
+    return json($zones);
+}
+
+/**
+ * Returns the available video output options from DRM and the `fppd` model list.
+ *
+ * @param bool $playlist When true, prepends a "--Default--" entry for playlist use.
+ * @return string JSON object mapping output names to themselves.
+ */
+function GetOptions_VideoOutput($playlist)
+{
+    global $settings;
+
+    $VideoOutputModels = array();
+    if ($playlist) {
+        $VideoOutputModels['--Default--'] = "--Default--";
+    }
+    $path = "/sys/class/drm/";
+    $files = array_diff(scandir($path), array('.', '..'));
+    foreach ($files as $file) {
+        if (str_contains($file, "HDMI")) {
+            $file = substr($file, stripos($file, "HDMI"));
+            $VideoOutputModels[$file] = $file;
+        } else if (str_contains($file, "DSI-")) {
+            $file = substr($file, stripos($file, "DSI-"));
+            $VideoOutputModels[$file] = $file;
+        } else if (str_contains($file, "Composite-")) {
+            $file = substr($file, stripos($file, "Composite-"));
+            $VideoOutputModels[$file] = $file;
+        }
+    }
+
+    $VideoOutputModels['Disabled'] = "Disabled";
+
+    $curl = curl_init('http://localhost:32322/models');
+    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 200);
+    $request_content = curl_exec($curl);
+    curl_close($curl);
+    if ($request_content !== false) {
+        $data = json_decode($request_content);
+        foreach ($data as $value) {
+            if ($value->Type != "FB" || !$value->autoCreated) {
+                $VideoOutputModels[$value->Name] = $value->Name;
+            }
+        }
+    }
+    return json($VideoOutputModels);
+}
+
+/**
+ * Returns the available BeagleBone Black LED trigger mode options.
+ *
+ * @return string JSON object mapping human-readable LED mode names to their trigger identifiers.
+ */
+function GetOptions_BBBLeds()
+{
+    global $settings;
+    $options = array();
+    $options["Disabled"] = "none";
+    $options["Heartbeat"] = "heartbeat";
+    $options["CPU Activity"] = "cpu";
+    if ($settings["Platform"] == "BeagleBone 64") {
+        $options["SD Card Activity"] = "mmc1";
+        $options["eMMC Activity"] = "mmc0";
+    } else {
+        $options["SD Card Activity"] = "mmc0";
+        $options["eMMC Activity"] = "mmc1";
+    }
+    return json($options);
+}
+
+/**
+ * Returns available GPIO pins, optionally filtered by `cape-info` show/hide rules.
+ *
+ * @param bool $list When true, returns a name => label map; when false, returns the raw GPIO objects.
+ * @return string JSON object or array of GPIO pin data.
+ */
+function GetOptions_GPIOS($list)
+{
+    global $settings;
+    $data = json_decode(file_get_contents('http://127.0.0.1:32322/gpio'));
+    $ret = array();
+    $includeFilters = array(
+    );
+    $excludeFilters = array(
+    );
+    if (!isset($settings["showAllOptions"]) || $settings["showAllOptions"] == 0) {
+        if (isset($settings['cape-info']['show']) && isset($settings['cape-info']['show']['gpio'])) {
+            $includeFilters = $settings['cape-info']['show']['gpio'];
+        }
+        if (isset($settings['cape-info']['hide']) && isset($settings['cape-info']['hide']['gpio'])) {
+            $excludeFilters = $settings['cape-info']['hide']['gpio'];
+        }
+    }
+    foreach ($data as $gpio) {
+        $pn = $gpio->pin;
+        $hide = false;
+        if (count($includeFilters) > 0) {
+            $hide = true;
+            foreach ($includeFilters as $value) {
+                if (preg_match("/" . $value . "/", $pn) == 1) {
+                    $hide = false;
+                }
+            }
+        }
+        if (count($excludeFilters) > 0) {
+            foreach ($excludeFilters as $value) {
+                if (preg_match("/" . $value . "/", $pn) == 1) {
+                    $hide = true;
+                }
+            }
+        }
+        if (!$hide) {
+            if ($list) {
+                $ret[$gpio->pin] = GPIOPinLabel($gpio->pin, $gpio->gpioChip ?? null, $gpio->gpioLine ?? null);
+            } else {
+                $ret[] = $gpio;
+            }
+        }
+    }
+
+    return json($ret);
+}
+
+/////////////////////////////////////////////////////////////////////////////
+function GetOptions_AES67Interface()
+{
+    $interfaces = array();
+    $interfaces['(Default)'] = '';
+    exec("ip -o link show | awk -F': ' '{print \$2}' | grep -v lo", $output, $return_val);
+    if (!$return_val && !empty($output)) {
+        foreach ($output as $iface) {
+            $iface = trim($iface);
+            if (!empty($iface)) {
+                $interfaces[$iface] = $iface;
+            }
+        }
+    }
+    return json($interfaces);
+}
+
+/**
+ * Get a setting's options
+ *
+ * Returns the available options for the specified setting.
+ * Supports `AudioMixerDevice`, `AudioOutput`, `AudioInput`, and other platform-specific option sets.
+ *
+ * @route GET /api/options/{SettingName}
+ * @response 200 Available options for the setting
+ * ```json
+ * {"Dummy": "0"}
+ * ```
+ */
+function GetOptions()
+{
+    $SettingName = params('SettingName');
+
+    switch ($SettingName) {
+        case 'AudioMixerDevice':
+            return GetOptions_AudioMixerDevice();
+        case 'AudioOutput':
+            return GetOptions_AudioOutputDevice(false);
+        case 'AudioInput':
+            return GetOptions_AudioInputDevice(false);
+        case 'AudioOutputList':
+            return GetOptions_AudioOutputDevice(true);
+        // SDL consumer (the SMPTE plugin opens this device with SDL, which fppd
+        // pins to the PulseAudio backend) -- it can only find the node by its
+        // description.
+        case 'AudioInputList':
+            return GetOptions_AudioInputDevice(true, false, 'node.description');
+        // GStreamer consumer (WLEDAudioInput feeds pipewiresrc target-object in
+        // src/overlays/wled/wled.cpp) -- that wants the PipeWire node.name.
+        case 'AudioInputListAllowMedia':
+            return GetOptions_AudioInputDevice(true, true, 'node.name');
+        case 'FrameBuffer':
+            return GetOptions_FrameBuffer();
+        case 'BBBLeds':
+            return GetOptions_BBBLeds();
+        case 'Locale':
+            return GetOptions_Locale();
+        case 'LegalJurisdiction':
+            return GetOptions_LegalJurisdiction();
+        case 'RTC':
+            return GetOptions_RTC();
+        case 'PlaylistVideoOutput':
+            return GetOptions_VideoOutput(1);
+        case 'TimeZone':
+            return GetOptions_TimeZone();
+        case 'VideoOutput':
+            return GetOptions_VideoOutput(0);
+        case 'GPIOS':
+            return GetOptions_GPIOS(false);
+        case 'GPIOLIST':
+            return GetOptions_GPIOS(true);
+        case 'AES67Interface':
+            return GetOptions_AES67Interface();
+
+    }
+
+    return json("{}");
+}

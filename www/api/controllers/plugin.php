@@ -1,102 +1,2212 @@
 <?
 
-/////////////////////////////////////////////////////////////////////////////
-// GET /api/plugin
-function GetInstalledPlugins()
+// Shared system-package helpers (hardened apt + per-requester ownership) used
+// when installing/removing a plugin's declared package dependencies.
+require_once __DIR__ . '/../../common/packages.inc.php';
+
+// Shared operation logging (OpLog), the PHP half of scripts/common's startOpLog.
+require_once __DIR__ . '/../../common/oplog.inc.php';
+
+// The plugin install history (AppendPluginHistory() and friends).
+require_once __DIR__ . '/../../common/pluginhistory.inc.php';
+
+/**
+ * Appends lines to the shared logs/fpp_plugin_manager.log in the same
+ * syslog-style format scripts/common's startPluginLog() writes:
+ * "<date time> [<op> <plugin>] <line>".
+ *
+ * The wrapper scripts log what they *ran*; this logs what the Plugin Manager
+ * *decided*. Without it the decisions that never reach a script leave no trace
+ * at all: the package/credentials/depth gates all refuse before anything is
+ * cloned, so a failed install was invisible in the log and in the Support Zip.
+ * Worse, a dependency failure aborts *after* a successful clone and deletes the
+ * partial install (CleanupPartialPluginInstall) -- leaving a clean
+ * "install FINISH (rc=0)" block in the log for a plugin no longer on disk.
+ */
+function PluginLog($op, $plugin, $msg)
+{
+	OpLog('fpp_plugin_manager.log', $op, $plugin, $msg);
+}
+
+// True when the caller asked for streamed progress output (?stream=...).
+function PluginStreaming($stream)
+{
+	return isset($stream) && $stream != "false";
+}
+
+/**
+ * Echo a message to the caller's streaming progress dialog AND record it in
+ * fpp_plugin_manager.log. The echo happens ONLY when streaming: a non-streaming
+ * caller gets a JSON body, and echoing into it produced output like
+ * "Installed plugin 'X'.\n{"Status":"OK"}" -- unparseable as strict JSON.
+ * The log write is unconditional; it is what makes a silent install failure
+ * diagnosable, so it must never depend on how the caller asked for output.
+ */
+function PluginEchoLog($op, $plugin, $msg, $stream)
+{
+	if (PluginStreaming($stream)) {
+		echo $msg;
+	}
+	PluginLog($op, $plugin, $msg);
+}
+
+// True if a dependencies block declares at least one non-empty apt package.
+function DepsRequirePackages($deps)
+{
+	if (!is_array($deps) || !isset($deps['packages']) || !is_array($deps['packages'])) {
+		return false;
+	}
+	foreach ($deps['packages'] as $p) {
+		if (is_string($p) && $p !== '') {
+			return true;
+		}
+	}
+	return false;
+}
+
+// True if a dependencies block declares at least one non-empty Python (pip) package.
+function DepsRequirePython($deps)
+{
+	if (!is_array($deps) || !isset($deps['python']) || !is_array($deps['python'])) {
+		return false;
+	}
+	foreach ($deps['python'] as $p) {
+		if (is_string($p) && $p !== '') {
+			return true;
+		}
+	}
+	return false;
+}
+
+// True if 'pip' (via `python3 -m pip`) is available. FPP's own OS image
+// provisions python3-pip via apt (see SD/FPP_Install.sh) specifically so
+// plugins have a sanctioned way to install Python packages -- see
+// PLUGIN_GUIDELINES.md #6.2 in fpp-plugin-Template. Cached per-request; this
+// is checked at most twice (posted info, then the authoritative re-check
+// after clone).
+function PipAvailable()
+{
+	static $available = null;
+	if ($available === null) {
+		$out = array();
+		$rc = 1;
+		exec('python3 -m pip --version 2>/dev/null', $out, $rc);
+		$available = ($rc === 0 && count($out) > 0);
+	}
+	return $available;
+}
+
+// "Official" = clone origin (srcURL) is a repo in the FalconChristmas GitHub
+// org. Mirrors plugins.php's client-side IsOfficialPlugin() -- host + first
+// path segment only, so a spoofed host/path can't earn it.
+function IsOfficialPluginSrcURL($url)
+{
+	if (!is_string($url) || $url === '') {
+		return false;
+	}
+	$parts = parse_url($url);
+	if (!is_array($parts) || !isset($parts['host']) || strtolower($parts['host']) !== 'github.com') {
+		return false;
+	}
+	$path = isset($parts['path']) ? $parts['path'] : '';
+	$segs = array_values(array_filter(explode('/', $path), function ($s) { return $s !== ''; }));
+	return count($segs) > 0 && strtolower($segs[0]) === 'falconchristmas';
+}
+
+$GLOBALS['PLUGIN_LIST_URL'] = 'https://raw.githubusercontent.com/FalconChristmas/fpp-data/master/pluginList.json';
+
+// Ceilings on what FPP will pull down from a plugin's repo. Neither is a
+// realistic size -- pluginList.json is ~8KB and a pluginInfo.json ~1KB, and the
+// largest icon in the live list is ~2.2MB -- they exist so a single bad or
+// hostile URL can't exhaust memory or fill the cache directory.
+define('PLUGIN_FETCH_MAX_JSON', 1048576);   // 1 MB
+define('PLUGIN_FETCH_MAX_ICON', 4194304);   // 4 MB
+
+// Bounds for FetchURLWithGitHubCredentials(). Looser than
+// PluginBoundedFetch()'s 8s because that path can go via api.github.com
+// with authentication over a slow link, but finite: the point is that a
+// stalled remote cannot hold a PHP-FPM worker forever.
+define('PLUGIN_GITHUB_CONNECT_TIMEOUT', 5);
+define('PLUGIN_GITHUB_TIMEOUT', 20);
+
+// How long a fetched plugin list stays fresh, and the grace file_cache()
+// adds on top. Past TTL+grace, a cached copy is one whose last refresh
+// attempt FAILED -- file_cache() keeps serving the old file rather than
+// losing it -- so it is fine to read but must not be used to conclude that
+// something is absent from it.
+define('PLUGIN_LIST_TTL', 900);
+define('PLUGIN_LIST_GRACE', 10);
+
+/**
+ * Bounded fetch for the small public resources this controller pulls from
+ * GitHub (the plugin list, a listed plugin's pluginInfo.json, and
+ * plugin icons). All of them live on raw.githubusercontent.com and need no
+ * credentials, so the only thing that matters is that a wedged or blackholed
+ * remote can't pin a PHP-FPM worker for PHP's 900s default_socket_timeout --
+ * which is what an unbounded file_get_contents() does.
+ *
+ * Redirects are deliberately NOT followed: a redirect would carry the request
+ * off the host PluginIconURLIsAllowed() just approved.
+ *
+ * Returns the body, or null on any failure (which is what file_cache() wants
+ * to see so it leaves a good cache entry alone).
+ */
+function PluginBoundedFetch($url, $timeout = 8, $maxBytes = PLUGIN_FETCH_MAX_JSON)
+{
+	$ctx = stream_context_create(array('http' => array(
+		'timeout' => $timeout,
+		'follow_location' => 0,
+		'user_agent' => 'FPP',
+	)));
+	$fp = @fopen($url, 'rb', false, $ctx);
+	if ($fp === false) {
+		return null;
+	}
+	// Read one byte past the limit: if it arrives, the body is over budget and
+	// is refused outright rather than truncated. A truncated JSON document
+	// fails to parse anyway, but a truncated image would be cached and served
+	// as a corrupt icon, which is worse than no icon.
+	$data = @stream_get_contents($fp, $maxBytes + 1);
+	fclose($fp);
+	if ($data === false || $data === '' || strlen($data) > $maxBytes) {
+		return null;
+	}
+	return $data;
+}
+
+/**
+ * True when the cached plugin list is recent enough to conclude that a plugin
+ * is NOT on it.
+ *
+ * Absence is only meaningful against a current list. file_cache() deliberately
+ * keeps serving the last good copy when a refresh fails, so "the list is
+ * non-empty" does not mean "the list is up to date" -- a months-old snapshot
+ * looks exactly like a fresh one to the caller, and every plugin added to
+ * fpp-data since would read as unlisted. Deciding "unknown" off that is a
+ * permanent false accusation, which is the whole failure mode this check
+ * exists to avoid.
+ *
+ * Being PRESENT in a stale list is still trustworthy: plugins are added to
+ * fpp-data far more often than they are removed, so a stale hit is safe to act
+ * on while a stale miss is not.
+ */
+function PluginListIsCurrent()
+{
+	$f = PluginListCacheFile();
+	if (!file_exists($f)) {
+		return false;
+	}
+	return (time() - filemtime($f)) <= (PLUGIN_LIST_TTL + PLUGIN_LIST_GRACE);
+}
+
+// Where GetPluginList()'s file_cache() entry lands. file_cache() composes
+// <dir>/cache_<name>.cache; the $cacheOnly read path needs the same path
+// without going through file_cache(), so it is built in exactly one place.
+function PluginListCacheFile()
+{
+	return file_cache_dir_persistent() . '/cache_plugin_list.cache';
+}
+
+/**
+ * The curated index of known plugins from FalconChristmas/fpp-data, as an
+ * array of [repoName, infoURL, category] entries. Returns an empty array when
+ * the list has never been fetched and can't be reached right now.
+ *
+ * Cached for 15 minutes via file_cache(), which single-flights the refresh and
+ * -- importantly -- refuses to overwrite a good entry with a failed fetch, so
+ * a transient GitHub outage degrades to slightly stale data rather than to no
+ * data. Callers MUST treat an empty return as "don't know", never as "not
+ * listed": see RecordPluginInstallSource().
+ *
+ * Cached on PERSISTENT storage rather than the /tmp default. On most FPP
+ * platforms /tmp is tmpfs, so a reboot would drop the list -- and
+ * ResolveUnverifiedPlugins() can only settle a pending plugin against a list it
+ * already has. Losing it every boot means a box that installed something while
+ * offline keeps reporting "Possibly Installed" long after it is back online.
+ *
+ * With $cacheOnly the cache file is read directly and no fetch is attempted at
+ * all, for callers on a latency-sensitive path who would rather have no answer
+ * than wait for one -- see ResolveUnverifiedPlugins(). Age is deliberately
+ * ignored there: for settling a pending plugin a stale list beats no list, and
+ * plugins are only ever added to it.
+ */
+function GetPluginList($cacheOnly = false)
+{
+	static $pluginList = null;
+	if ($pluginList === null) {
+		if ($cacheOnly) {
+			$listJSON = @file_get_contents(PluginListCacheFile());
+			if ($listJSON === false) {
+				return array();
+			}
+		} else {
+			$listJSON = file_cache('plugin_list', function () {
+				$url = $GLOBALS['PLUGIN_LIST_URL'];
+				$data = PluginBoundedFetch($url);
+				// fpp-data is public, so the bounded anonymous fetch is the
+				// normal path. Fall back to the credentialed fetcher only if
+				// that failed, to keep working for anyone who is rate-limited
+				// without a PAT.
+				return ($data !== null) ? $data : FetchURLWithGitHubCredentials($url);
+			}, PLUGIN_LIST_TTL, PLUGIN_LIST_GRACE, file_cache_dir_persistent());
+		}
+		$decoded = json_decode($listJSON, true);
+		$pluginList = (is_array($decoded) && isset($decoded['pluginList']) && is_array($decoded['pluginList'])) ? $decoded['pluginList'] : array();
+	}
+	return $pluginList;
+}
+
+/**
+ * The decoded pluginInfo.json for a LISTED plugin, cached for an hour.
+ *
+ * The infoURL is taken from the plugin list entry, never from the caller --
+ * this is the whole reason api/plugin/:RepoName/icon can exist without being an
+ * open proxy. A client names a repo; every URL the server actually fetches
+ * originated in FalconChristmas/fpp-data.
+ *
+ * Returns null when $repoName isn't listed or the fetch failed.
+ */
+function GetListedPluginInfo($repoName)
+{
+	if (!is_string($repoName) || $repoName === '') {
+		return null;
+	}
+	$entry = FindPluginIndexEntry($repoName);
+	if ($entry === null || !isset($entry[1]) || !is_string($entry[1]) || $entry[1] === '') {
+		return null;
+	}
+	$infoURL = $entry[1];
+
+	// Cache key has to be filesystem-safe; repoNames are already restricted to
+	// GitHub repo characters, but don't rely on that for a path.
+	$key = 'plugin_info_' . preg_replace('/[^A-Za-z0-9_.-]/', '_', $repoName);
+	$json = file_cache($key, function () use ($infoURL) {
+		return PluginBoundedFetch($infoURL);
+	}, 3600);
+
+	$decoded = json_decode($json, true);
+	return is_array($decoded) ? $decoded : null;
+}
+
+/**
+ * True if $url is an https URL on a GitHub host FPP will talk to.
+ *
+ * Anchored at the scheme and requiring the host be followed by "/", so the
+ * usual confusions don't slip through: "https://raw.githubusercontent.com@evil"
+ * and "https://github.com.evil.com/" both fail, as does any non-https scheme.
+ *
+ * This is the boundary for two different things -- which URLs are allowed to
+ * receive FPP's GitHub credentials, and which URLs FPP is willing to fetch on a
+ * caller's behalf -- so it is defined once here rather than repeated.
+ */
+function IsGitHubURL($url)
+{
+	return is_string($url) && (bool) preg_match('#^https://(github\.com|raw\.githubusercontent\.com|api\.github\.com)/#i', $url);
+}
+
+// Icon URLs FPP is willing to fetch. Every iconURL in the live plugin list is a
+// raw.githubusercontent.com path, so this costs nothing in practice while
+// removing the entire class of "point FPP at something on my LAN" abuse.
+//
+// svg is deliberately absent. FPP serves these bytes from its OWN origin, and
+// an SVG is a script-bearing document -- navigating directly to a proxied
+// image/svg+xml would run its script as FPP. The other five formats can't.
+$GLOBALS['PLUGIN_ICON_URL_RE'] = '#^https://raw\.githubusercontent\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+\.(png|jpg|jpeg|gif|webp)$#i';
+
+// True if $url is a fetchable plugin icon. On success $ext is set to the
+// lower-cased extension, which is where the served Content-Type comes from --
+// a closed set, rather than "whatever the URL ended in".
+function PluginIconURLIsAllowed($url, &$ext = null)
+{
+	$ext = null;
+	if (!is_string($url) || !preg_match($GLOBALS['PLUGIN_ICON_URL_RE'], $url, $m)) {
+		return false;
+	}
+	$ext = strtolower($m[1]);
+	return true;
+}
+
+// Looks up $repoName's [repoName, infoURL, category] entry in the plugin
+// list (see GetPluginList()). Returns the entry, or null if not found.
+// Shared by GetListedPluginInfo() and ResolvePluginInfoByName() so the
+// match logic exists in exactly one place.
+function FindPluginIndexEntry($repoName)
+{
+	foreach (GetPluginList() as $entry) {
+		if (is_array($entry) && count($entry) >= 2 && $entry[0] === $repoName) {
+			return $entry;
+		}
+	}
+	return null;
+}
+
+/**
+ * The two settings behind the "Unknown Plugins" health check.
+ *
+ *   PluginUnknownEverInstalled -- CERTAIN. A plugin FPP knows is not in the
+ *                                 curated plugin list was installed here.
+ *   PluginUnverifiedRepos      -- UNCERTAIN. Plugins installed while the plugin
+ *                                 list could not be reached, so FPP could not
+ *                                 check them either way. Non-empty IS the
+ *                                 uncertain state -- there is no separate flag,
+ *                                 since it would only ever restate this.
+ *                                 GetPluginSource() settles the entries
+ *                                 once the list is back.
+ *
+ * The first is sticky -- never cleared by uninstalling the plugin -- because it
+ * answers "has unsupported code ever touched this system" when someone is
+ * reading a Support Zip, not "is it installed right now". Only an FPPOS
+ * reflash resets it, since that replaces everything a plugin could have done
+ * to the OS; the boot code then parks every plugin still installed as
+ * unverified, so one that is still here is found again
+ * (resetPluginSourceAfterOS() in src/boot/FPPINIT_Config.cpp).
+ *
+ *   PluginUnknownRepos         -- which plugins set the first, in the same
+ *                                 "repoName|srcURL" form as PluginUnverifiedRepos,
+ *                                 so the health check can name them. Empty
+ *                                 when the flag predates it.
+ *
+ * Classification happens at INSTALL time, not at read time. Classifying on read
+ * needs the plugin list on every health check, and a box that is offline, rate
+ * limited or freshly imaged has no list to match against -- so every plugin
+ * on it looks unlisted, and the check hard-fails telling the user to reimage.
+ * Install time is the one moment FPP has ground truth about where a plugin came
+ * from, and it only has to be right once.
+ *
+ * resetConfig.php carries both forward across a "settings" reset, see the
+ * $pluginSourceSettings list there.
+ */
+$GLOBALS['PLUGIN_UNKNOWN_SETTING'] = 'PluginUnknownEverInstalled';
+$GLOBALS['PLUGIN_UNVERIFIED_REPOS_SETTING'] = 'PluginUnverifiedRepos';
+$GLOBALS['PLUGIN_UNKNOWN_REPOS_SETTING'] = 'PluginUnknownRepos';
+
+/**
+ * "owner/repo", lower-cased, out of a github.com or raw.githubusercontent.com
+ * URL. Returns '' for anything else. This is the one identity a plugin's clone
+ * URL and its plugin list entry are guaranteed to agree on.
+ */
+function PluginRepoSlugFromURL($url)
+{
+	if (!is_string($url) || $url === '') {
+		return '';
+	}
+	$parts = parse_url($url);
+	if (!is_array($parts) || !isset($parts['host'])) {
+		return '';
+	}
+	$host = strtolower($parts['host']);
+	if ($host !== 'github.com' && $host !== 'raw.githubusercontent.com') {
+		return '';
+	}
+	$segs = array_values(array_filter(explode('/', isset($parts['path']) ? $parts['path'] : ''), function ($s) {
+		return $s !== '';
+	}));
+	if (count($segs) < 2) {
+		return '';
+	}
+	return strtolower($segs[0] . '/' . preg_replace('/\.git$/i', '', $segs[1]));
+}
+
+/**
+ * True when $srcURL -- the URL git cloned the plugin from -- is one of the
+ * repos the plugin list names.
+ *
+ * The clone URL is the only identity worth judging on. repoName is just a label
+ * inside a pluginInfo.json, and on the "Enter a pluginInfo.json URL" path that
+ * document came from a URL the user chose, so a fork at
+ * github.com/someone-else/fpp-brightness can call itself "fpp-brightness" and
+ * would sail past a name match. Where the code was cloned from cannot be
+ * spoofed that way.
+ *
+ * Matching is on the GitHub owner/repo slug rather than the URL text, because a
+ * plugin's repoName is often not the name the list files it under -- 8 of the
+ * 58 current entries differ, e.g. "Statistics-Fpp-Plugin" for repoName
+ * "fpp-plugin-AdvancedStats".
+ *
+ * An empty or non-GitHub $srcURL is never listed: every listed plugin lives on
+ * GitHub, and with no clone URL there is nothing to verify.
+ *
+ * The caller MUST have established that the list is present and current first:
+ * this returns false for "not listed", "no list" and "stale list" alike, and
+ * only the first of those is a finding. See PluginListIsCurrent().
+ */
+function PluginSrcURLIsListed($srcURL)
+{
+	$slug = PluginRepoSlugFromURL($srcURL);
+	if ($slug === '') {
+		return false;
+	}
+	foreach (GetPluginList() as $entry) {
+		if (is_array($entry) && count($entry) >= 2 && $slug === PluginRepoSlugFromURL($entry[1])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The pending list is stored as comma-separated "repoName|srcURL" records.
+// srcURL is what a deferred check matches on, so it is exactly as accurate as
+// the immediate one. repoName rides along purely as a label, so whoever reads
+// this setting in a support bundle can see which plugin is awaiting an answer.
+// PluginUnknownRepos uses the same form.
+function GetUnverifiedPluginRepos()
+{
+	return GetPluginRepoRecords($GLOBALS['PLUGIN_UNVERIFIED_REPOS_SETTING']);
+}
+
+function SetUnverifiedPluginRepos($pending)
+{
+	SetPluginRepoRecords($GLOBALS['PLUGIN_UNVERIFIED_REPOS_SETTING'], $pending);
+}
+
+function GetPluginRepoRecords($setting)
+{
+	$raw = ReadSettingFromFile($setting);
+	if (!is_string($raw) || trim($raw) === '') {
+		return array();
+	}
+	$out = array();
+	foreach (explode(',', $raw) as $item) {
+		$item = trim($item);
+		if ($item === '') {
+			continue;
+		}
+		$parts = explode('|', $item, 2);
+		$out[] = array(
+			'repoName' => $parts[0],
+			'srcURL' => isset($parts[1]) ? $parts[1] : '',
+		);
+	}
+	return $out;
+}
+
+function SetPluginRepoRecords($setting, $pending)
+{
+	$items = array();
+	foreach ($pending as $p) {
+		// ',' and '|' are the separators, so they can never appear in a value.
+		$clean = function ($v) {
+			return str_replace(array(',', '|'), '', is_string($v) ? $v : '');
+		};
+		$repoName = $clean($p['repoName']);
+		// Without credentials, as the install history stores it: these
+		// settings are served by the settings API and kept in every backup.
+		$srcURL = $clean(PluginHistoryURL(isset($p['srcURL']) ? $p['srcURL'] : ''));
+		if ($repoName === '' && $srcURL === '') {
+			continue;
+		}
+		$items[$repoName . '|' . $srcURL] = true;
+	}
+	WriteSettingToFile($setting, implode(',', array_keys($items)));
+}
+
+// Raises the certain flag and records which plugin raised it. The caller
+// holds PluginUnverifiedLock(), which also serialises this list.
+function RecordPluginUnknown($repoName, $srcURL)
+{
+	WriteSettingToFile($GLOBALS['PLUGIN_UNKNOWN_SETTING'], '1');
+	$known = GetPluginRepoRecords($GLOBALS['PLUGIN_UNKNOWN_REPOS_SETTING']);
+	$known[] = array('repoName' => $repoName, 'srcURL' => $srcURL);
+	SetPluginRepoRecords($GLOBALS['PLUGIN_UNKNOWN_REPOS_SETTING'], $known);
+}
+
+// Serialises rewrites of the unverified list (installs adding,
+// ResolveUnverifiedPlugins() settling). Returns the handle; null if the lock
+// file can't be opened (the caller carries on unlocked); false if $wait is
+// false and it is taken.
+function PluginUnverifiedLock($wait)
+{
+	$file = file_cache_dir_persistent() . '/plugin-unverified.lock';
+	$new = !file_exists($file);
+	$lock = @fopen($file, 'c');
+	if (!$lock) {
+		return null;
+	}
+	if ($new) {
+		@chmod($file, 0664);
+	}
+	if (!flock($lock, $wait ? LOCK_EX : LOCK_EX | LOCK_NB)) {
+		fclose($lock);
+		return false;
+	}
+	return $lock;
+}
+
+function PluginUnverifiedUnlock($lock)
+{
+	if ($lock) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+	}
+}
+
+/**
+ * Records what this system now knows about where a just-installed plugin came
+ * from. Called once per successful install from InstallPluginFromInfo().
+ *
+ * The plugin list decides, but ONLY when it was actually fetched: an empty list
+ * means "couldn't check", which is parked as uncertain rather than collapsed
+ * into an accusation.
+ *
+ * How the install was started is deliberately NOT an input. A plugin pasted
+ * into the "Enter a pluginInfo.json URL" box that resolves to a listed repo is
+ * the same code from the same place as installing it from the Plugins page --
+ * flagging it would be crying wolf, and the health check's whole value is that
+ * it only fires on something real. What matters is where the code came from,
+ * which PluginSrcURLIsListed() answers from srcURL. That also covers the dev-tools
+ * case for free: there is no marker to strip, because there is no marker.
+ *
+ * Returns what it concluded -- 'official', 'listed', 'unknown' or
+ * 'unverified' -- for the install history (AppendPluginHistory()).
+ */
+function RecordPluginInstallSource($repoName, $srcURL)
+{
+	// Published by the FPP project -- nothing to record.
+	if (IsOfficialPluginSrcURL($srcURL)) {
+		return 'official';
+	}
+
+	// Decidable without the list: every listed plugin lives on GitHub, so a
+	// clone URL that is not a GitHub repo cannot be on it. Worth answering
+	// here so an offline box still gets a definite result for the clearest
+	// case instead of parking it.
+	if (is_string($srcURL) && $srcURL !== '' && PluginRepoSlugFromURL($srcURL) === '') {
+		$lock = PluginUnverifiedLock(true);
+		RecordPluginUnknown($repoName, $srcURL);
+		PluginUnverifiedUnlock($lock);
+		return 'unknown';
+	}
+
+	$list = GetPluginList();
+	if (!empty($list) && PluginSrcURLIsListed($srcURL)) {
+		// On the list. Safe to conclude even from a stale copy.
+		return 'listed';
+	}
+
+	if (empty($list) || !PluginListIsCurrent()) {
+		// Either no list at all, or one whose last refresh failed. Absence
+		// proves nothing against it -- park the plugin and let
+		// GetPluginSource() settle it once a current list is available.
+		$lock = PluginUnverifiedLock(true);
+		$pending = GetUnverifiedPluginRepos();
+		$pending[] = array('repoName' => $repoName, 'srcURL' => $srcURL);
+		SetUnverifiedPluginRepos($pending);
+		PluginUnverifiedUnlock($lock);
+		return 'unverified';
+	}
+
+	$lock = PluginUnverifiedLock(true);
+	RecordPluginUnknown($repoName, $srcURL);
+	PluginUnverifiedUnlock($lock);
+	return 'unknown';
+}
+
+// System package changes (upgrades, removals, holds, apt sources/pins/keys),
+// recorded apart: around a plugin's own script ('packages'), and around FPP's
+// own package work for it -- installing or reconciling its declared
+// dependencies, releasing its claims -- ('fppPackages', merged into one
+// record when it runs in two parts). Dependency plugins are outside both:
+// each records its own entry. Anything else changing packages meanwhile
+// counts too, hence "while", not "by". Not pip, npm or background jobs.
+
+// Identifies one version of dpkg's state: filemtime() is whole seconds, but
+// dpkg replaces the status file by rename, so its inode changes; an
+// interrupted dpkg leaves its changes in updates/ instead.
+function PluginDpkgStatusStamp()
+{
+	clearstatcache(true, '/var/lib/dpkg/status');
+	$st = @stat('/var/lib/dpkg/status');
+	$updates = @scandir('/var/lib/dpkg/updates');
+	return $st ? $st['ino'] . ':' . $st['size'] . ':' . $st['mtime'] . ':' . implode(',', $updates ?: array()) : null;
+}
+define('PLUGIN_APT_STATE_DIRS', '/etc/apt/sources.list.d /etc/apt/preferences.d /etc/apt/trusted.gpg.d /etc/apt/keyrings /usr/share/keyrings');
+// Names kept per kind in the history, with the full count alongside: up to
+// a runaway's worth of upgrades, removals, holds and apt file changes (the
+// ones that can break FPP), fewer of the routine new installs.
+define('PLUGIN_APT_CHANGES_MAX', 500);
+define('PLUGIN_APT_ADDED_MAX', 50);
+function PluginPackageChangesCap($kind)
+{
+	return $kind === 'added' ? PLUGIN_APT_ADDED_MAX : PLUGIN_APT_CHANGES_MAX;
+}
+
+// Whether the plugin has a script named one of $names in scripts/ or its top
+// directory (a superset of where the wrappers look): without one there is
+// nothing to bracket, so Update All over script-less plugins costs nothing.
+function PluginHasOwnScript($plugin, $names)
 {
 	global $settings;
-	$result = Array();
-	$plugins = Array();
-
-	$dir = $settings['pluginDirectory'];
-
-	if ($dh = opendir($dir))
-	{
-		while (($file = readdir($dh)) !== false)
-		{
-			if ((!in_array($file, array('.', '..'))) &&
-				(is_dir($dir . '/' . $file)) &&
-				(file_exists($dir . '/' . $file . '/pluginInfo.json')))
-			{
-				array_push($plugins, $file);
+	foreach ($names as $name) {
+		foreach (array('/scripts/', '/') as $sub) {
+			if (file_exists($settings['pluginDirectory'] . '/' . $plugin . $sub . $name)) {
+				return true;
 			}
 		}
 	}
-
-	$result['installedPlugins'] = $plugins;
-
-	return json($result);
+	return false;
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// POST /api/plugin
+function PluginAptFiles()
+{
+	$files = array();
+	foreach (array('/etc/apt/sources.list', '/etc/apt/preferences', '/etc/apt/trusted.gpg') as $f) {
+		if (is_file($f)) {
+			$files[$f] = is_readable($f) ? md5_file($f) : 'unreadable';
+		}
+	}
+	foreach (explode(' ', PLUGIN_APT_STATE_DIRS) as $dir) {
+		foreach (glob($dir . '/*') ?: array() as $f) {
+			if (is_file($f)) {
+				$files[$f] = is_readable($f) ? md5_file($f) : 'unreadable';
+			}
+		}
+	}
+	return $files;
+}
+
+// The installed packages ("name:arch" => array(version, want)), or null where
+// there is no dpkg (macOS, Fedora) or it cannot be read.
+function PluginDpkgList()
+{
+	$out = array();
+	exec("dpkg-query -W -f='\${Package}:\${Architecture} \${Version} \${db:Status-Want} \${db:Status-Status}\\n' 2>/dev/null", $out, $rc);
+	if ($rc !== 0 || empty($out)) {
+		return null;
+	}
+	$pkgs = array();
+	foreach ($out as $line) {
+		$f = explode(' ', $line);
+		// Present unless removed (not-installed) or removed but its config kept.
+		if (count($f) >= 4 && $f[3] !== 'not-installed' && $f[3] !== 'config-files') {
+			$pkgs[$f[0]] = array($f[1], $f[2]);
+		}
+	}
+	return $pkgs;
+}
+
+function PluginPackageSnapshot()
+{
+	if (!AptAvailable()) {
+		return null;
+	}
+	$pkgs = PluginDpkgList();
+	if ($pkgs === null) {
+		return null;
+	}
+	return array(
+		'statusStamp' => PluginDpkgStatusStamp(),
+		'pkgs' => $pkgs,
+		'apt' => PluginAptFiles(),
+	);
+}
+
+// What changed since $before, or null for nothing (or no snapshot). Lists are
+// capped (PluginPackageChangesCap()), with the full count alongside.
+function PluginPackageChanges($before)
+{
+	if (!is_array($before)) {
+		return null;
+	}
+	$c = array();
+	if ($before['statusStamp'] === null || PluginDpkgStatusStamp() !== $before['statusStamp']) {
+		$after = PluginDpkgList();
+		if ($after !== null) {
+			$removed = $added = $changed = $held = $unheld = array();
+			foreach ($before['pkgs'] as $p => $v) {
+				if (!isset($after[$p])) {
+					$removed[] = $p;
+					continue;
+				}
+				// Not labelled up or down: Debian version order needs a dpkg
+				// call per package (seconds on a BeagleBone after an apt-get
+				// upgrade); the two versions show it.
+				if ($after[$p][0] !== $v[0]) {
+					$changed[] = "$p {$v[0]} -> {$after[$p][0]}";
+				}
+				if ($v[1] !== 'hold' && $after[$p][1] === 'hold') {
+					$held[] = $p;
+				} else if ($v[1] === 'hold' && $after[$p][1] !== 'hold') {
+					$unheld[] = $p;
+				}
+			}
+			foreach ($after as $p => $v) {
+				if (!isset($before['pkgs'][$p])) {
+					$added[] = $p . ' ' . $v[0];
+					if ($v[1] === 'hold') {
+						$held[] = $p;
+					}
+				}
+			}
+			PluginPackageChangesKeep($c, 'removed', $removed);
+			PluginPackageChangesKeep($c, 'changed', $changed);
+			PluginPackageChangesKeep($c, 'held', $held);
+			PluginPackageChangesKeep($c, 'unheld', $unheld);
+			PluginPackageChangesKeep($c, 'added', $added);
+		} else {
+			$c['unknown'] = true; // dpkg changed, but its list can't be read now
+		}
+	}
+	$apt = PluginAptFiles();
+	$aptChanged = array();
+	foreach ($apt as $f => $md5) {
+		if (!isset($before['apt'][$f])) {
+			$aptChanged[] = "$f (added)";
+		} else if ($before['apt'][$f] !== $md5) {
+			$aptChanged[] = "$f (changed)";
+		}
+	}
+	foreach ($before['apt'] as $f => $md5) {
+		if (!isset($apt[$f])) {
+			$aptChanged[] = "$f (removed)";
+		}
+	}
+	PluginPackageChangesKeep($c, 'aptFiles', $aptChanged);
+	return empty($c) ? null : $c;
+}
+
+// Adds $list to $c as $kind: sorted (so the names kept read in order),
+// capped at PluginPackageChangesCap(), with the full count alongside when
+// cut. $total is the full count when $list is already a capped part of it.
+function PluginPackageChangesKeep(&$c, $kind, $list, $total = 0)
+{
+	if (empty($list)) {
+		return;
+	}
+	sort($list, SORT_NATURAL | SORT_FLAG_CASE);
+	$c[$kind] = array_slice($list, 0, PluginPackageChangesCap($kind));
+	$total = max($total, count($list));
+	if ($total > count($c[$kind])) {
+		$c[$kind . 'Count'] = $total;
+	}
+}
+
+// Two windows' changes as one (FPP's work for a plugin can run in two parts
+// either side of its dependency plugins). An identical entry in both counts
+// once, and a package installed in $a and removed in $b becomes one
+// 'addedRemoved' entry. When a side was capped, the names kept come from
+// what each side kept, and the count is the sum.
+function PluginPackageChangesMerge($a, $b)
+{
+	if (empty($a) || empty($b)) {
+		return empty($a) ? (empty($b) ? null : $b) : $a;
+	}
+	$count = function ($x, $kind) {
+		return isset($x[$kind . 'Count']) ? $x[$kind . 'Count'] : (isset($x[$kind]) ? count($x[$kind]) : 0);
+	};
+	// Installed in $a and removed in $b (a failed install's own packages):
+	// one 'addedRemoved' entry, rather than two that read in label order.
+	$name = function ($item) {
+		return explode(' ', $item, 2)[0];
+	};
+	$gone = array_flip(array_map($name, isset($b['removed']) ? $b['removed'] : array()));
+	$both = array_values(array_filter(isset($a['added']) ? $a['added'] : array(), function ($item) use ($gone, $name) {
+		return isset($gone[$name($item)]);
+	}));
+	if (count($both)) {
+		$names = array_flip(array_map($name, $both));
+		$drop = function ($list) use ($names, $name) {
+			return array_values(array_filter($list, function ($item) use ($names, $name) {
+				return !isset($names[$name($item)]);
+			}));
+		};
+		// The full counts, taken before the lists shrink.
+		$addedN = $count($a, 'added') - count($both);
+		$removedN = $count($b, 'removed') - count($both);
+		$a['added'] = $drop($a['added']);
+		$b['removed'] = $drop($b['removed']);
+		$a['addedCount'] = $addedN;
+		$b['removedCount'] = $removedN;
+		$a['addedRemoved'] = $both;
+	}
+	$c = array();
+	foreach (array_keys(PluginPackageChangeLabels()) as $kind) {
+		$list = array_merge(isset($a[$kind]) ? $a[$kind] : array(), isset($b[$kind]) ? $b[$kind] : array());
+		$unique = array_values(array_unique($list));
+		$total = $count($a, $kind) + $count($b, $kind) - (count($list) - count($unique));
+		PluginPackageChangesKeep($c, $kind, $unique, $total);
+	}
+	if (!empty($a['unknown']) || !empty($b['unknown'])) {
+		$c['unknown'] = true;
+	}
+	return empty($c) ? null : $c;
+}
+
+// The dependencies the copy of the plugin on disk declares for this box:
+// top level merged with the selected versions[] entry. null for none; false
+// when its pluginInfo.json can't be read, which must not read as "declares
+// nothing" (that would release every claim it holds).
+function PluginDeclaredDependencies($plugin)
+{
+	global $settings;
+	$infoFile = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
+	$info = file_exists($infoFile) ? json_decode(file_get_contents($infoFile), true) : null;
+	if (!is_array($info)) {
+		return false;
+	}
+	return MergePluginDependencies(
+		isset($info['dependencies']) ? $info['dependencies'] : null,
+		SelectPluginVersionEntry($info)
+	);
+}
+
+// Whether a dependencies block declares apt packages. Python packages don't
+// touch dpkg; dependency plugins record their own.
+function DepsMayChangePackages($deps)
+{
+	return !empty(DeclaredPackages($deps));
+}
+
+
+// One line for the operation's stream and the plugin manager log, or '' for
+// none. $fppTask names FPP's own work for the plugin ("installing <plugin>'s
+// declared dependencies"); without it the changes are its script's.
+function PluginPackageChangesText($op, $plugin, $c, $fppTask = null)
+{
+	static $arch = null; // ":all" and the native architecture are left off names
+	if ($arch === null) {
+		$arch = trim((string) shell_exec('dpkg --print-architecture 2>/dev/null'));
+	}
+	// Packages only added are routine; they go to the history without a line.
+	if (empty($c) || !array_diff(array_keys($c), array('added', 'addedCount'))) {
+		return '';
+	}
+	$parts = array();
+	foreach (PluginPackageChangeLabels() as $kind => $label) {
+		if (empty($c[$kind])) {
+			continue;
+		}
+		$n = isset($c[$kind . 'Count']) ? $c[$kind . 'Count'] : count($c[$kind]);
+		$names = array_map(function ($x) use ($kind, $arch) {
+			$x = preg_replace('#^/etc/apt/#', '', $x);
+			if ($kind === 'aptFiles') {
+				return $x; // apt files keep "(added)"
+			}
+			return preg_replace('/:(all|' . preg_quote($arch, '/') . ')$/', '', preg_replace('/ .*$/', '', $x));
+		}, array_slice($c[$kind], 0, 5));
+		$parts[] = "$label $n (" . implode(', ', $names) . ($n > 5 ? ', ...' : '') . ')';
+	}
+	$when = ($fppTask !== null) ? "FPP was $fppTask" : "$plugin's $op script was running";
+	if (!empty($c['unknown'])) {
+		// The package list could not be read: whatever is listed is partial.
+		return "Could not tell which system packages changed while $when (the package list could not be read)"
+			. (count($parts) ? '; seen: ' . implode('; ', $parts) : '') . '.';
+	}
+	return "System packages changed while $when: " . implode('; ', $parts) . '.';
+}
+
+// Releases $plugin's claims on $packages (apt-removing what nothing else
+// needs) in a tracked window. Returns the package changes, or null.
+function PluginReleaseClaimsTracked($op, $plugin, $packages, $stream, $fppTask)
+{
+	if (empty($packages)) {
+		return null;
+	}
+	// packages.inc.php echoes progress; only into a stream, never a JSON body.
+	PackagesSetStreaming(PluginStreaming($stream), $plugin);
+	list(, $changes) = PluginTrackPackages($op, $plugin, $plugin, true, function () use ($packages, $plugin) {
+		ReleasePackageClaims($packages, $plugin);
+	}, $stream, $fppTask);
+	return $changes;
+}
+
+// Runs $run inside a package snapshot when $track is true (nothing to
+// bracket otherwise, so it costs nothing), and prints any change worth a line
+// (tagged $logName in the plugin manager log). $fppTask names FPP's own work
+// for the plugin; null means $run is its script. Returns array($run's result, the
+// changes or null).
+function PluginTrackPackages($op, $plugin, $logName, $track, $run, $stream, $fppTask = null)
+{
+	$before = $track ? PluginPackageSnapshot() : null;
+	$result = $run();
+	$changes = PluginPackageChanges($before);
+	if ($track && $before === null && AptAvailable()) {
+		$changes = array('unknown' => true); // the "before" list can't be read
+	}
+	$text = $changes ? PluginPackageChangesText($op, $plugin, $changes, $fppTask) : '';
+	if ($text !== '') {
+		PluginEchoLog($op, $logName, "\n" . $text . "\n", $stream);
+	}
+	return array($result, $changes);
+}
+
+// How long GetPluginSource() will wait inline for a plugin list it does not
+// have. The health check gives the whole endpoint 3s, so this has to leave room
+// for everything else; anything slower is left to the detached warm below.
+define('PLUGIN_LIST_QUICK_TIMEOUT', 1.5);
+
+/**
+ * One short attempt to fetch the plugin list inline, for a caller that needs it
+ * now but must not stall. On success the list is written to its cache (via a
+ * temp file and rename, so a reader never sees it half-written) and true is
+ * returned. On failure a detached warm is left running and false is returned.
+ *
+ * Deliberately NOT routed through file_cache(): that takes a BLOCKING lock
+ * while it recomputes, so concurrent cold callers would queue and each pay the
+ * full timeout in turn -- five health checks at once became 1.5s, 3s, 4.5s...
+ * The non-blocking lock here means one caller does the work and every other
+ * returns instantly, which is the behaviour a latency-sensitive path needs.
+ */
+function PluginTryQuickListFetch()
+{
+	$cache = PluginListCacheFile();
+	$fd = @fopen($cache . '.trylock', 'c');
+	if ($fd === false) {
+		return false;
+	}
+	if (!flock($fd, LOCK_EX | LOCK_NB)) {
+		// Another request is already fetching. Don't queue behind it.
+		fclose($fd);
+		return false;
+	}
+
+	$ok = false;
+	$data = PluginBoundedFetch($GLOBALS['PLUGIN_LIST_URL'], PLUGIN_LIST_QUICK_TIMEOUT);
+	if ($data !== null && strpos($data, '"pluginList"') !== false) {
+		$tmp = $cache . '.quick';
+		if (@file_put_contents($tmp, $data) !== false) {
+			$ok = @rename($tmp, $cache);
+		}
+		@unlink($tmp);
+	}
+
+	flock($fd, LOCK_UN);
+	fclose($fd);
+
+	if (!$ok) {
+		PluginWarmListDetached();
+	}
+	return $ok;
+}
+
+/**
+ * Fetches the plugin list into its cache in a detached background process, so
+ * the NEXT caller has it. Returns immediately; the result is never waited on.
+ *
+ * flock -n means a warm already in flight wins and repeat health checks don't
+ * stack processes. curl -f keeps an error page out of the cache, and the
+ * download lands on a temp file that is moved into place, so a reader can never
+ * see a half-written list.
+ */
+function PluginWarmListDetached()
+{
+	$cache = PluginListCacheFile();
+	$inner = 'curl -sf --max-time 20 ' . escapeshellarg($GLOBALS['PLUGIN_LIST_URL'])
+		. ' -o ' . escapeshellarg($cache . '.warm')
+		. ' && mv -f ' . escapeshellarg($cache . '.warm') . ' ' . escapeshellarg($cache);
+
+	if (is_executable('/bin/flock') || is_executable('/usr/bin/flock')) {
+		$cmd = 'flock -n ' . escapeshellarg($cache . '.warmlock') . ' -c ' . escapeshellarg($inner);
+	} else {
+		$cmd = $inner;
+	}
+	exec($cmd . ' > /dev/null 2>&1 &');
+}
+
+/**
+ * Resolves any repos parked by an install that happened while the plugin list
+ * was unreachable, using it ONLY if already cached -- this runs on
+ * the health check path, which must never block on the network.
+ *
+ * A pending repo that turns out to be listed is dropped; one that isn't is
+ * promoted to the certain flag. With no cached list nothing changes, so
+ * this can only ever add information, never invent it.
+ */
+function ResolveUnverifiedPlugins()
+{
+	$pending = GetUnverifiedPluginRepos();
+	if (empty($pending)) {
+		return;
+	}
+	// No current list, and a plugin is waiting on an answer. Try briefly --
+	// if the list is a fast fetch away, settle it right now. If not, leave a
+	// detached fetch behind rather than making the health check wait, and the
+	// next run settles it. This is the only path that fetches here, and it
+	// only runs while something is pending. A stale copy is refreshed too: it
+	// can clear a pending plugin but never convict one, so without this an
+	// unlisted plugin (one still installed across an FPPOS upgrade, say) would
+	// wait for someone to open the Plugins page. Done before the list is
+	// loaded, as GetPluginList() keeps the first copy it reads.
+	if (!PluginListIsCurrent()) {
+		PluginTryQuickListFetch();
+	}
+	// Judged before loading: a detached refresh landing in between leaves
+	// this saying stale, which only defers a conviction.
+	$current = PluginListIsCurrent();
+	// Cache-only: primes GetPluginList()'s static, so the
+	// PluginSrcURLIsListed() calls below reuse it without a fetch.
+	if (empty(GetPluginList(true))) {
+		return;
+	}
+
+	// A stale list can clear a pending plugin (being present on it is
+	// trustworthy) but must not promote one to a finding, since absence from
+	// an out-of-date list proves nothing. Anything we still can't settle
+	// stays pending for a later run.
+	// The health check and its SSE twin can both get here at once: one
+	// settles the list, the other leaves it, so no answer is recorded twice.
+	$lock = PluginUnverifiedLock(false);
+	if ($lock === false) {
+		return;
+	}
+	$pending = GetUnverifiedPluginRepos(); // again, now that it is ours
+
+	$stillPending = array();
+	// Each answer also goes into the install history, which recorded the
+	// install as 'unverified'.
+	foreach ($pending as $p) {
+		if (PluginSrcURLIsListed($p['srcURL'])) {
+			AppendPluginHistory($p['repoName'], 'verified', array('source' => 'listed'));
+			continue;
+		}
+		if ($current) {
+			RecordPluginUnknown($p['repoName'], $p['srcURL']);
+			AppendPluginHistory($p['repoName'], 'verified', array('source' => 'unknown', 'srcURL' => PluginHistoryURL($p['srcURL'])));
+			continue;
+		}
+		$stillPending[] = $p;
+	}
+	SetUnverifiedPluginRepos($stillPending);
+	PluginUnverifiedUnlock($lock);
+}
+
+/**
+ * Get plugin source status
+ *
+ * Reports whether a plugin from outside the curated plugin list has ever been
+ * installed on this system, at one of two confidence levels:
+ *
+ *   "unknown"    -- it definitely has. "plugins" names the ones that did, and
+ *                   whether each is still installed; it is empty when the
+ *                   record predates FPP keeping the names.
+ *   "unverified" -- one may have been: something was installed while FPP could
+ *                   not reach the plugin list to check it, and the list still
+ *                   isn't cached, so the question is still open.
+ *   "none"       -- nothing to report.
+ *
+ * Answered entirely from settings plus an already-cached plugin list. No network
+ * call, no plugin-directory scan: this is on the health check's path and has
+ * to be instant even on a box with no internet.
+ *
+ * @route GET /api/plugin/source
+ * @response 200 Source level
+ * ```json
+ * {"level": "unknown", "plugins": [{"repoName": "fpp-example", "srcURL": "https://github.com/someone/fpp-example.git", "installed": false}]}
+ * ```
+ */
+function GetPluginSource()
+{
+	ResolveUnverifiedPlugins();
+
+	if (ReadSettingFromFile($GLOBALS['PLUGIN_UNKNOWN_SETTING']) == '1') {
+		global $settings;
+		$plugins = array();
+		foreach (GetPluginRepoRecords($GLOBALS['PLUGIN_UNKNOWN_REPOS_SETTING']) as $p) {
+			// Same allow-list installs enforce, before it goes near a path.
+			$name = $p['repoName'];
+			$plugins[] = array(
+				'repoName' => $name,
+				'srcURL' => $p['srcURL'],
+				'installed' => preg_match('/^[A-Za-z0-9_.-]+$/', $name) && $name !== '.' && $name !== '..'
+					&& is_dir($settings['pluginDirectory'] . '/' . $name),
+			);
+		}
+		return json(array('level' => 'unknown', 'plugins' => $plugins));
+	} else if (!empty(GetUnverifiedPluginRepos())) {
+		$level = 'unverified';
+	} else {
+		$level = 'none';
+	}
+
+	return json(array('level' => $level));
+}
+
+// Removes a partially-installed plugin directory (and any linkName symlink) so a
+// refused/failed install does not leave a half-installed plugin behind. The
+// privacy record is left alone: it is written only once an install has
+// passed its gates (InstallPluginFromInfo), so whatever is on file predates
+// this attempt and is still what the operator accepted.
+function CleanupPartialPluginInstall($plugin, $linkName = null)
+{
+	global $settings, $SUDO;
+	// linkName is the author's: only a plain file name, and only our own symlink.
+	if (is_string($linkName) && sanitizeFilename($linkName) === $linkName) {
+		$linkPath = $settings['pluginDirectory'] . '/' . $linkName;
+		if (is_link($linkPath) && readlink($linkPath) === $plugin) {
+			unlink($linkPath);
+		}
+	}
+	exec($SUDO . " rm -rf " . escapeshellarg($settings['pluginDirectory'] . '/' . $plugin));
+}
+
+// Refuse an install or upgrade on privacy grounds: the block the operator
+// would be landing is not the one they accepted (or none was shown for a
+// dependency). Logged under $op and echoed as a readable line; when
+// streaming an install, the block itself is then streamed on one marked line
+// (PLUGIN_PRIVACY_PENDING_MARK) so the Plugins page can open the review
+// dialog for it and post the install again with that block as accepted
+// ($marker; the upgrade stream carries no marker -- the page asks
+// GET …/privacy before an upgrade and its progress dialog would show the
+// line verbatim). The JSON (non-streaming) reply is the same shape for both
+// endpoints, built by PluginPrivacyRefusalReply() from
+// $GLOBALS['PLUGIN_PRIVACY_REFUSAL'].
+define('PLUGIN_PRIVACY_PENDING_MARK', '@@PRIVACY-PENDING@@');
+$GLOBALS['PLUGIN_PRIVACY_REFUSAL'] = null;
+// $reason is 'mismatch' (a block was accepted, and this is not it) or
+// 'notAccepted' (nothing was accepted for this plugin with the request or
+// before); it goes out as the reply's `reason`.
+function PluginPrivacyRefuse($repoName, $pending, $msg, $stream, $op = 'install', $marker = true, $reason = 'mismatch')
+{
+	PluginLog($op, $repoName, "refused: " . preg_replace('/\s+/', ' ', trim($msg)));
+	if ($GLOBALS['PLUGIN_PRIVACY_REFUSAL'] === null) {
+		$GLOBALS['PLUGIN_PRIVACY_REFUSAL'] = array('plugin' => $repoName, 'pending' => $pending, 'reason' => $reason);
+	}
+	if (PluginStreaming($stream)) {
+		echo "\nERROR: " . $msg . "\n";
+		if ($marker) {
+			echo PLUGIN_PRIVACY_PENDING_MARK . ' ' . json_encode(array('plugin' => $repoName, 'pending' => $pending), JSON_UNESCAPED_SLASHES) . "\n";
+		}
+		flush();
+	}
+}
+
+// The JSON reply for a refusal PluginPrivacyRefuse() recorded: one shape
+// for POST /plugin and POST /plugin/{RepoName}/upgrade (openapi.json). `plugin`
+// is the plugin (or dependency plugin) whose block must be reviewed, `pending`
+// that block (null = no disclosure); `Code` lets a script tell this refusal
+// from any other error without parsing `Message`, and `reason` says which kind
+// it is: 'notAccepted' (nothing accepted yet) or 'mismatch'. Either way the
+// operator reviews `pending` on the Plugins page; only that page posts it
+// back as accepted (POST /plugin docblock).
+function PluginPrivacyRefusalReply($msg)
+{
+	$ref = $GLOBALS['PLUGIN_PRIVACY_REFUSAL'];
+	return array(
+		'Status' => 'Error',
+		'Code' => 'PrivacyMismatch',
+		'reason' => is_array($ref) ? $ref['reason'] : 'mismatch',
+		'Message' => $msg,
+		'privacyChanged' => true,
+		'plugin' => is_array($ref) ? $ref['plugin'] : null,
+		'pending' => is_array($ref) ? $ref['pending'] : null,
+	);
+}
+
+// Installed plugin directory names (those with a pluginInfo.json).
+function InstalledPluginNames()
+{
+	global $settings;
+	$plugins = array();
+	$dir = $settings['pluginDirectory'];
+	if ($dh = opendir($dir)) {
+		while (($file = readdir($dh)) !== false) {
+			if (!in_array($file, array('.', '..')) && is_dir($dir . '/' . $file) && file_exists($dir . '/' . $file . '/pluginInfo.json')) {
+				$plugins[] = $file;
+			}
+		}
+		closedir($dh);
+	}
+	sort($plugins);
+	return $plugins;
+}
+
+// The post-FPPOS-upgrade flag doubles as the list of plugins still to be
+// reinstalled. Boot sets pluginReinstallNeededAfterOS to "1" (src/boot/
+// FPPINIT_Config.cpp); the first sync here turns that into the names of
+// every plugin installed at that moment, and each plugin drops off the list
+// as it is reinstalled or uninstalled ($done). When the list is empty the
+// setting is cleared, which is what fppd watches to drop its warning -- it
+// only ever tests the value for non-empty, so the list form changes nothing
+// there. A single Reinstall of one plugin therefore no longer clears the
+// warning while others are still stale.
+function PluginReinstallPendingSync($done = null)
+{
+	$v = trim((string) ReadSettingFromFile('pluginReinstallNeededAfterOS'));
+	if ($v === '') {
+		return;
+	}
+	$installed = InstalledPluginNames();
+	$pending = ($v === '1') ? $installed : array_filter(array_map('trim', explode(',', $v)));
+	$pending = array_values(array_filter($pending, function ($p) use ($installed, $done) {
+		return $p !== $done && in_array($p, $installed);
+	}));
+	$new = implode(',', $pending);
+	if ($new !== $v) {
+		WriteSettingToFile('pluginReinstallNeededAfterOS', $new);
+	}
+}
+
+/**
+ * Get all plugins
+ *
+ * Get list of installed plugins.
+ *
+ * @route GET /api/plugin
+ * @response 200 List of installed plugin names
+ * ```json
+ * ["fpp-brightness", "fpp-matrixtools", "fpp-vastfmt"]
+ * ```
+ */
+function GetInstalledPlugins()
+{
+	// Page load: seed or prune the post-FPPOS reinstall list (see above).
+	PluginReinstallPendingSync();
+	return json(InstalledPluginNames());
+}
+
+/**
+ * Install plugin
+ *
+ * Install a new plugin. The request body is a `pluginInfo.json` structure
+ * with `branch` and `sha` fields added to specify which branch and commit
+ * to install.
+ *
+ * The structure is NOT validated against a schema here, on purpose. FPP reads
+ * the keys it knows (repoName, srcURL, versions, dependencies, privacy, ...)
+ * and carries everything else through untouched, so a pluginInfo.json written
+ * for a newer FPP -- a key this release has never heard of, an unknown key
+ * inside `privacy` -- installs on this one. The Plugins page renders the
+ * parts it understands and ignores the rest (the full block is still shown
+ * as written). Strict validation lives in the fpp-data listing check
+ * (`.github/schema/pluginInfo.schema.json`), where a mistake is a rejected
+ * pull request rather than a plugin nobody can install. Keep it that way: any
+ * check added here must be on a key FPP acts on, never on the set of keys.
+ *
+ * `privacyAccepted` (optional, null allowed) is the privacy block the caller
+ * showed the operator, the same field `POST /plugin/{RepoName}/upgrade` takes.
+ * After the clone, before any dependency or the plugin's own install script,
+ * it is compared with the cloned copy's block (sends, collects, sensors,
+ * remoteAccess, systemChanges, closedCode): when they differ -- the listing is
+ * behind the repository, or the selected version pins an older commit -- the
+ * install is refused, the clone removed, and the reply carries
+ * `Code: "PrivacyMismatch"` and `pending` (the cloned block) so the Plugins
+ * page can show it and post again with it as `privacyAccepted`. A body
+ * without the field is compared with the block recorded for that plugin from an earlier
+ * install, if there is one (the record survives an uninstall), and refused
+ * the same way when they differ; with no record either, a plugin that
+ * declares a block is refused the same way (`pending` is the cloned block,
+ * for the operator to review), and only a plugin with no block installs.
+ * The block is recorded once the dependencies are in place, just before the
+ * plugin's own install script runs.
+ * `dependencyPrivacyAccepted` (optional) is a map repoName -> block or null
+ * for the dependency plugins the dialog also showed; each is gated and
+ * recorded the same way when that plugin is installed as a dependency of
+ * this one, and a dependency not in the map -- declared only in the cloned
+ * copy -- is refused before it is cloned (`pending` is then its listed
+ * block). Without the map, a dependency plugin that declares a block is
+ * refused the same way, and one with no block installs.
+ * A refusal's `reason` is `notAccepted` when nothing was accepted for that
+ * plugin and `mismatch` when the accepted block is not the one that would
+ * land.
+ *
+ * `privacyAccepted` and `dependencyPrivacyAccepted` record that a person saw
+ * and accepted the disclosure. Only the FPP Plugins page may send them, and
+ * only with a block it actually displayed. Scripts and other API clients must
+ * not send them -- not even by echoing `pending` back from a refusal: on
+ * `Code: "PrivacyMismatch"` they stop and send the operator to the Plugins
+ * page. The server cannot tell callers apart, so this is a rule for clients,
+ * not something it enforces.
+ *
+ * @route POST /api/plugin
+ * @body {"repoName": "fpp-matrixtools", "name": "MatrixTools", "author": "Chris Pinkham (CaptainMurdoch)", "srcURL": "https://github.com/cpinkham/fpp-matrixtools.git", "branch": "master", "sha": ""}
+ * @response 200 Plugin installed
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ * Refused on privacy grounds:
+ * ```json
+ * {"Status": "Error", "Code": "PrivacyMismatch", "reason": "mismatch", "Message": "…", "privacyChanged": true, "plugin": "fpp-matrixtools", "pending": {"sends": [], "remoteAccess": "none"}}
+ * ```
+ */
 function InstallPlugin()
 {
-	global $settings, $fppDir, $SUDO;
-	$result = Array();
+	global $settings, $_REQUEST;
+	// Finish once started, even if the browser goes away: a closed tab must not
+	// stop PHP at the next echo between the scripts and the bookkeeping after
+	// them (install history, plugin source, privacy record).
+	ignore_user_abort(true);
+	$result = array();
 
-	$pluginInfo = $GLOBALS['_POST'];
-
-	$plugin = $pluginInfo['repoName'];
-	$srcURL = $pluginInfo['srcURL'];
-	$branch = $pluginInfo['branch'];
-	$sha = $pluginInfo['sha'];
-	$infoURL = $pluginInfo['infoURL'];
-
-	if (!file_exists($settings['pluginDirectory'] . '/' . $plugin))
-	{
-		exec("export SUDO=\"" . $SUDO . "\"; export PLUGINDIR=\"" . $settings['pluginDirectory'] . "\"; $fppDir/scripts/install_plugin $plugin \"$srcURL\" \"$branch\" \"$sha\"", $output, $return_val);
-		unset($output);
-
-		if ($return_val == 0)
-		{
-			$infoFile = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
-			if (!file_exists($infoFile))
-			{
-				// no pluginInfo.json in repository, install the one we
-				// installed the plugin from
-				$info = file_get_contents($infoURL);
-				file_put_contents($infoFile, $info);
-			}
-
-			$result['Status'] = 'OK';
-			$result['Message'] = '';
-		}
-		else
-		{
-			$result['Status'] = 'Error';
-			$result['Message'] = 'Could not properly install plugin';
-		}
+	$pluginInfoJSON = "";
+	$postdata = fopen("php://input", "r");
+	while ($data = fread($postdata, 1024 * 16)) {
+		$pluginInfoJSON .= $data;
 	}
-	else
-	{
+	fclose($postdata);
+
+	$pluginInfo = json_decode($pluginInfoJSON, true);
+	if (!is_array($pluginInfo) || !isset($pluginInfo['repoName'])) {
+		$result['Status'] = 'Error';
+		$result['Message'] = 'Invalid pluginInfo (missing repoName)';
+		return json($result);
+	}
+
+	$stream = isset($_REQUEST['stream']) ? $_REQUEST['stream'] : null;
+	$streaming = PluginStreaming($stream);
+	// Strict allow-list for plugin repo name — prevents shell injection via repoName.
+	if (!preg_match('/^[A-Za-z0-9_.-]+$/', $pluginInfo['repoName'])) {
+		$result['Status'] = 'Error';
+		$result['Message'] = 'Invalid repoName';
+		return json($result);
+	}
+	$plugin = $pluginInfo['repoName'];
+
+	if (file_exists($settings['pluginDirectory'] . '/' . $plugin)) {
+		// Already pulled in as a dependency earlier in a Reinstall All batch:
+		// record the block the operator accepted if it is what is on disk.
+		if (array_key_exists('privacyAccepted', $pluginInfo)) {
+			$installed = PluginPrivacyBlock(PluginInstalledInfo($plugin));
+			if (PluginPrivacyMaterial($pluginInfo['privacyAccepted']) === PluginPrivacyMaterial($installed)) {
+				RecordPluginPrivacyAccepted($plugin, $installed, PluginInstalledSha($plugin));
+			}
+		}
+		if ($streaming) {
+			DisableOutputBuffering();
+			echo "The (" . $plugin . ") plugin is already installed\n";
+			return "\nDone\n";
+		}
 		$result['Status'] = 'Error';
 		$result['Message'] = 'The (' . $plugin . ') plugin is already installed';
+		return json($result);
 	}
 
+	if ($streaming) {
+		DisableOutputBuffering();
+	}
+
+	// $visited guards against dependency cycles (A depends on B depends on A)
+	// across the recursive install below.
+	$visited = array();
+	// The blocks the install dialog showed for the dependency plugins this
+	// install pulls in (repoName -> block or null), handed down to each one's
+	// own InstallPluginFromInfo through ResolveDependencyPlugins. null when
+	// the request did not carry the field (a script, an old page), which
+	// counts as none shown: a dependency the dialog did not show is refused
+	// unless it declares no block (ResolveDependencyPlugins).
+	$depShown = (isset($pluginInfo['dependencyPrivacyAccepted']) && is_array($pluginInfo['dependencyPrivacyAccepted']))
+		? $pluginInfo['dependencyPrivacyAccepted'] : null;
+	$ok = InstallPluginFromInfo($pluginInfo, $visited, $stream, 0, $depShown);
+
+	if ($streaming) {
+		return "\nDone\n";
+	}
+	$result['Status'] = $ok ? 'OK' : 'Error';
+	$result['Message'] = $ok ? '' : 'Could not properly install plugin';
+	// Refused on privacy grounds (PluginPrivacyRefuse): say which plugin and
+	// hand back the block to review, as POST …/upgrade does.
+	if (!$ok && is_array($GLOBALS['PLUGIN_PRIVACY_REFUSAL'])) {
+		$result = PluginPrivacyRefusalReply(($GLOBALS['PLUGIN_PRIVACY_REFUSAL']['plugin'] === $plugin)
+			? (($GLOBALS['PLUGIN_PRIVACY_REFUSAL']['reason'] === 'notAccepted')
+				? "The privacy disclosure of '$plugin' was not accepted with this request. Review it on the Plugins page and install again."
+				: "The privacy disclosure of '$plugin' is not the one that was accepted. Review it on the Plugins page and install again.")
+			: "'$plugin' depends on '" . $GLOBALS['PLUGIN_PRIVACY_REFUSAL']['plugin'] . "', whose privacy disclosure was not accepted. Review it on the Plugins page and install again.");
+	}
 	return json($result);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// GET /api/plugin/:RepoName
+/**
+ * Installs a single plugin from a decoded pluginInfo structure, resolving its
+ * declared dependencies (packages, scripts, plugins) BEFORE running the
+ * plugin's own fpp_install.sh. Recurses into dependency plugins with a shared
+ * $visited set (cycle guard) and a depth cap. Output is streamed to the client
+ * when $stream is truthy. Returns true on success.
+ */
+function InstallPluginFromInfo($pluginInfo, &$visited, $stream, $depth = 0, $depShown = null)
+{
+	global $settings, $fppDir, $SUDO;
+
+	$streaming = PluginStreaming($stream);
+
+	if (!is_array($pluginInfo) || !isset($pluginInfo['repoName'])) {
+		// No repoName to tag the log line with -- that IS the error.
+		PluginEchoLog('install', 'unknown', "\nERROR: dependency plugin info missing repoName\n", $stream);
+		return false;
+	}
+	$repoName = $pluginInfo['repoName'];
+	$plugin = escapeshellcmd($repoName);
+
+	// Cycle guard.
+	if (isset($visited[$repoName])) {
+		return true;
+	}
+	$visited[$repoName] = true;
+	// For the history: 'at' is when it finished; this is when it started, to
+	// line the entry up with apt's own log.
+	$startedAt = date('c');
+
+	if ($depth > 8) {
+		PluginEchoLog('install', $repoName, "\nERROR: plugin dependency chain too deep at '$repoName'; aborting.\n", $stream);
+		return false;
+	}
+
+	// Already installed -> dependency is satisfied.
+	if (file_exists($settings['pluginDirectory'] . '/' . $plugin)) {
+		if ($depth > 0 && $streaming) {
+			echo "\nDependency plugin '$plugin' is already installed.\n";
+		}
+		return true;
+	}
+
+	// Dependencies can be declared top-level (applies to every version) and/or
+	// on the specific versions[] entry that matches this system (additional to
+	// the top-level ones -- e.g. a package whose name differs between the FPP9
+	// and FPP10 image). Merge them once, up front.
+	$declaredDeps0 = MergePluginDependencies(
+		isset($pluginInfo['dependencies']) ? $pluginInfo['dependencies'] : null,
+		SelectPluginVersionEntry($pluginInfo)
+	);
+
+	// Refuse up front if the plugin declares required apt packages but this
+	// platform has no apt -- installing it would leave it broken. A plugin that
+	// genuinely needs packages should restrict itself with platforms[]; if the
+	// author forgot, we catch it here rather than half-installing. (Re-checked
+	// after clone against the repo's own pluginInfo.json, which is authoritative.)
+	if (DepsRequirePackages($declaredDeps0) && !AptAvailable()) {
+		$pkgs = implode(', ', $declaredDeps0['packages']);
+		$plat = isset($settings['Platform']) ? $settings['Platform'] : 'this platform';
+		PluginEchoLog('install', $repoName, "\nERROR: '$repoName' requires system packages ($pkgs) but $plat does not support system packages. Refusing to install.\n", $stream);
+		return false;
+	}
+
+	// Same idea for Python package dependencies: refuse up front rather than
+	// half-install if 'pip' isn't available. FPP's own OS image provisions
+	// python3-pip via apt (SD/FPP_Install.sh) specifically for this, so its
+	// absence means a non-standard/unprovisioned system, not a normal
+	// per-platform gap.
+	if (DepsRequirePython($declaredDeps0) && !PipAvailable()) {
+		PluginEchoLog('install', $repoName, "\nERROR: '$repoName' requires Python package dependencies but 'pip' is not available on this system. Refusing to install.\n", $stream);
+		return false;
+	}
+
+	$srcURL = isset($pluginInfo['srcURL']) ? $pluginInfo['srcURL'] : '';
+	// Captured before InjectGitHubCredentials() below rewrites $srcURL with an
+	// embedded user:token@ -- IsOfficialPluginSrcURL()'s host/path parse
+	// doesn't need credentials and it's one less thing carrying a PAT around.
+	$origSrcURL = $srcURL;
+	$branchRaw = isset($pluginInfo['branch']) && $pluginInfo['branch'] !== '' ? $pluginInfo['branch'] : 'master';
+	if (!preg_match('/^[A-Za-z0-9_.\/-]+$/', $branchRaw) || strpos($branchRaw, '..') !== false) {
+		PluginEchoLog('install', $repoName, "\nERROR: Invalid branch name.\n", $stream);
+		return false;
+	}
+	$branch = $branchRaw;
+	$sha = isset($pluginInfo['sha']) ? $pluginInfo['sha'] : '';
+	if ($sha !== '' && !preg_match('/^[a-fA-F0-9]{4,40}$/', $sha)) {
+		PluginEchoLog('install', $repoName, "\nERROR: Invalid SHA.\n", $stream);
+		return false;
+	}
+	$infoURL = isset($pluginInfo['infoURL']) ? $pluginInfo['infoURL'] : '';
+	$useCredentials = isset($pluginInfo['useCredentials']) && $pluginInfo['useCredentials'];
+
+	// Inject GitHub credentials for github URLs when configured. Only modifies
+	// github.com / raw.githubusercontent.com URLs so creds never leak elsewhere.
+	$injectedURL = InjectGitHubCredentials($srcURL);
+	if ($injectedURL !== false) {
+		$srcURL = $injectedURL;
+	} else if ($useCredentials) {
+		PluginEchoLog('install', $repoName, "\nERROR: Use Credentials was selected but GitHub user name and/or Personal Access Token are not configured on the Developer settings page.\n", $stream);
+		return false;
+	}
+
+	// Clone ONLY -- the plugin's own fpp_install.sh is deferred (via
+	// FPP_SKIP_INSTALL_SCRIPT) so dependencies can be resolved first.
+	$return_val = 0;
+	$envPrefix = "export FPP_SKIP_INSTALL_SCRIPT=1; export SUDO=\"" . $SUDO . "\"; export PLUGINDIR=\"" . $settings['pluginDirectory'] . "\"; ";
+	// Use escapeshellarg for each arg so spaces/semicolons cannot split into extra commands.
+	if ($srcURL !== '' && filter_var($srcURL, FILTER_VALIDATE_URL) === false) {
+		PluginEchoLog('install', $repoName, "\nERROR: Invalid srcURL.\n", $stream);
+		return false;
+	}
+	$cloneCmd = $envPrefix . escapeshellarg($fppDir . "/scripts/install_plugin") . " " . escapeshellarg($plugin) . " " . escapeshellarg($srcURL) . " " . escapeshellarg($branch) . " " . escapeshellarg($sha);
+	if ($streaming) {
+		system($cloneCmd, $return_val);
+	} else {
+		exec($cloneCmd, $o, $return_val);
+		unset($o);
+	}
+	if ($return_val != 0) {
+		PluginEchoLog('install', $repoName, "\nERROR: failed to clone plugin '$plugin'.\n", $stream);
+		return false;
+	}
+
+	// Determine the authoritative pluginInfo: the repo's own pluginInfo.json if
+	// it ships one, otherwise the one fetched from infoURL. Defer writing the
+	// fetched copy / creating the linkName symlink until after the package gate
+	// so a refusal leaves nothing behind.
+	$infoFile = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
+	$fetchedInfo = null;
+	$data = null;
+	if (file_exists($infoFile)) {
+		$data = json_decode(file_get_contents($infoFile), true);
+	} else if ($infoURL !== '') {
+		$fetchedInfo = FetchURLWithGitHubCredentials($infoURL);
+		$data = json_decode($fetchedInfo, true);
+	}
+	if (!is_array($data)) {
+		$data = $pluginInfo;
+	}
+	// Authoritative dependency set: the cloned repo's own pluginInfo.json may
+	// declare deps the posted info did not, and this also re-selects the
+	// versions[] entry against the AUTHORITATIVE data (not the posted body),
+	// merging in that entry's own 'dependencies' block per MergePluginDependencies().
+	$deps = MergePluginDependencies(
+		isset($data['dependencies']) ? $data['dependencies'] : null,
+		SelectPluginVersionEntry($data)
+	);
+
+	// Authoritative package gate: the cloned repo's own pluginInfo.json may
+	// declare packages the posted info did not. Same rule -- refuse on a
+	// platform without apt, and remove the partial clone.
+	if (DepsRequirePackages($deps) && !AptAvailable()) {
+		$pkgs = implode(', ', $deps['packages']);
+		$plat = isset($settings['Platform']) ? $settings['Platform'] : 'this platform';
+		// Logged, not just echoed: the clone above already wrote its own
+		// "install FINISH (rc=0)" block, so without this the log would show a
+		// clean install for a plugin this line is about to delete.
+		PluginEchoLog('install', $repoName, "\nERROR: '$repoName' requires system packages ($pkgs) but $plat does not support system packages. Refusing to install.\nRemoving the partial install of '$plugin'.\n", $stream);
+		CleanupPartialPluginInstall($plugin);
+		return false;
+	}
+
+	// Authoritative Python-dependency gate, same reasoning as the package gate above.
+	if (DepsRequirePython($deps) && !PipAvailable()) {
+		PluginEchoLog('install', $repoName, "\nERROR: '$repoName' requires Python package dependencies but 'pip' is not available on this system. Refusing to install.\nRemoving the partial install of '$plugin'.\n", $stream);
+		CleanupPartialPluginInstall($plugin);
+		return false;
+	}
+
+	// Privacy gate, before dependencies and the install script: what the
+	// cloned copy declares must be what the operator accepted -- the block
+	// the request carries (the dialog just showed it), else the block on
+	// record from an earlier install of this plugin (a reinstall from a
+	// script or an old page). Anything else is refused, the clone removed,
+	// and the cloned block handed back for review (PluginPrivacyRefuse).
+	// A request with neither -- a fresh install from a script -- is refused
+	// the same way when the plugin declares anything: the reply carries the
+	// block for the Plugins page to show. Only the Plugins page posts
+	// privacyAccepted (POST /plugin docblock); a script sends the operator
+	// there. Only a plugin with no block at all installs without one. The record itself is written once the
+	// dependencies are in, just before the install script.
+	$installedBlock = PluginPrivacyBlock($data);
+	$accepted = false;
+	$acceptedFrom = '';
+	if (array_key_exists('privacyAccepted', $pluginInfo)) {
+		$accepted = $pluginInfo['privacyAccepted'];
+		$acceptedFrom = 'the Plugins page showed';
+	} else {
+		$record = ReadPluginPrivacyAccepted();
+		if (isset($record[$repoName]) && array_key_exists('privacy', $record[$repoName])) {
+			$accepted = $record[$repoName]['privacy'];
+			$acceptedFrom = 'was accepted when it was installed before';
+		}
+	}
+	$recordBlock = ($acceptedFrom !== '');
+	if (!$recordBlock && $installedBlock !== null) {
+		PluginPrivacyRefuse($repoName, $installedBlock,
+			"the privacy disclosure of '$plugin' was not accepted with this request. Not installed: review it on the Plugins page and install again.\nRemoving the partial install of '$plugin'.", $stream, 'install', true, 'notAccepted');
+		CleanupPartialPluginInstall($plugin);
+		return false;
+	}
+	if ($recordBlock && PluginPrivacyMaterial($accepted) !== PluginPrivacyMaterial($installedBlock)) {
+		PluginPrivacyRefuse($repoName, $installedBlock,
+			"the privacy disclosure in this version of '$plugin' is not the one that $acceptedFrom (the listing may be behind the repository, or this version is pinned). Not installed: review it on the Plugins page and install again.\nRemoving the partial install of '$plugin'.", $stream);
+		CleanupPartialPluginInstall($plugin);
+		return false;
+	}
+
+	// Install is going ahead: commit the fetched pluginInfo.json + linkName.
+	$linkName = null;
+	if ($fetchedInfo !== null) {
+		file_put_contents($infoFile, $fetchedInfo);
+		if (isset($data['linkName'])) {
+			$linkName = $data['linkName'];
+			// Only a plain file name, never over an existing file.
+			if (!is_string($linkName) || sanitizeFilename($linkName) !== $linkName) {
+				PluginEchoLog('install', $repoName, "\nIgnoring linkName '" . (is_string($linkName) ? $linkName : '') . "': not a plain file name.\n", $stream);
+			} else {
+				$linkPath = $settings['pluginDirectory'] . '/' . $linkName;
+				if (!file_exists($linkPath) && !is_link($linkPath)) {
+					symlink($plugin, $linkPath);
+				}
+			}
+		}
+	}
+
+	// Resolve declared dependencies BEFORE the plugin's own install script. If a
+	// required dependency cannot be installed, refuse and clean up rather than
+	// run the plugin's install script against missing prerequisites.
+	// FPP's own package work for it is recorded as 'fppPackages': the local
+	// dependencies (apt, pip, scripts) in one window, then the claim release
+	// below in another (on failure, the release of what this attempt
+	// claimed), with the dependency plugins between them outside both (each
+	// records its own entry).
+	//
+	// Its history entry, for both outcomes below, so the two can't drift.
+	$historyEntry = function ($fields, $fppPkgChanges) use ($startedAt, $branch, $plugin, $depth) {
+		$entry = array_merge(array('startedAt' => $startedAt), $fields,
+			array('branch' => $branch, 'sha' => PluginInstalledSha($plugin)));
+		if ($depth > 0) {
+			$entry['dependency'] = true;
+		}
+		if ($fppPkgChanges) {
+			$entry['fppPackages'] = $fppPkgChanges;
+		}
+		return $entry;
+	};
+	$fppPkgChanges = null;
+	$depsOk = true;
+	$claimedBefore = PackagesClaimedBy($repoName); // a Reinstall that kept its packages holds some
+	if ($deps !== null) {
+		list($depsOk, $fppPkgChanges) = PluginTrackPackages('install', $repoName, $repoName, DepsMayChangePackages($deps), function () use ($deps, $repoName, $stream) {
+			return ResolveLocalDependencies($deps, $repoName, $stream, 'install');
+		}, $stream, "installing $repoName's declared dependencies");
+		// Even after a failure above: the install is refused either way.
+		$depsOk = ResolveDependencyPlugins($deps, $repoName, $visited, $stream, $depth, $depShown, 'install') && $depsOk;
+	}
+	if (!$depsOk) {
+		// Same trap as the package gate above: the clone's own rc=0 block is
+		// already in the log, and the cleanup below removes the plugin. Say so.
+		PluginEchoLog('install', $repoName, "\nERROR: refusing to complete install of '$plugin' -- a required dependency could not be installed.\nRemoving the partial install of '$plugin'.\n", $stream);
+		// What this attempt claimed comes out with it: the plugin is not
+		// staying. Claims it held before (a Reinstall that kept its packages)
+		// stay: a failure is often transient (no network), and a retry would
+		// have to download them again.
+		$released = PluginReleaseClaimsTracked('install', $repoName, array_values(array_diff(PackagesClaimedBy($repoName), $claimedBefore)),
+			$stream, "releasing what $repoName's dependencies installed");
+		// The only failure recorded: the others come before anything is
+		// installed. srcURL even for a listed plugin: it records what was tried.
+		AppendPluginHistory($repoName, 'install', $historyEntry(array('failed' => 'dependencies',
+			'srcURL' => PluginHistoryURL($origSrcURL)), PluginPackageChangesMerge($fppPkgChanges, $released)));
+		CleanupPartialPluginInstall($plugin, $linkName);
+		return false;
+	}
+
+	// A reinstall that kept its packages (keepPackages=1 on the uninstall
+	// half) still holds claims from the previous version; release the ones
+	// this version no longer declares. A fresh install has none, so no
+	// snapshot either.
+	$released = ReleaseUndeclaredPackageClaims($repoName, UndeclaredPackageClaims($repoName, DeclaredPackages($deps)), 'install', $stream);
+	$fppPkgChanges = PluginPackageChangesMerge($fppPkgChanges, $released);
+
+	// The code that is about to run is on disk and is what was accepted (the
+	// gate above), its dependencies are in place: record it now, from the
+	// installed copy, before a script that can take minutes -- the plugin is
+	// installed whether or not that script succeeds, and a browser that
+	// gives up waiting must not leave an accepted install unrecorded.
+	if ($recordBlock) {
+		RecordPluginPrivacyAccepted($repoName, $installedBlock, PluginInstalledSha($plugin));
+	}
+
+	// Finally, run the plugin's own install script. It was deferred above (via
+	// FPP_SKIP_INSTALL_SCRIPT) so dependencies are in place first; hand it back to
+	// install_plugin now that they are. That wrapper owns the mode normalization,
+	// the scripts/ -> repo-root resolution and the FPPDIR/SRCDIR invocation, so
+	// this phase runs identically to a non-deferred install -- and, because it goes
+	// through startPluginLog, its output lands in logs/fpp_plugin_manager.log instead of only
+	// streaming to the browser dialog (a plugin script can build/fetch for minutes).
+	$runCmd = $envPrefix . escapeshellarg($fppDir . '/scripts/install_plugin')
+		. ' --run-install-script ' . escapeshellarg($plugin);
+	list(, $pkgChanges) = PluginTrackPackages('install', $plugin, $repoName, PluginHasOwnScript($plugin, array('fpp_install.sh')), function () use ($streaming, $runCmd, &$return_val) {
+		if ($streaming) {
+			system($runCmd, $return_val);
+		} else {
+			exec($runCmd, $o, $return_val);
+		}
+	}, $stream);
+
+	// The only statement that the operation as a whole succeeded -- the wrapper
+	// scripts only ever report on their own phase.
+	if ($return_val != 0) {
+		PluginEchoLog('install', $repoName, "\nInstalled plugin '$plugin', but its install script failed (rc=$return_val); see logs/fpp_plugin_manager.log.\n", $stream);
+	} else {
+		PluginEchoLog('install', $repoName, "\nInstalled plugin '$plugin'.\n", $stream);
+	}
+	// Now that the plugin's install script has built or fetched whatever it
+	// needs, ask fppd to pick it up. Dependency plugins come through here too,
+	// so each is loaded as it finishes.
+	$loaded = FPPDPluginLifecycle($plugin, 'load');
+	if (!$loaded['ok']) {
+		PluginEchoLog('install', $repoName, "Installed, but FPPD did not load it (" . $loaded['message'] . "). Restart FPPD to enable it.\n", $stream);
+	}
+	// Dependency plugins are resolved from the plugin list into a fresh
+	// $depInfo (see ResolveDependencyPlugins()) and recorded through this same
+	// call, so each one is judged on where it actually came from rather than
+	// inheriting anything from the plugin that pulled it in.
+	$source = RecordPluginInstallSource($repoName, $origSrcURL);
+	$entry = $historyEntry(array('source' => $source), $fppPkgChanges);
+	if ($source !== 'official' && $source !== 'listed') {
+		$entry['srcURL'] = PluginHistoryURL($origSrcURL);
+	}
+	if ($return_val != 0) {
+		$entry['scriptFailed'] = true;
+	}
+	if ($pkgChanges) {
+		$entry['packages'] = $pkgChanges;
+	}
+	AppendPluginHistory($repoName, 'install', $entry);
+
+	// install_plugin may reset to a pinned sha: ask rather than assume up to
+	// date. Git only: the plugin's own update-check script (networked, up to
+	// two minutes) has no place inside an install stream; the sweep runs it.
+	list($u, $e) = PluginGitUpdateVerdict($repoName);
+	PluginUpdateStateSet($repoName, $u, $e, 'install');
+
+	// Freshly built on this OS: no longer waiting for a post-FPPOS reinstall.
+	PluginReinstallPendingSync($repoName);
+	return true;
+}
+
+/**
+ * Resolves the local part of a plugin's dependencies block: system packages
+ * (apt, ref-counted to the owning plugin), Python packages (pip, system-wide
+ * -- not isolated per plugin) and script-repository scripts
+ * ("Category/file"), in that order. Dependency plugins are
+ * ResolveDependencyPlugins(), run after this, so a caller can bracket FPP's
+ * own package work apart from their installs, which record their own.
+ * Returns false if a *required* dependency (a declared package or Python
+ * package) could not be installed, so the caller can refuse the whole
+ * install; script-repository entries are treated as soft.
+ */
+function ResolveLocalDependencies($deps, $ownerRepo, $stream, $op = 'install')
+{
+	global $fppDir, $SUDO;
+	$streaming = PluginStreaming($stream);
+	$ok = true;
+
+	// --- packages (apt) ---
+	if (isset($deps['packages']) && is_array($deps['packages']) && count($deps['packages'])) {
+		// packages.inc.php echoes progress; only into a stream, never a JSON body.
+		PackagesSetStreaming($streaming, $ownerRepo);
+		PluginEchoLog($op, $ownerRepo, "\n=== " . ($op === 'upgrade' ? 'Checking' : 'Installing') . " package dependencies for $ownerRepo ===\n", $stream);
+		// Refresh package lists once for the whole batch -- but only if
+		// something actually needs installing. An upgrade or reinstall of a
+		// plugin whose packages are all present would otherwise pay for an
+		// 'apt-get update' (and its retries) for nothing.
+		$missing = false;
+		foreach ($deps['packages'] as $pkg) {
+			if (ValidPackageName($pkg) && !PackageIsInstalled($pkg)) {
+				$missing = true;
+				break;
+			}
+		}
+		if ($missing) {
+			AptGetUpdate();
+		}
+		foreach ($deps['packages'] as $pkg) {
+			if (is_string($pkg) && $pkg !== '') {
+				if (!InstallSystemPackage($pkg, $ownerRepo, false)) {
+					// Name the package that failed. InstallSystemPackage echoes the
+					// apt transcript (and its own error) straight to the caller, so
+					// without this the log would record only the downstream
+					// "a required dependency could not be installed" refusal --
+					// naming the symptom but never the cause. Logged rather than
+					// echoed: the caller already saw the apt output above.
+					PluginLog($op, $ownerRepo, "ERROR: failed to install required package '$pkg' (apt output above)");
+					$ok = false;
+				}
+			}
+		}
+	}
+
+	// --- python packages (pip, system-wide) ---
+	if (isset($deps['python']) && is_array($deps['python']) && count($deps['python'])) {
+		$pyPkgs = array();
+		foreach ($deps['python'] as $pkg) {
+			if (is_string($pkg) && $pkg !== '') {
+				$pyPkgs[] = $pkg;
+			}
+		}
+		if (count($pyPkgs)) {
+			if ($streaming) {
+				echo "\n=== Installing Python package dependencies for $ownerRepo (pip) ===\n";
+				flush();
+			}
+			$args = implode(' ', array_map('escapeshellarg', $pyPkgs));
+			// `pip install --break-system-packages` is required on any current
+			// PEP-668-managed image (Debian/RPi OS Bookworm+) -- without it pip refuses
+			// outright ("externally managed environment"). This is safe here, not a
+			// corruption risk: it installs into /usr/local/lib/python3.x/dist-packages,
+			// which is NOT tracked by dpkg (apt-installed python3-* packages live in
+			// /usr/lib/python3/dist-packages instead) -- confirmed by inspecting both
+			// paths directly. No per-plugin venv/pyproject.toml to create or chown --
+			// plugin scripts just call the system "python3" (see PLUGIN_GUIDELINES.md
+			// #6.1). Packages are shared system-wide, not isolated per plugin: a version
+			// conflict between two plugins' declared deps will surface as a real install
+			// failure here, not silently coexist. Note: a plugin needing a Python version
+			// other than FPP's system default (e.g. a dependency with no wheel for it) has
+			// no built-in FPP mechanism for that -- must be handled by the plugin itself.
+			// "--": a declared name can't be read as a pip option ("--index-url=...").
+			$cmd = $SUDO . " python3 -m pip install --break-system-packages -- " . $args;
+			$rc = 0;
+			if ($streaming) {
+				system($cmd, $rc);
+			} else {
+				exec($cmd, $o, $rc);
+				unset($o);
+			}
+			if ($rc !== 0) {
+				PluginLog($op, $ownerRepo, "ERROR: 'pip install --break-system-packages' failed for one or more Python package dependencies (exit $rc)");
+				$ok = false;
+			} else {
+				PluginLog($op, $ownerRepo, "Installed Python package dependencies: " . implode(', ', $pyPkgs));
+			}
+		}
+	}
+
+	// --- scripts (script repository "Category/file") ---
+	if (isset($deps['scripts']) && is_array($deps['scripts']) && count($deps['scripts'])) {
+		if ($streaming) {
+			echo "\n=== Installing script dependencies for $ownerRepo ===\n";
+			flush();
+		}
+		foreach ($deps['scripts'] as $entry) {
+			if (!is_string($entry) || strpos($entry, '/') === false) {
+				// A declared dependency silently not satisfied -- same class as the
+				// unresolvable-dependency-plugin case below, so log it too.
+				PluginEchoLog($op, $ownerRepo, "\nSkipping malformed script dependency '$entry' (expected 'Category/file').\n", $stream);
+				continue;
+			}
+			list($category, $file) = explode('/', $entry, 2);
+			// Each is one path component: installScript (run as root) builds
+			// both the download URL and the file it writes from them, and the
+			// old patterns let "..", and a "/" in the file, through.
+			$component = '#^[A-Za-z0-9_][A-Za-z0-9._ -]*$#';
+			if (!preg_match($component, $category) || !preg_match($component, $file) ||
+				strpos($category, '..') !== false || strpos($file, '..') !== false) {
+				PluginEchoLog($op, $ownerRepo, "\nSkipping script dependency with unsafe characters: '$entry'.\n", $stream);
+				continue;
+			}
+			if ($streaming) {
+				echo "\nInstalling script '$entry'...\n";
+				flush();
+			}
+			$cmd = $SUDO . " $fppDir/scripts/installScript " . escapeshellarg($category) . " " . escapeshellarg($file);
+			if ($streaming) {
+				system($cmd);
+			} else {
+				exec($cmd, $o);
+				unset($o);
+			}
+		}
+	}
+
+	return $ok;
+}
+
+// The dependency plugins of a dependencies block, installed transitively (each
+// through InstallPluginFromInfo(), which records its own history entry), after
+// ResolveLocalDependencies(). Returns false if one could not be installed.
+// $depShown: repoName -> the privacy block the install dialog showed for that
+// dependency (or null), from the top-level request; see InstallPlugin(). null
+// when the request carried no such map (a script, an old page), which counts
+// as an empty one for any dependency that declares a block. A dependency
+// plugin that is not in the map was never shown -- the cloned copy declares a
+// dependency the listing's copy (what the dialog was built from) does not, a
+// different versions[] entry was selected, or the caller sent no map -- and is
+// refused before it is cloned, with its listed block as the one to review.
+function ResolveDependencyPlugins($deps, $ownerRepo, &$visited, $stream, $depth, $depShown = null, $op = 'install')
+{
+	global $settings;
+	$streaming = PluginStreaming($stream);
+	$ok = true;
+
+	// --- dependency plugins (transitive) ---
+	if (isset($deps['plugins']) && is_array($deps['plugins']) && count($deps['plugins'])) {
+		if ($streaming) {
+			echo "\n=== Installing plugin dependencies for $ownerRepo ===\n";
+			flush();
+		}
+		foreach ($deps['plugins'] as $depName) {
+			if (!is_string($depName) || $depName === '') {
+				continue;
+			}
+			if (isset($visited[$depName])) {
+				continue;
+			}
+			if (file_exists($settings['pluginDirectory'] . '/' . escapeshellcmd($depName))) {
+				if ($streaming) {
+					echo "\nDependency plugin '$depName' is already installed.\n";
+				}
+				$visited[$depName] = true;
+				continue;
+			}
+			$depInfo = ResolvePluginInfoByName($depName);
+			if ($depInfo === null) {
+				PluginEchoLog($op, $ownerRepo, "\nERROR: could not resolve dependency plugin '$depName' from pluginList.json (skipping).\n", $stream);
+				continue;
+			}
+			// A listed name that is not the plugin's repoName (its directory):
+			// installed under the latter is installed.
+			$depDir = (isset($depInfo['repoName']) && is_string($depInfo['repoName'])) ? $depInfo['repoName'] : $depName;
+			if ($depDir !== $depName && file_exists($settings['pluginDirectory'] . '/' . escapeshellcmd($depDir))) {
+				$visited[$depName] = true;
+				continue;
+			}
+			$depSeen = is_array($depShown) && (array_key_exists($depName, $depShown) || array_key_exists($depDir, $depShown));
+			if (!$depSeen && ($depShown !== null || PluginPrivacyBlock($depInfo) !== null)) {
+				PluginPrivacyRefuse($depName, PluginPrivacyBlock($depInfo),
+					"'$ownerRepo' depends on the plugin '$depName', whose privacy disclosure was not shown with this install. Not installed: review it on the Plugins page and install again.", $stream, 'install', true, 'notAccepted');
+				$ok = false;
+				break;
+			}
+			$ver = SelectPluginVersion($depInfo);
+			if ($ver !== null) {
+				$depInfo['branch'] = $ver['branch'];
+				$depInfo['sha'] = $ver['sha'];
+			}
+			// $depInfo is the author's listing JSON verbatim: only what the
+			// install dialog showed may be recorded, never a key the author
+			// put there.
+			unset($depInfo['privacyAccepted'], $depInfo['dependencyPrivacyAccepted']);
+			if ($depShown !== null) {
+				// Prefer the repoName key: a refusal of the dependency itself is
+				// keyed by it, so that is what the page's retry adds; the listing
+				// name's entry is the listed block that was refused.
+				$depInfo['privacyAccepted'] = array_key_exists($depDir, $depShown) ? $depShown[$depDir] : $depShown[$depName];
+			}
+			if (!InstallPluginFromInfo($depInfo, $visited, $stream, $depth + 1, $depShown)) {
+				PluginEchoLog($op, $ownerRepo, "\nERROR: dependency plugin '$depName' could not be installed.\n", $stream);
+				$ok = false;
+			}
+		}
+	}
+
+	return $ok;
+}
+
+/**
+ * Resolves a plugin repoName to its pluginInfo structure by consulting the
+ * official pluginList.json in FalconChristmas/fpp-data. Only names present in
+ * that list can be installed as dependencies (arbitrary URLs are rejected).
+ * Returns the decoded pluginInfo (with infoURL set) or null.
+ */
+function ResolvePluginInfoByName($repoName)
+{
+	$entry = FindPluginIndexEntry($repoName);
+	if ($entry === null) {
+		return null;
+	}
+	$infoURL = $entry[1];
+
+	$infoJSON = FetchURLWithGitHubCredentials($infoURL);
+	$info = json_decode($infoJSON, true);
+	if (!is_array($info)) {
+		return null;
+	}
+	$info['infoURL'] = $infoURL;
+	return $info;
+}
+
+/**
+ * Picks the branch/sha to install for a dependency plugin based on the running
+ * FPP version and platform. PHP port of the version-window selection in
+ * www/plugins.php (LoadPlugin). Falls back to the first version entry when none
+ * match. Returns array('branch'=>..., 'sha'=>...) or null.
+ */
+function SelectPluginVersion($pluginInfo)
+{
+	$v = SelectPluginVersionEntry($pluginInfo);
+	if ($v === null) {
+		return null;
+	}
+	return array(
+		'branch' => isset($v['branch']) && $v['branch'] !== '' ? $v['branch'] : 'master',
+		'sha' => isset($v['sha']) ? $v['sha'] : ''
+	);
+}
+
+/**
+ * Same matching logic as SelectPluginVersion(), but returns the full matched
+ * versions[] entry instead of just branch/sha, so callers can also read a
+ * per-version 'dependencies' block (see MergePluginDependencies()). Returns
+ * null if $pluginInfo has no versions[] array.
+ *
+ * This is THE rule for which versions[] entry FPP installs, for every path:
+ * a dependency plugin, the clone-time re-selection, and a Reinstall
+ * (PluginReinstallTarget, handed to the page as `reinstallTarget` by the
+ * update check and by GET …/privacy?target=reinstall, so the page posts the
+ * branch and sha the server chose rather than choosing again). The page's
+ * SelectPluginVersionIndices mirrors it for the cards, and must keep the
+ * same three steps: the last compatible entry, else the last "untested"
+ * one (an open-ended entry for an older major), else the first entry.
+ */
+function SelectPluginVersionEntry($pluginInfo)
+{
+	global $settings;
+	if (!isset($pluginInfo['versions']) || !is_array($pluginInfo['versions']) || count($pluginInfo['versions']) === 0) {
+		return null;
+	}
+	$triplet = getFPPVersionTriplet();
+	$curMajor = (int) explode('.', $triplet)[0];
+	$versions = $pluginInfo['versions'];
+	$compatible = -1;
+	$untested = -1;
+	foreach ($versions as $i => $v) {
+		$min = isset($v['minFPPVersion']) ? (string) $v['minFPPVersion'] : '0';
+		$max = isset($v['maxFPPVersion']) ? (string) $v['maxFPPVersion'] : '';
+		$openMax = ($max === '0' || $max === '0.0' || $max === '');
+		// The documented rule (fpp-plugin-Template PLUGININFO_FORMAT.md,
+		// maxFPPVersion) and the page's SelectPluginVersionIndices: an open
+		// max is open only within the major named by minFPPVersion; on a
+		// newer major it is capped at the previous major's .999 (untested).
+		if ($openMax) {
+			$minMajor = (int) explode('.', $min)[0];
+			if ($minMajor !== $curMajor) {
+				$max = ($curMajor - 1) . '.999';
+				$openMax = false;
+				$untested = $i; // the page's "Not updated for FPP N" entry
+			}
+		}
+		$platformsOk = true;
+		if (isset($v['platforms']) && is_array($v['platforms'])) {
+			$platformsOk = isset($settings['Platform']) && in_array($settings['Platform'], $v['platforms']);
+		}
+		$minOk = (ComparePluginFPPVersions($min, $triplet) <= 0);
+		$maxOk = $openMax || (ComparePluginFPPVersions($max, $triplet) >= 0);
+		if ($minOk && $maxOk && $platformsOk) {
+			$compatible = $i; // last matching entry wins, as on the page
+		}
+	}
+	if ($compatible < 0) {
+		// The page offers "Install anyway" on the untested entry; failing
+		// that, the first entry so the dependency still installs.
+		$compatible = ($untested >= 0) ? $untested : 0;
+	}
+	return $versions[$compatible];
+}
+
+/**
+ * Merges a plugin's top-level dependencies block with the ones declared on
+ * its currently-selected versions[] entry, if any. Per-version dependencies
+ * are ADDITIONAL to the top-level ones (e.g. a package whose name differs
+ * between the FPP9 and FPP10 image) -- they don't replace them. Arrays are
+ * concatenated per-key; a name declared both places is a harmless duplicate
+ * (every install path here -- apt/pip/script-repo/plugin -- is a no-op on a
+ * repeat). Returns null if neither side declares anything.
+ */
+function MergePluginDependencies($topLevelDeps, $versionEntry)
+{
+	$top = is_array($topLevelDeps) ? $topLevelDeps : array();
+	$ver = (is_array($versionEntry) && isset($versionEntry['dependencies']) && is_array($versionEntry['dependencies']))
+		? $versionEntry['dependencies'] : array();
+	if (!count($top) && !count($ver)) {
+		return null;
+	}
+	$merged = array();
+	foreach (array('packages', 'python', 'scripts', 'plugins') as $key) {
+		$list = array();
+		if (isset($top[$key]) && is_array($top[$key])) {
+			$list = array_merge($list, $top[$key]);
+		}
+		if (isset($ver[$key]) && is_array($ver[$key])) {
+			$list = array_merge($list, $ver[$key]);
+		}
+		if (count($list)) {
+			$merged[$key] = $list;
+		}
+	}
+	return count($merged) ? $merged : null;
+}
+
+// PHP port of versionToNumber() in www/js/fpp.js -- turns a version string into
+// a comparable integer.
+function PluginVersionToNumber($version)
+{
+	$version = (string) $version;
+	if (strlen($version) > 0 && $version[0] === 'v') {
+		$version = substr($version, 1);
+	}
+	$dash = strpos($version, '-');
+	if ($dash !== false) {
+		$version = substr($version, 0, $dash);
+	}
+	$parts = explode('.', $version);
+	while (count($parts) < 3) {
+		$parts[] = '0';
+	}
+	$number = 0;
+	for ($x = 0; $x < 3; $x++) {
+		$val = intval($parts[$x]);
+		if ($val >= 9990) {
+			return $number * 10000 + 9999;
+		} else if ($val > 99) {
+			$val = 99;
+		}
+		$number = $number * 100 + $val;
+	}
+	return $number;
+}
+
+// Returns -1/0/1 comparing two FPP version strings (port of CompareFPPVersions).
+function ComparePluginFPPVersions($a, $b)
+{
+	$a = PluginVersionToNumber($a);
+	$b = PluginVersionToNumber($b);
+	return ($a <=> $b);
+}
+
+/**
+ * Get plugin information
+ *
+ * Get `pluginInfo.json` for installed plugin `{RepoName}`. An additional
+ * `updatesAvailable` field is 1 when the last update check (background or
+ * `POST /api/plugin/{RepoName}/updates`) found an update, 0 otherwise.
+ *
+ * @route GET /api/plugin/{RepoName}
+ * @response 200 Plugin information
+ * ```json
+ * {
+ *   "repoName": "fpp-matrixtools",
+ *   "name": "MatrixTools",
+ *   "author": "Chris Pinkham (CaptainMurdoch)",
+ *   "srcURL": "https://github.com/cpinkham/fpp-matrixtools.git",
+ *   "updatesAvailable": 0,
+ *   "versions": [
+ *     {
+ *       "minFPPVersion": 0,
+ *       "maxFPPVersion": 0,
+ *       "branch": "master",
+ *       "sha": ""
+ *     }
+ *   ]
+ * }
+ * ```
+ */
 function GetPluginInfo()
 {
 	global $settings;
 
 	$plugin = params('RepoName');
+	// Every RepoName is a path component under the plugins directory, and
+	// /api/index.php?uri= skips Apache's dot-segment cleanup, so "." and ".."
+	// arrive here as names.  See IsValidPluginName().
+	if (!IsValidPluginName($plugin)) {
+		return json(array('Status' => 'Error', 'Message' => 'Plugin is not installed'));
+	}
 	$infoFile = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
 
-	if (file_exists($infoFile))
-	{
+	if (file_exists($infoFile)) {
 		$json = file_get_contents($infoFile);
 		$result = json_decode($json, true);
 		$result['Status'] = 'OK';
-		$result['updatesAvailable'] = PluginHasUpdates($plugin);
+		// Saved verdict, not a live check: the page asks for every plugin at once.
+		$state = PluginUpdateStateRead();
+		$result['updatesAvailable'] = (isset($state['plugins'][$plugin]['updates'])
+			&& $state['plugins'][$plugin]['updates'] === true) ? 1 : 0;
+
+		$iconFile = $settings['pluginDirectory'] . '/' . $plugin . '/icon.png';
+		$result['hasIcon'] = file_exists($iconFile) || !empty($result['iconURL']);
+
+		$pageInfo = _PluginGetBestPageUrl($plugin);
+		$result['pageUrl'] = $pageInfo['url'];
+		$result['pageType'] = $pageInfo['page'];
+
+		// What the Release Notes link offers: resolved against the update
+		// about to land, same as GetPluginReleaseNotes() will serve.
+		$result['releaseNotesStyle'] = PluginOfferedReleaseNotesStyle($plugin, PluginReleaseNotesInfo($plugin, $result));
 
 		return json($result);
 	}
 
-	$result = Array();
+	$result = array();
 	$result['Status'] = 'Error';
 
 	if (!file_exists($settings['pluginDirectory'] . '/' . $plugin))
@@ -107,33 +2217,364 @@ function GetPluginInfo()
 	return json($result);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// DELETE /api/plugin/:RepoName
-function UninstallPlugin()
+// Serves $data as an image and exits. Content-Type comes from $ext, which
+// only ever arrives here out of PluginIconURLIsAllowed()'s closed set, and
+// nosniff stops a browser second-guessing it from the bytes.
+function PluginEmitIcon($data, $ext)
 {
-	global $settings, $fppDir, $SUDO;
-	$result = Array();
+	$types = array(
+		'png' => 'image/png',
+		'jpg' => 'image/jpeg',
+		'jpeg' => 'image/jpeg',
+		'gif' => 'image/gif',
+		'webp' => 'image/webp',
+	);
+	header('Content-Type: ' . (isset($types[$ext]) ? $types[$ext] : 'image/png'));
+	header('X-Content-Type-Options: nosniff');
+	header('Cache-Control: public, max-age=86400');
+	ob_clean();
+	flush();
+	echo $data;
+	exit;
+}
 
+/**
+ * Fetches a remote plugin icon, with the bytes cached on disk for a day so a
+ * page full of plugin cards costs one round trip per plugin per day.
+ *
+ * Deliberately NOT file_cache(): that trims what it reads back, which would
+ * corrupt any image whose final byte is whitespace-ish (a PNG's IEND CRC
+ * frequently is).
+ *
+ * Returns the image bytes, or null.
+ */
+function PluginCachedIconData($repoName, $url, $ext)
+{
+	$file = '/tmp/cache_plugin_icon_' . preg_replace('/[^A-Za-z0-9_.-]/', '_', $repoName) . '.' . $ext;
+	if (file_exists($file) && (time() - filemtime($file)) < 86400) {
+		$data = @file_get_contents($file);
+		if ($data !== false && $data !== '') {
+			return $data;
+		}
+	}
+
+	$data = PluginBoundedFetch($url, 8, PLUGIN_FETCH_MAX_ICON);
+	if ($data === null) {
+		// Serve a stale icon rather than none if we have one.
+		$data = file_exists($file) ? @file_get_contents($file) : false;
+		return ($data === false || $data === '') ? null : $data;
+	}
+
+	@file_put_contents($file, $data, LOCK_EX);
+	return $data;
+}
+
+/**
+ * Serve plugin icon
+ *
+ * Serves the icon for {RepoName}, whether or not that plugin is installed.
+ * Resolved in three tiers:
+ *   1. a local icon.png in the plugin's directory;
+ *   2. the iconURL out of the plugin's own installed pluginInfo.json;
+ *   3. the iconURL out of the listed pluginInfo.json for {RepoName},
+ *      for plugins that are listed but not installed (the Browse tab).
+ *
+ * Serving these same-origin is what lets the Plugins page show icons at all --
+ * raw.githubusercontent.com is allow-listed in FPP's CSP connect-src, not
+ * img-src. The client passes only a repo name: tiers 2 and 3 both run their
+ * URL past PluginIconURLIsAllowed() before fetching, so the set of things this
+ * endpoint can be made to request is bounded by the plugin list and by that
+ * allow-list, not by the caller.
+ *
+ * @route GET /api/plugin/{RepoName}/icon
+ * @response 200 Image data
+ * @response 404 No icon available
+ */
+function PluginServeIcon()
+{
+	global $settings;
 	$plugin = params('RepoName');
 
-	if (file_exists($settings['pluginDirectory'] . '/' . $plugin))
-	{
-		exec("export SUDO=\"" . $SUDO . "\"; export PLUGINDIR=\"" . $settings['pluginDirectory'] ."\"; $fppDir/scripts/uninstall_plugin $plugin", $output, $return_val);
-		unset($output);
+	// Path segment, not a path. Keeps a crafted RepoName out of the
+	// filesystem lookups below.
+	if (!IsValidPluginName($plugin)) {
+		http_response_code(404);
+		return;
+	}
+	$pluginDir = $settings['pluginDirectory'] . '/' . $plugin;
 
-		if ($return_val == 0)
-		{
-			$result['Status'] = 'OK';
-			$result['Message'] = '';
+	// Tier 1: local icon.png
+	$file = $pluginDir . '/icon.png';
+	if (file_exists($file)) {
+		$mtime = filemtime($file);
+		$lastModified = gmdate('D, d M Y H:i:s', $mtime) . ' GMT';
+
+		header('Content-Type: image/png');
+		header('X-Content-Type-Options: nosniff');
+		header('Cache-Control: public, max-age=0, must-revalidate');
+		header('Last-Modified: ' . $lastModified);
+
+		if (isset($_SERVER['HTTP_IF_MODIFIED_SINCE']) && strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']) >= $mtime) {
+			header('HTTP/1.1 304 Not Modified');
+			exit;
 		}
-		else
-		{
+
+		ob_clean();
+		flush();
+		readfile($file);
+		exit;
+	}
+
+	// Tier 2: iconURL from the installed plugin's own pluginInfo.json. This
+	// file is attacker-influenced for a plugin installed by pasting a URL, so
+	// it gets the same allow-list check as anything else.
+	$infoFile = $pluginDir . '/pluginInfo.json';
+	if (file_exists($infoFile)) {
+		$info = json_decode(file_get_contents($infoFile), true);
+		$iconURL = (is_array($info) && isset($info['iconURL'])) ? $info['iconURL'] : '';
+		if (PluginIconURLIsAllowed($iconURL, $ext)) {
+			$data = PluginCachedIconData($plugin, $iconURL, $ext);
+			if ($data !== null) {
+				PluginEmitIcon($data, $ext);
+			}
+		}
+	}
+
+	// Tier 3: listed but not installed -- the Browse tab.
+	$info = GetListedPluginInfo($plugin);
+	$iconURL = (is_array($info) && isset($info['iconURL'])) ? $info['iconURL'] : '';
+	if (PluginIconURLIsAllowed($iconURL, $ext)) {
+		$data = PluginCachedIconData($plugin, $iconURL, $ext);
+		if ($data !== null) {
+			PluginEmitIcon($data, $ext);
+		}
+	}
+
+	http_response_code(404);
+}
+
+/**
+ * Uninstall plugin
+ *
+ * Uninstall plugin {RepoName}. Releases the plugin's claims on its apt
+ * package dependencies -- the packages it declared and the ones their install
+ * pulled in -- and apt-removes whatever nothing else still needs, unless
+ * `keepPackages=1`, which the reinstall flow passes so the install that
+ * follows can reuse them.
+ *
+ * @route DELETE /api/plugin/{RepoName}
+ * @param '1' keepPackages Leave the plugin's package claims in place (reinstall flow).
+ * @param string stream When set (and not "false"), progress is streamed as text instead of a JSON reply.
+ * @response 200 Plugin uninstalled
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+/**
+ * Ask fppd to load or unload a plugin, so an install takes effect and an
+ * uninstall stops having effect without restarting - which on a running show
+ * means not interrupting it.
+ *
+ * Goes through the documented proxy rather than fppd's internal port. Returns
+ * an array {ok, message}. A failure here is never fatal to the install or
+ * uninstall itself: the worst case is the old behaviour, where the change lands
+ * at the next restart. fppd not running is exactly that case - nothing is
+ * loaded, so there is nothing to change.
+ */
+function FPPDPluginLifecycle($plugin, $action)
+{
+    $ctx = stream_context_create(array('http' => array(
+        'method' => 'POST',
+        'content' => '',
+        'timeout' => 30,
+        'ignore_errors' => true,
+    )));
+    $url = 'http://localhost/api/fppd/plugin/' . rawurlencode($plugin) . '/' . $action;
+    $resp = @file_get_contents($url, false, $ctx);
+    if ($resp === false) {
+        // 'answered' tells "fppd is not running" (nothing to change; it loads
+        // what is on disk when it starts) apart from fppd refusing.
+        return array('ok' => false, 'answered' => false, 'message' => 'fppd did not answer (not running?)');
+    }
+    $json = json_decode($resp, true);
+    if (!is_array($json) || !isset($json['Status'])) {
+        return array('ok' => false, 'answered' => true, 'message' => 'unexpected response from fppd');
+    }
+    return array(
+        'ok' => ($json['Status'] === 'OK'),
+        'answered' => true,
+        'message' => isset($json['Message']) ? $json['Message'] : '',
+    );
+}
+
+/*
+ * The plugin's shared libraries as they are on disk, so an upgrade can tell
+ * whether it replaced the code fppd is running. By content, not inode or mtime:
+ * a plugin that re-downloads its binary on every upgrade renames an identical
+ * file into place, and reloading it for that would be churn for nothing.
+ */
+function PluginSharedLibraryFingerprint($plugin)
+{
+    global $settings;
+    $out = array();
+    $dir = $settings['pluginDirectory'] . '/' . $plugin;
+    foreach (array_merge(glob($dir . '/*.so') ?: array(), glob($dir . '/*.dylib') ?: array()) as $f) {
+        $sum = @sha1_file($f);
+        if ($sum !== false) {
+            $out[basename($f)] = $sum;
+        }
+    }
+    ksort($out);
+    return $out;
+}
+
+/*
+ * After an upgrade changed what fppd runs for a plugin, swap it in without a
+ * restart: unload the running copy and load the new one, the same calls an
+ * install and an uninstall make. fppd opens a replaced library under a name of
+ * its own, so the new build really is what loads. Falls back to the restart
+ * flag when fppd refuses (a plugin with a channel output in use can only go by
+ * restarting) or fails to load the new build. With fppd not running there is
+ * nothing to do: it loads what is on disk when it starts.
+ */
+function PluginReloadAfterUpgrade($plugin, $stream)
+{
+    $unloaded = FPPDPluginLifecycle($plugin, 'unload');
+    if (!$unloaded['answered']) {
+        return true;
+    }
+    $loaded = $unloaded['ok'] ? FPPDPluginLifecycle($plugin, 'load') : null;
+    if ($unloaded['ok'] && $loaded['ok']) {
+        PluginEchoLog('upgrade', $plugin, "Reloaded $plugin in FPPD; no restart needed.\n", $stream);
+        return true;
+    }
+    $why = $unloaded['ok'] ? $loaded['message'] : $unloaded['message'];
+    PluginEchoLog('upgrade', $plugin, "FPPD could not swap in the updated $plugin ($why). Restart FPPD to finish the update.\n", $stream);
+    WriteSettingToFile('restartFlag', 1);
+    return false;
+}
+
+function UninstallPlugin()
+{
+	global $settings, $fppDir, $SUDO, $_REQUEST;
+	// Finish once started, even if the browser goes away: a closed tab must not
+	// stop PHP at the next echo between the scripts and the bookkeeping after
+	// them (install history, plugin source, privacy record).
+	ignore_user_abort(true);
+	$result = array();
+	$stream = $_REQUEST['stream'];
+	$startedAt = date('c'); // for the history, as in InstallPluginFromInfo()
+
+	$plugin = params('RepoName');
+	if (!IsValidPluginName($plugin)) {
+		return json(array('Status' => 'Error', 'Message' => 'Plugin is not installed'));
+	}
+
+	if (file_exists($settings['pluginDirectory'] . '/' . $plugin)) {
+		$infoFile = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
+		if (file_exists($infoFile)) {
+			$info = file_get_contents($infoFile);
+
+			$data = json_decode($info, true);
+
+			// linkName is the author's: only a plain file name, and only our own symlink.
+			if (isset($data['linkName']) && is_string($data['linkName']) && sanitizeFilename($data['linkName']) === $data['linkName']) {
+				$linkPath = $settings['pluginDirectory'] . '/' . $data['linkName'];
+				if (is_link($linkPath) && readlink($linkPath) === $plugin) {
+					unlink($linkPath);
+				}
+			}
+
+		}
+
+		// Unload first: the files are about to be deleted, and a plugin left
+		// loaded would keep running against scripts and a binary that no longer
+		// exist. If fppd refuses (a channel output in use) or is not running,
+		// say so and carry on - the uninstall itself still proceeds, it just
+		// needs a restart to fully take hold.
+		$unloaded = FPPDPluginLifecycle($plugin, 'unload');
+		$uninstalledSha = PluginInstalledSha($plugin);
+
+		// PLUGINDIR/SUDO exported on both paths so the wrapper resolves the same
+		// directory PHP does (the streaming path used to rely on scripts/common's
+		// defaults).
+		$uninstallCmd = 'export SUDO=' . escapeshellarg($SUDO)
+			. '; export PLUGINDIR=' . escapeshellarg($settings['pluginDirectory'])
+			. '; ' . escapeshellarg($fppDir . '/scripts/uninstall_plugin') . ' ' . escapeshellarg($plugin);
+		// Before releasing its claims below: FPP's own removals are not the
+		// plugin's.
+		list(, $pkgChanges) = PluginTrackPackages('uninstall', $plugin, $plugin, PluginHasOwnScript($plugin, array('fpp_uninstall.sh')), function () use ($stream, $uninstallCmd, &$return_val) {
+			if (isset($stream) && $stream != "false") {
+				DisableOutputBuffering();
+				system($uninstallCmd, $return_val);
+			} else {
+				exec($uninstallCmd, $output, $return_val);
+			}
+		}, $stream);
+
+		// Drop this plugin's claim on every package it holds in the manifest
+		// (declared at any level -- top-level or a versions[] entry -- or
+		// left over from an older version). A package is only apt-removed
+		// once nothing else (the user or another plugin) still requires it.
+		// Done AFTER the plugin's own fpp_uninstall.sh has run: that script may
+		// well use one of the packages the plugin declared.
+		// The reinstall flow passes keepPackages=1: the install that
+		// follows leaves already-present packages alone and releases any
+		// claim the new version no longer declares, so nothing is removed
+		// and re-downloaded for no reason.
+		// Only once the plugin is really gone: a wrapper failure leaves it on
+		// disk, and it still needs its packages.
+		$keepPackages = isset($_REQUEST['keepPackages']) && $_REQUEST['keepPackages'] == '1';
+		$fppPkgChanges = null;
+		if (!$keepPackages && $return_val == 0) {
+			$claimed = PackagesClaimedBy($plugin);
+			if (count($claimed)) {
+				if (PluginStreaming($stream)) {
+					DisableOutputBuffering();
+				}
+				PluginEchoLog('uninstall', $plugin, "\n=== Releasing package dependencies for $plugin ===\n", $stream);
+				// FPP's removals, recorded apart from the script's ('fppPackages').
+				$fppPkgChanges = PluginReleaseClaimsTracked('uninstall', $plugin, $claimed, $stream, "releasing $plugin's package dependencies");
+			}
+		}
+
+
+		// Recorded even when it failed: what its script changed still happened.
+		// keepPackages is the first half of a Reinstall; its install follows.
+		$entry = array('startedAt' => $startedAt, 'sha' => $uninstalledSha);
+		if ($keepPackages) {
+			$entry['reinstall'] = true;
+		}
+		if ($fppPkgChanges) {
+			$entry['fppPackages'] = $fppPkgChanges;
+		}
+		if ($pkgChanges) {
+			$entry['packages'] = $pkgChanges;
+		}
+		if ($return_val != 0) {
+			$entry['scriptFailed'] = true;
+		}
+		AppendPluginHistory($plugin, 'uninstall', $entry);
+		if ($return_val == 0) {
+			PluginUpdateStateForget($plugin);
+
+			MarkPluginPrivacyUninstalled($plugin);
+			PluginReinstallPendingSync($plugin);
+			if (isset($stream) && $stream != "false") {
+				if (!$unloaded['ok']) {
+					return "\nUninstalled, but fppd still has it loaded (" . $unloaded['message'] . ") - restart FPPD to finish.\nDone\n";
+				}
+				return "\nDone\n";
+			}
+			$result['Status'] = 'OK';
+			$result['Message'] = $unloaded['ok'] ? ''
+				: 'Uninstalled, but FPPD still has it loaded (' . $unloaded['message'] . '). Restart FPPD to finish.';
+			$result['restartRequired'] = !$unloaded['ok'];
+		} else {
 			$result['Status'] = 'Error';
 			$result['Message'] = 'Failed to properly uninstall plugin (' . $plugin . ')';
 		}
-	}
-	else
-	{
+	} else {
 		$result['Status'] = 'Error';
 		$result['Message'] = 'The plugin (' . $plugin . ') is not installed';
 	}
@@ -141,77 +2582,3595 @@ function UninstallPlugin()
 	return json($result);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// POST /api/plugin/:RepoName/updates
+/**
+ * Check plugin for updates
+ *
+ * Check plugin `{RepoName}` for available updates: `git fetch` in the plugin
+ * directory, then the checked-out branch against origin (a pinned sha
+ * respected) and the plugin's own `scripts/fpp_update_check.sh` if it has one.
+ * The verdict is written to the shared update state the navbar reads.
+ *
+ * @route POST /api/plugin/{RepoName}/updates
+ * @body {"srcURL": "https://github.com/owner/repo.git", "useCredentials": 0} (optional: the
+ *       listing's clone URL, tried when the installed clone's own origin cannot be fetched)
+ * @response 200 Update check result
+ * ```json
+ * {"Status": "OK", "Message": "", "updatesAvailable": 1, "unchecked": false, "reason": "", "privacyChanged": false, "reinstallPrivacyChanged": false, "reinstallTarget": {"branch": "master", "sha": ""}}
+ * ```
+ *
+ * `unchecked` true: the fetch worked but there is no verdict (detached HEAD,
+ * no tracking ref, the plugin's own check gave no answer); `reason` says why
+ * and `Message` carries it with the plugin name. Treat it as a failed check,
+ * never as up to date. A failed fetch is `Status: "Error"` with the same
+ * `reason`/`Message`.
+ *
+ * `originUnreachable` (true only when present): the installed clone could not
+ * fetch from its origin but the reinstall target was reachable at `srcURL`, so
+ * a Reinstall will work while an upgrade cannot.  `updatesAvailable` is 0 and
+ * `privacyChanged` false in that case: nothing was learned about the
+ * checked-out branch.
+ *
+ * `privacyChanged`: the block `…/upgrade` would land (origin/<checked-out
+ * branch>, or its versions[] pin) differs materially from the accepted one, or nothing is accepted.
+ * `reinstallPrivacyChanged`: the same for the block a Reinstall would land
+ * (the versions[] branch and pin for this FPP) -- differs from the former
+ * only for plugins with one branch per FPP major or a pinned sha.
+ * `reinstallTarget`: that branch and sha (sha '' when unpinned; branch ''
+ * when the installed pluginInfo.json has no usable versions[]), the entry
+ * the server selects; a Reinstall posts these back.
+ */
+// How long a user's check or upgrade waits for another fetch of the same
+// plugin to end before it gives up on the lock. Not tied to the fetch timeout:
+// on timing out a check reads the other fetch's answer and an upgrade refuses
+// with "try again"; neither fetches against the held lock.
+define('PLUGIN_FETCH_LOCK_WAIT', 30);
+
+function PluginFetchLockFile($plugin)
+{
+	global $settings;
+	return $settings['mediaDirectory'] . '/cache/plugin-fetch-' . $plugin . '.lock';
+}
+
+/**
+ * Serialise fetches of one plugin clone: concurrent fetches fail on the ref lock
+ * and would read as "could not check". Users wait up to PLUGIN_FETCH_LOCK_WAIT;
+ * the sweep ($blocking = false) does not wait. Returns the handle, or false with
+ * $timedOut telling an unwritable lock (go ahead unlocked: refusing to check
+ * would be worse than racing) from a lock still held (the caller decides).
+ * Released when the returned handle is closed or goes out of scope.
+ */
+function PluginFetchLock($plugin, $blocking = true, &$timedOut = false)
+{
+	global $settings;
+	$timedOut = false;
+	if (!preg_match('/^[A-Za-z0-9_.-]+$/', $plugin)) {
+		return false;
+	}
+	$dir = $settings['mediaDirectory'] . '/cache';
+	if (!is_dir($dir)) {
+		@mkdir($dir, 0775, true);
+	}
+	// media/cache, not .git: archive installs have none, and it may be root-owned.
+	$fd = @fopen(PluginFetchLockFile($plugin), 'c');
+	if ($fd === false) {
+		// Unwritable clone: nothing to serialise against that we could fix
+		// here, and refusing to check would be worse than racing.
+		return false;
+	}
+	if (!$blocking) {
+		if (!flock($fd, LOCK_EX | LOCK_NB)) {
+			fclose($fd);
+			$timedOut = true;
+			return false;
+		}
+		return $fd;
+	}
+	// Polled: flock() has no timeout, and a stuck fetch must not hold up the page.
+	$deadline = microtime(true) + PLUGIN_FETCH_LOCK_WAIT;
+	do {
+		if (flock($fd, LOCK_EX | LOCK_NB)) {
+			return $fd;
+		}
+		usleep(100000);
+	} while (microtime(true) < $deadline);
+	fclose($fd);
+	$timedOut = true;
+	return false;
+}
+
+// Hard cap on one fetch, plus a stall detector (below 1000 B/s for STALL_SECONDS):
+// a remote that goes quiet must not hold a php-fpm worker indefinitely.
+define('PLUGIN_GIT_FETCH_TIMEOUT', 60);
+define('PLUGIN_GIT_FETCH_STALL_SECONDS', 15);
+
+/**
+ * Bounded, prompt-free `git fetch $args` (already shell-escaped) in $dir. `env`
+ * goes after $SUDO so the variables survive it; $keepStderr keeps git's message
+ * for PluginFetchFailureReason().
+ */
+function PluginGitFetchCmd($dir, $args = '', $keepStderr = false, $opts = array())
+{
+	global $SUDO;
+	$timeout = isset($opts['timeout']) ? (int) $opts['timeout'] : PLUGIN_GIT_FETCH_TIMEOUT;
+	// In front of git, not the whole command: `nice cd` exits 127 and skips the fetch.
+	$prio = !empty($opts['background']) ? ('nice -n 19 ' . (PluginHaveCommand('ionice') ? 'ionice -c2 -n7 ' : '')) : '';
+	// No `timeout` (macOS): the stall detector is then the only bound.
+	$limit = PluginHaveCommand('timeout') ? (' timeout -k 5 ' . $timeout) : '';
+	return 'cd ' . escapeshellarg($dir) . ' && ' . $SUDO . ' ' . $prio .
+		'env GIT_TERMINAL_PROMPT=0 GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=' . PLUGIN_GIT_FETCH_STALL_SECONDS .
+		$limit . ' git fetch' . ($args !== '' ? ' ' . $args : '') .
+		($keepStderr ? ' 2>&1' : ' 2>/dev/null');
+}
+
 function CheckForPluginUpdates()
 {
 	global $settings, $SUDO;
-	$result = Array();
+	$result = array();
 
 	$plugin = params('RepoName');
+	if (!IsValidPluginName($plugin) || !file_exists($settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json')) {
+		$result['Status'] = 'Error';
+		$result['reason'] = 'not installed';
+		$result['Message'] = 'Could not check ' . $plugin . ': not installed';
+		return json($result);
+	}
 
-	$cmd = '(cd ' . $settings['pluginDirectory'] . '/' . $plugin . ' && ' . $SUDO . ' git fetch)';
-	exec($cmd, $output, $return_val);
+	// Held until return; released when $fetchLock goes out of scope.
+	$waitedFrom = microtime(true);
+	$fetchLock = PluginFetchLock($plugin, true, $lockHeld);
+	if ($lockHeld) {
+		// Another fetch of this plugin (a sweep, an upgrade) has held the lock
+		// for the whole wait. If it has recorded an answer since we started
+		// waiting, that is the answer: the refs are as fresh as our own fetch
+		// would make them. Otherwise say so rather than fetch against it.
+		$state = PluginUpdateStateRead();
+		$e = isset($state['plugins'][$plugin]) ? $state['plugins'][$plugin] : null;
+		if (!is_array($e) || !array_key_exists('updates', $e) || PluginUpdateStateRecordedAt($e) < $waitedFrom) {
+			$result['Status'] = 'Error';
+			$result['reason'] = 'another check of this plugin is still running; try again in a moment';
+			$result['Message'] = 'Could not check ' . $plugin . ': ' . $result['reason'];
+			return json($result);
+		}
+		$output = array();
+		$return_val = 0;
+	} else {
+		exec(PluginGitFetchCmd($settings['pluginDirectory'] . '/' . $plugin, '', true), $output, $return_val);
+	}
 
-	if ($return_val == 0)
-	{
+	if ($return_val == 0) {
 		$result['Status'] = 'OK';
 		$result['Message'] = '';
-		$result['updatesAvailable'] = PluginHasUpdates($plugin);
-	}
-	else
-	{
-		$result['Status'] = 'Error';
-		$result['Message'] = 'Could not run git fetch for plugin ' . $plugin;
+		// The verdict, not the boolean: "could not check" must not become "up to date".
+		list($updates, $error) = PluginUpdateVerdict($plugin);
+		$result['updatesAvailable'] = ($updates === true) ? 1 : 0;
+		// Fetched fine but no verdict (detached HEAD, no tracking ref, ...):
+		// the page must treat this like a failed check, not "no updates".
+		$result['unchecked'] = ($updates === null);
+		$result['reason'] = ($updates === null) ? $error : '';
+		if ($updates === null) {
+			$result['Message'] = 'Could not check ' . $plugin . ': ' . $error;
+		}
+		// The freshest thing anyone knows, so write it through: the navbar then
+		// reads the same answer as the row this check is about to mark.
+		PluginUpdateStateSet($plugin, $updates, $error, 'check');
+		// The fetch above has just brought origin/<branch> up to date, so
+		// this reads the incoming declaration without a second fetch.
+		// Not gated on updatesAvailable: no record is "changed" too.
+		$result['privacyChanged'] = PluginPrivacyChanged($plugin, false);
+		// Reinstall lands the versions[] branch, which --single-branch keeps
+		// the fetch above from seeing; fetch and diff it too.
+		list($tBranch, $tSha) = PluginReinstallTarget($plugin);
+		if ($tBranch !== '' && $tBranch !== PluginCurrentBranch($plugin)) {
+			PluginFetchBranch($plugin, $tBranch);
+		}
+		$result['reinstallPrivacyChanged'] = PluginPrivacyChanged($plugin, false, $p, $a, $src, 'reinstall');
+		// The branch and sha that Reinstall would clone (the server's
+		// versions[] choice, SelectPluginVersionEntry), for the page to post
+		// back so both sides mean the same commit.
+		$result['reinstallTarget'] = array('branch' => $tBranch, 'sha' => $tSha);
+		return json($result);
 	}
 
+	// The installed clone cannot fetch from its origin.  That is either the
+	// network (nothing can be done, and a reinstall that uninstalls first
+	// would leave nothing behind) or this clone's origin alone: the branch it
+	// was cloned --single-branch from was renamed or deleted, or the repo
+	// moved.  A fresh clone from the listing's URL works in the second case,
+	// and that is exactly what Reinstall does -- but the page only reinstalls
+	// plugins whose check succeeded, so such a plugin was stuck installed and
+	// broken, and after an FPP OS upgrade stayed on the reinstall list with
+	// fppd's warning up for good.  Tell the two apart by fetching the
+	// reinstall target from the URL a reinstall would clone, into the same
+	// origin/<branch> ref the reinstall-side privacy diff reads.
+	list($tBranch, $tSha) = PluginReinstallTarget($plugin);
+	if ($tBranch !== '' && PluginFetchReinstallTargetByURL($plugin, $tBranch, PluginUpdateCheckSrcURL($plugin))) {
+		$result['Status'] = 'OK';
+		// Nothing about the checked-out branch could be learned; it is the
+		// origin that is gone, so an upgrade (git pull) cannot happen either.
+		$result['updatesAvailable'] = 0;
+		$result['privacyChanged'] = false;
+		$result['originUnreachable'] = true;
+		// Nothing learned about the checked-out branch: could not check, not up to date.
+		PluginUpdateStateSet($plugin, null, 'the installed copy can no longer fetch from where it was cloned; Reinstall clones it afresh', 'check');
+		$result['Message'] = 'The installed copy of ' . $plugin . ' can no longer fetch from where it was cloned; Reinstall will clone it afresh.';
+		$result['reinstallPrivacyChanged'] = PluginPrivacyChanged($plugin, false, $p, $a, $src, 'reinstall');
+		$result['reinstallTarget'] = array('branch' => $tBranch, 'sha' => $tSha);
+		return json($result);
+	}
+
+	$result['Status'] = 'Error';
+	$reason = PluginFetchFailureReason($output, $return_val);
+	// Message is the whole sentence; reason is the same thing without the
+	// plugin name, for a caller that is already naming the plugin itself.
+	$result['reason'] = $reason;
+	$result['Message'] = 'Could not check ' . $plugin . ': ' . $reason;
+	PluginUpdateStateSet($plugin, null, $reason, 'check');
 	return json($result);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// POST /api/plugin/:RepoName/upgrade
-function UpgradePlugin()
+/**
+ * Turn a failed fetch into a reason the user can act on ("needs a token", not
+ * "check the WiFi"); anything unrecognised quotes git's first line.
+ *
+ * @param array $output Combined stdout+stderr of the failed fetch.
+ * @param int $rv Its exit status; 124/137 mean the timeout fired.
+ * @param int $timeout The timeout the fetch ran with, for the message.
+ * @return string A reason, for the Updates tab and the state file.
+ */
+function PluginFetchFailureReason($output, $rv = 0, $timeout = PLUGIN_GIT_FETCH_TIMEOUT)
+{
+	$text = is_array($output) ? implode("\n", $output) : (string) $output;
+	if ($rv == 124 || $rv == 137) {
+		return 'the repository did not respond within ' . $timeout . ' seconds';
+	}
+	if (stripos($text, 'terminal prompts disabled') !== false
+		|| stripos($text, 'could not read Username') !== false
+		|| stripos($text, 'Authentication failed') !== false
+		|| stripos($text, 'Permission denied (publickey)') !== false
+		|| preg_match('/returned error: 40[13]\b/', $text)) {
+		// A fetch only uses credentials already in the clone's origin; the
+		// token from Settings > Developer is applied at clone time.
+		return 'this repository needs credentials; add a GitHub token on the Developer tab of Settings (UI Level: Developer) and Reinstall with Use Credentials, or use an ssh remote';
+	}
+	if (stripos($text, 'Repository not found') !== false
+		|| stripos($text, 'does not appear to be a git repository') !== false
+		|| preg_match('/returned error: 404\b/', $text)) {
+		return 'the repository could not be found; it may have moved, been renamed, or been made private';
+	}
+	if (stripos($text, 'Could not resolve host') !== false
+		|| stripos($text, 'unable to access') !== false
+		|| stripos($text, 'Connection timed out') !== false
+		|| stripos($text, 'Could not connect') !== false
+		|| stripos($text, 'Network is unreachable') !== false) {
+		return 'the player could not reach the repository host; it may be offline';
+	}
+	// git's message for a concurrent fetch. Not "Unable to create" on its own:
+	// that is also what a full disk or a permission problem says.
+	if (stripos($text, 'cannot lock ref') !== false) {
+		return 'another check was fetching this plugin at the same time; it will be retried';
+	}
+	// Redact tokens embedded in the remote URL: this reaches the UI and the support zip.
+	$first = trim((string) strtok($text, "\n"));
+	$first = preg_replace('#([a-z][a-z0-9+.-]*://)[^/\s@]+@#i', '$1***@', $first);
+	return ($first !== '') ? ('git fetch failed: ' . $first) : 'git fetch failed';
+}
+
+// The clone URL the page posts with an update check ({"srcURL": ..,
+// "useCredentials": ..} -- the listing's URL for the plugin, i.e. what a
+// Reinstall would clone), with GitHub credentials injected when asked for.
+// '' when absent or not a GitHub URL: the only place it is used is as a git
+// remote, and IsGitHubURL() is the same gate the install path applies.
+// It must also be where this plugin can legitimately come from -- a listed
+// plugin, or the source the installed plugin declares -- because it is
+// force-fetched into the installed clone; any GitHub repo would otherwise do.
+function PluginUpdateCheckSrcURL($plugin)
+{
+	$body = '';
+	$fp = fopen('php://input', 'r');
+	if ($fp) {
+		while ($d = fread($fp, 1024 * 16)) {
+			$body .= $d;
+		}
+		fclose($fp);
+	}
+	$req = json_decode($body, true);
+	if (!is_array($req)) {
+		return '';
+	}
+	$url = isset($req['srcURL']) && is_string($req['srcURL']) ? trim($req['srcURL']) : '';
+	if ($url === '' || !IsGitHubURL($url) || filter_var($url, FILTER_VALIDATE_URL) === false) {
+		return '';
+	}
+	$installed = PluginInstalledInfo($plugin);
+	$ownSrc = (is_array($installed) && isset($installed['srcURL'])) ? $installed['srcURL'] : '';
+	$slug = PluginRepoSlugFromURL($url);
+	if (!PluginSrcURLIsListed($url) && ($slug === '' || $slug !== PluginRepoSlugFromURL($ownSrc))) {
+		return '';
+	}
+	if (!empty($req['useCredentials'])) {
+		$injected = InjectGitHubCredentials($url);
+		if ($injected !== false) {
+			$url = $injected;
+		}
+	}
+	return $url;
+}
+
+// Fetch refs/heads/<branch> of $url into refs/remotes/origin/<branch> of the
+// installed clone, bypassing the clone's own (possibly dead) origin URL.
+// Populates the same ref PluginPendingPrivacy(.., 'reinstall') reads.  $url ''
+// falls back to the clone's origin, which is only useful when the branch,
+// not the URL, is what --single-branch could not see.
+function PluginFetchReinstallTargetByURL($plugin, $branch, $url)
 {
 	global $settings, $SUDO;
-	$result = Array();
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	if (!preg_match('/^[A-Za-z0-9_.-]+$/', $plugin) || !is_dir($dir) ||
+		$branch === '' || !preg_match('/^[A-Za-z0-9_.\/-]+$/', $branch) || strpos($branch, '..') !== false) {
+		return false;
+	}
+	$remote = ($url !== '') ? escapeshellarg($url) : 'origin';
+	exec(PluginGitFetchCmd($dir, $remote . ' ' . escapeshellarg('+refs/heads/' . $branch . ':refs/remotes/origin/' . $branch)), $o, $rv);
+	unset($o);
+	return $rv == 0;
+}
+
+/**
+ * Update plugin
+ *
+ * Pull in git updates for plugin {RepoName}: the checked-out branch's tip,
+ * or, when the versions[] entry for this FPP pins a sha the clone has not
+ * passed, that sha and no further. Before the plugin's own
+ * fpp_upgrade.sh (or fpp_install.sh) runs, its declared dependencies are
+ * reconciled against the new version: newly declared apt, Python and script
+ * dependencies are installed, and package claims the new version no longer
+ * declares are released (apt-removed once nothing else needs them). A newly
+ * declared dependency plugin is reported, not installed -- the operator has to
+ * see its privacy disclosure on the Plugins page. Supports ?stream=true.
+ *
+ * When the privacy block the update would land differs materially from the
+ * one accepted for this plugin, the update is refused unless the POST body
+ * is `{"privacyAccepted": <block>}` with that block. Only the FPP Plugins
+ * page may send `privacyAccepted`, and only with a block it actually showed
+ * the operator (GET /plugin/{RepoName}/privacy; its Update and Update All
+ * both do). Scripts and other API clients POST no body -- not even by
+ * echoing `pending` back from a refusal: on `Code: "PrivacyMismatch"` they
+ * stop and send the operator to the Plugins page. The server cannot tell callers apart, so
+ * this is a rule for clients, not something it enforces.
+ *
+ * Refused on privacy grounds (the same shape as POST /api/plugin):
+ * `{"Status": "Error", "Code": "PrivacyMismatch", "reason": "mismatch",
+ * "Message": "…", "privacyChanged": true, "plugin": "fpp-matrixtools",
+ * "pending": {"sends": [], "remoteAccess": "none"}}`.
+ *
+ * @route POST /api/plugin/{RepoName}/upgrade
+ * @body {"privacyAccepted": {"sends": [], "remoteAccess": "none"}}
+ * @response 200 Plugin upgraded
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+/**
+ * Update plugin by GET (deprecated)
+ *
+ * The same update as POST /api/plugin/{RepoName}/upgrade sent without a
+ * body: it is refused (`Code: "PrivacyMismatch"`) whenever the privacy
+ * disclosure the update would land differs from the one accepted for this
+ * plugin. FPP 11 will require the POST.
+ *
+ * @route GET /api/plugin/{RepoName}/upgrade deprecated
+ * @response 200 Plugin upgraded
+ * ```json
+ * {"Status": "OK", "Message": ""}
+ * ```
+ */
+// The apt packages a dependency block declares, as a flat list of names.
+// Arch-less, like the manifest's keys and "via" (a declared "foo:armhf" is
+// claimed as "foo"), so the two compare like with like.
+function DeclaredPackages($deps)
+{
+	$declared = array();
+	if (is_array($deps) && isset($deps['packages']) && is_array($deps['packages'])) {
+		foreach ($deps['packages'] as $p) {
+			if (is_string($p) && $p !== '') {
+				$declared[] = PackageBaseName($p);
+			}
+		}
+	}
+	return $declared;
+}
+
+// The packages the plugin holds a claim on but no longer declares ($declared:
+// DeclaredPackages()). A dependency the install pulled in is "declared"
+// through its parent: it stays as long as any parent is still declared, and
+// goes with the parent's batch when the parent is dropped.
+function UndeclaredPackageClaims($plugin, $declared)
+{
+	$stale = array();
+	foreach (PackagesClaimedBy($plugin) as $pkg) {
+		if (!in_array($pkg, $declared, true) && !count(array_intersect(PackageVia($pkg), $declared))) {
+			$stale[] = $pkg;
+		}
+	}
+	return $stale;
+}
+
+// Drop the plugin's claim on every package in $stale (UndeclaredPackageClaims();
+// a package is apt-removed only once nothing else needs it), in a tracked
+// window. Runs after an upgrade, and after the install half of a reinstall
+// that kept its packages, so a version that stops needing a package releases
+// it. Returns the package changes, or null.
+function ReleaseUndeclaredPackageClaims($plugin, $stale, $op, $stream)
+{
+	if (empty($stale)) {
+		return null;
+	}
+	PluginEchoLog($op, $plugin, "\nNo longer declared by '$plugin': " . implode(', ', $stale) . ".\n", $stream);
+	return PluginReleaseClaimsTracked($op, $plugin, $stale, $stream, "releasing package claims $plugin no longer declares");
+}
+
+// After a plugin's code has changed under an existing install (upgrade):
+// make its dependencies match what the version now on disk declares.
+// Packages this version no longer lists lose the plugin's claim; everything
+// it now lists goes through the same ResolveLocalDependencies() an install
+// uses, so a newly declared apt/python/script dependency is installed before
+// the plugin's own upgrade script runs against it. A newly declared
+// dependency plugin is not installed (see below). Packages already present
+// are left alone. Returns false if a newly declared dependency could not be
+// installed. $fppPkgChanges: the package changes, as 'fppPackages'; a window
+// opens only when there is something to release or install, so Update All
+// over plugins without dependencies costs nothing.
+function ReconcilePluginDependencies($plugin, $op, $stream, &$fppPkgChanges = null)
+{
+	global $settings;
+	$fppPkgChanges = null;
+	$deps = PluginDeclaredDependencies($plugin);
+	if ($deps === false) {
+		return true;
+	}
+	// A newly declared dependency PLUGIN is not installed from here: that
+	// would go through InstallPluginFromInfo with no privacy block shown or
+	// recorded, and an upgrade must never carry a new plugin past the
+	// operator unseen. Say so and leave it to the Plugins page.
+	if (isset($deps['plugins']) && is_array($deps['plugins']) && count($deps['plugins'])) {
+		$names = array();
+		foreach ($deps['plugins'] as $d) {
+			$n = is_array($d) ? ($d['repoName'] ?? '') : $d;
+			if (is_string($n) && $n !== '' && !file_exists($settings['pluginDirectory'] . '/' . $n)) {
+				$names[] = $n;
+			}
+		}
+		if (count($names)) {
+			PluginEchoLog($op, $plugin, "\n'$plugin' now depends on plugin(s) not installed here: " . implode(', ', $names) . ". Install them from the Plugins page.\n", $stream);
+		}
+	}
+	// Two windows, as on install: the claims released, then what it now
+	// declares installed.
+	$released = ReleaseUndeclaredPackageClaims($plugin, UndeclaredPackageClaims($plugin, DeclaredPackages($deps)), $op, $stream);
+	list($ok, $installed) = PluginTrackPackages($op, $plugin, $plugin, DepsMayChangePackages($deps), function () use ($plugin, $deps, $op, $stream) {
+		return $deps === null || ResolveLocalDependencies($deps, $plugin, $stream, $op);
+	}, $stream, "installing $plugin's declared dependencies");
+	$fppPkgChanges = PluginPackageChangesMerge($released, $installed);
+	return $ok;
+}
+
+function UpgradePlugin()
+{
+	global $settings, $SUDO, $_REQUEST, $fppDir;
+	// Finish once started, even if the browser goes away: a closed tab must not
+	// stop PHP at the next echo between the scripts and the bookkeeping after
+	// them (install history, plugin source, privacy record).
+	ignore_user_abort(true);
+	$result = array();
 
 	$plugin = params('RepoName');
+	if (!IsValidPluginName($plugin)) {
+		return json(array('Status' => 'Error', 'Message' => 'Plugin is not installed'));
+	}
+	$stream = $_REQUEST['stream'];
+	$streaming = isset($stream) && $stream != "false";
+	$startedAt = date('c'); // for the history, as in InstallPluginFromInfo()
 
-	$cmd = '(cd ' . $settings['pluginDirectory'] . '/' . $plugin . ' && ' . $SUDO . ' git pull)';
-	exec($cmd, $output, $return_val);
+	// A change to what the plugin declares about sends, collects, sensors,
+	// remote access, system changes or closed code re-shows the install
+	// dialog. The Plugins page asks api/plugin/:RepoName/privacy first and
+	// POSTs the block it showed as {"privacyAccepted": ...}; this is the
+	// backstop for every other caller (Update All, a script, an old page), so
+	// an upgrade can never carry a new declaration past the operator unseen.
+	// Same fetch-then-read the update check does; upgrade_plugin is then told
+	// not to fetch again (FPP_PLUGIN_NO_FETCH) but to fast-forward to the
+	// exact sha just read (FPP_PLUGIN_TARGET_SHA), so what is compared is
+	// what lands even if a push arrives in between. The
+	// record is written afterwards, from the block on disk, once the pull has
+	// succeeded (below) -- never for a version that did not land.
+	$pending = null;
+	$accepted = null;
+	$GLOBALS['PLUGIN_FETCH_OK'] = false;
+	$GLOBALS['PLUGIN_FETCHED_SHA'] = '';
+	// Keep a sweep's fetch from failing this upgrade's fetch and pull. A lock
+	// still held after the wait means a check is mid-fetch on this plugin:
+	// refuse plainly rather than fetch against it and report git's ref-lock
+	// error as the upgrade's failure.
+	if ($streaming && PluginFetchLock($plugin, false, $busy) === false && $busy) {
+		// Someone (a sweep, a check) is fetching this plugin now: say so before
+		// the wait below, or the progress popup sits blank for up to 30 s.
+		DisableOutputBuffering();
+		echo "Waiting for another check of $plugin to finish...\n";
+	}
+	$fetchLock = PluginFetchLock($plugin, true, $lockHeld);
+	if ($lockHeld) {
+		$msg = "Could not update '$plugin': another check of this plugin is still running; try again in a moment. Nothing was changed.\n";
+		PluginLog('upgrade', $plugin, "refused: another check holds the fetch lock");
+		if ($streaming) {
+			DisableOutputBuffering();
+			echo $msg;
+			return "\nDone\n";
+		}
+		$result['Status'] = 'Error';
+		$result['Message'] = trim($msg);
+		return json($result);
+	}
+	$changed = PluginPrivacyChanged($plugin, true, $pending, $accepted);
+	if (!$GLOBALS['PLUGIN_FETCH_OK']) {
+		// Before the privacy gate 'git pull' failed loudly here; with the
+		// fetch moved up front the same failure must not become a silent
+		// fast-forward to the old ref plus a root install script.
+		$msg = "Could not fetch updates for '$plugin' (offline, or the repository is unreachable). Nothing was changed.\n";
+		PluginLog('upgrade', $plugin, "refused: git fetch failed");
+		if ($streaming) {
+			DisableOutputBuffering();
+			echo $msg;
+			return "\nDone\n";
+		}
+		$result['Status'] = 'Error';
+		$result['Message'] = trim($msg);
+		return json($result);
+	}
+	if ($changed) {
+		$body = '';
+		$fp = fopen('php://input', 'r');
+		while ($d = fread($fp, 1024 * 16)) {
+			$body .= $d;
+		}
+		fclose($fp);
+		$req = json_decode($body, true);
+		$offered = (is_array($req) && array_key_exists('privacyAccepted', $req)) ? $req['privacyAccepted'] : false;
+		if ($offered === false || PluginPrivacyMaterial($offered) !== PluginPrivacyMaterial($pending)) {
+			// Same refusal and reply shape as an install (PluginPrivacyRefuse,
+			// PluginPrivacyRefusalReply); the stream carries no marker.
+			$msg = "The privacy disclosure of '$plugin' has changed since it was installed. Review it on the Plugins page and press Update there.";
+			if ($streaming) {
+				DisableOutputBuffering();
+			}
+			$record = ReadPluginPrivacyAccepted();
+			PluginPrivacyRefuse($plugin, $pending, $msg, $stream, 'upgrade', false,
+				isset($record[$plugin]) ? 'mismatch' : 'notAccepted');
+			if ($streaming) {
+				return "\nDone\n";
+			}
+			return json(PluginPrivacyRefusalReply($msg));
+		}
+	}
 
-	if ($return_val == 0)
-	{
+	// The git pull (plus its git-clean retry) and the plugin's optional
+	// post-pull script (fpp_upgrade.sh, else fpp_install.sh -- for plugins
+	// whose artifacts live outside git, e.g. prebuilt release binaries) all run
+	// in scripts/upgrade_plugin. Like install_plugin / uninstall_plugin, that
+	// wrapper logs (via startPluginLog) to the shared logs/fpp_plugin_manager.log, so a
+	// failed upgrade is diagnosable from the log viewer / Support Zip instead of
+	// the git-pull output vanishing. PLUGINDIR/SUDO are exported to match the values PHP
+	// uses (the same way UninstallPlugin invokes uninstall_plugin).
+	// The script phase is deferred (FPP_SKIP_UPGRADE_SCRIPT) so the plugin's
+	// declared dependencies can be reconciled against the version that just
+	// landed first: a release that adds an apt package needs it installed
+	// before fpp_upgrade.sh runs, and one that drops a package should release
+	// FPP's claim on it. Same split as install (FPP_SKIP_INSTALL_SCRIPT).
+	$envPrefix = 'export SUDO=' . escapeshellarg($SUDO)
+		. '; export PLUGINDIR=' . escapeshellarg($settings['pluginDirectory'])
+		. '; export FPP_PLUGIN_NO_FETCH=1'
+		. '; export FPP_PLUGIN_TARGET_SHA=' . escapeshellarg($GLOBALS['PLUGIN_FETCHED_SHA'])
+		// Tells the plugin's fpp_upgrade.sh that FPP reloads it in fppd once the
+		// upgrade lands (below), so it neither reloads itself nor asks for a
+		// restart.
+		. '; export FPP_RELOADS_PLUGIN=1'
+		. '; export FPP_SKIP_UPGRADE_SCRIPT=1; ';
+	$cmd = $envPrefix . escapeshellarg($fppDir . '/scripts/upgrade_plugin') . ' ' . escapeshellarg($plugin);
+	$runCmd = $envPrefix . escapeshellarg($fppDir . '/scripts/upgrade_plugin')
+		. ' --run-upgrade-script ' . escapeshellarg($plugin);
+
+	$fromSha = PluginInstalledSha($plugin);
+	$libsBefore = PluginSharedLibraryFingerprint($plugin);
+	$pkgChanges = null;
+	if ($streaming) {
+		DisableOutputBuffering();
+		system($cmd, $return_val);
+	} else {
+		exec($cmd, $output, $return_val);
+	}
+	$depFailed = false;
+	$fppPkgChanges = null;
+	if ($return_val == 0) {
+		// FPP's own package work for the new version, recorded apart from its
+		// script's ('fppPackages'). Reconciling never installs a dependency
+		// plugin, so nothing else's install falls in that window.
+		if (!ReconcilePluginDependencies($plugin, 'upgrade', $stream, $fppPkgChanges)) {
+			PluginEchoLog('upgrade', $plugin, "\nERROR: the code of '$plugin' was updated, but a dependency it now declares could not be installed; its upgrade script was not run.\n", $stream);
+			$return_val = 2;
+			$depFailed = true;
+		} else {
+			list(, $pkgChanges) = PluginTrackPackages('upgrade', $plugin, $plugin, PluginHasOwnScript($plugin, array('fpp_upgrade.sh', 'fpp_install.sh')), function () use ($streaming, $runCmd, &$output, &$return_val) {
+				if ($streaming) {
+					system($runCmd, $return_val);
+				} else {
+					exec($runCmd, $output, $return_val);
+				}
+			}, $stream);
+		}
+		if ($return_val != 0) {
+			$return_val = 2; // the code landed; only the script phase failed
+		}
+	}
+	if ($return_val == 0) {
+		PluginReinstallPendingSync($plugin); // rebuilt on this OS
+	}
+	// The running fppd still has the old code: FPP never reloaded a plugin
+	// after an upgrade, so every plugin had to ask for a restart. Reload it
+	// when what fppd runs changed -- the code moved, or a library was replaced
+	// without the code moving (a plugin that downloads prebuilt binaries in its
+	// upgrade script). Not after a failed script, which may have left things
+	// half done, and not for an Update All pass that changed nothing.
+	if ($return_val == 0 && (PluginInstalledSha($plugin) !== $fromSha || PluginSharedLibraryFingerprint($plugin) !== $libsBefore)) {
+		$result['restartRequired'] = !PluginReloadAfterUpgrade($plugin, $stream);
+	}
+	PluginRecordUpgradedPrivacy($plugin, $return_val, $changed, $pending, $stream);
+	// rc 0 and 2 both mean the code landed. Before the streaming return: the UI always streams.
+	if ($return_val != 1) {
+		$entry = array('startedAt' => $startedAt, 'fromSha' => $fromSha, 'sha' => PluginInstalledSha($plugin));
+		if ($depFailed) {
+			$entry['dependencyFailed'] = true;
+		} else if ($return_val == 2) {
+			$entry['scriptFailed'] = true;
+		}
+		if (!empty($fppPkgChanges)) {
+			$entry['fppPackages'] = $fppPkgChanges;
+		}
+		if (!empty($pkgChanges)) {
+			$entry['packages'] = $pkgChanges;
+		}
+		// Update All runs upgrade_plugin on plugins with nothing new; it
+		// succeeds without moving, and that is not an event worth keeping
+		// (unless packages changed anyway).
+		if ($entry['sha'] !== $fromSha || $return_val == 2 || !empty($pkgChanges) || !empty($fppPkgChanges)) {
+			AppendPluginHistory($plugin, 'upgrade', $entry);
+		}
+		// The refs were fetched moments ago, so this is a local read.
+		list($u, $e) = PluginUpdateVerdict($plugin);
+		PluginUpdateStateSet($plugin, $u, $e, 'upgrade');
+	}
+	if ($streaming) {
+		return "\nDone\n";
+	}
+
+	// upgrade_plugin's exit code says which phase failed: 1 = the code was
+	// not updated (pull and its reset fallback failed, or still behind
+	// origin), 2 = the code was updated but the plugin's own
+	// fpp_upgrade.sh / fpp_install.sh returned non-zero. The two need
+	// different next steps, so they get different messages.
+	if ($return_val == 0) {
 		$result['Status'] = 'OK';
 		$result['Message'] = '';
-	}
-	else
-	{
+	} else {
 		$result['Status'] = 'Error';
-		$result['Message'] = 'Could not run git pull for plugin ' . $plugin;
+		$result['Message'] = ($return_val == 2)
+			? "Plugin $plugin was updated, but its install/upgrade script failed; see logs/fpp_plugin_manager.log"
+			: "Could not update plugin $plugin from its repository; see logs/fpp_plugin_manager.log";
 	}
 
 	return json($result);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////
-// Helper functions
-function PluginHasUpdates($plugin)
+// After upgrade_plugin: rc 0 or 2 means the code landed (2: its own script
+// failed), so record what is on disk now -- provided it is what the operator
+// accepted ($pending after the gate above; the existing record when nothing
+// had changed). A push between the fetch and the fast-forward can land a
+// block nobody saw: then the record is dropped and the next check asks. On
+// rc 1 nothing landed and nothing is recorded.
+function PluginRecordUpgradedPrivacy($plugin, $rc, $changed, $pending, $stream)
 {
-	global $settings;
-	$output = '';
-
-	$cmd = '(cd ' . $settings['pluginDirectory'] . '/' . $plugin . ' && git log ..origin)';
-	exec($cmd, $output, $return_val);
-
-	if (($return_val == 0) && !empty($output))
-		return 1;
-
-	return 0;
+	if ($rc != 0 && $rc != 2) {
+		return;
+	}
+	$landed = PluginPrivacyBlock(PluginInstalledInfo($plugin));
+	if ($changed) {
+		$expected = $pending;
+	} else {
+		$all = ReadPluginPrivacyAccepted();
+		if (!isset($all[$plugin]) || !array_key_exists('privacy', $all[$plugin])) {
+			return; // nothing accepted, nothing pending: leave it that way
+		}
+		$expected = $all[$plugin]['privacy'];
+	}
+	if (PluginPrivacyMaterial($landed) === PluginPrivacyMaterial($expected)) {
+		RecordPluginPrivacyAccepted($plugin, $landed, PluginInstalledSha($plugin));
+	} else {
+		ForgetPluginPrivacyAccepted($plugin);
+		PluginEchoLog('upgrade', $plugin, "\nThe privacy disclosure of '$plugin' that was installed is not the one that was accepted (the repository changed between the check and the update). FPP will ask about it at the next update check.\n", $stream);
+	}
 }
 
-/////////////////////////////////////////////////////////////////////////////
+// --- Plugin privacy disclosure ----------------------------------------
+// A pluginInfo.json may carry a `privacy` block (fpp-data schema; format and
+// colouring rules in fpp-plugin-Template's PLUGININFO_FORMAT.md and
+// PLUGIN_GUIDELINES.md §14.15): what the plugin sends,
+// keeps, senses, listens on, changes and whether all of its code can be
+// checked. The Plugins page turns it into the six coloured lights
+// (js/fpp-privacy-lights.js). The server's part is small and deliberately
+// tolerant:
+//
+//   - read the block out of any pluginInfo without caring what else is in it
+//     or in the block (PluginPrivacyBlock);
+//   - remember the block the operator saw when they pressed Install
+//     (RecordPluginPrivacyAccepted), in config/ so a backup carries it;
+//   - on upgrade, compare the incoming block's MATERIAL keys -- the whole
+//     block minus `summary`: sends, collects, sensors, remoteAccess,
+//     systemChanges, closedCode and the free-text `other` (where support
+//     access, payments, self-update and the like are declared) -- against
+//     the accepted one (PluginPrivacyChanged) so a plugin that starts
+//     talking to somebody new re-shows the dialog, while a reworded summary
+//     does not. Keys outside that list, known or unknown, are ignored by
+//     the diff. Whether a block is DECLARED at all is judged on the six
+//     light keys only: an `other`-only block says nothing material.
+//
+// Nothing here rejects a block. An empty, absent or oddly shaped block is
+// "nothing declared", never "invalid".
 
+define('PLUGIN_PRIVACY_ACCEPTED_FILE', 'pluginPrivacyAccepted.json');
+$GLOBALS['PLUGIN_PRIVACY_LIGHT_KEYS'] = array('sends', 'collects', 'sensors', 'remoteAccess', 'systemChanges', 'closedCode');
+$GLOBALS['PLUGIN_PRIVACY_MATERIAL_KEYS'] = array_merge($GLOBALS['PLUGIN_PRIVACY_LIGHT_KEYS'], array('other'));
+
+function PluginPrivacyAcceptedFile()
+{
+	global $settings;
+	return $settings['configDirectory'] . '/' . PLUGIN_PRIVACY_ACCEPTED_FILE;
+}
+
+// The `privacy` block of a decoded pluginInfo, or null when there is none.
+// An object with keys FPP has never seen is still a block: the unknown keys
+// ride along (the page ignores them but shows the block as written).
+function PluginPrivacyBlock($info)
+{
+	if (!is_array($info) || !isset($info['privacy']) || !is_array($info['privacy'])) {
+		return null;
+	}
+	return $info['privacy'];
+}
+
+// Recursively key-sorts so two blocks that say the same thing in a different
+// order encode the same. Lists keep their order: a reordered sends list is a
+// change nobody is harmed by seeing again.
+function PluginPrivacyCanonical($v)
+{
+	if (is_array($v)) {
+		$isList = (count($v) === 0) || array_keys($v) === range(0, count($v) - 1);
+		$out = array();
+		foreach ($v as $k => $item) {
+			$out[$k] = PluginPrivacyCanonical($item);
+		}
+		if (!$isList) {
+			ksort($out, SORT_STRING);
+		}
+		return $out;
+	}
+	return $v;
+}
+
+// The part of a block a change to which re-shows the dialog, as one
+// comparable string; null when there is no block. Keys the block does not
+// have are simply absent, so a block that gains a new material key counts as
+// changed (it says something it did not say before) and one that gains a
+// key FPP has never heard of does not.
+function PluginPrivacyMaterial($privacy)
+{
+	if (!is_array($privacy)) {
+		return null;
+	}
+	$m = array();
+	$lights = 0;
+	foreach ($GLOBALS['PLUGIN_PRIVACY_MATERIAL_KEYS'] as $k) {
+		if (!array_key_exists($k, $privacy)) {
+			continue;
+		}
+		if ($k === 'other') {
+			// Free text: whitespace and "none" (the page shows neither)
+			// are not a change; anything else is compared as written.
+			$other = is_string($privacy[$k]) ? trim($privacy[$k]) : '';
+			if ($other !== '' && strtolower($other) !== 'none') {
+				$m[$k] = $other;
+			}
+			continue;
+		}
+		$m[$k] = $privacy[$k];
+		$lights++;
+	}
+	// `"privacy": {}`, a summary-only or an `other`-only block says nothing
+	// material: the same as no block, per the section comment above.
+	if ($lights === 0) {
+		return null;
+	}
+	return json_encode(PluginPrivacyCanonical($m));
+}
+
+// The installed copy's pluginInfo.json, decoded, or null.
+function PluginInstalledInfo($plugin)
+{
+	global $settings;
+	$f = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
+	if (!preg_match('/^[A-Za-z0-9_.-]+$/', $plugin) || !file_exists($f)) {
+		return null;
+	}
+	$info = json_decode(file_get_contents($f), true);
+	return is_array($info) ? $info : null;
+}
+
+// HEAD of the installed plugin, for the record; '' when unreadable.
+function PluginInstalledSha($plugin)
+{
+	global $settings;
+	return PluginGitHead($settings['pluginDirectory'] . '/' . $plugin);
+}
+
+// The record is device-scoped, like the privacyConsent record
+// (www/privacyConsent.inc, BackupIsFromThisDevice in backup.php): the file
+// carries the UUID of the player that wrote it and is honoured only on that
+// player. A backup restored onto another player therefore does not carry
+// its acceptances -- nobody was shown those disclosures on this device --
+// and the first Reinstall All asks about each plugin once, as a fresh
+// install would. Identity-less players (getSystemUUID() "Unknown") honour
+// only a file that is equally identity-less: the same rule privacyConsent
+// applies, and the one class of backup that cannot be told apart anyway.
+function PluginPrivacyRecordIsForThisDevice($fileUuid)
+{
+	$device = getSystemUUID();
+	if (isValidSystemUUID($fileUuid) && isValidSystemUUID($device)) {
+		return $fileUuid === $device;
+	}
+	return !isValidSystemUUID($fileUuid) && !isValidSystemUUID($device);
+}
+
+// Reads the record file into [status, plugins]: status 'none' (no file),
+// 'ok' (this player's file), 'foreign' (another player's UUID), 'bad'
+// (unreadable). Callers that only want the entries use ReadPluginPrivacyAccepted().
+function LoadPluginPrivacyAccepted()
+{
+	$file = PluginPrivacyAcceptedFile();
+	if (!file_exists($file)) {
+		return array('none', array());
+	}
+	$all = json_decode((string) @file_get_contents($file), true);
+	if (!is_array($all) || !isset($all['plugins']) || !is_array($all['plugins'])) {
+		return array('bad', array());
+	}
+	if (!PluginPrivacyRecordIsForThisDevice(isset($all['uuid']) ? $all['uuid'] : '')) {
+		return array('foreign', array());
+	}
+	// One malformed entry (a hand edit, a bad restore) must not fatal every
+	// reader with a TypeError on $entry['privacy']; drop it, keep the rest.
+	$plugins = array();
+	foreach ($all['plugins'] as $name => $entry) {
+		if (is_array($entry)) {
+			$plugins[$name] = $entry;
+		}
+	}
+	return array('ok', $plugins);
+}
+
+function ReadPluginPrivacyAccepted()
+{
+	list(, $plugins) = LoadPluginPrivacyAccepted();
+	return $plugins;
+}
+
+// Applies $change (a function on the plugins array returning the new one)
+// under an exclusive lock, so two requests -- a Reinstall All install and a
+// second tab's update check -- cannot lose each other's entry. A file that is
+// not this player's (another UUID) or cannot be read is never overwritten:
+// it is moved aside as <file>.<foreign|bad>.bak first and logged, so nothing
+// anyone accepted anywhere disappears silently.
+function UpdatePluginPrivacyAccepted($change)
+{
+	$file = PluginPrivacyAcceptedFile();
+	$lock = @fopen($file . '.lock', 'c');
+	if ($lock) {
+		flock($lock, LOCK_EX);
+	}
+	list($status, $plugins) = LoadPluginPrivacyAccepted();
+	if ($status === 'foreign' || $status === 'bad') {
+		$aside = $file . '.' . $status . '.bak';
+		@rename($file, $aside);
+		error_log("pluginPrivacyAccepted.json was $status; moved to $aside and started afresh");
+	}
+	$plugins = $change($plugins);
+	$json = json_encode(array('uuid' => getSystemUUID(), 'plugins' => $plugins), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+	// Write-then-rename so a crash mid-write cannot leave a truncated file
+	// that reads as "nothing accepted for anything".
+	$tmp = $file . '.tmp';
+	$ok = (@file_put_contents($tmp, $json) !== false);
+	if ($ok) {
+		@chmod($tmp, 0664);
+		$ok = @rename($tmp, $file);
+	}
+	if ($lock) {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+	}
+	return $ok;
+}
+
+/**
+ * Remember the block the operator accepted for $repoName. $privacy may be
+ * null: "installed with nothing declared" is itself the accepted state, and
+ * is what later distinguishes a plugin that gains a declaration (dialog) from
+ * one installed before this record existed (also dialog, once). $sha is the
+ * commit the block was read from -- informational: HEAD of the installed
+ * copy, since install and upgrade both record once the code is on disk.
+ */
+function RecordPluginPrivacyAccepted($repoName, $privacy, $sha = '')
+{
+	if (!is_string($repoName) || $repoName === '') {
+		return;
+	}
+	UpdatePluginPrivacyAccepted(function ($all) use ($repoName, $privacy, $sha) {
+		$all[$repoName] = array(
+			'privacy' => $privacy,
+			'sha' => is_string($sha) ? $sha : '',
+			'acceptedAt' => gmdate('c'),
+		);
+		return $all;
+	});
+}
+
+// Uninstall keeps the record, stamped: a reinstall from a script or an old
+// page (POST /plugin without privacyAccepted) is then still checked against
+// what was accepted, and an install from the page with the same block is a
+// no-op on the record. Records of plugins gone for 90 days are dropped here.
+function MarkPluginPrivacyUninstalled($repoName)
+{
+	list($status, $all) = LoadPluginPrivacyAccepted();
+	if ($status !== 'ok' || !isset($all[$repoName])) {
+		return;
+	}
+	UpdatePluginPrivacyAccepted(function ($all) use ($repoName) {
+		$all[$repoName]['uninstalledAt'] = gmdate('c');
+		$cutoff = time() - 90 * 86400;
+		foreach ($all as $name => $entry) {
+			$gone = isset($entry['uninstalledAt']) ? strtotime((string) $entry['uninstalledAt']) : false;
+			if ($gone !== false && $gone < $cutoff) {
+				unset($all[$name]);
+			}
+		}
+		return $all;
+	});
+}
+
+function ForgetPluginPrivacyAccepted($repoName)
+{
+	list($status, $all) = LoadPluginPrivacyAccepted();
+	if ($status !== 'ok' || !isset($all[$repoName])) {
+		return; // nothing of ours to forget; a foreign/bad file is left for the next write to move aside
+	}
+	UpdatePluginPrivacyAccepted(function ($all) use ($repoName) {
+		unset($all[$repoName]);
+		return $all;
+	});
+}
+
+// Where a Reinstall of $plugin would land, as [branch, sha]: the versions[]
+// entry the installed pluginInfo.json selects for THIS FPP
+// (SelectPluginVersionEntry; the page's BuildReinstallInfo posts what this
+// returns), branch 'master' when unset, sha '' when unpinned. After an FPP major upgrade this is often a different branch
+// from the one checked out -- five listed plugins keep one branch per major
+// -- which is exactly when Reinstall All is asked for.
+function PluginReinstallTarget($plugin)
+{
+	global $settings;
+	$infoFile = $settings['pluginDirectory'] . '/' . $plugin . '/pluginInfo.json';
+	if (!file_exists($infoFile)) {
+		return array('', '');
+	}
+	$entry = SelectPluginVersionEntry(json_decode(file_get_contents($infoFile), true));
+	if (!is_array($entry)) {
+		return array('', '');
+	}
+	$branch = (isset($entry['branch']) && is_string($entry['branch']) && $entry['branch'] !== '') ? $entry['branch'] : 'master';
+	$sha = (isset($entry['sha']) && is_string($entry['sha'])) ? $entry['sha'] : '';
+	if (!preg_match('/^[A-Za-z0-9_.\/-]+$/', $branch) || !preg_match('/^([a-fA-F0-9]{4,40})?$/', $sha)) {
+		return array('', '');
+	}
+	return array($branch, $sha);
+}
+
+// The checked-out branch of an installed plugin, or '' when there is none:
+// detached HEAD, a branch name this code will not put in a shell command, or
+// git itself failing (corrupt clone, "dubious ownership"). Since '' covers all
+// three, $why receives a one-line reason the caller can show ("not on a branch
+// (detached HEAD)"); it is '' on success. Callers that only want the branch
+// pass nothing.
+function PluginCurrentBranch($plugin, &$why = null)
+{
+	global $settings;
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	unset($output);
+	exec('cd ' . escapeshellarg($dir) . ' && git rev-parse --abbrev-ref HEAD 2>&1', $output, $rv);
+	if ($rv != 0) {
+		// "dubious ownership", a corrupt repository: not a detached HEAD.
+		$first = isset($output[0]) ? trim($output[0]) : '';
+		$why = 'git could not read the checked-out branch' . ($first !== '' ? ' (' . $first . ')' : '');
+		return '';
+	}
+	$branch = isset($output[0]) ? trim($output[0]) : '';
+	if ($branch === '' || $branch === 'HEAD') {
+		$why = 'not on a branch (detached HEAD)';
+		return '';
+	}
+	if (!preg_match('/^[A-Za-z0-9_.\/+@-]+$/', $branch)) {
+		$why = 'unsupported branch name ' . $branch;
+		return '';
+	}
+	$why = '';
+	return $branch;
+}
+
+// Bring origin/<branch> up to date for a branch other than the checked-out
+// one. Plugins are cloned --single-branch, so a plain `git fetch` only
+// refreshes the current branch's remote ref; the explicit refspec fetches
+// the other branch into the same origin/ namespace without changing the
+// clone's configuration.
+function PluginFetchBranch($plugin, $branch)
+{
+	global $settings, $SUDO;
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	// Same set PluginCurrentBranch() accepts, or a branch could pass one and fail the other.
+	if ($branch === '' || !preg_match('/^[A-Za-z0-9_.\/+@-]+$/', $branch)) {
+		return false;
+	}
+	exec(PluginGitFetchCmd($dir, 'origin ' . escapeshellarg('refs/heads/' . $branch . ':refs/remotes/origin/' . $branch)), $o, $rv);
+	unset($o);
+	return $rv == 0;
+}
+
+// The declaration the next upgrade would land, as [block, source]. Read from
+// the fetched upstream tip (or pin) when the repo ships its own pluginInfo.json (the
+// authoritative copy after a pull), else from the listing's copy, else from
+// the installed file. $fetch runs `git fetch` first; the update check has
+// usually just done that, so its callers pass false.
+//
+// $target is 'upgrade' (default: origin/<checked-out branch>, what `git
+// pull` lands, or its versions[] pin while the clone is at or behind it)
+// or 'reinstall' (the versions[] branch and pin for this FPP,
+// what a fresh clone lands -- see PluginReinstallTarget). The two differ
+// only for plugins that keep one branch per FPP major, or pin a sha.
+function PluginPendingPrivacy($plugin, $fetch = false, $target = 'upgrade')
+{
+	global $settings, $SUDO;
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	if (!preg_match('/^[A-Za-z0-9_.-]+$/', $plugin) || !is_dir($dir)) {
+		return array(null, 'none');
+	}
+	$branch = PluginCurrentBranch($plugin);
+	$rev = '';
+	if ($target === 'reinstall') {
+		list($tBranch, $tSha) = PluginReinstallTarget($plugin);
+		if ($tBranch !== '') {
+			if ($fetch && $tBranch !== $branch) {
+				PluginFetchBranch($plugin, $tBranch);
+			}
+			$branch = $tBranch;
+			$rev = $tSha;
+		}
+	}
+	if ($fetch) {
+		exec(PluginGitFetchCmd($dir), $o, $rv);
+		unset($o);
+		$GLOBALS['PLUGIN_FETCH_OK'] = ($rv === 0);
+	}
+	// An upgrade of a clone sitting at (or behind) its versions[] pin moves
+	// only as far as the pin, the same rule PluginPinnedVerdict() gives the
+	// update check; past the pin (a downgrade) the branch tip applies.
+	$upgradePin = '';
+	if ($target === 'upgrade' && $branch !== '' && PluginPinnedVerdict($plugin, $branch, $upgradePin) !== null) {
+		$rev = $upgradePin;
+	}
+	if ($fetch) {
+		// UpgradePlugin reads both: a failed fetch (offline) must refuse
+		// rather than fast-forward to whatever stale ref is here, and the
+		// sha read now is what upgrade_plugin is told to land, so a push
+		// between this read and the merge cannot slip past the gate.
+		$GLOBALS['PLUGIN_FETCHED_SHA'] = ($target === 'upgrade' && $rev !== '') ? $rev
+			: (($branch !== '')
+				? trim((string) shell_exec('cd ' . escapeshellarg($dir) . ' && git rev-parse --verify -q ' . escapeshellarg('origin/' . $branch) . ' 2>/dev/null'))
+				: '');
+	}
+	if ($branch !== '') {
+		// A pinned sha is what the clone checks out; it is normally an
+		// ancestor of the fetched branch. Fall back to the branch tip if
+		// the object is not here (a pin on a commit never fetched) -- but
+		// not for an upgrade pin, which is resolved here: a pinned commit
+		// with no pluginInfo.json of its own lands without one, so the
+		// tip's block is not what lands (the copies below are closer).
+		$json = '';
+		if ($rev !== '') {
+			$json = shell_exec('cd ' . escapeshellarg($dir) . ' && git show ' . escapeshellarg($rev . ':pluginInfo.json') . ' 2>/dev/null');
+		}
+		if ((!is_string($json) || $json === '') && $upgradePin === '') {
+			$json = shell_exec('cd ' . escapeshellarg($dir) . ' && git show ' . escapeshellarg('origin/' . $branch . ':pluginInfo.json') . ' 2>/dev/null');
+		}
+		if (is_string($json) && $json !== '') {
+			$info = json_decode($json, true);
+			if (is_array($info)) {
+				return array(PluginPrivacyBlock($info), 'upstream');
+			}
+		}
+	}
+	$listed = GetListedPluginInfo($plugin);
+	if (is_array($listed)) {
+		return array(PluginPrivacyBlock($listed), 'listing');
+	}
+	$infoFile = $dir . '/pluginInfo.json';
+	if (file_exists($infoFile)) {
+		return array(PluginPrivacyBlock(json_decode(file_get_contents($infoFile), true)), 'installed');
+	}
+	return array(null, 'none');
+}
+
+/**
+ * True when the block the next upgrade would land differs materially from
+ * the one the operator accepted. A plugin installed before FPP kept this
+ * record has no accepted block, so the first upgrade that carries any
+ * declaration shows the dialog once and records it.
+ */
+function PluginPrivacyChanged($plugin, $fetch = false, &$pending = null, &$accepted = null, &$source = null, $target = 'upgrade')
+{
+	list($pending, $source) = PluginPendingPrivacy($plugin, $fetch, $target);
+	$all = ReadPluginPrivacyAccepted();
+	$accepted = (isset($all[$plugin]) && array_key_exists('privacy', $all[$plugin])) ? $all[$plugin]['privacy'] : null;
+	// Only the target version's own pluginInfo.json can say a disclosure
+	// was removed. No block from a fallback copy (the listing's cache may
+	// predate the block; the installed file is not the target) against a
+	// recorded one is "cannot tell", not "the author took it back".
+	if ($pending === null && $accepted !== null && $source !== 'upstream') {
+		return false;
+	}
+	return PluginPrivacyMaterial($pending) !== PluginPrivacyMaterial($accepted);
+}
+
+/**
+ * Privacy disclosure status for an installed plugin
+ *
+ * What the operator accepted at install, what the next upgrade would land,
+ * and whether the two differ in a way that re-shows the install dialog.
+ * Reads the already-fetched upstream tip (or versions[] pin); call
+ * `POST /plugin/{RepoName}/updates` first to fetch. `?target=reinstall` diffs
+ * the block a Reinstall would land (the versions[] branch and pin selected for
+ * this FPP) instead of the one `…/upgrade` would (origin/<checked-out branch>,
+ * or its pin while the clone is at or behind it), and adds
+ * `reinstallTarget: {branch, sha}`, the server's choice, for the page to post.
+ *
+ * @route GET /api/plugin/{RepoName}/privacy
+ * @response 200 Privacy status
+ * ```json
+ * {"Status": "OK", "changed": true, "recorded": false, "accepted": null, "pending": {"sends": [], "remoteAccess": "none"}, "source": "upstream"}
+ * ```
+ */
+function GetPluginPrivacyStatus()
+{
+	global $settings;
+	$plugin = params('RepoName');
+	if (!IsValidPluginName($plugin) || !is_dir($settings['pluginDirectory'] . '/' . $plugin)) {
+		return json(array('Status' => 'Error', 'Message' => 'Plugin is not installed'));
+	}
+	$target = (isset($_GET['target']) && $_GET['target'] === 'reinstall') ? 'reinstall' : 'upgrade';
+	$pending = null;
+	$accepted = null;
+	$source = null;
+	$changed = PluginPrivacyChanged($plugin, false, $pending, $accepted, $source, $target);
+	$all = ReadPluginPrivacyAccepted();
+	$result = array(
+		'Status' => 'OK',
+		'target' => $target,
+		'changed' => $changed,
+		'recorded' => isset($all[$plugin]),
+		'accepted' => $accepted,
+		'pending' => $pending,
+		'source' => $source,
+	);
+	if ($target === 'reinstall') {
+		// The commit the block is from, for the page to post back (see
+		// CheckForPluginUpdates's reinstallTarget).
+		list($tBranch, $tSha) = PluginReinstallTarget($plugin);
+		$result['reinstallTarget'] = array('branch' => $tBranch, 'sha' => $tSha);
+	}
+	return json($result);
+}
+
+// Helper functions
+
+/**
+ * Injects GitHub credentials (username + Personal Access Token) into a
+ * GitHub HTTPS URL so `git clone` and `curl` can authenticate against
+ * private repositories.
+ *
+ * @param string $url GitHub HTTPS URL to inject credentials into.
+ * @return string|false Modified URL on success, or false if credentials are not
+ *                      configured or the URL is not a recognized GitHub URL.
+ */
+function InjectGitHubCredentials($url)
+{
+	global $settings;
+
+	$user = isset($settings['gitHubUser']) ? trim($settings['gitHubUser']) : '';
+	$pat = isset($settings['gitHubPAT']) ? trim($settings['gitHubPAT']) : '';
+
+	if ($user === '' || $pat === '')
+		return false;
+
+	// Only inject into GitHub URLs to avoid leaking credentials to unrelated
+	// hosts.
+	if (!IsGitHubURL($url))
+		return $url;
+
+	return preg_replace('#^https://#i', 'https://' . rawurlencode($user) . ':' . rawurlencode($pat) . '@', $url, 1);
+}
+
+/**
+ * Fetches the contents of a URL using GitHub credentials when available.
+ * Falls back to `file_get_contents` when credentials are not configured.
+ * `raw.githubusercontent.com` requires an `Authorization: token <PAT>`
+ * header rather than HTTP Basic auth for private content. Temporary
+ * share-link tokens (`?token=GHSAT...`) are stripped and replaced with
+ * the configured PAT.
+ *
+ * @param string $url URL to fetch.
+ * @return string|false Response body on success, or false on failure.
+ */
+function FetchURLWithGitHubCredentials($url)
+{
+	global $GitHubFetchLastError;
+	$GitHubFetchLastError = '';
+	global $settings;
+
+	$user = isset($settings['gitHubUser']) ? trim($settings['gitHubUser']) : '';
+	$pat = isset($settings['gitHubPAT']) ? trim($settings['gitHubPAT']) : '';
+	$haveCreds = ($user !== '' && $pat !== '');
+
+	// Only treat as a GitHub URL (and apply credentials/normalization) when
+	// the host is one of the known GitHub hosts.
+	$isGitHub = IsGitHubURL($url);
+
+	if ($isGitHub && $haveCreds) {
+		// Strip GitHub's temporary "Raw" share-link token (e.g. ?token=GHSAT...)
+		// since we'll authenticate with the configured PAT instead.
+		$fetchUrl = preg_replace('/([?&])token=GHSAT[^&]*(&|$)/i', '$1', $url);
+		$fetchUrl = preg_replace('/[?&]$/', '', $fetchUrl);
+		$hadGhsatToken = ($fetchUrl !== $url);
+
+		$attempts = array($fetchUrl);
+
+		// Build a fallback URL using the GitHub Contents API which is the
+		// most reliable way to fetch a file from a private repo with a PAT
+		// (raw.githubusercontent.com can return 404 even with a valid PAT
+		// in some configurations -- particularly with fine-grained tokens).
+		if (preg_match('#^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$#i', $fetchUrl, $m)) {
+			$owner = $m[1];
+			$repo = $m[2];
+			$ref = $m[3];
+			$path = $m[4];
+			// raw URLs sometimes use "refs/heads/<branch>"
+			if (strpos($ref, 'refs') === 0 && isset($m[4])) {
+				// path starts with "heads/<branch>/<file>" -- handle "refs/heads/<branch>/<path>"
+				if (preg_match('#^heads/([^/]+)/(.+)$#', $path, $rm)) {
+					$ref = $rm[1];
+					$path = $rm[2];
+				}
+			}
+			$apiUrl = 'https://api.github.com/repos/' . $owner . '/' . $repo . '/contents/' . $path . '?ref=' . rawurlencode($ref);
+			$attempts[] = $apiUrl;
+		}
+
+		$lastCode = 0;
+		$lastBody = '';
+		$lastErr = '';
+		foreach ($attempts as $tryUrl) {
+			if (function_exists('curl_init')) {
+				$ch = curl_init($tryUrl);
+				curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+				curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+				// Without these this call has no upper bound at all: a remote
+				// that accepts and then stalls pins a PHP-FPM worker
+				// indefinitely. Every caller here fetches a small JSON file,
+				// so the caps are generous and still finite.
+				curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, PLUGIN_GITHUB_CONNECT_TIMEOUT);
+				curl_setopt($ch, CURLOPT_TIMEOUT, PLUGIN_GITHUB_TIMEOUT);
+				curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+				// Redirects stay on https: FOLLOWLOCATION is on and this request
+				// carries an "Authorization: token" header, so a redirect to
+				// http would put the PAT on the wire in clear.
+				if (defined('CURLPROTO_HTTPS')) {
+					curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+					curl_setopt($ch, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+				}
+				// Only enforced when the server sends a Content-Length, so the
+				// length check below is the one that actually holds.
+				curl_setopt($ch, CURLOPT_MAXFILESIZE, PLUGIN_FETCH_MAX_JSON);
+				curl_setopt($ch, CURLOPT_USERAGENT, 'FPP-PluginManager');
+				curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+					'Authorization: token ' . $pat,
+					'Accept: application/vnd.github.raw, application/json, */*',
+					'X-GitHub-Api-Version: 2022-11-28',
+				));
+				$data = curl_exec($ch);
+				$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+				$curlErr = curl_error($ch);
+				curl_close($ch);
+				if ($data !== false && $httpCode >= 200 && $httpCode < 400) {
+					if (strlen($data) > PLUGIN_FETCH_MAX_JSON) {
+						$GitHubFetchLastError = 'response exceeded ' . PLUGIN_FETCH_MAX_JSON . ' bytes';
+						return false;
+					}
+					return $data;
+				}
+				$lastCode = $httpCode;
+				$lastBody = is_string($data) ? $data : '';
+				$lastErr = $curlErr;
+			} else {
+				$ctx = stream_context_create(array(
+					'http' => array(
+						'header' => "Authorization: token " . $pat . "\r\n" .
+							"User-Agent: FPP-PluginManager\r\n" .
+							"Accept: application/vnd.github.raw, application/json, */*\r\n",
+						'follow_location' => 1,
+						'max_redirects' => 3,
+						'timeout' => PLUGIN_GITHUB_TIMEOUT,
+						'ignore_errors' => 1,
+					),
+				));
+				$data = @file_get_contents($tryUrl, false, $ctx, 0, PLUGIN_FETCH_MAX_JSON);
+				if ($data !== false && $data !== '') {
+					return $data;
+				}
+				$lastBody = '';
+				$lastErr = 'file_get_contents failed';
+			}
+		}
+
+		// PAT authentication failed. If the original URL contained a GitHub share-link
+		// token (?token=GHSAT...) try it as a last resort — server-side requests are not
+		// subject to CORS, so the share-link token can work here even when the browser
+		// fetch failed. This handles the case where the PAT is missing or expired but
+		// the URL was freshly copied from GitHub.
+		if ($hadGhsatToken) {
+			$ghsatData = PluginBoundedFetch($url, PLUGIN_GITHUB_TIMEOUT);
+			if ($ghsatData !== false && $ghsatData !== '') {
+				return $ghsatData;
+			}
+		}
+
+		$patHint = ($lastCode === 401 || $lastCode === 403)
+			? ' The configured GitHub Personal Access Token may be invalid or expired — check the Developer settings page.'
+			: '';
+		$GitHubFetchLastError = 'HTTP ' . $lastCode .
+			($lastErr !== '' ? ' (' . $lastErr . ')' : '') .
+			($lastBody !== '' ? ': ' . trim(substr($lastBody, 0, 200)) : '') .
+			$patHint;
+		return false;
+	}
+
+	// Plugin info is fetched from the web.  A plugin install request names
+	// this URL, and file_get_contents() would otherwise read local files
+	// (file://, php://filter) and hand them back as the plugin's info.
+	if (!preg_match('#^https?://#i', (string) $url)) {
+		$GitHubFetchLastError = 'only http(s) URLs can be fetched';
+		return false;
+	}
+	return @file_get_contents($url);
+}
+
+/**
+ * Get plugin info from URL
+ *
+ * Server-side proxy for fetching a `pluginInfo.json` from a remote URL.
+ * Used to retrieve plugin repository info without CORS issues, and to
+ * authenticate against private GitHub repositories using credentials
+ * configured on the Developer settings page.
+ *
+ * @route POST /api/plugin/fetchInfo
+ * @body {"url": "https://example.com/pluginInfo.json", "useCredentials": 1}
+ * @response 200 Plugin info fetched from remote URL
+ * ```json
+ * {}
+ * ```
+ */
+// --- Plugin install-popularity proxy -------------------------------------
+// Community install-count stats live on the SAME FPP stats server that FPP
+// already submits anonymous usage stats to and checks for updates against:
+// fppstats.falconchristmas.com (see statsPublishUrl in www/config.php and the
+// fppstats.falconchristmas.com update checks in www/common.php). Using the
+// FalconChristmas-branded hostname (a CNAME to the stats host) keeps us
+// consistent with core FPP and off any contributor's personal domain. The
+// device browser cannot fetch that host directly -- Apache's CSP connect-src
+// blocks the cross-origin request -- so the Plugins UI calls this SAME-ORIGIN
+// endpoint instead. We fetch the ~620KB summary server-side (CSP does not apply
+// to PHP), requesting gzip so only ~65KB crosses the wire, then slim it to just
+// the install counts (~3KB) and cache that on disk. Every browser/tab on this
+// box shares one upstream fetch per TTL. Fail-soft: on any error we serve a
+// stale cache if we have one, else an empty map -- the UI then hides the Popular
+// strip and falls back to name sort (see BuildPopularStrip / GetPluginPopularity
+// in plugins.php).
+define('PLUGIN_POPULARITY_URL', 'https://fppstats.falconchristmas.com/api/summary/false');
+define('PLUGIN_POPULARITY_PERIOD', 'last365Days');
+define('PLUGIN_POPULARITY_TTL', 7 * 24 * 60 * 60); // 7d shared per-box cache (counts move slowly)
+
+function PluginPopularityCacheFile()
+{
+	global $settings;
+	$base = isset($settings['mediaDirectory']) ? $settings['mediaDirectory'] : '/home/fpp/media';
+	return $base . '/tmp/pluginPopularity.cache.json';
+}
+
+// Build the slim { period, counts } payload from a full stats-summary array.
+// Coerces every count to a non-negative int (the feed is untrusted third-party
+// data) and drops anything non-numeric.
+function BuildSlimPluginPopularity($summary)
+{
+	if (!is_array($summary) || !isset($summary['topPlugins']['data'][PLUGIN_POPULARITY_PERIOD])) {
+		return null;
+	}
+	$raw = $summary['topPlugins']['data'][PLUGIN_POPULARITY_PERIOD];
+	if (!is_array($raw)) {
+		return null;
+	}
+	$counts = array();
+	foreach ($raw as $repo => $n) {
+		if (is_string($repo) && $repo !== '' && is_numeric($n)) {
+			$counts[$repo] = max(0, (int)$n);
+		}
+	}
+	return array('period' => PLUGIN_POPULARITY_PERIOD, 'counts' => $counts);
+}
+
+/**
+ * Get plugin install-popularity counts (repoName -> install count, last 365
+ * days), proxied + cached from the community stats feed.
+ *
+ * @route GET /api/plugin/popularity
+ * @response 200 { "period": "last365Days", "counts": { "remote-falcon": 1680 }, "source": "live|cache|stale|unavailable" }
+ */
+function GetPluginPopularity()
+{
+	$cacheFile = PluginPopularityCacheFile();
+
+	// Fresh cache -> serve it, no upstream hit.
+	if (file_exists($cacheFile) && (time() - filemtime($cacheFile)) < PLUGIN_POPULARITY_TTL) {
+		$cached = json_decode(file_get_contents($cacheFile), true);
+		if (is_array($cached) && isset($cached['counts'])) {
+			$cached['source'] = 'cache';
+			return json($cached);
+		}
+	}
+
+	// Stale or missing cache -> fetch upstream (gzip), slim, refresh cache.
+	$data = false;
+	if (function_exists('curl_init')) {
+		$ch = curl_init(PLUGIN_POPULARITY_URL);
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+		curl_setopt($ch, CURLOPT_ENCODING, '');        // advertise gzip/deflate; curl auto-decodes
+		curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);   // host down/unreachable -> give up fast (async, non-blocking)
+		curl_setopt($ch, CURLOPT_TIMEOUT, 6);          // hard cap incl. transfer; never hang the page
+		curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+		curl_setopt($ch, CURLOPT_USERAGENT, 'FPP-PluginPopularity');
+		$data = curl_exec($ch);
+		curl_close($ch);
+	}
+
+	$slim = ($data !== false && $data !== null && $data !== '')
+		? BuildSlimPluginPopularity(json_decode($data, true))
+		: null;
+
+	if (is_array($slim)) {
+		@file_put_contents($cacheFile, json_encode($slim));   // refresh shared cache
+		$slim['source'] = 'live';
+		return json($slim);
+	}
+
+	// Upstream failed. Serve a stale cache if present; else an empty map so the
+	// UI hides the Popular strip rather than showing stale/absent data.
+	if (file_exists($cacheFile)) {
+		$cached = json_decode(file_get_contents($cacheFile), true);
+		if (is_array($cached) && isset($cached['counts'])) {
+			$cached['source'] = 'stale';
+			return json($cached);
+		}
+	}
+	return json(array('period' => PLUGIN_POPULARITY_PERIOD, 'counts' => new stdClass(), 'source' => 'unavailable'));
+}
+
+// --- Plugin GitHub issue/PR stats (Developer UI) ---------------------------
+// Open-issue and open-PR counts for each plugin repo, shown in the bottom-right
+// corner of the plugin card in Developer UI mode. Counts come from GitHub's
+// issue-search API, which can answer a whole GROUP of repos in one request
+// instead of one request per repo -- the per-repo pattern is what produces a
+// flood of 404s when a repo is renamed/removed or the device has no route to
+// api.github.com (every miss is a 404 + a wasted request). Issues and PRs come
+// back in the SAME issues-search result set (a PR is an issue carrying a
+// pull_request field), so one untyped `state:open` query per group yields both
+// counts. Fail-soft throughout, matching the popularity proxy: any network or
+// rate-limit problem yields a stale disk cache if we have one, else an empty
+// map, and the UI then hides the corner -- it never surfaces an error.
+define('PLUGIN_GITHUB_STATS_TTL', 6 * 60 * 60);   // 6h shared per-box cache (counts move slowly)
+define('PLUGIN_GITHUB_STATS_CHUNK', 15);          // repos per search query: bounds q length + a dead repo's blast radius
+define('PLUGIN_GITHUB_STATS_MAX_REPOS', 100);     // sanity cap on one request
+define('PLUGIN_GITHUB_STATS_MAX_PAGES', 5);       // cap pagination (500 items per group)
+
+function PluginGitHubStatsCacheFile()
+{
+	global $settings;
+	$base = isset($settings['mediaDirectory']) ? $settings['mediaDirectory'] : '/home/fpp/media';
+	return $base . '/tmp/pluginGithubStats.cache.json';
+}
+
+// One search API request. Returns http status, curl errno/message and body.
+function GitHubStatsSearchPage($url)
+{
+	$res = array('http' => 0, 'errno' => 0, 'error' => '', 'body' => '');
+	if (function_exists('curl_init')) {
+		$ch = curl_init($url);
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+		curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+		curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+		curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+		curl_setopt($ch, CURLOPT_USERAGENT, 'FPP-PluginGitHubStats');
+		curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: application/vnd.github+json'));
+		$body = curl_exec($ch);
+		$res['http'] = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		$res['errno'] = (int)curl_errno($ch);
+		$res['error'] = (string)curl_error($ch);
+		curl_close($ch);
+		$res['body'] = is_string($body) ? $body : '';
+		return $res;
+	}
+
+	$ctx = stream_context_create(array('http' => array(
+		'timeout' => 8,
+		'follow_location' => 1,
+		'ignore_errors' => 1,
+		'user_agent' => 'FPP-PluginGitHubStats',
+		'header' => "Accept: application/vnd.github+json\r\n",
+	)));
+	$body = @file_get_contents($url, false, $ctx);
+	if ($body === false) {
+		$res['error'] = 'file_get_contents failed';
+		return $res;
+	}
+	$res['body'] = $body;
+	if (isset($http_response_header)) {
+		foreach ($http_response_header as $h) {
+			if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) {
+				$res['http'] = (int)$m[1];
+			}
+		}
+	}
+	return $res;
+}
+
+// Fetch every open issue AND open PR for the repos named in $orQuery (a
+// space-separated "repo:owner/name repo:..." string), paginating until all
+// results are seen. Returns array('ok'=>true, 'items'=>array(array('repo'=>..,'isPull'=>bool))) or
+// array('ok'=>false, 'http'=>.., 'errno'=>.., 'error'=>..) on a hard failure.
+function GitHubStatsSearchAll($orQuery)
+{
+	$items = array();
+	$page = 1;
+	$fetched = 0;
+	$total = null;
+	while ($page <= PLUGIN_GITHUB_STATS_MAX_PAGES) {
+		$url = 'https://api.github.com/search/issues?q=' .
+			rawurlencode('state:open ' . $orQuery) .
+			'&per_page=100&page=' . $page;
+		$res = GitHubStatsSearchPage($url);
+		if ((int)$res['http'] !== 200) {
+			return array('ok' => false, 'http' => $res['http'], 'errno' => $res['errno'], 'error' => $res['error']);
+		}
+		$body = json_decode($res['body'], true);
+		if (!is_array($body) || !isset($body['items']) || !is_array($body['items'])) {
+			return array('ok' => false, 'http' => $res['http'], 'errno' => 0, 'error' => 'invalid search response');
+		}
+		if ($total === null) {
+			$total = (int)$body['total_count'];
+		}
+		foreach ($body['items'] as $it) {
+			if (!is_array($it)) continue;
+			$repo = '';
+			if (isset($it['repository_url']) && preg_match('#/repos/([^/]+/[^/]+)$#', $it['repository_url'], $m)) {
+				$repo = strtolower($m[1]);
+			}
+			if ($repo !== '') {
+				$items[] = array('repo' => $repo, 'isPull' => isset($it['pull_request']) && is_array($it['pull_request']));
+			}
+		}
+		$fetched += count($body['items']);
+		if ($fetched >= $total || $total === 0) {
+			break;
+		}
+		$page++;
+	}
+	return array('ok' => true, 'items' => $items);
+}
+
+// Fetch counts for one chunk of repos, merging into $result (lowercased repo =>
+// array('openIssues'=>int, 'openPRs'=>int)). Returns false when a hard failure
+// (rate limit / offline) should stop all further fetching; true otherwise --
+// including the per-repo fallback, which only ever hides data for the genuinely
+// broken repos rather than failing the whole request.
+function PluginGitHubStatsFetchChunk($repos, &$result)
+{
+	$lower = array();
+	foreach ($repos as $r) {
+		$lower[] = strtolower($r);
+	}
+	$orQuery = implode(' ', array_map(function ($r) { return 'repo:' . $r; }, $lower));
+	$res = GitHubStatsSearchAll($orQuery);
+
+	if ($res['ok']) {
+		foreach ($res['items'] as $item) {
+			$repo = $item['repo'];
+			if (!isset($result[$repo])) {
+				$result[$repo] = array('openIssues' => 0, 'openPRs' => 0);
+			}
+			if ($item['isPull']) $result[$repo]['openPRs']++;
+			else $result[$repo]['openIssues']++;
+		}
+		foreach ($lower as $r) {
+			if (!isset($result[$r])) {
+				$result[$r] = array('openIssues' => 0, 'openPRs' => 0);
+			}
+		}
+		return true;
+	}
+
+	// A 422 means at least one repo in the chunk is not searchable (renamed,
+	// removed, or private) -- GitHub rejects the WHOLE query. Retry one repo at
+	// a time so a single dead repo can't hide stats for the rest of the chunk;
+	// a repo that 422s by itself is treated as "no data" (and cached) rather
+	// than an error. Any non-422 failure here means "stop fetching entirely".
+	if ((int)$res['http'] === 422) {
+		foreach ($lower as $r) {
+			$one = GitHubStatsSearchAll('repo:' . $r);
+			if ($one['ok']) {
+				if (!isset($result[$r])) {
+					$result[$r] = array('openIssues' => 0, 'openPRs' => 0);
+				}
+				foreach ($one['items'] as $item) {
+					if ($item['repo'] !== $r) continue;
+					if ($item['isPull']) $result[$r]['openPRs']++;
+					else $result[$r]['openIssues']++;
+				}
+			} elseif ((int)$one['http'] !== 422) {
+				return false; // rate-limited / offline mid-fallback: give up
+			} else {
+				$result[$r] = array('openIssues' => 0, 'openPRs' => 0); // genuinely gone
+			}
+		}
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Get open issue / open PR counts for a list of GitHub repos.
+ *
+ * Developer-UI helper for the plugin cards. Accepts a comma-separated list of
+ * `owner/name` repos and returns per-repo `{ openIssues, openPRs }`. Counts are
+ * proxied from GitHub's issue-search API (one aggregate query per group of
+ * repos, cached per box), never one request per plugin -- which is what floods
+ * the device with 404s when there is no network or a repo is gone. Fail-soft:
+ * on any upstream problem it serves a stale cache if present, else an empty map
+ * (`source: unavailable`); the UI then hides the corner counts.
+ *
+ * @route GET /api/plugin/githubStats
+ * @param string repos Comma-separated `owner/name` GitHub repos.
+ * @response 200 { "repos": { "FalconChristmas/fpp-brightness": { "openIssues": 7, "openPRs": 1 } }, "source": "live|cache|partial|unavailable" }
+ */
+function GetPluginGitHubStats()
+{
+	$requested = array();
+	$raw = isset($_GET['repos']) ? $_GET['repos'] : '';
+	foreach (explode(',', $raw) as $r) {
+		$r = trim($r);
+		// "owner/name.git" (a srcURL fragment) refers to the same repo as
+		// "owner/name"; a ".git" repo in a search query fails the whole query.
+		$r = preg_replace('/\.git$/i', '', $r);
+		if ($r === '' || preg_match('#^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$#', $r) !== 1) continue;
+		$requested[strtolower($r)] = true;
+		if (count($requested) >= PLUGIN_GITHUB_STATS_MAX_REPOS) break;
+	}
+	if (count($requested) === 0) {
+		return json(array('repos' => new stdClass(), 'source' => 'unavailable'));
+	}
+
+	$cacheFile = PluginGitHubStatsCacheFile();
+	$cache = array();
+	if (file_exists($cacheFile)) {
+		$tmp = json_decode(@file_get_contents($cacheFile), true);
+		if (is_array($tmp)) $cache = $tmp;
+	}
+
+	$result = array();
+	$toFetch = array();
+	foreach ($requested as $r => $v) {
+		if (isset($cache[$r]) && is_array($cache[$r]) &&
+			isset($cache[$r]['ts']) && (time() - (int)$cache[$r]['ts']) < PLUGIN_GITHUB_STATS_TTL) {
+			$result[$r] = array(
+				'openIssues' => max(0, (int)$cache[$r]['openIssues']),
+				'openPRs'    => max(0, (int)$cache[$r]['openPRs']),
+			);
+		} else {
+			$toFetch[$r] = true;
+		}
+	}
+
+	$hadLive = false;
+	$freshNow = array();
+	if (count($toFetch) > 0) {
+		$chunks = array_chunk(array_keys($toFetch), PLUGIN_GITHUB_STATS_CHUNK);
+		foreach ($chunks as $chunk) {
+			if (!PluginGitHubStatsFetchChunk($chunk, $result)) break;
+			$hadLive = true;
+		}
+		// Persist every repo we actually resolved this request (live results AND
+		// the zero-filled fallback for dead repos) so the next page load within
+		// the TTL is served without touching GitHub again.
+		$freshNow = array_intersect(array_keys($toFetch), array_keys($result));
+	}
+	if (count($freshNow) > 0) {
+		foreach ($freshNow as $r) {
+			$cache[$r] = array(
+				'openIssues' => max(0, (int)$result[$r]['openIssues']),
+				'openPRs'    => max(0, (int)$result[$r]['openPRs']),
+				'ts'         => time(),
+			);
+		}
+		@file_put_contents($cacheFile, json_encode($cache));
+	}
+
+	$covered = count($result);
+	if ($covered === 0) {
+		return json(array('repos' => new stdClass(), 'source' => 'unavailable'));
+	}
+	$source = ($covered < count($requested)) ? 'partial' : ($hadLive ? 'live' : 'cache');
+	return json(array('repos' => $result, 'source' => $source));
+}
+
+define('PLUGIN_RELEASE_NOTES_CACHE_TTL', 6 * 60 * 60); // 6h, same horizon as PLUGIN_GITHUB_STATS_TTL
+define('PLUGIN_RELEASE_NOTES_MAX_JSON', 1024 * 1024);  // a release object, body included
+define('PLUGIN_RELEASE_NOTES_CONNECT_TIMEOUT', 4);
+define('PLUGIN_RELEASE_NOTES_TIMEOUT', 8); // the user is waiting on the dialog
+define('PLUGIN_RELEASE_HISTORY_MAX_COMMITS', 50);
+define('PLUGIN_RELEASE_HISTORY_MIN_INSTALLED', 10);
+define('PLUGIN_RELEASE_NOTES_SCRIPT_TIMEOUT', 15);
+define('PLUGIN_RELEASE_NOTES_MAX_TEXT', 64 * 1024);
+
+function PluginReleaseNotesCacheFile()
+{
+	global $settings;
+	$base = isset($settings['mediaDirectory']) ? $settings['mediaDirectory'] : '/home/fpp/media';
+	return $base . '/tmp/pluginReleaseNotes.cache.json';
+}
+
+// "owner/repo" of a plugin's own srcURL for the GitHub API, '' unless it is a
+// github.com repo. Read server-side from the plugin's pluginInfo.json rather
+// than taken from the client, so GetPluginReleaseNotes() only ever talks to
+// the repo the plugin itself points at.
+function PluginGitHubRepoOf($pluginInfo)
+{
+	$url = isset($pluginInfo['srcURL']) ? $pluginInfo['srcURL'] : '';
+	// No userinfo or backslashes: parse_url() and git can disagree about the
+	// host of "https://evil.com\@github.com/o/r".
+	if (!is_string($url) || strpbrk($url, '@\\') !== false
+		|| strtolower((string) parse_url($url, PHP_URL_HOST)) !== 'github.com') {
+		return '';
+	}
+	$repo = PluginRepoSlugFromURL($url);
+	return (preg_match('#^[a-z0-9_.-]+/[a-z0-9_.-]+$#', $repo) && !preg_match('#(^|/)\.\.?(/|$)#', $repo)) ? $repo : '';
+}
+
+// What Update would land on $branch, as a git revision: its versions[] pin
+// while the clone is at or behind it (PluginPinnedVerdict), else
+// origin/<branch> as of the last fetch.
+function PluginUpgradeRev($plugin, $branch)
+{
+	$pin = '';
+	return (PluginPinnedVerdict($plugin, $branch, $pin) !== null) ? $pin : 'origin/' . $branch;
+}
+
+// The pluginInfo.json the next update would land (PluginUpgradeRev, as of the
+// last fetch), falling back to the installed copy. Release notes describe the
+// incoming update, so its declaration wins: a plugin that adds (or changes)
+// releaseNotesStyle gets the link for the very update that introduces it.
+function PluginReleaseNotesInfo($plugin, $installedInfo)
+{
+	global $settings;
+	$branch = PluginCurrentBranch($plugin);
+	if ($branch !== '') {
+		$json = shell_exec('cd ' . escapeshellarg($settings['pluginDirectory'] . '/' . $plugin)
+			. ' && git show ' . escapeshellarg(PluginUpgradeRev($plugin, $branch) . ':pluginInfo.json') . ' 2>/dev/null');
+		if (is_string($json) && $json !== '') {
+			$info = json_decode($json, true);
+			if (is_array($info)) {
+				return $info;
+			}
+		}
+	}
+	return $installedInfo;
+}
+
+function PluginReleaseNotesStyleOf($pluginInfo)
+{
+	$style = isset($pluginInfo['releaseNotesStyle']) ? $pluginInfo['releaseNotesStyle'] : 'none';
+	return in_array($style, array('gitRelease', 'gitHistory', 'script'), true) ? $style : 'none';
+}
+
+// The style the Plugin Manager actually offers for an installed plugin.
+// `script` runs the INSTALLED scripts/fpp_releasenotes.sh -- never the one in
+// a pending update, which the user hasn't accepted yet -- so while the update
+// that adds the script is still pending there is nothing to show: no link.
+function PluginOfferedReleaseNotesStyle($plugin, $pluginInfo)
+{
+	global $settings;
+	$style = PluginReleaseNotesStyleOf($pluginInfo);
+	if ($style === 'script' && !file_exists($settings['pluginDirectory'] . '/' . $plugin . '/scripts/fpp_releasenotes.sh')) {
+		return 'none';
+	}
+	// Likewise a gitRelease plugin whose srcURL isn't on github.com: there
+	// is no Release to fetch, so no link rather than one that always fails.
+	if ($style === 'gitRelease' && PluginGitHubRepoOf($pluginInfo) === '') {
+		return 'none';
+	}
+	return $style;
+}
+
+// Script output and commit subjects are not guaranteed UTF-8 (and output cut
+// at the size cap can end mid-character); one bad byte makes json_encode()
+// fail the whole response. ENT_SUBSTITUTE swaps invalid sequences for U+FFFD
+// and needs no mbstring, which not every FPP image has.
+function PluginReleaseNotesText($s)
+{
+	return htmlspecialchars_decode(htmlspecialchars((string) $s, ENT_NOQUOTES | ENT_SUBSTITUTE, 'UTF-8'), ENT_NOQUOTES);
+}
+
+function PluginReleaseNotesError($code, $message)
+{
+	http_response_code($code);
+	return json(array('Status' => 'Error', 'Message' => $message));
+}
+
+/**
+ * Get a plugin's release notes
+ *
+ * In whichever form the plugin declared via `releaseNotesStyle` in its
+ * `pluginInfo.json` (see the Template's PLUGININFO_FORMAT.md). Installed
+ * plugins only; the style is read from the pluginInfo.json the next update
+ * would land, else the installed one.
+ *
+ * - `gitRelease`: the latest GitHub Release of the `srcURL` repo (GitHub
+ *   only; offered as `none` otherwise), proxied and cached for 6h, using the
+ *   configured GitHub token when there is one. `release` is null when the
+ *   repo has no Release; `stale` is true when GitHub could not be reached and
+ *   an older cached copy is served.
+ * - `gitHistory`: `pending` is what Update would pull in (HEAD..origin/<branch>,
+ *   or HEAD..the versions[] pin for a pinned plugin, as of the last update check), `installed` the most recent installed
+ *   commits. Both are empty-safe; being up to date is not an error.
+ * - `script`: the stdout of the plugin's installed
+ *   `scripts/fpp_releasenotes.sh` (15s timeout, 64 KiB cap), as plain text;
+ *   offered as `none` until the script is installed.
+ *
+ * 404 when the plugin is not installed, declares no release notes, or its repo
+ * isn't visible to GitHub's API; 502 when GitHub or the plugin's script
+ * failed. Errors carry `Status`/`Message`.
+ *
+ * @route GET /api/plugin/{RepoName}/releaseNotes
+ * @response 200 Shape depends on `style`
+ * ```json
+ * {"Status": "OK", "style": "gitRelease", "release": {"name": "v1.2.0", "tag_name": "v1.2.0", "published_at": "2026-01-01T00:00:00Z", "body": "...", "html_url": "https://github.com/owner/repo/releases/tag/v1.2.0"}, "releasesUrl": "https://github.com/owner/repo/releases", "stale": false}
+ * ```
+ */
+function GetPluginReleaseNotes()
+{
+	$plugin = params('RepoName');
+	if (!IsValidPluginName($plugin)) {
+		return PluginReleaseNotesError(404, 'Plugin is not installed');
+	}
+	$installedInfo = PluginInstalledInfo($plugin);
+	if ($installedInfo === null) {
+		return PluginReleaseNotesError(404, 'Plugin is not installed');
+	}
+
+	$pluginInfo = PluginReleaseNotesInfo($plugin, $installedInfo);
+	switch (PluginOfferedReleaseNotesStyle($plugin, $pluginInfo)) {
+		case 'gitRelease':
+			return PluginReleaseNotesFromGitHub($plugin, $pluginInfo);
+		case 'gitHistory':
+			return PluginReleaseNotesFromGitHistory($plugin);
+		case 'script':
+			return PluginReleaseNotesFromScript($plugin);
+		default:
+			return PluginReleaseNotesError(404, 'This plugin does not publish release notes');
+	}
+}
+
+// One GET against api.github.com, as [http code, body|false]. $pat is sent
+// when given; redirects stay on https so it never goes out in clear.
+function PluginReleaseNotesGitHubGet($path, $pat)
+{
+	if (!function_exists('curl_init')) {
+		return array(0, false);
+	}
+	$headers = array('Accept: application/vnd.github+json', 'X-GitHub-Api-Version: 2022-11-28');
+	if ($pat !== '') {
+		$headers[] = 'Authorization: token ' . $pat;
+	}
+	$curl = curl_init('https://api.github.com/' . $path);
+	curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+	curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+	curl_setopt($curl, CURLOPT_MAXREDIRS, 3);
+	if (defined('CURLPROTO_HTTPS')) {
+		curl_setopt($curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+		curl_setopt($curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+	}
+	curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, PLUGIN_RELEASE_NOTES_CONNECT_TIMEOUT);
+	curl_setopt($curl, CURLOPT_TIMEOUT, PLUGIN_RELEASE_NOTES_TIMEOUT);
+	curl_setopt($curl, CURLOPT_MAXFILESIZE, PLUGIN_RELEASE_NOTES_MAX_JSON);
+	curl_setopt($curl, CURLOPT_USERAGENT, 'FPP-PluginReleaseNotes');
+	curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
+	$response = curl_exec($curl);
+	$httpCode = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+	curl_close($curl);
+	if ($response !== false && strlen($response) > PLUGIN_RELEASE_NOTES_MAX_JSON) {
+		$response = false;
+	}
+	return array($httpCode, $response);
+}
+
+// releaseNotesStyle: gitRelease -- latest GitHub Release, proxied and cached
+// server-side. Same idea as GitOSReleaseNotes() (FPP's own release notes)
+// but for an arbitrary plugin repo: GitHub's unauthenticated rate limit is
+// shared by every box behind the same NAT, and this keeps api.github.com out
+// of the CSP. Only a confirmed "repo visible, no Release" is cached as such;
+// any other failure serves the last good copy, however old, rather than
+// overwrite it.
+function PluginReleaseNotesFromGitHub($plugin, $pluginInfo)
+{
+	global $settings;
+
+	$repo = PluginGitHubRepoOf($pluginInfo);
+	if ($repo === '') {
+		return PluginReleaseNotesError(404, 'This plugin\'s srcURL is not a github.com repository, so it has no GitHub Releases to show');
+	}
+
+	$cacheFile = PluginReleaseNotesCacheFile();
+	$cache = array();
+	if (file_exists($cacheFile)) {
+		$tmp = json_decode(@file_get_contents($cacheFile), true);
+		if (is_array($tmp)) $cache = $tmp;
+	}
+	$entry = (isset($cache[$repo]) && is_array($cache[$repo]) && isset($cache[$repo]['ts'])
+		&& array_key_exists('release', $cache[$repo])) ? $cache[$repo] : null;
+	$result = function ($release, $stale) use ($repo) {
+		return json(array(
+			'Status' => 'OK',
+			'style' => 'gitRelease',
+			'release' => $release,
+			'releasesUrl' => 'https://github.com/' . $repo . '/releases',
+			'stale' => $stale,
+		));
+	};
+
+	$now = time();
+	if ($entry !== null && ($now - (int) $entry['ts']) < PLUGIN_RELEASE_NOTES_CACHE_TTL) {
+		return $result($entry['release'], false);
+	}
+
+	// The configured PAT goes with the request whenever there is one, the
+	// same as install/update clone every GitHub plugin with it
+	// (InjectGitHubCredentials) -- whether or not the plugin says `private`.
+	// A rejected token (401) retries anonymously so public repos still work.
+	$pat = isset($settings['gitHubPAT']) ? trim($settings['gitHubPAT']) : '';
+	$path = 'repos/' . $repo . '/releases/latest';
+	list($httpCode, $response) = PluginReleaseNotesGitHubGet($path, $pat);
+	if ($httpCode == 401 && $pat !== '') {
+		$pat = '';
+		list($httpCode, $response) = PluginReleaseNotesGitHubGet($path, $pat);
+	}
+
+	$release = false; // false = upstream failure, null = no Release
+	if ($httpCode == 404) {
+		// GitHub answers 404 both for "no Release yet" and for a repo it
+		// won't show this caller (private, no or wrong token). Only the
+		// first is an answer worth caching.
+		list($repoCode, ) = PluginReleaseNotesGitHubGet('repos/' . $repo, $pat);
+		if ($repoCode == 200) {
+			$release = null;
+		} else if ($repoCode == 404) {
+			return PluginReleaseNotesError(404, 'GitHub does not show github.com/' . $repo . ' to this FPP. If it is a private repository, check the GitHub user name and token on the Developer settings page.');
+		}
+	} else if ($httpCode == 200 && $response !== false) {
+		$data = json_decode($response, true);
+		if (is_array($data)) {
+			// Only the fields the UI uses; the release object also carries
+			// assets, author, reactions, ... that would just bloat the cache.
+			$release = array();
+			foreach (array('name', 'tag_name', 'published_at', 'body', 'html_url') as $f) {
+				$release[$f] = (isset($data[$f]) && is_string($data[$f])) ? $data[$f] : '';
+			}
+		}
+	}
+
+	if ($release === false) {
+		if ($entry !== null) {
+			return $result($entry['release'], true);
+		}
+		return PluginReleaseNotesError(502, 'GitHub could not be reached (or refused the request) for ' . $repo . '. Try again later.');
+	}
+
+	// Write-then-rename, so a concurrent reader never sees a half-written
+	// cache (and resets it) -- at worst two requests race and one entry is
+	// fetched again.
+	$cache[$repo] = array('release' => $release, 'ts' => $now);
+	$tmpFile = $cacheFile . '.' . getmypid() . '.tmp';
+	if (@file_put_contents($tmpFile, json_encode($cache)) !== false) {
+		@rename($tmpFile, $cacheFile);
+	}
+	return $result($release, false);
+}
+
+// Up to $max commits of `git log <range>` in the plugin's clone, newest first,
+// or [] when the range doesn't resolve (no origin ref yet, not a git clone).
+function PluginReleaseNotesGitLog($dir, $range, $max)
+{
+	$commits = array();
+	if ($max <= 0) {
+		return $commits;
+	}
+	exec('git -C ' . escapeshellarg($dir) . ' log --no-merges -n ' . (int) $max
+		. ' --date=short --pretty=format:' . escapeshellarg('%h%x1f%an%x1f%ad%x1f%s')
+		. ' ' . escapeshellarg($range) . ' -- 2>/dev/null', $lines, $rv);
+	if ($rv != 0) {
+		return $commits;
+	}
+	foreach ($lines as $line) {
+		$parts = explode("\x1f", PluginReleaseNotesText($line));
+		if (count($parts) === 4) {
+			$commits[] = array('hash' => $parts[0], 'author' => $parts[1], 'date' => $parts[2], 'subject' => $parts[3]);
+		}
+	}
+	return $commits;
+}
+
+// releaseNotesStyle: gitHistory -- read straight from the plugin's own clone:
+// no GitHub API call, works for any git host. No live `git fetch` either; it
+// rides the origin/<branch> the last update check fetched, like
+// PluginUpdateVerdict(), and stops at a versions[] pin as Update does. The installed history is always included, so an
+// up-to-date plugin still shows what its latest changes were.
+function PluginReleaseNotesFromGitHistory($plugin)
+{
+	global $settings;
+
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	$branch = PluginCurrentBranch($plugin);
+	$pending = array();
+	$pendingCount = 0;
+	if ($branch !== '') {
+		$range = 'HEAD..' . PluginUpgradeRev($plugin, $branch);
+		$pending = PluginReleaseNotesGitLog($dir, $range, PLUGIN_RELEASE_HISTORY_MAX_COMMITS);
+		$pendingCount = (int) trim((string) shell_exec('git -C ' . escapeshellarg($dir)
+			. ' rev-list --no-merges --count ' . escapeshellarg($range) . ' -- 2>/dev/null'));
+		$pendingCount = max($pendingCount, count($pending));
+	}
+	$installed = PluginReleaseNotesGitLog($dir, 'HEAD',
+		max(PLUGIN_RELEASE_HISTORY_MIN_INSTALLED, PLUGIN_RELEASE_HISTORY_MAX_COMMITS - count($pending)));
+
+	return json(array(
+		'Status' => 'OK',
+		'style' => 'gitHistory',
+		'branch' => $branch,
+		'pending' => $pending,
+		'pendingCount' => $pendingCount,
+		'installed' => $installed,
+	));
+}
+
+// macOS has no coreutils/util-linux: use timeout, setsid and ionice only where present.
+function PluginHaveCommand($name)
+{
+	static $have = array();
+	if (!isset($have[$name])) {
+		$have[$name] = false;
+		foreach (array('/usr/bin', '/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/opt/homebrew/bin') as $d) {
+			if (is_executable($d . '/' . $name)) {
+				$have[$name] = true;
+				break;
+			}
+		}
+	}
+	return $have[$name];
+}
+
+// Built, not inherited: under php-fpm getenv() carries the request's headers,
+// HTTP_AUTHORIZATION included.
+function PluginScriptEnv()
+{
+	global $fppDir;
+
+	$env = array('FPPDIR' => $fppDir, 'SRCDIR' => $fppDir . '/src');
+	foreach (array('PATH', 'HOME', 'USER', 'LANG', 'LC_ALL') as $k) {
+		$v = getenv($k, true);
+		if ($v !== false) {
+			$env[$k] = $v;
+		}
+	}
+	if (!isset($env['PATH'])) {
+		$env['PATH'] = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+	}
+	return $env;
+}
+
+/**
+ * Run a plugin script with a hard deadline and a clean environment, capturing at
+ * most $maxBytes of stdout. Returns array($rc, $stdout, $truncated, $timedOut);
+ * $rc is null if it could not start or the read loop gave up, 124/137 if
+ * `timeout` fired. setsid lets the whole process group be killed, so a leftover
+ * child holding stdout cannot pin a php-fpm worker.
+ *
+ * $keep 'tail': keep the last $maxBytes (fpp_update_check.sh's answer is its
+ * last line). 'head': keep the first $maxBytes and stop (release notes).
+ */
+function PluginRunScriptBounded($script, $dir, $timeout, $maxBytes = 8192, $keep = 'tail')
+{
+	$argv = array();
+	$group = PluginHaveCommand('setsid');
+	if ($group) {
+		$argv[] = 'setsid';
+	}
+	if (PluginHaveCommand('timeout')) {
+		array_push($argv, 'timeout', '-k', '2', (string) $timeout);
+	}
+	// Without `timeout` (macOS) the read loop's deadline below is the bound.
+	$argv[] = $script;
+	$proc = @proc_open(
+		$argv,
+		array(0 => array('file', '/dev/null', 'r'), 1 => array('pipe', 'w'), 2 => array('file', '/dev/null', 'w')),
+		$pipes, $dir, PluginScriptEnv());
+	if (!is_resource($proc)) {
+		return array(null, '', false, false);
+	}
+	$status = proc_get_status($proc);
+	$pid = (int) $status['pid'];
+	stream_set_blocking($pipes[1], false);
+
+	$deadline = microtime(true) + $timeout + 3;
+	$head = ($keep === 'head');
+	$text = '';
+	$rc = null;
+	$truncated = false;
+	$timedOut = false;
+	$read = function () use (&$pipes, &$text, &$truncated, $maxBytes, $head) {
+		while (!($head && $truncated) && ($chunk = fread($pipes[1], 4096)) !== false && $chunk !== '') {
+			$text .= $chunk;
+			if (strlen($text) > $maxBytes) {
+				$text = $head ? substr($text, 0, $maxBytes) : substr($text, -$maxBytes);
+				$truncated = true;
+			}
+		}
+	};
+	while (true) {
+		$r = array($pipes[1]);
+		$w = null;
+		$e = null;
+		if (@stream_select($r, $w, $e, 0, 200000)) {
+			$read();
+			if (!($head && $truncated) && feof($pipes[1])) {
+				// stdout is closed but the script has not exited yet: select()
+				// would return immediately from here on, so don't spin.
+				usleep(100000);
+			}
+		}
+		if ($head && $truncated) {
+			break;
+		}
+		$status = proc_get_status($proc);
+		if (!$status['running']) {
+			$read(); // whatever it wrote just before exiting
+			$rc = $status['signaled'] ? 128 + (int) $status['termsig'] : (int) $status['exitcode'];
+			break;
+		}
+		if (microtime(true) > $deadline) {
+			$timedOut = true;
+			break; // the kill below deals with it; $rc stays null
+		}
+	}
+	if ($pid > 0) {
+		// With setsid the script leads its own process group, so the whole
+		// group goes; without it, only the script itself can be named.
+		$target = $group ? -$pid : $pid;
+		if (function_exists('posix_kill')) {
+			@posix_kill($target, 9);
+		} else {
+			exec('kill -KILL -- ' . $target . ' 2>/dev/null');
+		}
+	}
+	fclose($pipes[1]);
+	proc_close($proc);
+	return array($rc, $text, $truncated, $timedOut);
+}
+
+// releaseNotesStyle: script -- for a plugin whose update-worthy changes
+// aren't git commits (components fetched by scripts/fpp_update_check.sh /
+// fpp_upgrade.sh). Runs scripts/fpp_releasenotes.sh as the web user with the
+// same minimal environment as fpp_update_check.sh (PluginScriptEnv()), a hard
+// timeout and an output cap, and returns its stdout as plain text -- never markup.
+function PluginReleaseNotesFromScript($plugin)
+{
+	global $settings;
+
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	$script = $dir . '/scripts/fpp_releasenotes.sh';
+	if (!file_exists($script)) {
+		return PluginReleaseNotesError(404, 'This plugin declares script release notes but has no scripts/fpp_releasenotes.sh');
+	}
+
+	// 'head': for release notes the cap is a real end of text, worth reporting.
+	$started = microtime(true);
+	list($rv, $text, $truncated, $timedOut) = PluginRunScriptBounded(
+		$script, $dir, PLUGIN_RELEASE_NOTES_SCRIPT_TIMEOUT, PLUGIN_RELEASE_NOTES_MAX_TEXT, 'head');
+
+	if ($rv === null && !$truncated && !$timedOut) {
+		return PluginReleaseNotesError(502, 'Could not run the plugin\'s release notes script');
+	}
+	if (!$truncated) {
+		// 124: `timeout` fired; 137: the script ignored SIGTERM and was
+		// killed 2s later (`timeout` re-raises that SIGKILL on itself). A
+		// script can exit with either code by itself, hence the clock.
+		$ranFull = (microtime(true) - $started) >= PLUGIN_RELEASE_NOTES_SCRIPT_TIMEOUT - 1;
+		if ($timedOut || (($rv == 124 || $rv == 137) && $ranFull)) {
+			return PluginReleaseNotesError(502, 'The plugin\'s release notes script did not finish within ' . PLUGIN_RELEASE_NOTES_SCRIPT_TIMEOUT . ' seconds');
+		}
+		if ($rv == 126) {
+			return PluginReleaseNotesError(502, 'The plugin\'s scripts/fpp_releasenotes.sh is not executable');
+		}
+		if ($rv != 0) {
+			return PluginReleaseNotesError(502, 'The plugin\'s release notes script failed (exit code ' . $rv . ')');
+		}
+	}
+
+	return json(array(
+		'Status' => 'OK',
+		'style' => 'script',
+		'text' => PluginReleaseNotesText(rtrim($text)),
+		'truncated' => $truncated,
+	));
+}
+
+/**
+ * Fetch a pluginInfo.json on the browser's behalf
+ *
+ * Backs the "Enter a pluginInfo.json URL" box on the Plugins page. The browser
+ * tries the URL directly first; this is the fallback for when that fails, which
+ * is normally CORS or a private repo needing the configured PAT.
+ *
+ * Restricted to GitHub hosts. Without that this is an open proxy: it fetches
+ * whatever URL the caller names and hands back the response body, so anyone who
+ * can reach FPP's web UI could read anything FPP's network can reach. The
+ * restriction costs nothing real -- a plugin is a git repo FPP clones from
+ * GitHub, and the credentialed path here is GitHub-PAT-specific already. A
+ * pluginInfo.json hosted elsewhere still loads via the browser's direct attempt
+ * when that host allows it; only the server-side fallback is GitHub-only.
+ *
+ * @route POST /api/plugin/fetchInfo
+ * @response 200 The decoded pluginInfo.json
+ */
+function FetchPluginInfoProxy()
+{
+	$body = '';
+	$fp = fopen('php://input', 'r');
+	while ($d = fread($fp, 1024 * 16)) {
+		$body .= $d;
+	}
+	fclose($fp);
+
+	$req = json_decode($body, true);
+	$url = isset($req['url']) ? $req['url'] : '';
+	$useCreds = isset($req['useCredentials']) && $req['useCredentials'];
+
+	if (!IsGitHubURL($url)) {
+		return json(array(
+			'Status' => 'Error',
+			'Message' => 'FPP will only fetch a pluginInfo.json from github.com or raw.githubusercontent.com.',
+		));
+	}
+
+	if ($useCreds) {
+		$user = isset($GLOBALS['settings']['gitHubUser']) ? trim($GLOBALS['settings']['gitHubUser']) : '';
+		$pat = isset($GLOBALS['settings']['gitHubPAT']) ? trim($GLOBALS['settings']['gitHubPAT']) : '';
+		if ($user === '' || $pat === '') {
+			return json(array('Status' => 'Error', 'Message' => 'GitHub user name and/or Personal Access Token are not configured on the Developer settings page.'));
+		}
+		$data = FetchURLWithGitHubCredentials($url);
+	} else {
+		$data = PluginBoundedFetch($url);
+	}
+
+	if ($data === false || $data === null || $data === '') {
+		global $GitHubFetchLastError;
+		$detail = (isset($GitHubFetchLastError) && $GitHubFetchLastError !== '') ? ' [' . $GitHubFetchLastError . ']' : '';
+		return json(array('Status' => 'Error', 'Message' => 'Failed to fetch pluginInfo.json from ' . $url . $detail));
+	}
+
+	$decoded = json_decode($data, true);
+	if (!is_array($decoded)) {
+		$snippet = trim(substr($data, 0, 200));
+		return json(array('Status' => 'Error', 'Message' => 'Response from ' . $url . ' was not valid JSON. First bytes: ' . $snippet));
+	}
+
+	return json($decoded);
+}
+
+// How long a plugin's own scripts/fpp_update_check.sh gets before it is killed.
+// A bound on a hung script, not a budget: in the sweep nobody waits and the
+// fetch lock is already released, and the one foreground caller is the detail
+// dialog's Check for Update, which the user asked for. Long enough for a
+// manifest or asset fetch on a Pi Zero over marginal WiFi at nice 19 during a
+// show; the sweep's 10-minute cap and resume cover the worst case.
+define('PLUGIN_UPDATE_CHECK_SCRIPT_TIMEOUT', 120);
+
+/**
+ * Whether an installed plugin has an update: array($updates, $error), with
+ * $updates null and $error the reason when no answer was reached. Unchecked must
+ * never read as up to date.
+ *
+ * A plugin may provide scripts/fpp_update_check.sh. It is run with FPPDIR/SRCDIR
+ * set (like fpp_install.sh); the last line of its stdout must be "1" if an update
+ * is available or "0" if not. A non-zero exit status means "could not check".
+ * Its answer is OR'd with the git check, so repo commits are still detected.
+ *
+ * Runs the plugin's own fpp_update_check.sh (arbitrary, often networked code),
+ * also for archive installs where it is the only check, so never call this from
+ * GetPluginUpdateStatus(), which every page polls.
+ */
+function PluginUpdateVerdict($plugin)
+{
+	global $settings;
+
+	list($updates, $error) = PluginGitUpdateVerdict($plugin);
+	if ($updates === true) {
+		return array(true, '');
+	}
+
+	// Last line "1" from the plugin's own script means an update (e.g. release binaries).
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	$script = $dir . '/scripts/fpp_update_check.sh';
+	if (!file_exists($script)) {
+		return array($updates, $error);
+	}
+	list($srv, $text, , $timedOut) = PluginRunScriptBounded($script, $dir, PLUGIN_UPDATE_CHECK_SCRIPT_TIMEOUT);
+	if ($srv === 0) {
+		$lines = array_values(array_filter(array_map('trim', explode("\n", $text)), 'strlen'));
+		$answer = empty($lines) ? '' : end($lines);
+		if ($answer === '1') {
+			return array(true, '');
+		}
+		if ($answer !== '0') {
+			// Exit 0 but no 1 or 0 on the last line (empty output, a curl
+			// message): not an answer. Without a clone that leaves no verdict;
+			// with one, git's stands and the oddity is kept for the support zip.
+			$why = ($answer === '') ? 'it printed nothing' : ('its last line was "' . substr($answer, 0, 40) . '", not 1 or 0');
+			if (!is_dir($dir . '/.git') || $updates === null) {
+				return array(null, trim($error . ($error !== '' ? '; ' : '') . 'the plugin\'s own update check gave no answer (' . $why . ')'));
+			}
+			return array(false, 'the plugin\'s own update check gave no answer (' . $why . '); git says up to date');
+		}
+		// Without a clone the script is the whole check, so its "0" is the
+		// answer. With one, git's own verdict (or lack of one) stands.
+		if (!is_dir($dir . '/.git')) {
+			return array(false, '');
+		}
+		return array($updates, $error);
+	}
+	// `timeout` kills the script before the read loop gives up on it, so a
+	// timed-out script usually comes back as 124 (TERM) or 137 (KILL).
+	if ($timedOut || $srv === 124 || $srv === 137) {
+		$why = 'it did not finish in ' . PLUGIN_UPDATE_CHECK_SCRIPT_TIMEOUT . ' seconds';
+	} else if ($srv === null) {
+		$why = 'it could not be started';
+	} else {
+		$why = 'it exited ' . $srv;
+	}
+	if ($updates === null) {
+		return array(null, $error . '; the plugin\'s own update check did not run either (' . $why . ')');
+	}
+	// The script failing doesn't undo git's answer; record it for the Updates tab.
+	return array(false, 'the plugin\'s own update check did not run (' . $why . '); git says up to date');
+}
+
+/**
+ * A clone installed at a pinned versions[] sha is behind its branch on purpose.
+ * The pin comes from the fetched branch's pluginInfo.json (the installed copy is
+ * AT the pin and cannot name itself). false: HEAD is the pin; true: the pin moved
+ * past HEAD; null: not pinned, or HEAD is not behind the pin (a downgrade), so
+ * the ordinary branch comparison applies. $pin receives the pin's commit id
+ * ('' when not pinned), so a caller that lands it need not look it up again.
+ */
+function PluginPinnedVerdict($plugin, $branch, &$pin = null)
+{
+	global $settings;
+
+	$pin = PluginPinnedSha($plugin, $branch);
+	if ($pin === '') {
+		return null;
+	}
+	$cd = 'cd ' . escapeshellarg($settings['pluginDirectory'] . '/' . $plugin) . ' && ';
+	$head = trim((string) shell_exec($cd . 'git rev-parse --verify -q HEAD 2>/dev/null'));
+	if ($head === '') {
+		return null;
+	}
+	if ($pin === $head) {
+		return false;
+	}
+	exec($cd . 'git merge-base --is-ancestor ' . escapeshellarg($head) . ' ' . escapeshellarg($pin) . ' 2>/dev/null', $o, $rv);
+	return ($rv === 0) ? true : null;
+}
+
+// The full commit id the fetched origin/<branch>'s pluginInfo.json pins this
+// FPP's versions[] entry to, or '' when that entry is on another branch, has
+// no sha, or names a commit this clone does not have.
+function PluginPinnedSha($plugin, $branch)
+{
+	global $settings;
+
+	$cd = 'cd ' . escapeshellarg($settings['pluginDirectory'] . '/' . $plugin) . ' && ';
+	$incoming = json_decode((string) shell_exec($cd . 'git show ' . escapeshellarg('origin/' . $branch . ':pluginInfo.json') . ' 2>/dev/null'), true);
+	$entry = is_array($incoming) ? SelectPluginVersionEntry($incoming) : null;
+	if (!is_array($entry)) {
+		return '';
+	}
+	$pinBranch = (isset($entry['branch']) && is_string($entry['branch']) && $entry['branch'] !== '') ? $entry['branch'] : 'master';
+	$pinSha = (isset($entry['sha']) && is_string($entry['sha'])) ? $entry['sha'] : '';
+	if ($pinBranch !== $branch || !preg_match('/^[a-fA-F0-9]{4,40}$/', $pinSha)) {
+		return '';
+	}
+	return trim((string) shell_exec($cd . 'git rev-parse --verify -q ' . escapeshellarg($pinSha . '^{commit}') . ' 2>/dev/null'));
+}
+
+// The git half of PluginUpdateVerdict(): local refs only, never plugin code.
+function PluginGitUpdateVerdict($plugin)
+{
+	global $settings;
+
+	$dir = $settings['pluginDirectory'] . '/' . $plugin;
+	if (!is_dir($dir . '/.git')) {
+		return array(null, 'not a git checkout (installed from an archive?)');
+	}
+	$branch = PluginCurrentBranch($plugin, $why);
+	if ($branch == '') {
+		// Detached HEAD: upgrade_plugin cannot move it, so there is no verdict.
+		return array(null, $why);
+	}
+	$remote = 'origin/' . $branch;
+	unset($output);
+	exec('cd ' . escapeshellarg($dir) . ' && git rev-parse --verify --quiet ' . escapeshellarg($remote) . ' 2>/dev/null', $output, $rv);
+	if ($rv != 0) {
+		return array(null, 'no remote-tracking ref for ' . $remote . ' (never fetched)');
+	}
+
+	$pinned = PluginPinnedVerdict($plugin, $branch);
+	if ($pinned !== null) {
+		return array($pinned, '');
+	}
+
+	unset($output);
+	exec('cd ' . escapeshellarg($dir) . ' && git log --oneline ' . escapeshellarg($branch . '..' . $remote) . ' 2>/dev/null', $output, $rv);
+	if ($rv != 0) {
+		return array(null, 'git log ' . $branch . '..' . $remote . ' failed');
+	}
+	return array(!empty($output), '');
+}
+
+// ---------------------------------------------------------------------------
+// Plugin update state: one JSON file of per-plugin verdicts, written by the
+// sweep, user checks and install/upgrade/uninstall, and only read by
+// GetPluginUpdateStatus(). That read side is polled by every page, so it must
+// never fetch, exec or take a blocking lock (file_cache() takes a blocking
+// LOCK_EX while rebuilding, which is why it is not used here).
+define('PLUGIN_UPDATE_STATE_VERSION', 1);
+// Past this age the UI says how old "no updates" is instead of presenting it as current.
+define('PLUGIN_UPDATE_STALE_SECONDS', 24 * 60 * 60);
+// How long after a completed sweep the next page load starts another.
+define('PLUGIN_UPDATE_SWEEP_INTERVAL', 3 * 60 * 60);
+// After a sweep that could reach nothing or ran out of time, the next one is
+// due on this shorter clock instead. The sweep records which applies (retryAt).
+define('PLUGIN_UPDATE_SWEEP_RETRY', 15 * 60);
+// Longest a sweep may run before it leaves the rest for next time; also how
+// long a start with no finish is believed before it is treated as a dead run
+// (php-fpm restart, power cut) and another is started.
+define('PLUGIN_UPDATE_SWEEP_MAX_RUNTIME', 10 * 60);
+
+// media/cache, not media/tmp (wiped at every boot) or config/ (swept into backups).
+function PluginUpdateStateFile()
+{
+	global $settings;
+	return $settings['mediaDirectory'] . '/cache/plugin_updates.json';
+}
+
+// An empty, valid state. Also what a missing or corrupt file reads as: this is
+// only ever a cache of what was learned, so losing it costs one sweep.
+function PluginUpdateStateEmpty()
+{
+	return array(
+		'version' => PLUGIN_UPDATE_STATE_VERSION,
+		'sweep' => array('startedAt' => 0, 'finishedAt' => 0, 'retryAt' => 0, 'retryAfter' => 0, 'result' => '', 'message' => '',
+			'lastResult' => '', 'lastMessage' => '', 'trigger' => '', 'done' => 0, 'total' => 0,
+			'forceRequested' => false),
+		'plugins' => array(),
+	);
+}
+
+function PluginUpdateStateRead()
+{
+	$f = PluginUpdateStateFile();
+	if (!file_exists($f)) {
+		return PluginUpdateStateEmpty();
+	}
+	$json = @file_get_contents($f);
+	$state = ($json === false) ? null : json_decode($json, true);
+	if (!is_array($state) || !isset($state['plugins']) || !is_array($state['plugins'])) {
+		return PluginUpdateStateEmpty();
+	}
+	if (!isset($state['sweep']) || !is_array($state['sweep'])) {
+		$state['sweep'] = PluginUpdateStateEmpty()['sweep'];
+	}
+	if (!isset($state['version']) || (int) $state['version'] !== PLUGIN_UPDATE_STATE_VERSION) {
+		// Written by a different layout of this file. It is only ever a cache
+		// of what was learned, so start again rather than guess at the shape.
+		return PluginUpdateStateEmpty();
+	}
+	return $state;
+}
+
+// Written via a temp file and rename so a reader never sees it half-written.
+function PluginUpdateStateWrite($state)
+{
+	$f = PluginUpdateStateFile();
+	$dir = dirname($f);
+	if (!is_dir($dir)) {
+		@mkdir($dir, 0775, true);
+	}
+	$state['version'] = PLUGIN_UPDATE_STATE_VERSION;
+	$tmp = $f . '.' . getmypid() . '.tmp';
+	if (@file_put_contents($tmp, json_encode($state, JSON_PRETTY_PRINT)) === false) {
+		@unlink($tmp);
+		return false;
+	}
+	@chmod($tmp, 0664);
+	if (!@rename($tmp, $f)) {
+		@unlink($tmp);
+		return false;
+	}
+	return true;
+}
+
+// Read-modify-write under an exclusive lock, held only across the read and the write.
+function PluginUpdateStateUpdate($fn)
+{
+	$lock = PluginUpdateStateFile() . '.lock';
+	$dir = dirname($lock);
+	if (!is_dir($dir)) {
+		@mkdir($dir, 0775, true);
+	}
+	$fd = @fopen($lock, 'c');
+	if ($fd === false) {
+		return false; // unwritable media: nothing to record, nothing to break
+	}
+	@chmod($lock, 0664);
+	flock($fd, LOCK_EX);
+	$state = PluginUpdateStateRead();
+	$changed = $fn($state);
+	$ok = $changed ? PluginUpdateStateWrite($state) : true;
+	flock($fd, LOCK_UN);
+	fclose($fd);
+	return $ok;
+}
+
+// When a verdict was recorded, to compare with a microtime(true) instant.
+// Whole seconds for an entry an older FPP wrote.
+function PluginUpdateStateRecordedAt($e)
+{
+	if (isset($e['recordedAt']) && is_numeric($e['recordedAt'])) {
+		return (float) $e['recordedAt'];
+	}
+	return (float) (isset($e['checkedAt']) ? (int) $e['checkedAt'] : 0);
+}
+
+/**
+ * Record one plugin's verdict (true/false/null, as PluginUpdateVerdict() returns);
+ * $source ('sweep', 'check', 'upgrade', 'install') is kept for the support zip.
+ *
+ * $since: when the caller's fetch began (microtime(true)). The sweep drops the
+ * fetch lock before computing its verdict (the plugin's own script can take
+ * minutes), so an upgrade or hand check can land in that gap; a verdict older
+ * than what is already recorded is then discarded rather than written over the
+ * fresher one.
+ */
+function PluginUpdateStateSet($plugin, $updates, $error = '', $source = 'check', $since = 0)
+{
+	PluginUpdateStateUpdate(function (&$state) use ($plugin, $updates, $error, $source, $since) {
+		if ($since > 0 && isset($state['plugins'][$plugin])
+			&& PluginUpdateStateRecordedAt($state['plugins'][$plugin]) >= $since
+			&& isset($state['plugins'][$plugin]['source'])
+			&& $state['plugins'][$plugin]['source'] !== $source) {
+			return false;
+		}
+		$entry = array(
+			'updates' => ($updates === null) ? null : (bool) $updates,
+			'checkedAt' => time(),
+			// Sub-second: an install's verdict and a sweep's fetch often fall in
+			// the same second, and must still be told apart.
+			'recordedAt' => microtime(true),
+			'error' => (string) $error,
+			'source' => $source,
+		);
+		// A failed check must not silently retract "update available": an
+		// offline reboot would otherwise put the icon out until the next
+		// successful check. Carry the last real verdict (and when it was
+		// reached) until a check answers again.
+		if ($updates === null && isset($state['plugins'][$plugin]) && is_array($state['plugins'][$plugin])) {
+			$prev = $state['plugins'][$plugin];
+			if (isset($prev['updates']) && $prev['updates'] === true) {
+				$entry['lastKnown'] = true;
+				$entry['lastKnownAt'] = (int) (isset($prev['checkedAt']) ? $prev['checkedAt'] : 0);
+			} else if (!empty($prev['lastKnown'])) {
+				$entry['lastKnown'] = true;
+				$entry['lastKnownAt'] = (int) (isset($prev['lastKnownAt']) ? $prev['lastKnownAt'] : 0);
+			}
+		}
+		$state['plugins'][$plugin] = $entry;
+		return true;
+	});
+}
+
+function PluginUpdateStateForget($plugin)
+{
+	if (preg_match('/^[A-Za-z0-9_.-]+$/', $plugin)) {
+		@unlink(PluginFetchLockFile($plugin));
+	}
+	PluginUpdateStateUpdate(function (&$state) use ($plugin) {
+		if (!isset($state['plugins'][$plugin])) {
+			return false;
+		}
+		unset($state['plugins'][$plugin]);
+		return true;
+	});
+}
+
+/**
+ * Record how a sweep went (ok, partial, offline, or in-progress when $starting),
+ * for the support zip and for PluginUpdateSweepDue(). A finishing record sets
+ * retryAt = now + $retryAfter: when the next page load may start another.
+ * Returns false when the state file could not be written.
+ */
+function PluginUpdateStateRecordSweep($result, $message = '', $trigger = 'background', $starting = false, $retryAfter = PLUGIN_UPDATE_SWEEP_INTERVAL)
+{
+	return PluginUpdateStateUpdate(function (&$state) use ($result, $message, $trigger, $starting, $retryAfter) {
+		$state['sweep'] = PluginUpdateSweepRecord($state['sweep'], $result, $message, $trigger, $starting, $retryAfter);
+		return true;
+	});
+}
+
+// The sweep record PluginUpdateStateRecordSweep() writes, built from the one before.
+function PluginUpdateSweepRecord($prev, $result, $message, $trigger, $starting, $retryAfter)
+{
+	// Rebuilt from the known keys, not merged: a key an earlier layout
+	// wrote must not ride along in the file for ever.
+	$prev = is_array($prev) ? $prev : array();
+	return array(
+		'startedAt' => $starting ? time() : (int) (isset($prev['startedAt']) ? $prev['startedAt'] : 0),
+		'finishedAt' => $starting ? (int) (isset($prev['finishedAt']) ? $prev['finishedAt'] : 0) : time(),
+		'retryAt' => $starting ? (int) (isset($prev['retryAt']) ? $prev['retryAt'] : 0) : time() + (int) $retryAfter,
+		// Kept so the next offline pass can back off from it.
+		'retryAfter' => $starting ? (int) (isset($prev['retryAfter']) ? $prev['retryAfter'] : 0) : (int) $retryAfter,
+		'result' => $result,
+		'message' => (string) $message,
+		// The last FINISHED result, kept through the in-progress record so
+		// the script can back off from it and keep it when a pass checks
+		// nothing. (The endpoint writes in-progress before the script runs.)
+		'lastResult' => $starting
+			? ((isset($prev['result']) && $prev['result'] !== 'in-progress' && $prev['result'] !== '')
+				? (string) $prev['result'] : (string) (isset($prev['lastResult']) ? $prev['lastResult'] : ''))
+			: (string) $result,
+		'lastMessage' => $starting
+			? ((isset($prev['result']) && $prev['result'] !== 'in-progress' && $prev['result'] !== '')
+				? (string) (isset($prev['message']) ? $prev['message'] : '') : (string) (isset($prev['lastMessage']) ? $prev['lastMessage'] : ''))
+			: (string) $message,
+		'trigger' => $trigger,
+		// How far a running sweep has got, for the Updates tab's progress line.
+		'done' => 0,
+		'total' => $starting ? (int) (isset($prev['total']) ? $prev['total'] : 0) : 0,
+		// A Check for Updates that arrived while this sweep ran (see
+		// RefreshPluginUpdateStatus()). Kept through the script's own start
+		// record, which can land after the request did.
+		'forceRequested' => $starting && !empty($prev['forceRequested']),
+	);
+}
+
+/**
+ * The end of a sweep pass. When Check for Updates asked for a check while the
+ * pass ran, the pass may have fetched a plugin before what the user is looking
+ * for was pushed, or (a background pass) skipped it as recently checked: then
+ * nothing is recorded as finished, the sweep starts over as a forced pass, and
+ * this returns false. Otherwise it records the result and returns true. One
+ * locked update for both, so a request can't land between the look and the
+ * finishing record and be dropped with no pass to answer it.
+ */
+function PluginUpdateStateFinishSweep($result, $message, $trigger, $retryAfter)
+{
+	$finished = true;
+	PluginUpdateStateUpdate(function (&$state) use ($result, $message, $trigger, $retryAfter, &$finished) {
+		if (!empty($state['sweep']['forceRequested'])) {
+			$finished = false;
+			$state['sweep'] = PluginUpdateSweepRecord($state['sweep'], 'in-progress', '', 'manual', true, 0);
+			$state['sweep']['forceRequested'] = false;
+		} else {
+			$state['sweep'] = PluginUpdateSweepRecord($state['sweep'], $result, $message, $trigger, false, $retryAfter);
+		}
+		return true;
+	});
+	return $finished;
+}
+
+// The running sweep's progress: $done of $total plugins so far.
+function PluginUpdateStateRecordSweepProgress($done, $total)
+{
+	PluginUpdateStateUpdate(function (&$state) use ($done, $total) {
+		$state['sweep']['done'] = (int) $done;
+		$state['sweep']['total'] = (int) $total;
+		return true;
+	});
+}
+
+// Whether a page load should start a sweep, from the last one's record.
+// A running (or recently started) sweep counts as not due.
+function PluginUpdateSweepRunning($sweep)
+{
+	$sweep = is_array($sweep) ? $sweep : array();
+	if (!isset($sweep['result']) || $sweep['result'] !== 'in-progress') {
+		return false;
+	}
+	$startedAt = (int) (isset($sweep['startedAt']) ? $sweep['startedAt'] : 0);
+	return $startedAt <= time() && (time() - $startedAt) <= PLUGIN_UPDATE_SWEEP_MAX_RUNTIME;
+}
+
+function PluginUpdateSweepDue($sweep)
+{
+	$sweep = is_array($sweep) ? $sweep : array();
+	$startedAt = (int) (isset($sweep['startedAt']) ? $sweep['startedAt'] : 0);
+	$retryAt = (int) (isset($sweep['retryAt']) ? $sweep['retryAt'] : 0);
+	// Written under a clock that has since been set back (RTC-less Pi, date
+	// typed by hand): a record from the future would otherwise hold off every
+	// sweep for as long as the error was. Same rule as the per-plugin one.
+	if ($startedAt > time() || $retryAt > time() + PLUGIN_UPDATE_SWEEP_INTERVAL) {
+		return true;
+	}
+	if (isset($sweep['result']) && $sweep['result'] === 'in-progress') {
+		// Running, or started and never finished (killed): believe it for
+		// the maximum runtime, then treat it as dead.
+		return (time() - $startedAt) > PLUGIN_UPDATE_SWEEP_MAX_RUNTIME;
+	}
+	// Never run (retryAt 0), or the last one said when the next may start.
+	return time() >= $retryAt;
+}
+
+// Start the background refresh when the last sweep's record says one is due.
+function PluginUpdateMaybeSweep($state)
+{
+	if (!PluginUpdateSweepDue(isset($state['sweep']) ? $state['sweep'] : null)) {
+		return false;
+	}
+	return PluginUpdateStartSweep('background');
+}
+
+/**
+ * Spawn the sweep script, detached, like PluginWarmListDetached(). The
+ * in-progress record written here is the claim, so the next page load sees a
+ * fresh start and does not spawn another; two loads that race past that are
+ * settled by the child's flock -n. setsid so a php-fpm restart does not kill
+ * it. $trigger 'manual' (Check for Updates) re-checks every plugin, however
+ * fresh. Returns true if one was started.
+ */
+function PluginUpdateStartSweep($trigger)
+{
+	global $fppDir;
+
+	$script = $fppDir . '/scripts/plugin_update_check.php';
+	if (!file_exists($script)) {
+		return false;
+	}
+	if (!PluginUpdateStateRecordSweep('in-progress', '', $trigger, true)) {
+		// Unwritable (or root-owned) media/cache: with no claim every page load
+		// would fork a child that cannot record anything either, so do nothing,
+		// and say so at most once a day.
+		$warned = sys_get_temp_dir() . '/fpp-plugin-update-state.warned';
+		if (!file_exists($warned) || (time() - filemtime($warned)) > 24 * 60 * 60) {
+			@touch($warned);
+			error_log('plugin update check: cannot write ' . PluginUpdateStateFile() . '; background checks disabled');
+		}
+		return false;
+	}
+
+	// The whole child at the back of the CPU and IO queues, not just its git
+	// fetches: it also runs git log and each plugin's own update script.
+	$inner = 'nice -n 19 ' . (PluginHaveCommand('ionice') ? 'ionice -c2 -n7 ' : '') . 'php ' . escapeshellarg($script)
+		. ($trigger === 'manual' ? ' --force' : '');
+	if (is_executable('/bin/flock') || is_executable('/usr/bin/flock')) {
+		$inner = 'flock -n ' . escapeshellarg(PluginUpdateStateFile() . '.sweep.lock') . ' -c ' . escapeshellarg($inner);
+	}
+	if (is_executable('/bin/setsid') || is_executable('/usr/bin/setsid')) {
+		$inner = 'setsid ' . $inner;
+	}
+	exec($inner . ' > /dev/null 2>&1 &');
+	return true;
+}
+
+/**
+ * Plugin update status
+ *
+ * What is known about plugin updates, read from a file; starts a background refresh when the answer is a few hours old. `unchecked`/`errors` are plugins with no verdict and why. `sweep.result` is `in-progress` while a check runs (`done` of `total` so far); poll until it is not.
+ *
+ * @route GET /api/plugin/updateStatus
+ * @response 200 Plugin update status
+ * ```json
+ * {"status": "OK", "updatesAvailable": true, "plugins": ["fpp-node-red"], "unchecked": [], "errors": {}, "installed": 3, "checked": true, "lastCheck": 1758600000, "stale": false, "sweep": {"finishedAt": 1758600000, "result": "ok", "message": "", "trigger": "background", "done": 0, "total": 0}}
+ * ```
+ */
+function GetPluginUpdateStatus()
+{
+	$installed = InstalledPluginNames();
+	$state = PluginUpdateStateRead();
+	if (!empty($installed) && PluginUpdateMaybeSweep($state)) {
+		$state = PluginUpdateStateRead(); // now says in-progress; the page polls until it isn't
+	}
+
+	$withUpdates = array();
+	$unchecked = array();
+	$errors = array();
+	$newestCheck = 0;
+	$oldestCheck = null;
+	foreach ($installed as $plugin) {
+		$e = isset($state['plugins'][$plugin]) ? $state['plugins'][$plugin] : null;
+		if (!is_array($e) || !array_key_exists('updates', $e)) {
+			$unchecked[] = $plugin;
+			continue;
+		}
+		// A future timestamp means the clock moved (RTC-less Pis): treat as never checked.
+		$at = (int) (isset($e['checkedAt']) ? $e['checkedAt'] : 0);
+		if ($at > time()) {
+			// The sweep picks it up first for the same reason (it reads as
+			// the oldest), so this lasts until the next background pass.
+			$unchecked[] = $plugin;
+			continue;
+		}
+		if ($e['updates'] === null) {
+			// Not a check for lastCheck/stale purposes: an all-failed sweep must
+			// not read as "checked just now".
+			$unchecked[] = $plugin;
+			if (!empty($e['error'])) {
+				$errors[$plugin] = $e['error'];
+			}
+			// Still flagged: an update was waiting the last time a check
+			// answered, and nothing since has said otherwise. It is in both
+			// lists on purpose: the icon stays lit, the tab says why it is
+			// not current.
+			if (!empty($e['lastKnown'])) {
+				$withUpdates[] = $plugin;
+				$errors[$plugin] = (isset($errors[$plugin]) ? $errors[$plugin] : 'could not be checked')
+					. '; an update was waiting when it was last checked';
+			}
+			continue;
+		}
+		$newestCheck = max($newestCheck, $at);
+		$oldestCheck = ($oldestCheck === null) ? $at : min($oldestCheck, $at);
+		// A verdict can carry an error too (the plugin's own script failed but
+		// git answered); that stays in the state file for the Support Zip.
+		if ($e['updates']) {
+			$withUpdates[] = $plugin;
+		}
+	}
+
+	// Missing keys: the file is only ever advisory, and a hand-edited or
+	// half-written one must not warn on the hottest endpoint in the feature.
+	$sweep = array_merge(PluginUpdateStateEmpty()['sweep'], $state['sweep']);
+	$sweep = array(
+		'finishedAt' => (int) $sweep['finishedAt'],
+		'result' => (string) $sweep['result'],
+		'message' => (string) $sweep['message'],
+		'trigger' => (string) $sweep['trigger'],
+		'done' => (int) $sweep['done'],
+		'total' => (int) $sweep['total'],
+	);
+	$startedAt = (int) (isset($state['sweep']['startedAt']) ? $state['sweep']['startedAt'] : 0);
+	if ($sweep['result'] === 'in-progress'
+		&& ($startedAt > time() || (time() - $startedAt) > PLUGIN_UPDATE_SWEEP_MAX_RUNTIME)) {
+		// Started, never finished: the child was killed (php-fpm restart, power
+		// cut). Saying "checking now" for ever is worse than saying nothing.
+		$sweep['result'] = '';
+		$sweep['message'] = '';
+	}
+
+	return json(array(
+		'status' => 'OK',
+		'updatesAvailable' => !empty($withUpdates),
+		'plugins' => $withUpdates,
+		'unchecked' => $unchecked,
+		// Objects even when empty: json_encode would otherwise emit [] for an
+		// empty PHP array, and the contract says these are name->reason maps.
+		'errors' => (object) $errors,
+		'installed' => count($installed),
+		// False means nothing at all is known, so "no updates" is not a verdict.
+		'checked' => ($newestCheck > 0),
+		// The OLDEST answer, so one hand-checked plugin cannot make stale ones look fresh.
+		'lastCheck' => ($oldestCheck === null) ? 0 : $oldestCheck,
+		'stale' => ($oldestCheck === null) || ($oldestCheck == 0)
+			|| ((time() - $oldestCheck) > PLUGIN_UPDATE_STALE_SECONDS),
+		'sweep' => $sweep,
+	));
+}
+
+/**
+ * Check every plugin for updates now
+ *
+ * Starts the background check of every installed plugin (the same one that runs off page loads, but every plugin regardless of age) and returns at once. Poll `GET /api/plugin/updateStatus` until `sweep.result` is no longer `in-progress`. `started` is false when one was already running; that one then checks every plugin again before it finishes, so the answer polled for still comes from a check made after this request.
+ *
+ * @route POST /api/plugin/updateStatus/refresh
+ * @response 200 Started, or already running
+ * ```json
+ * {"status": "OK", "started": true}
+ * ```
+ */
+function RefreshPluginUpdateStatus()
+{
+	if (empty(InstalledPluginNames())) {
+		return json(array('status' => 'OK', 'started' => false, 'message' => 'no plugins installed'));
+	}
+	// A sweep already running may be a background one, which skips plugins
+	// checked lately, or may have fetched a plugin before what the user is
+	// after was pushed; the page then waited for it and offered nothing to
+	// update. Ask it for a forced pass of its own once it is done (it stays
+	// in progress meanwhile, so the page waits for that one). Looked at and
+	// asked under the state lock, so the sweep can't finish in between.
+	$running = false;
+	PluginUpdateStateUpdate(function (&$state) use (&$running) {
+		if (!PluginUpdateSweepRunning($state['sweep'])) {
+			return false;
+		}
+		$running = true;
+		$state['sweep']['forceRequested'] = true;
+		return true;
+	});
+	if ($running) {
+		return json(array('status' => 'OK', 'started' => false, 'message' => 'a check is already running; every plugin is checked again when it finishes'));
+	}
+	if (!PluginUpdateStartSweep('manual')) {
+		return json(array('status' => 'ERROR', 'started' => false, 'message' => 'could not start the check; see the FPP log'));
+	}
+	return json(array('status' => 'OK', 'started' => true));
+}
+
+/**
+ * Get setting from plugin
+ *
+ * Returns the value of setting `{SettingName}` from plugin `{RepoName}`.
+ *
+ * @route GET /api/plugin/{RepoName}/settings/{SettingName}
+ * @response 200 Plugin setting value
+ * ```json
+ * {"status": "OK", "SettingName": "SettingValue"}
+ * ```
+ */
+function PluginGetSetting()
+{
+	$setting = params("SettingName");
+	$plugin = params("RepoName");
+
+	// An empty name reads the main settings file; the setting name is also
+	// spliced into a regex by ReadSettingFromFile().
+	if (!IsValidPluginName($plugin) || !IsValidSettingName($setting)) {
+		http_response_code(400);
+		return json(array("status" => "ERROR", "message" => "Invalid plugin or setting name."));
+	}
+
+	$value = ReadSettingFromFile($setting, $plugin);
+
+	$result = array("status" => "OK");
+	$result[$setting] = $value;
+
+	return json($result);
+
+}
+
+/**
+ * Set setting for plugin
+ *
+ * Sets `{SettingName}` for plugin `{RepoName}` and returns the updated value.
+ *
+ * @route POST /api/plugin/{RepoName}/settings/{SettingName}
+ * @route PUT /api/plugin/{RepoName}/settings/{SettingName}
+ * @body SettingValue
+ * @response 200 Plugin setting updated
+ * ```json
+ * {"status": "OK", "SettingName": "SettingValue"}
+ * ```
+ */
+function PluginSetSetting()
+{
+
+	$setting = params("SettingName");
+	$plugin = params("RepoName");
+	$value = file_get_contents('php://input');
+
+	// Errors must be non-2xx: SetPluginSetting() in fpp.js reports any 2xx
+	// as "setting saved".
+	if (!IsValidSettingName($setting)) {
+		http_response_code(400);
+		return json(array("status" => "ERROR", "message" => "Invalid setting name."));
+	}
+	// The plugin name becomes the config filename; same pattern plugin install enforces.
+	if (!IsValidPluginName($plugin)) {
+		http_response_code(400);
+		return json(array("status" => "ERROR", "message" => "Invalid plugin name."));
+	}
+
+	if (!WriteSettingToFile($setting, $value, $plugin)) {
+		http_response_code(500);
+		return json(array(
+			"status" => "ERROR",
+			"message" => "Unable to save the '" . $setting . "' setting.  The plugin config file is not writable - check the FPP logs."
+		));
+	}
+
+	return PluginGetSetting();
+}
+
+/**
+ * Get plugin page URL
+ *
+ * Scans the plugin's menu files (menu.inc, status_menu.inc, etc.) and returns
+ * the best page URL for the plugin.  Prefers the Status/Control page; falls
+ * back to the Content Setup (config) page if no status page is found.
+ *
+ * @route GET /api/plugin/{RepoName}/page
+ * @response 200 Plugin page info
+ * ```json
+ * {"url": "plugin.php?plugin=fpp-matrixtools&page=status.php", "page": "status.php", "found": true}
+ * ```
+ */
+function GetPluginPageUrl()
+{
+	$plugin = params('RepoName');
+	if (!IsValidPluginName($plugin)) {
+		return json(array('url' => '', 'page' => '', 'found' => false));
+	}
+	return json(_PluginGetBestPageUrl($plugin));
+}
+
+/**
+ * Helper: compute the "best" page URL for a plugin by scanning its menu files.
+ * Returns ['url' => ..., 'page' => ..., 'found' => true/false].
+ *
+ * Strategy – scan raw menu file content rather than PHP-including it, so we
+ * are immune to PHP errors, missing variables, side effects, and unusual
+ * execution contexts that would make @include produce empty or broken output:
+ *
+ *   1. Look for `'page' => 'xxx.php'` inside a PHP array (the template
+ *      pattern: $menuEntries = [ ['page' => 'status.php', ...], ...]).
+ *      When a `'type' => 'status'` / `'type' => 'content'` key precedes
+ *      the page entry we can rank by menu section.
+ *
+ *   2. Look for `page=xxx.php` inside an href (old-style *_menu.inc or
+ *      inline HTML in menu.inc).
+ *
+ *   3. Also try the PHP-include approach and merge results, so dynamically
+ *      constructed URLs that cannot be found via raw-text scan are still
+ *      captured (e.g. $page from a variable).  The raw-text scan runs
+ *      first, so it wins for the common cases; the include outcome is a
+ *      silent fallback that adds entries without replacing the raw ones.
+ */
+function _PluginGetBestPageUrl($plugin)
+{
+	global $pluginDirectory;
+	// The scan below include()s the plugin's menu files.
+	if (!IsValidPluginName($plugin)) {
+		return array('url' => '', 'page' => '', 'found' => false);
+	}
+	$dir = $pluginDirectory . '/' . $plugin;
+
+	// Gather candidate page names keyed by menu type (status, content, …).
+	// _RawScan returns [pageName => true] for that menu type; a page that
+	// appears under multiple types is recorded under each.
+	$byType = [];
+
+	// List of menu types in priority order (raw+include for each).
+	foreach (['status', 'content', 'output', 'help'] as $type) {
+		$names = _PluginScanMenuPagesRaw($dir, $plugin, $type);
+		$byType[$type] = [];
+
+		// Deduplicate while preserving the order they were found in.
+		$seen = [];
+		foreach ($names as $name) {
+			if (!isset($seen[$name])) {
+				$seen[$name] = true;
+				$byType[$type][] = $name;
+			}
+		}
+	}
+
+	// Return the first page from the highest-priority menu type.
+	foreach (['status', 'content', 'output', 'help'] as $type) {
+		if (!empty($byType[$type])) {
+			$page = $byType[$type][0];
+			return [
+				'url'   => 'plugin.php?plugin=' . urlencode($plugin) . '&page=' . urlencode($page),
+				'page'  => $page,
+				'found' => true,
+			];
+		}
+	}
+
+	return ['url' => null, 'page' => null, 'found' => false];
+}
+
+/**
+ * Scan raw content of the plugin's menu files for a given menu type,
+ * returning an array of page-file names (e.g. ['status.php', …]).
+ *
+ * Both file conventions are checked:
+ *   – unified  menu.inc       (new pattern, PHP array-driven)
+ *   – per-type  ${type}_menu.inc  (old pattern, static HTML)
+ *
+ * Inside each file two extractors run:
+ *   a) PHP-include (fallback) – captures links constructed dynamically
+ *      that a raw-text scan cannot see.
+ *   b) Raw-text scan (primary) – immune to execution-context issues.
+ */
+function _PluginScanMenuPagesRaw($dir, $plugin, $type)
+{
+	$pages = [];
+	$files = [];
+
+	if (file_exists($dir . '/menu.inc')) {
+		$files[] = ['path' => $dir . '/menu.inc', 'unified' => true];
+	}
+	$specific = $dir . '/' . $type . '_menu.inc';
+	if (file_exists($specific)) {
+		$files[] = ['path' => $specific, 'unified' => false];
+	}
+
+	foreach ($files as $info) {
+		$path = $info['path'];
+
+		// ---- (a) Raw-text scan (primary) --------------------------------
+		// Runs first so its results take precedence over the include
+		// fallback below: the raw scan reads the declared 'page' => value
+		// directly and is immune to quirks in the rendered HTML (e.g. a
+		// 'nopage=1' suffix whose "page=" substring can mislead the href
+		// parser).
+		$src = @file_get_contents($path);
+		if ($src !== false && $src !== '') {
+			_PluginExtractPageFromRaw($src, $info['unified'], $type, $pages);
+		}
+
+		// ---- (b) PHP-include fallback -----------------------------------
+		// Executes the file with $menu/$plugin in scope so that PHP-built
+		// hrefs are captured when the raw-text scan misses them. Failure
+		// is silent. IMPORTANT: Save/restore $pages around the include
+		// because the included file may define its own $pages variable
+		// (e.g. with 'name', 'type', 'page' keys) which would corrupt our
+		// array.
+		$pagesBefore = $pages;
+		$html = '';
+		try {
+			$menu = $type;
+			ob_start();
+			@include $path;
+			$html = ob_get_clean();
+		} catch (\Throwable $_) {
+			$html = '';
+		}
+		$pages = $pagesBefore;
+		if ($html !== '') {
+			_PluginExtractPageFromHtml($html, $pages);
+		}
+	}
+
+	return $pages;
+}
+
+/**
+ * Extract page names from HTML output (the include fallback).
+ *
+ * Populates $pages (by reference) with page-file names found in
+ * href="plugin.php?plugin=…&page=…" or href='…' attributes.
+ */
+function _PluginExtractPageFromHtml($html, array &$pages)
+{
+	// NOTE: anchor "page=" on a ?/& boundary so it does not match the "page="
+	// substring inside "nopage=1" (added for menu entries with 'wrap' => 0).
+	// Without the [?&] anchor the greedy [^"']* backtracks to the last "page="
+	// and captures the nopage value (e.g. "1") instead of the real page name.
+	if (preg_match_all('/href=(["\'])(?:[^"\']*plugin\.php[^"\']*[?&]page=([^"&\'&]+)|([^"\']*[?&]page=[^"&\'&]+[^"\']*plugin\.php[^"\']*))\1/i', $html, $m)) {
+		foreach ($m[2] as $i => $page) {
+			$v = trim($page !== '' ? $page : $m[3][$i]);
+			if ($v !== '') {
+				$pages[] = htmlspecialchars_decode($v);
+			}
+		}
+	}
+}
+
+/**
+ * Extract page names from raw PHP source code.
+ *
+ * Patterns (checked in order; first that matches wins):
+ *
+ *   1. PHP array entries:  'page' => 'xxx.php'
+ *      When inside a unified menu.inc, also looks for a preceding
+ *      'type' => '{type}' key to filter by the requested menu type.
+ *
+ *   2. page= in HTML attributes:  page="xxx.php"
+ *
+ *   3. page= in unquoted URL contexts:  page=xxx.php
+ *
+ *   4. Any .php filename inside quotes (broad catch-all for
+ *      variable assignments like $statusPage = 'advancedstats.php').
+ *
+ *   5. Any .php filename that could be a page, even without
+ *      surrounding quotes (aggressive fallback).
+ *
+ * Populates $pages (by reference).
+ */
+function _PluginExtractPageFromRaw($src, $unified, $type, array &$pages)
+{
+	$skipFiles = ['plugin.php'];
+
+	// ---- Pattern 1: PHP array entries ----------------------------------
+	$p1matchedAny = false;
+	if ($unified && preg_match_all("/['\"]((?:type|page))['\"]\s*=>\s*['\"]([^'\"]+)['\"]/i", $src, $entryM, PREG_SET_ORDER)) {
+		$lastType = null;
+		foreach ($entryM as $em) {
+			$key = strtolower($em[1]);
+			$val = $em[2];
+			$p1matchedAny = true;
+			if ($key === 'type') {
+				$lastType = $val;
+			} elseif ($key === 'page' && preg_match('/\.php$/i', $val)) {
+				if ($lastType === null || $lastType === $type) {
+					$pages[] = $val;
+				}
+				$lastType = null;
+			}
+		}
+		// If Pattern 1 found any array-style entries, stop here.
+		// Even if none matched the requested type, we must not fall
+		// through to the broader patterns which lack type filtering.
+		if ($p1matchedAny) {
+			return;
+		}
+	}
+
+	// ---- Pattern 2: page= in HTML attributes ---------------------------
+	if (preg_match_all('/page\s*=\s*["\']([a-zA-Z0-9_\-\.\/]+\.php)["\']/i', $src, $m)) {
+		foreach ($m[1] as $v) {
+			if (!in_array(strtolower($v), $skipFiles)) {
+				$pages[] = $v;
+			}
+		}
+		if (!empty($pages)) { return; }
+	}
+
+	// ---- Pattern 3: page= in unquoted URL contexts ---------------------
+	if (preg_match_all('/page\s*=\s*([a-zA-Z0-9_\-\.\/]+\.php)/i', $src, $m)) {
+		foreach ($m[1] as $v) {
+			if (!in_array(strtolower($v), $skipFiles)) {
+				$pages[] = $v;
+			}
+		}
+		if (!empty($pages)) { return; }
+	}
+
+	// ---- Pattern 4: any .php filename in quotes (broad) ---------------
+	if (preg_match_all('/["\']([a-zA-Z0-9_\-]+\.php)["\']/i', $src, $m)) {
+		foreach ($m[1] as $v) {
+			if (!in_array(strtolower($v), $skipFiles)) {
+				$pages[] = $v;
+			}
+		}
+		if (!empty($pages)) { return; }
+	}
+
+	// ---- Pattern 5: any .php filename after variable assignment -------
+	if (preg_match_all('/=\s*["\']([a-zA-Z0-9_\-]+\.php)["\']/i', $src, $m)) {
+		foreach ($m[1] as $v) {
+			if (!in_array(strtolower($v), $skipFiles)) {
+				$pages[] = $v;
+			}
+		}
+	}
+}
+
+/**
+ * Function names a plugin's api.php must not declare, beyond anything FPP has
+ * already declared (which is checked dynamically).
+ *
+ * These are limonade's request-handling hooks. It either calls them when a
+ * global of that name happens to exist (call_if_exists: configure, initialize,
+ * before, autorender, before_exit, before_sending_header) or defines its own
+ * only when one does not (after, route_missing, autoload_controller, not_found,
+ * server_error). Either way a plugin declaring one silently takes over part of
+ * request handling for EVERY API call, not just its own endpoints --
+ * autoload_controller() in particular decides whether FPP's controllers get
+ * loaded at all. None of them are defined yet when plugin code is included, so
+ * function_exists() cannot catch them; they have to be named.
+ */
+function PluginApiReservedFunctions()
+{
+    return array(
+        'configure', 'initialize', 'before', 'autorender', 'before_exit',
+        'before_sending_header', 'after', 'route_missing', 'autoload_controller',
+        'not_found', 'server_error',
+    );
+}
+
+/**
+ * Top-level function names declared by a PHP file.
+ *
+ * Uses the tokenizer rather than a regex so that the word "function" inside a
+ * comment or a string can't produce a false hit. Methods are skipped (they live
+ * in a class's namespace and cannot collide), as are functions inside a
+ * namespace declaration, and closures have no name to collect.
+ */
+function PluginApiDeclaredFunctions($file)
+{
+    $src = @file_get_contents($file);
+    if ($src === false || $src === '') {
+        return array();
+    }
+    $tokens = @token_get_all($src);
+    if (!is_array($tokens)) {
+        return array();
+    }
+
+    $names = array();
+    $depth = 0;          // current brace depth
+    $classDepth = -1;    // brace depth the enclosing class body sits at, or -1
+    $namespaced = false;
+    $count = count($tokens);
+
+    for ($i = 0; $i < $count; $i++) {
+        $t = $tokens[$i];
+
+        if (is_string($t)) {
+            if ($t === '{') {
+                $depth++;
+            } else if ($t === '}') {
+                $depth--;
+                if ($classDepth >= 0 && $depth <= $classDepth) {
+                    $classDepth = -1;
+                }
+            }
+            continue;
+        }
+
+        if ($t[0] === T_NAMESPACE) {
+            // Anything declared from here on is namespaced and cannot collide
+            // with FPP's global functions.
+            $namespaced = true;
+            continue;
+        }
+
+        if ($t[0] === T_CLASS || $t[0] === T_INTERFACE || $t[0] === T_TRAIT) {
+            // Skip the "::class" constant, which is not a class declaration.
+            $prev = $i - 1;
+            while ($prev >= 0 && is_array($tokens[$prev]) && $tokens[$prev][0] === T_WHITESPACE) {
+                $prev--;
+            }
+            if ($prev >= 0 && is_array($tokens[$prev]) && $tokens[$prev][0] === T_DOUBLE_COLON) {
+                continue;
+            }
+            $classDepth = $depth;
+            continue;
+        }
+
+        if ($t[0] !== T_FUNCTION) {
+            continue;
+        }
+
+        // The name, if any, is the next token that isn't whitespace, a comment,
+        // or the "&" of a by-reference return. No name means a closure.
+        //
+        // The ampersand is a plain string token on older PHP but its own token
+        // type from 8.1, so both forms have to be skipped or "function &foo()"
+        // reads as anonymous and its name is missed.
+        $skip = array(T_WHITESPACE, T_COMMENT, T_DOC_COMMENT);
+        foreach (array('T_AMPERSAND_FOLLOWED_BY_VAR_OR_VARARG',
+                       'T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG') as $amp) {
+            if (defined($amp)) {
+                $skip[] = constant($amp);
+            }
+        }
+        $j = $i + 1;
+        while ($j < $count) {
+            if (is_string($tokens[$j])) {
+                if ($tokens[$j] !== '&') {
+                    break;
+                }
+            } else if (!in_array($tokens[$j][0], $skip, true)) {
+                break;
+            }
+            $j++;
+        }
+        if ($j < $count && is_array($tokens[$j]) && $tokens[$j][0] === T_STRING) {
+            if ($classDepth < 0 && !$namespaced) {
+                $names[] = $tokens[$j][1];
+            }
+        }
+    }
+
+    return $names;
+}
+
+/**
+ * The names in a plugin's api.php that would collide with something FPP relies
+ * on. Empty means the file is safe to include.
+ */
+function PluginApiFunctionConflicts($file)
+{
+    $conflicts = array();
+    foreach (PluginApiDeclaredFunctions($file) as $name) {
+        if (in_array(strtolower($name), PluginApiReservedFunctions(), true)) {
+            $conflicts[] = $name . ' (reserved)';
+        } else if (function_exists($name)) {
+            $conflicts[] = $name;
+        }
+    }
+    return $conflicts;
+}
+
+// Returns an array of all plugin endpoints: [['plugin'=>..., 'method'=>..., 'endpoint'=>..., 'callback'=>...], ...]
+//
+// Memoized: this is called once from addPluginEndpoints() at bootstrap and
+// again from ServeOpenApiSpec() (controllers/docs.php) when /openapi.json is
+// requested. Recomputing it the second time is wrong, not just wasteful --
+// PluginApiFunctionConflicts() treats function_exists() as a signal, and by
+// the second call every plugin's own functions exist because the first call
+// just require_once'd them. That reads as every plugin conflicting with
+// itself, so a naive second pass silently drops all plugin paths from the
+// served spec while the routes (registered by the first pass) keep working.
+//
+// Depends on FPP's own controllers -- this file included -- already being
+// loaded, so that PluginApiFunctionConflicts()'s function_exists() checks see
+// every FPP-declared name before any plugin's api.php is required. index.php
+// guarantees that ordering (require_once_dir(controllers) runs before
+// addPluginEndpoints(), which calls this); see the comment there.
+function collectPluginEndpoints()
+{
+    static $collected = null;
+    if ($collected !== null) {
+        return $collected;
+    }
+
+    global $pluginDirectory;
+    $collected = array();
+    $baseDir = $pluginDirectory . '/';
+    if ($dir = opendir($baseDir)) {
+        while (($file = readdir($dir)) !== false) {
+            if (!in_array($file, array('.', '..')) && is_dir($baseDir . $file) && is_file($baseDir . $file . '/api.php')) {
+                // Including a file that redeclares an existing function is a
+                // fatal error, and it would happen here -- taking down every
+                // route in the API, not just this plugin's. Check first and skip
+                // the plugin instead. Losing one plugin's endpoints is a bad
+                // outcome; losing the API is a much worse one.
+                $conflicts = PluginApiFunctionConflicts($baseDir . $file . '/api.php');
+                if (!empty($conflicts)) {
+                    error_log("FPP: skipping plugin API for '$file' -- api.php declares "
+                        . "function(s) FPP already provides: " . implode(', ', $conflicts));
+                    continue;
+                }
+
+                $functionsBefore = get_defined_functions();
+                $userFunctionsBefore = isset($functionsBefore['user']) ? $functionsBefore['user'] : array();
+
+                // A syntax error in a plugin's api.php is a ParseError thrown at
+                // require_once time -- catchable, unlike a redeclaration fatal
+                // (PHP never turned "cannot redeclare" into a catchable Error, so
+                // that one still has to be prevented before this point rather than
+                // caught here; see PluginApiFunctionConflicts() above). Confirmed
+                // live: an uncaught ParseError here previously took down every
+                // route in the API, not just this plugin's, exactly like the
+                // conflict case -- catch it and skip the plugin instead.
+                try {
+                    require_once $baseDir . $file . '/api.php';
+                } catch (\Throwable $e) {
+                    error_log("FPP: skipping plugin API for '$file' -- api.php failed to load: "
+                        . get_class($e) . ': ' . $e->getMessage());
+                    continue;
+                }
+
+                $functionsAfter = get_defined_functions();
+                $userFunctionsAfter = isset($functionsAfter['user']) ? $functionsAfter['user'] : array();
+                $newUserFunctions = array_diff($userFunctionsAfter, $userFunctionsBefore);
+
+                $sfile = preg_replace('/-/', '', $file);
+                $endpointFunction = "getEndpoints$sfile";
+
+                if (!is_callable($endpointFunction)) {
+                    foreach ($newUserFunctions as $funcName) {
+                        if (stripos($funcName, 'getEndpoints') === 0) {
+                            $endpointFunction = $funcName;
+                            break;
+                        }
+                    }
+                }
+
+                if (!is_callable($endpointFunction)) {
+                    error_log("Skipping plugin API endpoint registration for '$file': no callable getEndpoints* function found");
+                    continue;
+                }
+
+                foreach (call_user_func($endpointFunction) as $ep) {
+                    if (!isset($ep['callback'])) {
+                        error_log("Skipping plugin endpoint for '$file': callback missing");
+                        continue;
+                    }
+                    $collected[] = array(
+                        'plugin'   => $file,
+                        'method'   => $ep['method'],
+                        'endpoint' => $ep['endpoint'],
+                        'callback' => $ep['callback'],
+                    );
+                }
+            }
+        }
+    }
+    return $collected;
+}
+
+// Called once from index.php, after require_once_dir(controllers) and before
+// run(), so plugin routes register after every one of FPP's own dispatch_*
+// calls (route_find() returns the first match, so a plugin can never shadow
+// an FPP route this way).
+function addPluginEndpoints()
+{
+    foreach (collectPluginEndpoints() as $ep) {
+        if (!is_callable($ep['callback'])) {
+            error_log("Skipping plugin endpoint for '{$ep['plugin']}': callback not callable");
+            continue;
+        }
+        $path = '/plugin/' . $ep['plugin'] . '/' . $ep['endpoint'];
+        if ($ep['method'] == 'GET') {
+            dispatch_get($path, $ep['callback']);
+        } else if ($ep['method'] == 'POST') {
+            dispatch_post($path, $ep['callback']);
+        } else if ($ep['method'] == 'PUT') {
+            dispatch_put($path, $ep['callback']);
+        } else if ($ep['method'] == 'DELETE') {
+            dispatch_delete($path, $ep['callback']);
+        }
+    }
+}
 
 ?>

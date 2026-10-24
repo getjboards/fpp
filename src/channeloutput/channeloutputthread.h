@@ -1,43 +1,84 @@
+#pragma once
 /*
- *   output channel thread for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _CHANNELOUTPUTTHREAD_H
-#define _CHANNELOUTPUTTHREAD_H
+#include <mutex>
+
+// Held by the channel output thread for the whole of each output cycle -- the
+// cycle that runs PrepareChannelData()/SendChannelData(), both of which walk
+// the channelOutputs list and call into every ChannelOutput on it.  It is
+// released only while the thread waits out the rest of the frame interval, or
+// hands it to a LockOutputThread() caller (below), so
+// anything that mutates that list, and in particular anything that destroys a
+// ChannelOutput, has to hold this to avoid pulling an instance out from under
+// a walk that is already in progress.
+//
+// Two things it is NOT safe to do with it.  Do not call
+// StartChannelOutputThread() while holding it: that function waits for
+// ThreadIsRunning, which the new thread sets only after taking this lock.  And
+// do not take it on a path an FSEQ-triggered command can reach -- the output
+// thread holds it across Sequence::SendSequenceData(), which runs those
+// commands, so anything they call that takes it deadlocks that thread.  It is
+// a plain mutex on purpose: the output thread waits on a condition_variable
+// with it, which rules out making it recursive.
+extern std::mutex outputThreadLock;
+
+// Take outputThreadLock from any thread but the output thread.  That thread
+// lets go of it only in its wait for the next frame, which it skips while it
+// is behind, so a plain lock() waited for as long as every cycle ran over its
+// frame time: an output reload then stopped the main loop until the outputs
+// sped up, and slow outputs could not be replaced to fix them.  This counts
+// the caller as waiting, and the thread hands the lock over at the end of its
+// pass.
+std::unique_lock<std::mutex> LockOutputThread(void);
+
+// Held by a thread that drives the outputs itself instead of the output thread
+// (Sequence::SendBlankingData() when the output thread isn't sending), and by
+// an output reload around its teardown, so a reload can't free an output that
+// such a send is in the middle of using.  Always taken after outputThreadLock
+// when both are held.  Recursive: the inline send can re-enter
+// SendBlankingData() through OverlayEffects().
+extern std::recursive_mutex inlineOutputLock;
 
 void DisableChannelOutput(void);
 void EnableChannelOutput(void);
 void InitChannelOutputSyncVars(void);
 void DestroyChannelOutputSyncVars(void);
-void ForceChannelOutputNow(void);
+// Send a frame now rather than at the next due time.  False when the output
+// thread isn't running (or is stopping) and so won't: send it yourself.
+bool ForceChannelOutputNow(void);
+// The same, and that frame is sent even while output is disabled (the outputs
+// API's "disable"): the output thread then still prepares every frame, so a
+// blank has to go out from it rather than from a second thread alongside it.
+bool ForceChannelOutputSendNow(void);
 
-int  ChannelOutputThreadIsRunning(void);
-void SetChannelOutputRefreshRate(int rate);
-int  StartChannelOutputThread(void);
-int  StopChannelOutputThread(void);
+int ChannelOutputThreadIsRunning(void);
+// Whether the caller is the channel output thread (which holds
+// outputThreadLock for the whole of each cycle).
+bool IsChannelOutputThread(void);
+int ChannelOutputThreadIsEnabled();
+void SetChannelOutputRefreshRate(float rate);
+float GetChannelOutputRefreshRate();
+void StartChannelOutputThread(void);
+int StopChannelOutputThread(void);
+void StartForcingChannelOutput(void);
+void StopForcingChannelOutput(void);
 void ResetMasterPosition(void);
 void UpdateMasterPosition(int frameNumber);
+// framePosition is where the master is in frames, fractions included (a
+// remoteOffset that is not a whole number of frames); frameNumber is it rounded.
+void UpdateMasterPosition(int frameNumber, double framePosition);
 void CalculateNewChannelOutputDelay(float mediaPosition);
-
-#endif
+// The media clock the sequence follows runs at `rate` times the system clock's
+// pace; call it with each position update.  Frames go out at that pace.
+void SetMediaClockRate(double rate);
+void CalculateNewChannelOutputDelayForFrame(int expectedFramesSent);

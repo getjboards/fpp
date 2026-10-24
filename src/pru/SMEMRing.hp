@@ -1,0 +1,115 @@
+#ifndef __SMEM_RING_HP__
+#define __SMEM_RING_HP__
+/*
+ * Layout of the shared-memory ring used to stream output data from an ARM
+ * real-time pump thread to a PRU program (see BBShiftPanel for the first
+ * user).  DDR reads from the PRU (XFR2VBUS or LBBO) have a 1.1-1.8us round
+ * trip on the AM62x and cannot sustain high output data rates; reads from
+ * the 32KB PRU shared RAM take 18 cycles and are fully predictable, so the
+ * ARM streams the data into a ring there instead.
+ *
+ * This header is valid both for C++ and for PRU assembly that is run
+ * through cpp, so it only contains #defines.
+ *
+ * The ring is a block of shared RAM followed by two free-running uint32
+ * byte counters:
+ *     ring base + ring size + 0:  bytes produced (written by the ARM)
+ *     ring base + ring size + 4:  bytes consumed (written by the PRU)
+ * The ring size must be a multiple of 48 (the PRU consumes 48 bytes per
+ * load) and of 8 (the ARM copies with aligned 64 bit stores).
+ *
+ * The PRU firmware reads its ring base/size from its own data RAM at
+ * SMEM_RING_CONFIG_OFFSET (written by the ARM before the firmware starts,
+ * zero size = use the full-SMEM default).  A single user gets the whole
+ * shared RAM; when both PRUs stream (e.g. panels on one PRU and
+ * BBShiftString pixels on the other) each gets half via the SPLIT defines.
+ *
+ * Note: the shared RAM is NOT behind the async clock-domain crossing that
+ * makes external memory so expensive when the cores run on the 333MHz core
+ * clock instead of VBUSP-synchronous ICLK (ICSSM CFG CORE_SYNC(0x3C)=0 vs 1).
+ * Measured both ways: a 48 byte ring read is 15 cycles and a 64 byte read 19
+ * cycles in EITHER mode, so the ring simply rides the faster core - 60.1ns ->
+ * 45.1ns and 76.1ns -> 57.1ns.  Only DDR pays the crossing: a 32 byte LBBO
+ * goes 77.5 -> 748 cycles (310ns -> 2244ns, 7.2x).  ARM stores into the ring
+ * are unaffected too (561 -> 595 MB/s).  End to end on an 8-bit panel load the
+ * refresh scales with the clock, 108.1Hz -> 144.2Hz at 64 panels with zero
+ * ring starvation.
+ *
+ * That makes 333MHz attractive for ring-fed outputs, but it is NOT just a
+ * matter of setting the bit, and the measurements above are not on their own
+ * a reason to.
+ *
+ * The biggest caveat is the panels themselves, not the SoC.  A faster core
+ * shortens every hand-placed NOP in the panel firmware by 25%, and several of
+ * those NOPs are not clock-rate padding - they are edge rise/fall and setup
+ * margin, added deliberately to cure ghosting seen on real panels.  Running
+ * the same instruction sequence 33% faster drives the HUB75 lines faster than
+ * some panels can follow, so this needs re-validating on real hardware (and
+ * on several panel types) before it can ship, not just a refresh number.
+ *
+ * The mux is also PRUSS-wide, so switching it is not a per-output decision:
+ * every driver that reads DDR from the PRU (BBB48String, BBBMatrix) takes the
+ * 7x hit, and every driver with ns-denominated timing depends on NS2CLK() in
+ * FalconPRUDefs.hp, which is hard-coded to 250MHz.
+ *
+ * Both BBShiftPanel paths read only this ring, PWM included - but the PWM
+ * panels have nothing to gain, because their frame rate is paced by the
+ * panel's own free-running PWM engine rather than by PRU shift speed (ring
+ * throughput measures identical at both clocks).  What they do have is
+ * BBShiftPanel_gclk.asm, whose GCLK is hand-tuned integer-cycle NOP padding
+ * (ONE_PULSE = 10 cycles = 40ns = 25MHz), and 40ns is not representable at
+ * 3ns granularity.  So the sane gate is the configured output set: 333MHz for
+ * shift panels and ring-fed strings, 250MHz whenever a PWM panel type or a
+ * DDR-reading driver is present.
+ */
+
+/* PRU-side address of the shared RAM */
+#define SMEM_RING_SMEM_PRU_ADDR 0x00010000
+
+/* Offsets within the owning PRU's data RAM.  These live at the very top of
+ * the 8KB data RAM to stay clear of the driver structures (BBShiftString's
+ * command table reaches ~0x1C24). */
+#define SMEM_RING_STATS_OFFSET 0x1FE0  /* [0]=ring wait iterations, [1]=frames output */
+/* Frames the consumer has finished, incremented by the firmware once a frame
+ * is fully rendered.  A producer that hands the consumer discrete frames needs
+ * this: the ring positions alone cannot tell it whether a frame has finished,
+ * because a frame offset by a whole number of blocks reaches empty exactly like
+ * one that is not offset at all.  See BBShiftString's pumpFrameData(). */
+#define SMEM_RING_FRAMES_OFFSET 0x1FE4
+/* How many times the consumer has had to re-seat its read position on a frame
+ * start the producer published, i.e. how many times the two had drifted apart.
+ * Healthy output never touches this. */
+#define SMEM_RING_RESYNC_OFFSET 0x1FEC
+#define SMEM_RING_CONFIG_OFFSET 0x1FF0 /* [0]=ring base (PRU address), [1]=ring size */
+
+/* Single user: the whole 32KB shared RAM minus the control words */
+#define SMEM_RING_DEFAULT_BASE 0x00010000
+#define SMEM_RING_DEFAULT_SIZE 30720
+
+/* Two users: 16KB each; 16320 = 340 * 48 = 255 * 64, leaving room for the
+ * counters. */
+#define SMEM_RING_SPLIT0_BASE 0x00010000
+#define SMEM_RING_SPLIT1_BASE 0x00014000
+#define SMEM_RING_SPLIT_SIZE 16320
+
+/* Strings on one PRU with the FalconV5 listener on the other.  The listener
+ * captures from the base of shared RAM upwards, so the ring takes everything
+ * above its reservation.
+ *
+ * Sizing the reservation: the listener does NOT sample once per FalconV5 bit.
+ * It supersamples - one byte holding all eight listener pins every
+ * FALCONV5_PERIOD (166ns on the AM62x, ~6.8x the 1130ns bit period), so it
+ * captures at ~6MB/s.  BBShiftString leaves it enabled for a window bounded by
+ * its sleep sequence at ~2.1ms, which is ~12.6KB.  Hence the 12KB below: it is
+ * driven by the window, and shrinking it truncates the tail of a capture.
+ *
+ * That leaves 20416 bytes for the ring.  A 16 deep chain drains it at 12.8MB/s
+ * (16 bytes per WS281x bit), so that is 1.6ms of buffer - down from 2.55ms at
+ * 8 deep, which is why the 16 deep firmware counts ring-empty events into
+ * SMEM_RING_STATS_OFFSET. */
+#define SMEM_RING_LISTENER_BYTES 12288
+#define SMEM_RING_V5_BASE 0x00013000
+/* 0x13000..0x17FC0, a multiple of BBShiftString's 64 byte block */
+#define SMEM_RING_V5_SIZE 20416
+
+#endif

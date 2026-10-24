@@ -1,0 +1,1010 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+// This #define must be before any #include's
+#define _FILE_OFFSET_BITS 64
+#define __STDC_FORMAT_MACROS
+
+#include "common_mini.h"
+#include "SysSocket.h"
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#if defined(__APPLE__)
+#include <copyfile.h>
+#else
+#include <sys/sendfile.h>
+#endif
+
+#include <arpa/inet.h>
+#include <curl/curl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <ctime>
+#include <ctype.h>
+#include <cxxabi.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <iomanip>
+#include <list>
+#include <map>
+#include <netdb.h>
+#include <pwd.h>
+#include <random>
+#include <sstream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+/*
+ * Get the current time down to the microsecond
+ */
+long long GetTime(void) {
+    struct timeval now_tv;
+    gettimeofday(&now_tv, NULL);
+    return now_tv.tv_sec * 1000000LL + now_tv.tv_usec;
+}
+long long GetTimeMicros(void) {
+    struct timeval now_tv;
+    gettimeofday(&now_tv, NULL);
+    return now_tv.tv_sec * 1000000LL + now_tv.tv_usec;
+}
+
+long long GetTimeMS(void) {
+    struct timeval now_tv;
+    gettimeofday(&now_tv, NULL);
+    return now_tv.tv_sec * 1000LL + now_tv.tv_usec / 1000;
+}
+
+long long GetMonotonicTimeMS(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+long long GetMonotonicTimeMicros(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+std::string GetTimeStr(std::string fmt) {
+    auto t = std::time(nullptr);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    std::stringstream sstr;
+    sstr << std::put_time(&tm, fmt.c_str());
+
+    return sstr.str();
+}
+
+std::string GetDateStr(std::string fmt) {
+    auto t = std::time(nullptr);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    std::stringstream sstr;
+    sstr << std::put_time(&tm, fmt.c_str());
+
+    return sstr.str();
+}
+
+// strerror_r() comes in two flavours: the GNU version returns char* while the
+// XSI/POSIX version returns int and fills the supplied buffer.  These overloads
+// pick the right behaviour at compile time via the return type.
+static inline const char* fppStrerrorResult(char* gnuResult, char* /*buf*/) {
+    return gnuResult;
+}
+static inline const char* fppStrerrorResult(int xsiResult, char* buf) {
+    return xsiResult == 0 ? buf : "Unknown error";
+}
+const char* FPPstrerror(int errnum) {
+    static thread_local char buf[256];
+    buf[0] = '\0';
+    return fppStrerrorResult(strerror_r(errnum, buf, sizeof(buf)), buf);
+}
+
+int FPPrand() {
+    static thread_local std::mt19937 engine(std::random_device{}());
+    static thread_local std::uniform_int_distribution<int> dist(0, RAND_MAX);
+    return dist(engine);
+}
+
+bool GetUserIds(const std::string& username, uid_t* uid, gid_t* gid, std::string* homedir) {
+    long bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (bufsize <= 0) {
+        bufsize = 16384;
+    }
+    std::vector<char> buf(bufsize);
+    struct passwd pwd;
+    struct passwd* result = nullptr;
+    int rc = getpwnam_r(username.c_str(), &pwd, buf.data(), buf.size(), &result);
+    if (rc != 0 || result == nullptr) {
+        return false;
+    }
+    if (uid) {
+        *uid = result->pw_uid;
+    }
+    if (gid) {
+        *gid = result->pw_gid;
+    }
+    if (homedir && result->pw_dir) {
+        *homedir = result->pw_dir;
+    }
+    return true;
+}
+
+/*
+ * Check to see if the specified directory exists
+ */
+int DirectoryExists(const char* Directory) {
+    DIR* dir = opendir(Directory);
+    if (dir) {
+        closedir(dir);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+int DirectoryExists(const std::string& Directory) {
+    return DirectoryExists(Directory.c_str());
+}
+
+/*
+ * Check if the specified file exists or not
+ */
+int FileExists(const char* File) {
+    struct stat sts;
+    if (stat(File, &sts) == -1) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+int FileExists(const std::string& f) {
+    return FileExists(f.c_str());
+}
+uint64_t FileTimestamp(const std::string& File) {
+    struct stat sts;
+    if (stat(File.c_str(), &sts) == -1) {
+        return 0;
+    } else {
+        return (uint64_t)sts.st_mtime;
+    }
+}
+
+int Touch(const std::string& File) {
+    int fd = open(File.c_str(), O_WRONLY | O_CREAT | O_NOCTTY | O_NONBLOCK, 0666);
+    if (fd < 0)
+        return 0;
+
+    close(fd);
+
+    return 1;
+}
+
+/*
+ * Get IP address on specified network interface
+ */
+int GetInterfaceAddress(const char* interface, char* addr, char* mask, char* gw) {
+    int fd;
+    struct ifreq ifr;
+
+    memset(&ifr, 0, sizeof(ifr));
+
+    fd = OpenSocket(AF_INET, SOCK_DGRAM, 0);
+    ifr.ifr_addr.sa_family = AF_INET;
+
+    /* I want IP address attached to E131interface */
+    strncpy(ifr.ifr_name, (const char*)interface, IFNAMSIZ - 1);
+    int retVal = 0;
+    if (addr) {
+        if (ioctl(fd, SIOCGIFADDR, &ifr)) {
+            strcpy(addr, "127.0.0.1");
+            retVal = 1;
+        } else {
+            inet_ntop(AF_INET, &((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr, addr, INET_ADDRSTRLEN);
+        }
+    }
+
+    if (mask) {
+        if (ioctl(fd, SIOCGIFNETMASK, &ifr))
+            strcpy(mask, "255.255.255.255");
+        else
+            inet_ntop(AF_INET, &((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr, mask, INET_ADDRSTRLEN);
+    }
+
+    if (gw) {
+        *gw = 0;
+
+        FILE* f;
+        char line[100];
+        char* iface;
+        char* dest;
+        char* route;
+        char* saveptr;
+
+        f = fopen("/proc/net/route", "r");
+
+        if (f) {
+            while (fgets(line, 100, f)) {
+                iface = strtok_r(line, " \t", &saveptr);
+                dest = strtok_r(NULL, " \t", &saveptr);
+                route = strtok_r(NULL, " \t", &saveptr);
+
+                if ((iface && dest && route) &&
+                    (!strcmp(iface, interface)) &&
+                    (!strcmp(dest, "00000000"))) {
+                    char* end;
+                    int ng = strtol(route, &end, 16);
+                    struct in_addr addr;
+                    addr.s_addr = ng;
+                    inet_ntop(AF_INET, &addr, gw, INET_ADDRSTRLEN);
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    close(fd);
+
+    return retVal;
+}
+
+/*
+ *
+ */
+
+/*
+ *
+ */
+
+static unsigned char bitLookup[16] = {
+    0x0,
+    0x8,
+    0x4,
+    0xc,
+    0x2,
+    0xa,
+    0x6,
+    0xe,
+    0x1,
+    0x9,
+    0x5,
+    0xd,
+    0x3,
+    0xb,
+    0x7,
+    0xf,
+};
+
+/*
+ * Reverse bits in a byte
+ */
+uint8_t ReverseBitsInByte(uint8_t n) {
+    return (bitLookup[n & 0b1111] << 4) | bitLookup[n >> 4];
+}
+
+/*
+ * Convert a string of the form "YYYY-MM-DD to an integer YYYYMMDD
+ */
+int DateStrToInt(const char* str) {
+    // Check the length before indexing: a short string put str[7] and
+    // str[10] past its terminator.
+    if ((!str) || (strnlen(str, 11) != 10) || (str[4] != '-') || (str[7] != '-'))
+        return 0;
+
+    int result = 0;
+
+    result += atoi(str) * 10000;   // Year
+    result += atoi(str + 5) * 100; // Month
+    result += atoi(str + 8);       // Day
+
+    return result;
+}
+
+/*
+ * Get the current date in an integer form YYYYMMDD
+ */
+int GetCurrentDateInt(int daysOffset) {
+    time_t currTime = time(NULL) + (daysOffset * 86400);
+    struct tm now;
+    int result = 0;
+
+    localtime_r(&currTime, &now);
+
+    result += (now.tm_year + 1900) * 10000;
+    result += (now.tm_mon + 1) * 100;
+    result += (now.tm_mday);
+
+    return result;
+}
+std::string secondsToTime(int i) {
+    std::stringstream sstr;
+
+    if (i > (24 * 60 * 60)) {
+        int days = i / (24 * 60 * 60);
+        sstr << days;
+        if (days == 1)
+            sstr << " day, ";
+        else
+            sstr << " days, ";
+
+        i = i % (24 * 60 * 60);
+    }
+
+    if (i > (60 * 60)) {
+        int hour = i / (60 * 60);
+        sstr << std::setw(2) << std::setfill('0') << hour;
+        sstr << ":";
+        i = i % (60 * 60);
+    }
+
+    int min = i / 60;
+    int sec = i % 60;
+    sstr << std::setw(2) << std::setfill('0') << min;
+    sstr << ":";
+    sstr << std::setw(2) << std::setfill('0') << sec;
+    return sstr.str();
+}
+// fds 0-2 are always open: on /dev/null, when the process was started
+// without them. This runs before the static initializers, because they open
+// descriptors too: drogon's main loop (its epoll, timerfd and eventfd) took
+// 0-2 in an fppd started without them (a "-d" restart closed them before its
+// exec), and CreateDaemon() then closed them, so nothing on that loop ran
+// again.
+__attribute__((constructor(101))) static void OpenStandardDescriptors() {
+    int fd;
+    while ((fd = open("/dev/null", O_RDWR)) >= 0 && fd <= STDERR_FILENO) {
+    }
+    if (fd > STDERR_FILENO) {
+        close(fd);
+    }
+}
+
+/*
+ * Close all open file descriptors (used after fork())
+ *
+ * stdin/stdout/stderr are left open, daemonMode or not: a daemon's are
+ * /dev/null, and closed, they were taken by the next files the process
+ * opened. daemonMode is kept for plugins that call this.
+ */
+void CloseOpenFiles(int daemonMode) {
+    int maxfd = sysconf(_SC_OPEN_MAX);
+    for (int fd = 3; fd < maxfd; fd++) {
+        if (fcntl(fd, F_GETFD) != -1) {
+            bool doClose = false;
+            struct stat statBuf;
+            if (fstat(fd, &statBuf) == 0) {
+                // it's a file or unix domain socket or similar
+                doClose = true;
+            }
+            struct sockaddr_in address;
+            memset(&address, 0, sizeof(address));
+            socklen_t addrLen = sizeof(address);
+            getsockname(fd, (struct sockaddr*)&address, &addrLen);
+            if (address.sin_family) {
+                // its a tcp/udp socket of some sort
+                doClose = true;
+            }
+            if (doClose) {
+                // if it's not a file or socket, we cannot close it
+                // On OSX, that may be a "NPOLICY" descriptor which
+                // if closed will terminate the process immediately
+                close(fd);
+            }
+        }
+    }
+}
+
+// Redirect our stdout (and everything we fork, which is why this dup2's the fd
+// rather than just wrapping printf) into logs/fppd.log, prefixing every line
+// with fppd's own line shape: "<date time.ms> <program>(<pid>) [<facility>] ".
+//
+// fppd.log is the merged, sequential record of the system: boot -> init -> fppd
+// -> restarts -> operations, in one file, in time order. Init used to write its
+// own fpp_init.log / fpp_boot.log, which could not be interleaved with fppd's
+// log after the fact -- exactly the problem this arc exists to fix.
+//
+// This is a tee, not a redirect: the line is also echoed to the stdout we were
+// started with. Under systemd that is journald, so `systemctl status fppinit`
+// and `journalctl -u fpprtc` keep showing what the service did; run by hand from
+// a shell it is the terminal, so `fppinit setupAudio` still prints as it goes.
+// Only the fppd.log copy carries the timestamp/program/facility prefix -- the
+// console copy is the raw line, because journald stamps and tags it already.
+//
+// The prefixing is done by bash rather than in C++ because the point of the
+// dup2 is to capture child output too: the filter has to live on the far side of
+// the pipe, where tee used to sit. printf '%(...)T' and EPOCHREALTIME are bash
+// builtins (hence /bin/bash explicitly -- popen uses /bin/sh, which is dash on
+// Debian and has neither), so this forks nothing per line. Appending per line
+// rather than holding the file open is what makes it survive a logrotate rename.
+//
+// `|| [ -n "$__l" ]` keeps a final line that has no trailing newline: read
+// returns false at EOF, and that unterminated line is what a process killed
+// mid-write leaves behind -- the output most worth having.
+void teeOutput(const std::string& log, const std::string& program, const std::string& facility, pid_t pid) {
+    std::size_t slash = log.rfind('/');
+    if (slash != std::string::npos && slash > 0) {
+        // logs/ under the media dir, and the media dir itself: a first boot can
+        // reach here before either exists.
+        std::string dir = log.substr(0, slash);
+        std::size_t parent = dir.rfind('/');
+        if (parent != std::string::npos && parent > 0) {
+            mkdir(dir.substr(0, parent).c_str(), 0775);
+        }
+        mkdir(dir.c_str(), 0775);
+    }
+
+    // The bash `>>` below would create the file root-owned (these services run as
+    // root), which then locks out fppd and the PHP-side writers that share it.
+    // Whoever creates fppd.log owns making it group-writable by fpp -- log.cpp
+    // and FPPINIT do the same for the cases where they get there first.
+    if (access(log.c_str(), F_OK) != 0) {
+        FILE* nf = fopen(log.c_str(), "a");
+        if (nf) {
+            uid_t uid;
+            gid_t gid;
+            if (GetUserIds("fpp", &uid, &gid) && fchown(fileno(nf), uid, gid) == 0) {
+                fchmod(fileno(nf), 0664);
+            }
+            fclose(nf);
+        }
+    }
+
+    // Grab a second handle on the console (journald/terminal) BEFORE the dup2
+    // below takes fd 1 over, so the writer can still reach it. dup() leaves
+    // FD_CLOEXEC clear, so it survives popen's exec into bash and is addressable
+    // there by number -- and it returns the lowest free descriptor, which for a
+    // service this early is a single digit, well clear of the fds bash reserves
+    // for its own redirections.
+    int consoleFd = dup(STDOUT_FILENO);
+    std::string echoConsole;
+    if (consoleFd >= 0) {
+        echoConsole = "printf \"%s\\n\" \"$__l\" >&" + std::to_string(consoleFd) + "; ";
+    }
+
+    std::string cmd = "/bin/bash -c 'while IFS= read -r __l || [ -n \"$__l\" ]; do " +
+                      echoConsole +
+                      "__now=${EPOCHREALTIME}; __us=${__now#*.}; "
+                      "printf \"%(%Y-%m-%d %H:%M:%S)T.%s " +
+                      program + "(" + std::to_string(pid) + ") [" + facility + "] %s\\n\" " +
+                      "\"${__now%.*}\" \"${__us:0:3}\" \"$__l\" >> " + log + "; done'";
+
+    FILE* f = popen(cmd.c_str(), "w");
+    if (!f) {
+        printf("Couldn't start the log writer\n");
+        if (consoleFd >= 0) {
+            close(consoleFd);
+        }
+        return;
+    }
+    if (dup2(fileno(f), STDOUT_FILENO) < 0) {
+        printf("Couldn't redirect output to log file\n");
+    }
+    // The writer child has its own copy; ours would otherwise be inherited by
+    // every command we fork from here on.
+    if (consoleFd >= 0) {
+        close(consoleFd);
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+}
+
+int DateInRange(time_t when, int startDate, int endDate) {
+    struct tm dt;
+    localtime_r(&when, &dt);
+
+    int dateInt = 0;
+    dateInt += (dt.tm_year + 1900) * 10000;
+    dateInt += (dt.tm_mon + 1) * 100;
+    dateInt += (dt.tm_mday);
+
+    return DateInRange(dateInt, startDate, endDate);
+}
+
+/*
+ * Check to see if current date int is in the range specified
+ */
+int CurrentDateInRange(int startDate, int endDate) {
+    int currentDate = GetCurrentDateInt();
+
+    return DateInRange(currentDate, startDate, endDate);
+}
+
+int DateInRange(int currentDate, int startDate, int endDate) {
+    if ((startDate < 10000) || (endDate < 10000)) {
+        startDate = startDate % 10000;
+        endDate = endDate % 10000;
+        currentDate = currentDate % 10000;
+
+        if (endDate < startDate) {
+            if (currentDate <= endDate)
+                currentDate += 10000;
+
+            endDate += 10000; // next year
+        }
+    }
+
+    if ((startDate < 100) || (endDate < 100)) {
+        startDate = startDate % 100;
+        endDate = endDate % 100;
+        currentDate = currentDate % 100;
+
+        if (endDate < startDate) {
+            if (currentDate <= endDate)
+                currentDate += 100;
+
+            endDate += 100; // next month
+        }
+    }
+
+    if ((startDate == 0) && (endDate == 0))
+        return 1;
+
+    if ((startDate <= currentDate) && (currentDate <= endDate))
+        return 1;
+
+    return 0;
+}
+
+std::string tail(std::string const& source, size_t const length) {
+    if (length >= source.size())
+        return source;
+
+    return source.substr(source.size() - length);
+}
+
+/*
+ * Helpers to split a string on the specified character delimiter
+ */
+std::vector<std::string>& split(const std::string& s, char delim, std::vector<std::string>& elems) {
+    std::stringstream ss(s);
+    std::string item;
+
+    while (getline(ss, item, delim)) {
+        elems.push_back(item);
+    }
+
+    return elems;
+}
+
+std::vector<std::string> split(const std::string& s, char delim) {
+    std::vector<std::string> elems;
+
+    split(s, delim, elems);
+
+    return elems;
+}
+
+bool ParseTimeString(const std::string& str, int& hour, int& minute, int& second) {
+    std::vector<std::string> parts = split(str, ':');
+
+    if (parts.size() < 2) {
+        return false;
+    }
+
+    hour = atoi(parts[0].c_str());
+    minute = atoi(parts[1].c_str());
+    second = parts.size() > 2 ? atoi(parts[2].c_str()) : 0;
+
+    return true;
+}
+
+inline std::string dequote(const std::string& s) {
+    if (s.length() > 2 && (s[0] == '\'' || s[0] == '"') && s[0] == s[s.length() - 1]) {
+        return s.substr(1, s.length() - 2);
+    }
+    return s;
+}
+
+std::vector<std::string> splitWithQuotes(const std::string& s, char delim) {
+    std::vector<std::string> ret;
+    const char* mystart = s.c_str();
+    bool instring = false;
+    for (const char* p = mystart; *p; p++) {
+        if (*p == '"' || *p == '\'') {
+            instring = !instring;
+        } else if (*p == delim && !instring) {
+            ret.push_back(dequote(std::string(mystart, p - mystart)));
+            mystart = p + 1;
+        }
+    }
+    ret.push_back(dequote(std::string(mystart)));
+    return ret;
+}
+
+// Upper bound on what GetFileContents() returns.  Its callers read configs,
+// sysfs/proc nodes and small data files; this stops a runaway file or a
+// device node from being read into an allocation that throws.
+static constexpr size_t MAX_FILE_CONTENTS = 64 * 1024 * 1024;
+
+std::string GetFileContents(const std::string& filename) {
+    FILE* fd = fopen(filename.c_str(), "r");
+    std::string contents;
+    if (fd != nullptr) {
+        // A directory opens fine for reading on Linux, and its seek-to-end
+        // offset is not a size (ext4 reports LLONG_MAX), which made the
+        // resize below throw.
+        struct stat st;
+        if (fstat(fileno(fd), &st) != 0 || S_ISDIR(st.st_mode)) {
+            fclose(fd);
+            return contents;
+        }
+        flock(fileno(fd), LOCK_SH);
+        // st_size is only a hint: /proc reports 0 and sysfs 4096 whatever
+        // the real length, and the file can change under us.  Read to EOF
+        // and keep what fread actually returned.
+        if (S_ISREG(st.st_mode) && st.st_size > 0 && (uint64_t)st.st_size <= MAX_FILE_CONTENTS) {
+            contents.reserve(st.st_size);
+        }
+        char buf[4096];
+        size_t i;
+        while ((i = fread(buf, 1, sizeof(buf), fd)) > 0) {
+            if (contents.size() + i > MAX_FILE_CONTENTS) {
+                fprintf(stderr, "ERROR: %s is larger than %zu bytes, not reading it.\n", filename.c_str(), MAX_FILE_CONTENTS);
+                contents.clear();
+                break;
+            }
+            contents.append(buf, i);
+        }
+        flock(fileno(fd), LOCK_UN);
+        fclose(fd);
+        int x = contents.size() - 1;
+        for (; x > 0; x--) {
+            if (contents[x] != 0) {
+                break;
+            }
+        }
+        contents.resize(x + 1);
+    }
+    return contents;
+}
+
+bool PutFileContents(const std::string& filename, const std::string& str) {
+    // Lock before truncating and write unbuffered, so a LOCK_SH reader never
+    // sees the file empty or half written.
+    int fd = open(filename.c_str(), O_WRONLY | O_CREAT, 0666);
+    if (fd == -1) {
+        fprintf(stderr, "ERROR: Unable to open %s for writing.\n", filename.c_str());
+        return false;
+    }
+    while (flock(fd, LOCK_EX) == -1 && errno == EINTR) {
+    }
+    // Only regular files can be truncated; device nodes and FIFOs are just written.
+    bool ok = true;
+    int err = 0;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fd, 0) != 0) {
+        ok = false;
+        err = errno;
+    }
+    const char* p = str.data();
+    size_t left = str.size();
+    while (ok && left > 0) {
+        ssize_t n = write(fd, p, left);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = false;
+            err = errno;
+        } else if (n == 0) {
+            // A sysfs store() returning 0 makes no progress; don't spin on it.
+            ok = false;
+            err = EIO;
+        } else {
+            p += n;
+            left -= n;
+        }
+    }
+    flock(fd, LOCK_UN);
+    close(fd);
+    SetFilePerms(filename);
+    if (!ok) {
+        fprintf(stderr, "ERROR: Unable to write %s: %s\n", filename.c_str(), strerror(err));
+    }
+    return ok;
+}
+bool CopyFileContents(const std::string& srcFile, const std::string& destFile) {
+    int input, output;
+    if ((input = open(srcFile.c_str(), O_RDONLY)) == -1) {
+        fprintf(stderr, "ERROR: Unable to open %s for reading.\n", srcFile.c_str());
+        return false;
+    }
+    if ((output = creat(destFile.c_str(), 0660)) == -1) {
+        close(input);
+        return false;
+    }
+    // Here we use kernel-space copying for performance
+#if defined(__APPLE__)
+    int result = fcopyfile(input, output, 0, COPYFILE_ALL);
+    bool ok = result == 0;
+#else
+    off_t bytesCopied = 0;
+    struct stat fileinfo = { 0 };
+    fstat(input, &fileinfo);
+    // sendfile returns the number of bytes copied, not 0, on success
+    ssize_t result = sendfile(output, input, &bytesCopied, fileinfo.st_size);
+    bool ok = result == fileinfo.st_size;
+#endif
+    close(input);
+    close(output);
+    if (!ok) {
+        fprintf(stderr, "ERROR: Unable to copy %s to %s.\n", srcFile.c_str(), destFile.c_str());
+    }
+    return ok;
+}
+
+bool SetFilePerms(const std::string& filename, bool exBit) {
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH;
+    if (exBit) {
+        mode |= S_IRWXU | S_IRWXG | S_IXOTH;
+    }
+    chmod(filename.c_str(), mode);
+#ifndef PLATFORM_OSX
+    uid_t uid;
+    gid_t gid;
+    if (GetUserIds("fpp", &uid, &gid)) {
+        chown(filename.c_str(), uid, gid);
+    }
+#endif
+
+    return true;
+}
+
+bool SetFilePerms(const char* file, bool exBit) {
+    const std::string filename = file;
+    return SetFilePerms(filename, exBit);
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// trim from start (in place)
+static inline void ltrim(std::string& s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](int ch) {
+                return !std::isspace(ch);
+            }));
+}
+// trim from end (in place)
+static inline void rtrim(std::string& s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) {
+                return !std::isspace(ch);
+            }).base(),
+            s.end());
+}
+// trim from both ends (in place)
+void TrimWhiteSpace(std::string& s) {
+    ltrim(s);
+    rtrim(s);
+}
+
+bool startsWith(const std::string& str, const std::string& prefix) {
+    return ((prefix.size() <= str.size()) && std::equal(prefix.begin(), prefix.end(), str.begin()));
+}
+bool endsWith(const std::string& str, const std::string& suffix) {
+    return str.size() >= suffix.size() && 0 == str.compare(str.size() - suffix.size(), suffix.size(), suffix);
+}
+bool IsShowEthernetInterface(const std::string& dev) {
+    // kernel ethernet naming only (eth0, eno1, enp3s0, enx<mac>, end0).
+    // Deliberately not every 'e' name: erspan0 or an admin's e-named
+    // bridge/veth must not get its qdisc replaced or its drops counted as
+    // FPP show-traffic drops.
+    return startsWith(dev, "eth") || startsWith(dev, "en");
+}
+std::string TcPath() {
+    return FileExists("/usr/sbin/tc") ? "/usr/sbin/tc" : "/sbin/tc";
+}
+static std::string currentRootQdisc(const std::string& dev) {
+    std::string cmd = TcPath() + " qdisc show dev " + dev + " 2>/dev/null";
+    std::string ret;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (pipe) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), pipe)) {
+            if (strstr(buf, " root ") && strncmp(buf, "qdisc ", 6) == 0) {
+                char* start = &buf[6];
+                char* end = strchr(start, ' ');
+                if (end) {
+                    ret = std::string(start, end - start);
+                }
+                break;
+            }
+        }
+        pclose(pipe);
+    }
+    return ret;
+}
+bool InstallShowTrafficQdisc(const std::string& dev) {
+    // fq enables per-socket pacing (SO_MAX_PACING_RATE).  flow_limit must
+    // exceed the packets one paced socket can queue (wmem_max ~768KB
+    // effective / ~2KB skb truesize ~= 330) or fq silently drops the tail
+    // of large frames at enqueue, invisibly to the sender.
+    std::string cur = currentRootQdisc(dev);
+    if (cur == "fq") {
+        return true;
+    }
+    if (cur != "" && cur != "pfifo_fast" && cur != "fq_codel" && cur != "mq" && cur != "noqueue" && cur != "pfifo") {
+        // an admin deliberately installed something (htb/tbf/cake/prio/...);
+        // leave it alone - pacing will just fall back to drain-based sending
+        return false;
+    }
+    std::string cmd = TcPath() + " qdisc replace dev " + dev + " root fq flow_limit 1000 > /dev/null 2>&1";
+    return system(cmd.c_str()) == 0;
+}
+bool InterfaceHasRoutableIPv4(const std::string& dev) {
+    struct ifaddrs* ifaddr;
+    if (getifaddrs(&ifaddr) != 0) {
+        return false;
+    }
+    bool found = false;
+    for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET && dev == ifa->ifa_name) {
+            uint32_t addr = ntohl(((struct sockaddr_in*)ifa->ifa_addr)->sin_addr.s_addr);
+            // 169.254.0.0/16 link-local is what every unconfigured interface
+            // gets from the catch-all networkd config; not a show network
+            if ((addr & 0xFFFF0000) != 0xA9FE0000 && addr != 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    freeifaddrs(ifaddr);
+    return found;
+}
+bool contains(const std::string& str, const std::string& v) {
+    return str.find(v) != std::string::npos;
+}
+void replaceAll(std::string& str, const std::string& from, const std::string& to) {
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); // ...
+    }
+}
+
+bool replaceStart(std::string& str, const std::string& from, const std::string& to) {
+    if (!startsWith(str, from))
+        return false;
+
+    str.replace(0, from.size(), to);
+    return true;
+}
+
+bool replaceEnd(std::string& str, const std::string& from, const std::string& to) {
+    if (!endsWith(str, from))
+        return false;
+
+    str.replace(str.size() - from.size(), from.size(), to);
+    return true;
+}
+
+void toUpper(std::string& str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+}
+void toLower(std::string& str) {
+    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+}
+std::string toUpperCopy(const std::string& str) {
+    std::string cp = str;
+    toUpper(cp);
+    return cp;
+}
+std::string toLowerCopy(const std::string& str) {
+    std::string cp = str;
+    toLower(cp);
+    return cp;
+}
+
+const std::string& getRawMediaDir() {
+    static const std::string dir = [] {
+        const char* e = getenv("FPP_MEDIA_DIR");
+        return std::string(e && *e ? e : "/home/fpp/media");
+    }();
+    return dir;
+}
+
+bool getRawSetting(const std::string& setting, std::string& value) {
+    const std::string settingsFile = getRawMediaDir() + "/settings";
+    if (!FileExists(settingsFile)) {
+        return false;
+    }
+    std::string c = GetFileContents(settingsFile);
+    size_t idx = c.find(setting + " = ");
+    if (idx != std::string::npos) {
+        int offset = idx + setting.size() + 3;
+        size_t idx2 = c.find("\r", offset);
+        size_t idx3 = c.find("\n", offset);
+        if (idx2 == std::string::npos) {
+            idx2 = idx3;
+        }
+        if (idx3 != std::string::npos && idx3 < idx2) {
+            idx2 = idx3;
+        }
+        std::string s = c.substr(offset, idx2 - offset);
+        TrimWhiteSpace(s);
+        value = dequote(s);
+        return true;
+    }
+    return false;
+}
+int getRawSettingInt(const std::string& setting, int def) {
+    // Parse with strtol and check where it stopped: the hand-rolled digit
+    // loop turned "" into -14, read past the end of a file without a final
+    // newline, and accepted any junk as digits.
+    std::string s;
+    if (!getRawSetting(setting, s)) {
+        return def;
+    }
+    TrimWhiteSpace(s);
+    if (s.empty()) {
+        return def;
+    }
+    errno = 0;
+    char* end = nullptr;
+    long v = strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || *end != '\0' || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
+        return def;
+    }
+    return (int)v;
+}
+
+void setRawSetting(const std::string& setting, const std::string& value) {
+    const std::string settingsFile = getRawMediaDir() + "/settings";
+    std::string content = GetFileContents(settingsFile);
+    std::vector<std::string> lines = split(content, '\n');
+    content = "";
+    for (auto& line : lines) {
+        if (line.find(setting + " = ") == std::string::npos) {
+            content += line;
+            content += "\n";
+        }
+    }
+    content += setting;
+    content += " = \"";
+    content += value;
+    content += "\"\n";
+    PutFileContents(settingsFile, content);
+}
+
+std::map<std::string, std::string> loadSettingsFile(const std::string& filename) {
+    std::map<std::string, std::string> ret;
+    std::string content = GetFileContents(filename);
+    std::vector<std::string> lines = split(content, '\n');
+    for (auto& line : lines) {
+        size_t idx = line.find("=");
+        if (idx != std::string::npos) {
+            std::string key = line.substr(0, idx);
+            std::string value = line.substr(idx + 1);
+            TrimWhiteSpace(key);
+            TrimWhiteSpace(value);
+            if (!value.empty() && value[0] == '"') {
+                value = value.substr(1);
+                value = value.substr(0, value.size() - 1);
+            }
+            ret[key] = value;
+        }
+    }
+    return ret;
+}

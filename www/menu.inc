@@ -2,212 +2,590 @@
 
 $kernel_version = exec("uname -r");
 
-$fpp_head_version = "v" . exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ describe --tags", $output, $return_val);
-if ( $return_val != 0 ) 
-	$fpp_head_version = "Unknown";
-unset($output);
-
-$git_branch = exec("git --git-dir=".dirname(dirname(__FILE__))."/.git/ branch --list | grep '\\*' | awk '{print \$2}'", $output, $return_val);
-if ( $return_val != 0 )
-	$git_branch = "Unknown";
-unset($output);
+$fpp_head_version = "v" . getFPPVersion();
+$git_branch = getFPPBranch();
 
 if (!preg_match("/^$git_branch(-.*)?$/", $fpp_head_version))
-	$fpp_head_version .= " ($git_branch branch)";
+    $fpp_head_version .= " ($git_branch branch)";
 
-$IPs = explode("\n",trim(shell_exec("/sbin/ifconfig -a | cut -f1 -d' ' | grep -v ^$ | grep -v lo | grep -v eth0:0 | grep -v usb | grep -v SoftAp | grep -v 'can.' | sed -e 's/://g' | while read iface ; do /sbin/ifconfig \$iface | grep 'inet ' | awk '{print \$2}'; done")));
+if (!isset($activeParentMenuItem)) {
+    $activeParentMenuItem = "";
+}
+// True when www/help/<this page>.php exists, so the Help menu can advertise
+// page-specific (F1) help. See .claude/HELP-PAGES.md. Note: do not put a
+// title= on the Help nav link for this - SetupToolTips() turns any [title]
+// into data-bs-toggle="tooltip", which clobbers the dropdown toggle.
+// A plugin page (plugin.php?plugin=X&page=Y) keeps its help at <plugin>/help/Y;
+// this must match how config.php builds helpPage and plugin.php serves it.
+$pageFile = basename($_SERVER['PHP_SELF']);
+$pageHasHelp = file_exists(__DIR__ . "/help/" . $pageFile);
+if ($pageFile == 'plugin.php' && !empty($pluginName) && !empty($_GET['page']) && is_string($_GET['page'])) {
+    $pageHasHelp = ($p = pluginRealPath($pluginDirectory, $pluginName, 'help/' . $_GET['page'])) !== null && is_file($p);
+}
 ?>
+<script type="text/javascript">
+    var FPP_LOCAL_COMMIT = "<? echo get_local_git_version(); ?>";
+    var FPP_BRANCH = "<? echo $git_branch ?>";
+</script>
 
-<?php require_once(dirname(__FILE__)."/config.php"); ?>
+<?php require_once(dirname(__FILE__) . "/config.php"); ?>
 <?php
 function list_plugin_entries($menu)
 {
-	global $pluginDirectory;
-	if ( $menu && file_exists($pluginDirectory))
-	{
-		$handle = opendir($pluginDirectory);
-		if ( $handle )
-		{
-			$first = 1;
-			while (($plugin = readdir($handle)) !== false)
-			{
-				if (!in_array($plugin, array('.', '..')))
-				{
-					// Old naming convention ${MENU}_menu.inc
-					if ( file_exists($pluginDirectory."/".$plugin."/".$menu."_menu.inc") )
-					{
-						if ($first)
-						{
-							$first = 0;
-							echo "<li><b><font color='white' size=-1>-=- Plugins -=-</font></b></li>\n";
-						}
+    global $pluginDirectory;
+    $menukey = $menu;
+    if ($menu == "output") {
+        $menukey = "input-output";
+    }
+    if ($menu && file_exists($pluginDirectory)) {
+        $handle = opendir($pluginDirectory);
+        if ($handle) {
+            $first = 1;
+            while (($plugin = readdir($handle)) !== false) {
+                if (!in_array($plugin, array('.', '..'))) {
+                    // Old naming convention ${MENU}_menu.inc
+                    if (file_exists($pluginDirectory . "/" . $plugin . "/" . $menu . "_menu.inc")) {
+                        if ($first) {
+                            $first = 0;
+                            echo '<h6 class="dropdown-header">- - - - - - - Plugins - - - - - - -</h6>';
+                        }
 
-						-include_once($pluginDirectory."/".$plugin."/".$menu."_menu.inc");
-					}
+                        ob_start();
+                        -include_once($pluginDirectory . "/" . $plugin . "/" . $menu . "_menu.inc");
+                        $buffer = ob_get_clean();
+                        $buffer = str_replace(array("<li>", "</li>", "</li\n>"), "", $buffer);
+                        $buffer = str_replace("<a ", "<a class=\"dropdown-item\" ", $buffer);
+                        $buffer = str_replace("plugin.php?plugin", "plugin.php?_menu=" . $menukey . "&plugin", $buffer);
+                        echo $buffer;
+                    }
 
-					// New single menu.inc file which has some logic in it to display relevant menus.
-					// See the example in the fpp-plugin-Template plugin
-					if ( file_exists($pluginDirectory."/".$plugin."/menu.inc") )
-					{
-						if ($first)
-						{
-							$first = 0;
-							echo "<li><b><font color='white' size=-1>-=- Plugins -=-</font></b></li>\n";
-						}
+                    // New single menu.inc file which has some logic in it to display relevant menus.
+                    // See the example in the fpp-plugin-Template plugin
+                    if (file_exists($pluginDirectory . "/" . $plugin . "/menu.inc")) {
+                        ob_start();
+                        -include($pluginDirectory . "/" . $plugin . "/menu.inc");
+                        $buffer = ob_get_clean();
+                        $buffer = str_replace(array("<li>", "</li>"), "", $buffer);
+                        $buffer = str_replace("<a ", "<a class=\"dropdown-item\" ", $buffer);
+                        $buffer = str_replace("plugin.php?plugin", "plugin.php?_menu=" . $menukey . "&plugin", $buffer);
+                        if ($first && !empty($buffer)) {
+                            $first = 0;
+                            echo '<h6 class="dropdown-header">- - - - - - - Plugins - - - - - - -</h6>';
+                        }
 
-						-include($pluginDirectory."/".$plugin."/menu.inc");
-					}
-				}
-			}
-		}
-	}
+                        echo $buffer;
+                    }
+                }
+            }
+        }
+    }
 }
 ?>
 
-  <div style='float: right'><a href='#' class='nonULLink' onClick='ClearRestartFlag(); ClearRebootFlag();'><img src='images/1x1.png' width='5' height='5' style="vertical-align: top;"></a></div>
-  <div class="header">
-    <div class="headerLeft"><a href="http://www.falconchristmas.com"><img src="images/falconlogo.png" class="logo" /></a></div>
-    <div class="headerCenter"><div class="siteName"><? echo $settings['Title']; ?></div>
-      Version: <a href='about.php' class='nonULLink'><?php echo $fpp_head_version; ?></a>&nbsp;&nbsp;Host: <? echo "<a href='networkconfig.php' class='nonULLink'>" . $settings['HostName'] . "</a> (" . join(' ', $IPs) . ")"; ?>
-<?
-	if (file_exists("/etc/fpp/rfs_version") && exec('grep "^[^#].*/home/pi/media" /etc/fstab') )
-	{
-		$mounted = 0;
-		$needToMount = 0;
-		$mountPoints = file("/etc/fstab");
-		foreach ($mountPoints as $mountPoint)
-		{
-			if (preg_match("/^[^#].*\/home\/[a-z]*\/media/", $mountPoint))
-			{
-				$needToMount = 1;
-				$mounts = file("/proc/mounts");
-				$mounted = 0;
-				foreach ($mounts as $mount)
-				{
-					if (preg_match("/\/home\/[a-z]*\/media/", $mount))
-					{
-						$mounted = 1;
-						break;
-					}
-				}
+<div class="header">
+    <div class="headerLeft">
+        <div class="headerLeftCol fppBrand">
+            <a href="index.php">
+                <img src='<?= $themeInfo["HEADER_LOGO1"] ?>' class="logo"
+                    title="Host: <? echo htmlspecialchars($settings['HostName'], ENT_QUOTES, 'UTF-8'); ?>">
+                <? if (isset($themeInfo["HEADER_LOGO2"]) && $themeInfo["HEADER_LOGO2"] != "") {
+                    echo "<img src='" . $themeInfo["HEADER_LOGO2"] . "' class='fpp-logo'  title='Host: " . htmlspecialchars($settings["HostName"], ENT_QUOTES, 'UTF-8') . "' >";
+                }
+                ?>
+            </a>
+            <a href='about.php' class='nonULLink headerLink versionHead'><?php echo $fpp_head_version; ?></a>
+            <div id="navbarUpdateAvail">
+                &nbsp;<a href="about.php" role="button">
+                    <i class="fa-solid fa-download" id="navbarUpdateAvailIcon"></i>
+                </a>
+            </div>
+            <div id="navbarUpdateInProgress">
+                &nbsp;<a href="javascript:void(0)" id="navbarUpdateInProgressLink" role="button"
+                    title="Update in progress — view progress">
+                    <i class="fa-solid fa-circle-notch fa-spin" id="navbarUpdateInProgressIcon"></i>
+                </a>
+            </div>
+            <div id="navbarPluginUpdateAvail">
+                &nbsp;<a href="plugins.php?tab=updates" role="button">
+                    <i class="fa-solid fa-puzzle-piece" id="navbarPluginUpdateAvailIcon"></i>
+                </a>
+            </div>
+        </div>
 
-				break;
-			}
-		}
-
-
-		if ($needToMount && !$mounted)
-		{
-?>
-	<br><b><font color='#ff0000'>WARNING: <?= $fppHome; ?>/media is not mounted, is a USB flash drive inserted?</font></b>
-<?
-		}
-	}
-?>
     </div>
-    <div class="headerRight">
-		  <?
-            if ($settings['LogoLink'] != "") echo "<a href='" . $settings['LogoLink'] . "' target='_blank'>";
-		    if ($settings['Logo'] != "") echo "<img src='images/" . $settings['Logo'] . "' class='logo'>";
-		    if ($settings['LogoLink'] != "") echo "</a>";
-if (isSet($settings['cape-info']) && isSet($settings['cape-info']['vendor']) && isSet($settings['cape-info']['vendor']['image'])) {
-echo "<a href=\"" . $settings['cape-info']['vendor']['url'] . "\"><img style='max-width:125px; max-height:60px;' src=\"". $settings['cape-info']['vendor']['image'] . "?sn=" . $settings['cape-info']['serialNumber'] . "&id=" . $settings['cape-info'][id] . "\"></a>";
-}
-          ?>
+    <div class="headerCenter">
+        <div class="headerCenterRow headerHost">
+            <?
+            if (isset($settings['HostDescription']) && $settings['HostDescription'] != "") {
+                echo ("<span class=\"headerHostName headerBox\" id=\"header_host\" data-bs-placement=\"bottom\" data-bs-title=\"" . htmlspecialchars($settings['HostDescription'], ENT_QUOTES, 'UTF-8') . "\" data-bs-toggle=\"tooltip\"><a href='index.php' class='nonULLink'>" . htmlspecialchars($settings['HostName'], ENT_QUOTES, 'UTF-8') . "</a></span>");
+            } else {
+                echo ("<span class=\"headerHostName headerBox\" id=\"header_host\" ><a href='index.php' class='nonULLink'>" . htmlspecialchars($settings['HostName'], ENT_QUOTES, 'UTF-8') . "</a></span>");
+            }
 
-		</div>
-    <div class="clear"></div>
-  </div>
+            $currentHeaderSensor = "1";
+            if (isset($settings['currentHeaderSensor'])) {
+                $currentHeaderSensor = $settings['currentHeaderSensor'];
+            }
 
-    <ul id="fppMenu" class="sm sm-clean">
-      <li><a>Status/Control</a>
-        <ul>
-          <li><a href="/">Status Page</a></li>
-          <li><a href="uipassword.php">Set UI Password</a></li>
-          <li><a href="timeconfig.php">Config/Set Time</a></li>
-          <li><a href="networkconfig.php">Network</a></li>
-          <li><a href="multisync.php">MultiSync</a></li>
-          <li><a href="settings.php">FPP Settings</a></li>
-          <li><a href="backup.php">FPP Backup</a></li>
-          <li><a href="email.php">Email Settings</a></li>
-          <li><a href="events.php">Events</a></li>
-          <li><a href="effects.php">Effects</a></li>
-          <li><a href="testing.php">Display Testing</a></li>
-          <?php list_plugin_entries("status"); ?>
-        </ul>
-      </li>
-      <li><a>Content Setup</a>
-        <ul>
-          <li><a href="uploadfile.php">File Manager</a></li>
-          <li><a href="playlists.php">Playlists</a></li>
-          <li><a href="scheduler.php">Scheduler</a></li>
-		  <li><a href="plugins.php">Plugin Manager</a></li>
-          <li><a href="scriptbrowser.php">Script Repository Browser</a></li>
-          <?php list_plugin_entries("content"); ?>
-        </ul>
-      </li>
-      <li><a>Input/Output Setup</a>
-        <ul>
-          <li><a href="channelinputs.php">Channel Inputs</a></li>
-          <li><a href="channeloutputs.php">Channel Outputs</a></li>
-          <li><a href="outputprocessors.php">Output Processors</a></li>
-          <li><a href="pixeloverlaymodels.php">Pixel Overlay Models</a></li>
-          <li><a href="gpio.php">GPIO Inputs</a></li>
-          <?php list_plugin_entries("output"); ?>
-        </ul>
-      </li>
-      <li><a>Help</a>
-        <ul>
-          <li><a href="http://falconchristmas.com/wiki/index.php/Falcon_FPP" target="_blank">Wiki/Help</a></li>
-          <li><a href="help.php">Help Index</a></li>
-          <li><a href="cliHelp.php">fpp &amp; fppmm Usage</a></li>
-          <li><a href="troubleshooting.php">Troubleshooting Commands</a></li>
-          <li><a href="http://<?php echo $_SERVER['SERVER_ADDR'] ?>:4200" target="_new">SSH Shell</a></li>
-          <li><a href="about.php">About</a></li>
-          <li><a href="credits.php">Credits</a></li>
-          <?php list_plugin_entries("help"); ?>
-        </ul>
-      </li>
-    </ul>
-<!--
-  <div id='upgradeFlag'>FPP v1.6 is available for install - <input name="btnUpgrade" onClick="ViewReleaseNotes('1.6');" type="button" class = "buttons" value="Upgrade"></div>
--->
-  <div id='restartFlag'>Settings have changed. FPPD Restart Required - <input name="btnRestartFPPD" type="button" onClick="RestartFPPD();" class = "buttons" value="Restart FPPD">
-<?
-  if (basename($_SERVER['PHP_SELF']) == "developer.php")
-  {
-?>
-  <input type='button' class = "buttons" value='Clear' onClick='ClearRestartFlag();'>
-<?
-  }
-?>
-  </div>
-  <div id='rebootFlag'>Base configuration has changed. Reboot Required - <input name="btnReboot" onClick="RebootPi();" type="button" class = "buttons" value="Reboot">
-<?
-  if (basename($_SERVER['PHP_SELF']) == "developer.php")
-  {
-?>
-  <input type='button' class = "buttons" value='Clear' onClick='ClearRebootFlag();'>
-<?
-  }
-?>
-  </div>
+            if (isset($uiLevelOverrideActive) && $uiLevelOverrideActive) {
+                echo "<span class=\"headerBox\" id=\"header_uiLevelOverride\">"
+                    . "<a href=\"javascript:void(0)\" role=\"button\" onclick=\"ExitUiLevelOverride()\""
+                    . " title=\"Advanced, ~" . $uiLevelOverrideMinsLeft . " min remaining. Click to exit.\">"
+                    . "<i class=\"fas fa-unlock\"></i></a></span>";
+            }
+            ?>
+            <span class="headerBox" id="header_player"></span>
+            <span class="headerBox" id="header_plugin_indicators"></span>
+            <span class="headerBox largeonly" id="header_sensors"
+                data-defaultsensor="<? echo $currentHeaderSensor; ?>"></span>
+            <span class="headerBox" id="header_IPs"></span>
+            <span class="headerBox" id="header_Time"></span>
+        </div>
+    </div>
+    <div class="headerRight largeonly">
+        <div class="platformLogoDiv" style="position:relative;">
+            <?
+            if ($settings['LogoLink'] != "") {
+                echo "<a href='" . $settings['LogoLink'] . "' target='_blank' rel='noopener noreferrer' class='platformLogoLink'>";
+            }
+            if ($settings['Logo'] != "") {
+                echo "<img style='z-index: -100;' src='images/" . $settings['Logo'] . "' class='logo' id='platformLogo' alt='" . $settings['Variant'] . " Logo'>";
+            }
+            if ($settings['LogoLink'] != "") {
+                echo "</a>";
+            }
+            echo "<span class='overlay' id='powerPlaceHolder' style='z-index: 100;  position:absolute; left: 5px; top: 5px;'></span>";
+            echo "</div>";
+            $capeVendorUrls = CapeVendorUrls(isset($settings['cape-info']) ? $settings['cape-info'] : array(), $settings, true);
+            if ($capeVendorUrls['image'] != '') {
+                // One builder decides when the serial goes on these URLs (see
+                // CapeVendorUrls).  json_encode / htmlspecialchars, not a bare
+                // echo: every part of these URLs comes from the EEPROM.
+                $landing = $capeVendorUrls['landing'];
+                $iurl = $capeVendorUrls['image'];
+                ?>
+                <div class="capeVendor">
+                    <div class="capeVendorLogo">
+                        <a href="<? echo htmlspecialchars($landing, ENT_QUOTES); ?>" id="capeVendorLink" target="capeVendor"></a>
+                        <script>
+                            // Load the vendor logo only after the page's own load
+                            // event: an <img> in the markup would hold that event
+                            // (and everything waiting on it) hostage to a DNS/connect
+                            // timeout when the vendor host is unreachable, which is
+                            // the normal state of an offline show box.  An image
+                            // created afterwards fetches asynchronously, delays
+                            // nothing, and unlike the XHR this used to be it is not
+                            // subject to CORS, so a vendor host that doesn't send
+                            // Access-Control-Allow-Origin (most don't) still works.
+                            // Failure is silent by design: no logo, nothing else.
+                            (function () {
+                                const url = <? echo json_encode($iurl); ?>;
+                                const load = function () {
+                                    const img = new Image();
+                                    img.onload = function () {
+                                        img.classList.add("logo");
+                                        img.setAttribute("alt", "Cape Logo");
+                                        $("#capeVendorLink").append(img);
+                                    };
+                                    img.onerror = function () { };
+                                    img.src = url;
+                                };
+                                if (document.readyState === "complete") {
+                                    load();
+                                } else {
+                                    window.addEventListener("load", load, { once: true });
+                                }
+                            })();
+                        </script>
+                    </div>
+                </div>
+                <?
+            }
+            ?>
+        </div>
 
-      <div class='helpLinkDiv'><a href='javascript:void();' onClick='DisplayHelp();' class='nonULLink'>&nbsp;Press F1 for help&nbsp;&nbsp;</a></div>
+    </div>
+    <div style='float: right'><a href='#' class='nonULLink' onClick='ClearRestartFlag(); ClearRebootFlag();'><img
+                src='images/1x1.png' width='5' height='5' style="vertical-align: top;" alt=''></a>
+    </div>
+    <div class='helpLinkDiv largeonly'><a href='javascript:void();' onClick='DisplayHelp();'
+            class='nonULLink'>&nbsp;Press
+            F1 for help&nbsp;&nbsp;</a></div>
 
-<script language="Javascript">
-function handleKeypress(e) {
-	if(e.keyCode == 112) {
-		e.preventDefault();
-		DisplayHelp();
-	}
-};
+    <button class='buttons' onclick="scrollToTop()" id="scrollTopButton">Top</button>
 
-$(document).ready(function() {
-	$(document).on('keydown', handleKeypress);
+    <div class="fppOuterContainer">
+        <div class="fppMenuContainer">
+            <?
+            if (file_exists("/etc/fpp/rfs_version") && exec('grep "^[^#].*/home/pi/media" /etc/fstab')) {
+                $mounted = 0;
+                $needToMount = 0;
+                $mountPoints = file("/etc/fstab");
+                foreach ($mountPoints as $mountPoint) {
+                    if (preg_match("/^[^#].*\/home\/[a-z]*\/media/", $mountPoint)) {
+                        $needToMount = 1;
+                        $mounts = file("/proc/mounts");
+                        $mounted = 0;
+                        foreach ($mounts as $mount) {
+                            if (preg_match("/\/home\/[a-z]*\/media/", $mount)) {
+                                $mounted = 1;
+                                break;
+                            }
+                        }
 
-	CheckRestartRebootFlags();
-});
+                        break;
+                    }
+                }
 
-</script>
 
+                if ($needToMount && !$mounted) {
+                    ?>
+                    <div class="alert danger">
+                        WARNING: <?= $fppHome; ?>/media is not mounted, is a USB flash drive inserted?
+                    </div>
+                    <?
+                }
+            }
+            // A media directory that is not there is not the same as one that is
+            // nearly full, and it used to be reported as one: disk_free_space()
+            // warns and returns false on a missing path, and false < 50000000 is
+            // true -- so the page printed a PHP warning and then blamed the disk.
+            // It is worth saying out loud either way. Everything FPP persists
+            // lives under this path, so while it is missing nothing saves: not a
+            // setting, not a playlist, not an upload.
+            if (!is_dir($mediaDirectory)) {
+                ?>
+                <div class="alert alert-danger"><b>WARNING:</b> the media directory <?= $mediaDirectory ?> does not
+                    exist. Nothing can be saved -- settings, playlists and uploads will all fail. It is set by
+                    <?= $fppDir ?>/www/media_root.txt.</div>
+                <?
+            } else if (!is_writable($mediaDirectory)) {
+                ?>
+                <div class="alert alert-danger"><b>WARNING:</b> the media directory <?= $mediaDirectory ?> is not
+                    writable. Settings, playlists and uploads will fail to save.</div>
+                <?
+            } else if (disk_free_space($mediaDirectory) < 50000000) {
+                ?>
+                <div class="alert alert-danger"><b>WARNING:</b> <?= $mediaDirectory ?> is running low on space. Problems may
+                    occur
+                    with saving settings or uploading content.</div>
+                <?
+            }
+            ?>
+            <div id='upgradeFlag' class="alert detract" style="display: none;">
+                <span class='inlineBlock' id='upgradeFlagText'>FPP update available</span>
+                <span class='inlineBlock'>
+                    <button name="btnUpgrade" type="button" id='upgradeFlagButton' class="buttons btn-outline-light">
+                        <i class='fas fa-fw fa-sync fa-nbsp'></i><span id='upgradeFlagButtonText'>Upgrade FPP</span>
+                    </button>
+                </span>
+            </div>
+            <script>
+            $(document).on('fpp:updateStatusChanged', function(e, state) {
+                if (state.branchUpgradeAvailable && !state.isMajorVersionUpgrade) {
+                    // Minor branch upgrade available - show banner with release notes link
+                    $('#upgradeFlagText').text('FPP ' + state.branchUpgradeTarget + ' is available for install');
+                    $('#upgradeFlagButtonText').text('Upgrade to ' + state.branchUpgradeTarget);
+                    $('#upgradeFlagButton').off('click').on('click', function() {
+                        ViewReleaseNotes(state.branchUpgradeVersion);
+                    });
+                    $('#upgradeFlag').show();
+                } else {
+                    // No branch upgrade or major version (requires OS upgrade) - hide banner
+                    $('#upgradeFlag').hide();
+                }
+            });
+            </script>
+            <div id='updateInProgressFlag' class="alert detract" style="display: none;"><div class="d-flex flex-wrap align-items-center gap-2">
+                <span><i class='fas fa-circle-notch fa-spin'></i> <span
+                        id='updateInProgressFlagText'>FPP update in progress</span></span>
+                <span>
+                    <button name="btnViewUpdateProgress" type="button" id='updateInProgressViewBtn'
+                        class="buttons btn-outline-light">
+                        <i class='fas fa-fw fa-eye fa-nbsp'></i>View progress</button>
+                    <button name="btnDismissUpdateProgress" type="button" id='updateInProgressDismissBtn'
+                        class="buttons btn-outline-light">
+                        <i class='fas fa-fw fa-times fa-nbsp'></i>Dismiss</button>
+                </span>
+            </div></div>
+            <?php // The inner flex row wraps the message and its buttons with a gap: on a phone the
+                  // message took two lines and the button sat on its last one. ?>
+            <div id='restartFlag' class="alert detract"><div class="d-flex flex-wrap align-items-center gap-2"><span>Settings have changed. FPPD Restart
+                    Required</span><span><button name="btnRestartFPPD" type="button"
+                        onClick="RestartFPPD();common_ViewPortChange();" class="buttons btn-outline-light"><i
+                            class='fas fa-fw fa-sync fa-nbsp'></i>Restart FPPD</button>
+
+                    <?
+                    if (basename($_SERVER['PHP_SELF']) == "developer.php") {
+                        ?>
+                        <input type='button' class="buttons btn-outline-light" value='Clear' onClick='ClearRestartFlag();'>
+                        <?
+                    }
+                    ?>
+                </span></div>
+            </div>
+            <? if (!fppdBinaryValid()) { ?>
+                <div id='rebuildPopup' title='FPP Upgrade' style="display: none">
+                    <textarea style='width: 99%; height: 97%;' disabled id='rebuildText'>
+                                                                                                                                                                                                    </textarea>
+                </div>
+                <script>
+                    function RebuildFPPDDone() {
+                        $('#rebuildFPPCloseButton').prop("disabled", false);
+                        EnableModalDialogCloseButton("rebuildFPP");
+                    }
+                    function RebuildFPPD() {
+                        // Refuse while any update owns the box (same guard as the
+                        // about.php starters); the server lock below is the atomic
+                        // backstop and answers 409 in the dialog.
+                        if (typeof UpdateActivityBusySide === 'function' && UpdateActivityBusySide() !== null) {
+                            $.jGrowl('An update is already in progress. Wait for it to finish before rebuilding.', { themeState: 'warning' });
+                            return;
+                        }
+                        if (typeof FPPUpdate_MarkStarted === 'function') {
+                            FPPUpdate_MarkStarted('fpp');
+                        }
+                        DisplayProgressDialog("rebuildFPP", "Rebuild FPP");
+                        if (typeof FPPUpdate_AddHideButton === 'function') {
+                            FPPUpdate_AddHideButton('rebuildFPP');
+                        }
+                        StreamURL('manualUpdate.php?wrapped=1', 'rebuildFPPText', 'RebuildFPPDDone', 'RebuildFPPDDone', 'POST');
+                    }
+                </script>
+                <div id="compileFPPDBanner" class="alert alert-danger"><span class='inlineBlock'>FPPD is missing or damaged. Rebuild
+                        required</span><span class='inlineBlock'><input name="btnRebuild" onClick="RebuildFPPD();"
+                            type="button" class="buttons btn-outline-light" value="Rebuild"></span></div>
+            <? } ?>
+            <div id='unsupportedBrowser' class="alert alert-danger">FPP will not work with this browser. Chrome,
+                Firefox, or
+                Edge is strongly recommended.</div>
+            <?
+            // Not offered where no reboot is pending or possible: on macOS FPP is
+            // not what owns the machine's boot, nothing consumes or clears the
+            // flag, and the button would restart the developer's desktop.
+            if ($settings['Platform'] != 'MacOS') {
+                ?>
+                <div id='rebootFlag' class="alert detract"><div class="d-flex flex-wrap align-items-center gap-2"><span>Base configuration has changed. Reboot
+                        Required</span><span><input name="btnReboot" onClick="Reboot();" type="button"
+                            class="buttons btn-outline-light" value="Reboot">
+                        <?
+                        if (basename($_SERVER['PHP_SELF']) == "developer.php") {
+                            ?>
+                            <input type='button' class="buttons btn-outline-light" value='Clear' onClick='ClearRebootFlag();'>
+                            <?
+                        }
+                        ?>
+                    </span></div>
+                </div>
+                <?
+            }
+            ?>
+
+
+            <nav id="fppMenu" class="navbar navbar-expand-lg navbar-dark">
+                <div class="navbar-translate">
+                    <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+                        data-bs-target="#navbarNavDropdown" aria-controls="navbarNavDropdown" aria-expanded="false"
+                        aria-label="Toggle navigation">
+                        <span class="navbar-toggler-icon"></span>
+                    </button>
+                </div>
+                <div class="collapse navbar-collapse" id="navbarNavDropdown">
+                    <ul id="fppMenuList" class="navbar-nav">
+
+                        <li class="nav-item dropdown <? echo $activeParentMenuItem == 'status' ? 'active' : ''; ?>">
+                            <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownMenuLinkStatus" role="button"
+                                data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                Status/Control
+                            </a>
+                            <div class="dropdown-menu dropdown-with-icons"
+                                aria-labelledby="navbarDropdownMenuLinkStatus">
+                                <a class="dropdown-item" href="index.php"><i class="fas fa-info"></i> Status Page</a>
+                                <?
+                                if (isset($settings['cape-info']) && isset($settings['cape-info']['provides']) && in_array("currentMonitoring", $settings['cape-info']['provides'])) {
+                                    echo "<a class='dropdown-item' href='currentmonitor.php'><i class='fas fa-bolt'></i> Port Status</a>";
+                                }
+                                if ((!$settings["IsDesktop"]) || ($settings['uiLevel'] > 2)) {
+                                    echo "<a class='dropdown-item' href='networkconfig.php'><i class='fas fa-network-wired'></i> Network</a>";
+                                }
+                                ?>
+                                <a class="dropdown-item" href="multisync.php"><i class="fas fa-cogs"></i> MultiSync</a>
+                                <a class="dropdown-item" href="settings.php"><i class="fas fa-cog"></i> FPP Settings</a>
+                                <a class="dropdown-item" href="backup.php"><i class="fas fa-sim-card"></i> FPP
+                                    Backup</a>
+                                <a class="dropdown-item" href="proxies.php"><i class="fas fa-globe"></i> Proxy
+                                    Settings</a>
+                                <a class="dropdown-item" href="commandPresets.php"><i class="fas fa-calendar-alt"></i>
+                                    Command
+                                    Presets</a>
+                                <a class="dropdown-item" href="effects.php"><i class="fas fa-magic"></i> Effects</a>
+                                <a class="dropdown-item" href="testing.php"><i class="fas fa-clipboard-check"></i>
+                                    Display Testing</a>
+                                <?
+                                if (file_exists($settings['co-other'])) {
+                                    $js = json_decode(file_get_contents($settings['co-other']), true);
+                                    $has2D = false;
+                                    $has3D = false;
+                                    if (isset($js["channelOutputs"])) {
+                                        foreach ($js["channelOutputs"] as $key => $val) {
+                                            if ($val["enabled"] == 1) {
+                                                if ($val["type"] == "HTTPVirtualDisplay") {
+                                                    $has2D = true;
+                                                } elseif ($val["type"] == "HTTPVirtualDisplay3D") {
+                                                    $has3D = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if ($has2D) {
+                                        echo "<a class='dropdown-item' href='virtualdisplaywrapper.php'><i class='fas fa-tv'></i> 2D Virtual Display</a>";
+                                    }
+                                    if ($has3D) {
+                                        echo "<a class='dropdown-item' href='virtualdisplaywrapper3d.php'><i class='fas fa-object-group'></i> 3D Virtual Display</a>";
+                                    }
+                                }
+                                ?>
+
+                                <?php list_plugin_entries("status"); ?>
+                            </div>
+                        </li>
+
+                        <li class="nav-item dropdown <? echo $activeParentMenuItem == 'content' ? 'active' : ''; ?>">
+                            <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownMenuLinkContent"
+                                role="button" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                Content Setup
+                            </a>
+                            <div class="dropdown-menu dropdown-with-icons"
+                                aria-labelledby="navbarDropdownMenuLinkContent">
+                                <a class="dropdown-item" href="filemanager.php"><i class="fas fa-upload"></i> File
+                                    Manager</a>
+                                <a class="dropdown-item" href="playlists.php"><i class="fas fa-list-ol"></i>
+                                    Playlists</a>
+
+                                <? if (($settings['fppMode'] == 'player') || ($uiLevel >= 1)) { ?>
+                                    <a class="dropdown-item" href="scheduler.php"><i class="fas fa-clock"></i> Scheduler</a>
+                                <? } ?>
+                                <? if ($uiLevel >= 1) { ?>
+                                    <a class="dropdown-item" href="scriptbrowser.php"><i class="fas fa-scroll"></i> Script
+                                        Repository
+                                        Browser</a>
+                                <? } ?>
+                                <a class="dropdown-item" href="plugins.php"><i class="fas fa-puzzle-piece"></i> Plugin
+                                    Manager</a>
+                                <? if ($uiLevel >= 1) { ?>
+                                    <a class="dropdown-item" href="packages.php"><i class="fas fa-box"></i> Packages </a>
+                                <? } ?>
+                                <? if ($uiLevel >= 1) { ?>
+                                    <a class="dropdown-item" href="variables.php"><i class="fas fa-tags"></i>
+                                        Variables</a>
+                                    <a class="dropdown-item" href="recurringtasks.php"><i class="fas fa-clock"></i>
+                                        Recurring Tasks</a>
+                                <? } ?>
+                                <?php list_plugin_entries("content"); ?>
+                            </div>
+                        </li>
+
+                        <li
+                            class="nav-item dropdown <? echo $activeParentMenuItem == 'input-output' ? 'active' : ''; ?>">
+                            <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownMenuLinkInOut" role="button"
+                                data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                Input/Output Setup
+                            </a>
+                            <div class="dropdown-menu dropdown-with-icons"
+                                aria-labelledby="navbarDropdownMenuLinkInOut">
+                                <a class="dropdown-item" href="channelinputs.php"><i class="fas fa-project-diagram"
+                                        style="color:red;"></i> Channel Inputs</a>
+                                <a class="dropdown-item" href="channeloutputs.php"><i class="fas fa-project-diagram"
+                                        style="color:green;"></i> Channel Outputs</a>
+                                <? if ($uiLevel >= 1) { ?>
+                                    <a class="dropdown-item" href="outputprocessors.php"><i class="fas fa-microchip"></i>
+                                        Output
+                                        Processors</a>
+                                <? } ?>
+                                <a class="dropdown-item" href="pixeloverlaymodels.php"><i class="fas fa-cubes"></i>
+                                    Pixel Overlay
+                                    Models</a>
+                                <a class="dropdown-item" href="gpio.php"><i class="fas fa-exchange-alt"></i> GPIO
+                                    Inputs</a>
+                                <?php list_plugin_entries("output"); ?>
+                            </div>
+                        </li>
+
+                        <li class="nav-item dropdown <? echo $activeParentMenuItem == 'help' ? 'active' : ''; ?>">
+                            <a class="nav-link dropdown-toggle<?= $pageHasHelp ? ' has-page-help' : '' ?>" href="#" id="navbarDropdownMenuLinkHelp" role="button"
+                                data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                <?= $pageHasHelp ? '<i class="fas fa-question-circle text-primary"></i> ' : '' ?>Help
+                            </a>
+                            <div class="dropdown-menu dropdown-with-icons dropdown-menu-end"
+                                aria-labelledby="navbarDropdownMenuLinkHelp">
+                                <?php
+                                if ($pageHasHelp) {
+                                    echo "<a class='dropdown-item help-for-page fw-semibold' href='javascript:void(0)' onClick='DisplayHelp();'><i class='fas fa-question-circle'></i> Help for This Page <span class='badge bg-body text-primary-emphasis border border-primary-subtle fw-normal float-end ms-3'>F1</span></a>\n";
+                                    echo "<hr class='dropdown-divider'>\n";
+                                }
+                                ?>
+                                <a class="dropdown-item" href="about.php"><i class="fas fa-info-circle"></i> System Upgrade</a>
+                                <?php
+                                $eepromFile = "/home/fpp/media/tmp/eeprom.bin";
+                                if (!file_exists($eepromFile) && file_exists("/home/fpp/media/config/cape-eeprom.bin")) {
+                                    $eepromFile = "/home/fpp/media/config/cape-eeprom.bin";
+                                }
+
+                                if (file_exists($eepromFile)) {
+                                    echo "<a class='dropdown-item' href='cape-info.php'><i class='fas fa-microchip'></i> Cape Info</a>\n";
+                                }
+                                $externalLinkClass = "dropdown-item";
+                                if ($settings["hideExternalURLs"]) {
+                                    $externalLinkClass = "hiddenExternalLink";
+                                }
+                                ?>
+                                <a class="dropdown-item" href="help.php"><i class="fas fa-question-circle"></i> Get
+                                    Help</a>
+                                <a class="dropdown-item" href="credits.php"><i class="fas fa-stream"></i> Credits</a>
+                                <a class="<?= $externalLinkClass ?>"
+                                    href="https://www.paypal.com/donate/?hosted_button_id=ASF9XYZ2V2F5G" target='_blank'
+                                    rel="noopener noreferrer"><i class="fas fa-solid fa-gift"></i> Donate to FPP <i
+                                        class="fas fa-external-link-alt external-link"></i></a>
+                                <hr class="dropdown-divider">
+                                <a class="dropdown-item" href="system-stats.php"><i class="fas fa-thermometer-half"></i>
+                                    System Health
+                                    Check</a>
+                                <a class="dropdown-item" href="troubleshooting.php"><i class="fas fa-code"></i>
+                                    Troubleshooting Commands</a>
+<?                                $baseLink = $_SERVER['HTTP_HOST'];
+                                if (isset($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+                                    $baseLink = $_SERVER['HTTP_X_FORWARDED_HOST'] . '/proxy/' . $_SERVER['SERVER_ADDR'];
+                                }
+                                ?>
+                                <a class="<?= $externalLinkClass ?>" href="http://<?= $baseLink ?>:4200" target="_blank"
+                                    rel="noopener noreferrer"><i class="fas fa-terminal"></i> SSH Shell</a>
+                                <?php list_plugin_entries("help"); ?>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+            </nav>
+
+
+        </div>
+        <script type="text/javascript">
+            // Just so other things have time to load.  A page that needs the
+            // answer sooner (about.php) kicks the same check off itself, so skip
+            // it if one has already answered -- publishFppUpdateState() has
+            // already rendered this header from it.  One check, one answer, no
+            // two views disagreeing over which side of the server's cache
+            // refresh they landed on.
+            setTimeout(function () {
+                if (!FPP_UPDATE_STATE.answered) {
+                    checkForFppUpdate();
+                }
+            }, 500);
+            // Same shape for the plugin-update icon: a file read on the server,
+            // skipped if a page (plugins.php) already asked. The offset from the
+            // check above is only so the two don't start in the same tick.
+            setTimeout(function () {
+                if (!FPP_PLUGIN_UPDATE_STATE.answered) {
+                    checkForPluginUpdates();
+                }
+            }, 700);
+        </script>

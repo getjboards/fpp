@@ -1,940 +1,1822 @@
 /*
- *   Scheduler Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include <ctype.h>
-#include <time.h>
-#include <unistd.h>
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <climits>
+#include <ctime>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdio.h>
-#include <sys/types.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <condition_variable>
+#include <time.h>
+#include <utility>
+#include <vector>
 
-#include "command.h"
+#include "Player.h"
+#include "Warnings.h"
 #include "common.h"
-#include "fpp.h"
 #include "log.h"
-#include "playlist/Playlist.h"
-#include "Scheduler.h"
 #include "settings.h"
-#include "SunSet.h"
+#include "commands/Commands.h"
+#include "mediaoutput/mediaoutput.h"
+#include "playlist/Playlist.h"
 
-Scheduler *scheduler = NULL;
+#include "Scheduler.h"
+
+Scheduler* scheduler = NULL;
 
 /////////////////////////////////////////////////////////////////////////////
 
-Scheduler::Scheduler()
-  : m_ScheduleEntryCount(0),
-	m_CurrentScheduleHasbeenLoaded(0),
-	m_NextScheduleHasbeenLoaded(0),
-	m_nowWeeklySeconds2(0),
-	m_lastLoadDate(0),
-	m_lastProcTime(0),
-	m_lastLoadTime(0),
-	m_lastCalculateTime(0),
-	m_runThread(0),
-	m_threadIsRunning(0)
-{
-	bzero(&m_currentSchedulePlaylist, sizeof(m_currentSchedulePlaylist));
-	pthread_mutex_init(&m_scheduleLock, NULL);
+// Test assumptions
+static_assert(std::is_move_constructible_v<ScheduledItem>);
+
+// Warning 23 is removed by an exact match on its text, so every site that adds
+// or removes it for an entry has to produce the identical string.
+// strftime() into a fixed buffer.  The time and date formats come from
+// settings; when a result doesn't fit, strftime() returns 0 and leaves the
+// buffer's contents undefined, and the callers then read an unterminated
+// string.  Leave it empty instead.
+static void FormatTime(char* buf, size_t size, const char* fmt, const struct tm* t) {
+    if (strftime(buf, size, fmt, t) == 0)
+        buf[0] = '\0';
 }
 
-Scheduler::~Scheduler()
-{
-	pthread_mutex_destroy(&m_scheduleLock);
+static std::string missingEntryWarning(const ScheduleEntry& entry) {
+    return std::string("Scheduled ") + (entry.sequence ? "Sequence" : "Playlist") +
+           " '" + entry.playlist + "' does not exist";
 }
 
-void Scheduler::ScheduleProc(void)
-{
-  time_t procTime = time(NULL);
+/////////////////////////////////////////////////////////////////////////////
 
-  if ((m_lastLoadDate != GetCurrentDateInt()) ||
-      ((procTime - m_lastProcTime) > 5))
-  {
-    if (FPPstatus == FPP_STATUS_IDLE)
-      m_CurrentScheduleHasbeenLoaded = 0;
+// A schedule entry's args are stored as given, and the command layer accepts
+// objects and arrays among them (an If command's condition), so asString()
+// and operator[] can't be used on them blindly: either throws LogicError, and
+// on the main loop nothing catches it - fppd aborted at every countdown to
+// such an entry.
+static std::string ScheduleArgToString(const Json::Value& v) {
+    if (v.isObject() || v.isArray()) {
+        return SaveJsonToString(v);
+    }
+    if (v.isNull()) {
+        return "";
+    }
+    return v.asString();
+}
 
-    m_NextScheduleHasbeenLoaded = 0;
-  }
+// Whether two items carry the same first argument (how a ran item is matched).
+static bool SameFirstScheduleArg(const Json::Value& a, const Json::Value& b) {
+    if (!a.isArray() || !b.isArray()) {
+        return a == b;
+    }
+    if (a.empty() || b.empty()) {
+        return a.empty() && b.empty();
+    }
+    return a[0] == b[0];
+}
 
-  m_lastProcTime = procTime;
+Scheduler::Scheduler() :
+    m_schedulerDisabled(false),
+    m_loadSchedule(true),
+    m_lastLoadDate(0),
+    m_lastProcTime(0),
+    m_lastCommandCheckTime(0),
+    m_timeDelta(0),
+    m_timeDeltaThreshold(0),
+    m_forcedNextPlaylist(SCHEDULE_INDEX_INVALID),
+    m_lastBlockedTime(0),
+    m_schedulesExtendBeyondDistance(false) {
+    RegisterCommands();
 
-  if (!m_CurrentScheduleHasbeenLoaded || !m_NextScheduleHasbeenLoaded)
+    m_schedulerDisabled = getSettingInt("DisableScheduler") == 1;
+
+    if ((m_schedulerDisabled) && (getFPPmode() == PLAYER_MODE)) {
+        WarningHolder::AddWarning(19, "FPP Scheduler is disabled");
+        LogWarn(VB_SCHEDULE, "Scheduler is disabled!\n");
+    }
+
+    m_lastProcTime = time(NULL);
+    // Seed the FPP-command catch-up window to now rather than leaving it at the
+    // epoch.  CheckScheduledItems() fires any command whose second falls in
+    // (m_lastCommandCheckTime, now], which exists so a second this process
+    // MISSED -- a slow midnight reload, an NTP step -- still runs.  A second
+    // that passed before this process existed was never missed by it, and the
+    // 60s catch-up cap is not a substitute: from 0 every start would replay the
+    // preceding minute of commands, so a scheduled "Outputs Off" or a restart
+    // would run a second time on every restart, and repeatedly in a restart
+    // loop.
+    m_lastCommandCheckTime = m_lastProcTime;
     LoadScheduleFromFile();
 
-  if(!m_CurrentScheduleHasbeenLoaded)
-    LoadCurrentScheduleInfo();
-
-  if(!m_NextScheduleHasbeenLoaded)
-    LoadNextScheduleInfo();
-
-  switch(FPPstatus)
-  {
-    case FPP_STATUS_IDLE:
-      if (m_currentSchedulePlaylist.ScheduleEntryIndex != SCHEDULE_INDEX_INVALID)
-        PlayListLoadCheck();
-      break;
-    case FPP_STATUS_PLAYLIST_PLAYING:
-      if (playlist->WasScheduled())
-        PlayListStopCheck();
-      else if (m_currentSchedulePlaylist.ScheduleEntryIndex != SCHEDULE_INDEX_INVALID)
-        PlayListLoadCheck();
-      break;
-    default:
-      break;
-
-  }
+    // Sun-relative times and the coordinates warning come from these, and
+    // are only worked out when the schedule is loaded.
+    for (const char* s : { "Latitude", "Longitude" }) {
+        registerSettingsListener("Scheduler", s, [this](const std::string&) {
+            ReloadScheduleFile();
+        });
+    }
 }
 
-void Scheduler::CheckIfShouldBePlayingNow(int ignoreRepeat)
-{
-  int i,j,dayCount;
-  time_t currTime = time(NULL);
-  struct tm now;
-
-  localtime_r(&currTime, &now);
-
-  int nowWeeklySeconds = GetWeeklySeconds(now.tm_wday, now.tm_hour, now.tm_min, now.tm_sec);
-  LoadScheduleFromFile();
-  for(i=0;i<m_ScheduleEntryCount;i++)
-  {
-		// only check schedule entries that are enabled and set to repeat.
-		// Do not start non repeatable entries
-		if ((m_Schedule[i].enable) &&
-			(m_Schedule[i].repeat || ignoreRepeat) &&
-			(CurrentDateInRange(m_Schedule[i].startDate, m_Schedule[i].endDate)))
-		{
-			for(j=0;j<m_Schedule[i].weeklySecondCount;j++)
-			{
-				// If end is less than beginning it means this entry wraps from Saturday to Sunday,
-				// otherwise, end should always be higher than start even if end is the next morning.
-				if (((m_Schedule[i].weeklyEndSeconds[j] < m_Schedule[i].weeklyStartSeconds[j]) &&
-					 ((nowWeeklySeconds >= m_Schedule[i].weeklyStartSeconds[j]) ||
-					  (nowWeeklySeconds < m_Schedule[i].weeklyEndSeconds[j]))) ||
-					((nowWeeklySeconds >= m_Schedule[i].weeklyStartSeconds[j]) && (nowWeeklySeconds < m_Schedule[i].weeklyEndSeconds[j])))
-				{
-					LogWarn(VB_SCHEDULE, "Should be playing now - schedule index = %d weekly index= %d\n",i,j);
-					m_currentSchedulePlaylist.ScheduleEntryIndex = i;
-					m_currentSchedulePlaylist.startWeeklySeconds = m_Schedule[i].weeklyStartSeconds[j];
-					m_currentSchedulePlaylist.endWeeklySeconds = m_Schedule[i].weeklyEndSeconds[j];
-
-					// Make end time non-inclusive
-					if (m_currentSchedulePlaylist.startWeeklySeconds != m_currentSchedulePlaylist.endWeeklySeconds)
-						m_currentSchedulePlaylist.endWeeklySeconds--;
-
-					m_CurrentScheduleHasbeenLoaded = 1;
-					m_NextScheduleHasbeenLoaded = 0;
-
-					playlist->Play(m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].playList,
-						0, m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].repeat, 1);
-				}				
-			}
-		}
-  }
+Scheduler::~Scheduler() {
+    unregisterSettingsListener("Scheduler", "Latitude");
+    unregisterSettingsListener("Scheduler", "Longitude");
 }
 
-std::string Scheduler::GetPlaylistThatShouldBePlaying(int &repeat)
-{
-	int i,j,dayCount;
-	time_t currTime = time(NULL);
-	struct tm now;
+void Scheduler::ScheduleProc(void) {
+    time_t procTime = time(NULL);
 
-	repeat = 0;
+    // Only check schedule once per second at most
+    if (m_lastProcTime == procTime)
+        return;
 
-	localtime_r(&currTime, &now);
+    int timeDelta = (int)(procTime - m_lastProcTime);
+    m_lastProcTime = procTime;
 
-	if (FPPstatus != FPP_STATUS_IDLE)
-		return m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].playList;
+    // reload the schedule file once per day or if 5 seconds has elapsed
+    // since the last process time in case the time jumps
+    if ((m_lastLoadDate != GetCurrentDateInt()) ||
+        (abs(timeDelta) > 5)) {
+        m_loadSchedule = true;
 
-	int nowWeeklySeconds = GetWeeklySeconds(now.tm_wday, now.tm_hour, now.tm_min, now.tm_sec);
-	for(i=0;i<m_ScheduleEntryCount;i++)
-	{
-		if ((m_Schedule[i].enable) &&
-			(CurrentDateInRange(m_Schedule[i].startDate, m_Schedule[i].endDate)))
-		{
-			for(j=0;j<m_Schedule[i].weeklySecondCount;j++)
-			{
-				// If end is less than beginning it means this entry wraps from Saturday to Sunday,
-				// otherwise, end should always be higher than start even if end is the next morning.
-				if (((m_Schedule[i].weeklyEndSeconds[j] < m_Schedule[i].weeklyStartSeconds[j]) &&
-					 ((nowWeeklySeconds >= m_Schedule[i].weeklyStartSeconds[j]) ||
-					  (nowWeeklySeconds < m_Schedule[i].weeklyEndSeconds[j]))) ||
-					((nowWeeklySeconds >= m_Schedule[i].weeklyStartSeconds[j]) && (nowWeeklySeconds < m_Schedule[i].weeklyEndSeconds[j])))
-				{
-					repeat = m_Schedule[i].repeat;
+        // Cleanup any ran items older than 2 days.  SetItemRan mutates m_ranItems
+        // under m_scheduleLock from HTTP/MQTT/detached command threads, so this
+        // prune has to hold the lock too.
+        const time_t twoDaysAgo = time(NULL) - (2 * 24 * 60 * 60);
+        std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+        for (auto it = m_ranItems.begin(); it != m_ranItems.end(); /* in loop */) {
+            if (it->first >= twoDaysAgo)
+                break;
+            it = m_ranItems.erase(it);
+        }
 
-					return m_Schedule[i].playList;
-				}
-			}
-		}
-	}
+        if (timeDelta < -SCHEDULE_COMMAND_CATCHUP_S) {
+            // The clock stepped back (an RTC that was ahead, corrected by
+            // NTP).  Whatever "ran" at the wrong, later time hasn't really run
+            // yet: forget it so the reload below schedules it again, and pull
+            // the command check window back so commands in the stepped-over
+            // span fire when their second actually comes instead of being
+            // treated as already examined.
+            LogWarn(VB_SCHEDULE, "Clock stepped back %d seconds; re-arming schedule items after now\n", -timeDelta);
+            m_ranItems.erase(m_ranItems.upper_bound(procTime), m_ranItems.end());
+            m_lastCommandCheckTime = procTime;
+        }
+    }
 
-	return "";
+    if (m_loadSchedule)
+        LoadScheduleFromFile();
+
+    CheckScheduledItems();
+
+    return;
 }
 
-int Scheduler::GetNextScheduleEntry(int *weeklySecondIndex)
-{
-  int i,j,dayCount;
-  int leastWeeklySecondDifferenceFromNow=SECONDS_PER_WEEK;
-  int difference;
-  int nextEntryIndex = SCHEDULE_INDEX_INVALID;
-  time_t currTime = time(NULL);
-  struct tm now;
-  
-  localtime_r(&currTime, &now);
+void Scheduler::CheckIfShouldBePlayingNow(int ignoreRepeat, int forceStopped) {
+    if (m_schedulerDisabled)
+        return;
 
-  int nowWeeklySeconds = GetWeeklySeconds(now.tm_wday, now.tm_hour, now.tm_min, now.tm_sec);
-  for(i=0;i<m_ScheduleEntryCount;i++)
-  {
-		if ((m_Schedule[i].enable) &&
-			(CurrentDateInRange(m_Schedule[i].startDate, m_Schedule[i].endDate)))
-		{
-			for(j=0;j<m_Schedule[i].weeklySecondCount;j++)
-			{
-				difference = GetWeeklySecondDifference(nowWeeklySeconds,m_Schedule[i].weeklyStartSeconds[j]);
-				if(difference > 0 && difference<leastWeeklySecondDifferenceFromNow)
-				{
-					leastWeeklySecondDifferenceFromNow = difference; 
-					nextEntryIndex = i;
-					*weeklySecondIndex = j;
-				}
-			}
-		}
-  }
-  LogDebug(VB_SCHEDULE, "nextEntryIndex = %d, least diff = %d, weekly index = %d\n",nextEntryIndex,leastWeeklySecondDifferenceFromNow,*weeklySecondIndex);
-  return nextEntryIndex;
+    LogDebug(VB_SCHEDULE, "CheckIfShouldBePlayingNow(%d, %d)\n", ignoreRepeat, forceStopped);
+
+    std::time_t now = time(nullptr);
+    {
+        std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+
+        // Idle in a switch is no stop (see Player::SwitchScope): re-armed
+        // then, the next pass pre-empts the playlist being switched to.
+        // Read after the status, as in the main loop.
+        bool idle = Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE;
+        bool switching = Player::Switching();
+
+        for (auto& itemTime : m_scheduledItems) {
+            if (itemTime.first > now) {
+                break; // no need to look at items that are further in the future
+            }
+
+            LogExcess(VB_SCHEDULE, "Checking scheduled items:\n");
+            for (auto& item : itemTime.second) {
+                if (WillLog(LOG_EXCESSIVE, VB_SCHEDULE))
+                    DumpScheduledItem(item.startTime, item);
+                if (item.isPlaylist) {
+                    if (item.endTime <= now) {
+                        LogExcess(VB_SCHEDULE, "End time is in the past, skipping item\n");
+                        continue;
+                    }
+
+                    bool ir = ignoreRepeat;
+                    if ((m_forcedNextPlaylist == item.entryIndex) &&
+                        (m_forcedNextPlaylistStart == item.startTime)) {
+                        LogExcess(VB_SCHEDULE, "This item entry index == m_forcedNextPlaylist\n");
+                        ir = true;
+                    }
+
+                    if (!switching &&
+                        (idle || (Player::INSTANCE.GetPlaylistName() != item.entry->playlist)) &&
+                        (forceStopped != item.entryIndex) &&
+                        (item.entry->repeat || ir) &&
+                        !m_startsInFlight.count({ item.startTime, item.entryIndex })) {
+                        LogExcess(VB_SCHEDULE, "Item run status reset\n");
+                        item.ran = false;
+                    }
+                }
+            }
+        }
+    }
+    LogExcess(VB_SCHEDULE, "Done checking list, proceeding to call CheckScheduledItems()\n");
+
+    CheckScheduledItems(getSettingInt("restarted") == 1);
 }
 
-void Scheduler::ReLoadCurrentScheduleInfo(void)
-{
-  m_lastLoadDate = 0;
-  m_CurrentScheduleHasbeenLoaded = 0;
+std::string Scheduler::GetPlaylistThatShouldBePlaying(int& repeat) {
+    if (m_schedulerDisabled)
+        return "";
+
+    std::time_t now = time(nullptr);
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+
+    for (auto& itemTime : m_scheduledItems) {
+        if (itemTime.first > now) {
+            break; // no need to look at items that are further in the future
+        }
+
+        for (auto& item : itemTime.second) {
+            if (item.isPlaylist) {
+                // Skip things that should have ended in the past
+                if (item.endTime <= now) {
+                    continue;
+                }
+
+                repeat = item.entry->repeat;
+                return item.entry->playlist;
+            }
+        }
+    }
+
+    repeat = 0;
+    return "";
 }
 
-void Scheduler::ReLoadNextScheduleInfo(void)
-{
-  m_lastLoadDate = 0;
-  m_NextScheduleHasbeenLoaded = 0;
+void Scheduler::ReloadScheduleFile(void) {
+    m_loadSchedule = true;
 }
 
-void Scheduler::LoadCurrentScheduleInfo(void)
-{
-  m_currentSchedulePlaylist.ScheduleEntryIndex = GetNextScheduleEntry(&m_currentSchedulePlaylist.weeklySecondIndex);
-	m_currentSchedulePlaylist.startWeeklySeconds = m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].weeklyStartSeconds[m_currentSchedulePlaylist.weeklySecondIndex];
-	m_currentSchedulePlaylist.endWeeklySeconds = m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].weeklyEndSeconds[m_currentSchedulePlaylist.weeklySecondIndex];
+void Scheduler::AddScheduledItems(ScheduleEntry* entry, int index, std::time_t loadTime) {
+    if (!entry->enabled)
+        return;
 
-	// Make end time non-inclusive
-	if (m_currentSchedulePlaylist.startWeeklySeconds != m_currentSchedulePlaylist.endWeeklySeconds)
-		m_currentSchedulePlaylist.endWeeklySeconds--;
+    if (!entry->playlist.empty()) {
+        std::string playlistFile;
+        std::string warning = missingEntryWarning(*entry);
 
-  m_CurrentScheduleHasbeenLoaded = 1;
+        if (entry->sequence) {
+            playlistFile = FPP_DIR_SEQUENCE("/" + entry->playlist);
+        } else {
+            playlistFile = FPP_DIR_PLAYLIST("/" + entry->playlist + ".json");
+        }
+
+        if (FileExists(playlistFile)) {
+            WarningHolder::RemoveWarning(23, warning);
+        } else {
+            ScheduleLoadWarning(23, warning);
+            entry->enabled = false;
+            return;
+        }
+    }
+
+    int dayIndex = entry->dayIndex;
+    std::time_t currTime = loadTime;
+    struct tm now;
+    localtime_r(&currTime, &now);
+    int scheduleDistance = getSettingInt("ScheduleDistance");
+
+    // Check if this schedule's end date extends beyond the schedule distance
+    // Track this for warning display but respect the user's ScheduleDistance setting
+    if (entry->endDate > 0 && entry->endDate < 10000000) {
+        // This is a yearless date (< 10000000), calculate actual end date
+        int currentDate = (now.tm_year + 1900) * 10000 + (now.tm_mon + 1) * 100 + now.tm_mday;
+        int endMD = entry->endDate;
+
+        // Reconstruct the full end date for the current or next year
+        int endYear = now.tm_year + 1900;
+        int calculatedEndDate = endYear * 10000 + endMD;
+
+        // If calculated end date is before today, use next year
+        if (calculatedEndDate < currentDate) {
+            calculatedEndDate = (endYear + 1) * 10000 + endMD;
+        }
+
+        // Calculate days from now to end date
+        int daysToEnd = (calculatedEndDate / 10000 - currentDate / 10000) * 365 +
+                        ((calculatedEndDate / 100 % 100) - (currentDate / 100 % 100)) * 30 +
+                        (calculatedEndDate % 100 - currentDate % 100);
+
+        if (daysToEnd > scheduleDistance) {
+            m_schedulesExtendBeyondDistance = true;
+        }
+    } else if (entry->endDate >= 10000000) {
+        // Full date specified
+        int currentDate = (now.tm_year + 1900) * 10000 + (now.tm_mon + 1) * 100 + now.tm_mday;
+        int daysDiff = ((entry->endDate / 10000) - (currentDate / 10000)) * 365 +
+                       ((entry->endDate / 100 % 100) - (currentDate / 100 % 100)) * 30 +
+                       (entry->endDate % 100 - currentDate % 100);
+
+        if (daysDiff > scheduleDistance) {
+            m_schedulesExtendBeyondDistance = true;
+        }
+    }
+
+    // Convert everything to a day mask to simplify code below.  Odd/even is
+    // not a fixed set of weekdays, so it schedules its own occurrences here
+    // rather than through the mask; dayIndex is left as INX_ODD_DAY/EVEN_DAY.
+    if ((dayIndex == INX_ODD_DAY) || (dayIndex == INX_EVEN_DAY)) {
+        // dayOffset is 0 when today already matches this entry's parity, 1
+        // when it does not (so the next - and previous - matching day is one
+        // day away, since odd/even parity alternates daily).
+        int dayOffset = entry->IsOddEvenMatch(currTime) ? 0 : 1;
+
+        // Schedule yesterday if needed to handle midnight crossovers
+        if (dayOffset)
+            entry->pushStartEndTimes(now.tm_wday - 1, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+        for (int i = now.tm_wday + dayOffset; i <= scheduleDistance; i += 2) {
+            entry->pushStartEndTimes(i, m_timeDelta, m_timeDeltaThreshold, currTime);
+        }
+    } else {
+        dayIndex = ScheduleEntry::DayIndexToMask(dayIndex);
+    }
+
+    // Special case: if today is Sunday, a Saturday-night start that crosses
+    // midnight (e.g. 22:00->02:00) bleeds into Sunday morning.  Push it only
+    // for entries that actually run on Saturday - hence the Saturday-mask
+    // test - so a Monday-only crossover entry no longer plays early Sunday.
+    // Odd/even entries are excluded because the block above already pushes
+    // yesterday (Saturday, when today is Sunday) whenever today's parity does
+    // not match; firing here too would double-push or push the wrong parity.
+    if ((now.tm_wday == 0) &&
+        (entry->dayIndex != INX_ODD_DAY) && (entry->dayIndex != INX_EVEN_DAY) &&
+        (dayIndex & INX_DAY_MASK_SATURDAY))
+        entry->pushStartEndTimes(-1, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+    if ((entry->dayIndex != INX_ODD_DAY) && (entry->dayIndex != INX_EVEN_DAY)) {
+        for (int weekOffset = 0; weekOffset <= scheduleDistance; weekOffset += 7) {
+            if (dayIndex & INX_DAY_MASK_SUNDAY)
+                entry->pushStartEndTimes(INX_SUN + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+            if (dayIndex & INX_DAY_MASK_MONDAY)
+                entry->pushStartEndTimes(INX_MON + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+            if (dayIndex & INX_DAY_MASK_TUESDAY)
+                entry->pushStartEndTimes(INX_TUE + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+            if (dayIndex & INX_DAY_MASK_WEDNESDAY)
+                entry->pushStartEndTimes(INX_WED + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+            if (dayIndex & INX_DAY_MASK_THURSDAY)
+                entry->pushStartEndTimes(INX_THU + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+            if (dayIndex & INX_DAY_MASK_FRIDAY)
+                entry->pushStartEndTimes(INX_FRI + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+
+            if (dayIndex & INX_DAY_MASK_SATURDAY)
+                entry->pushStartEndTimes(INX_SAT + weekOffset, m_timeDelta, m_timeDeltaThreshold, currTime);
+        }
+    }
+
+    // loop through entry->startEndTimes and add to m_scheduledItems
+    time_t startTime = 0;
+    time_t endTime = 0;
+    for (auto& startEnd : entry->startEndTimes) {
+        startTime = startEnd.first;
+        endTime = startEnd.second;
+
+        // Check to see if this occurrence is within the date range
+        struct tm later;
+        localtime_r(&startTime, &later);
+        int dateInt = 0;
+        dateInt += (later.tm_year + 1900) * 10000;
+        dateInt += (later.tm_mon + 1) * 100;
+        dateInt += (later.tm_mday);
+
+        // Skip if occurrence is outside the date range
+        if (!DateInRange(dateInt, entry->startDate, entry->endDate)) {
+            continue;
+        }
+
+        auto& vec = m_scheduledItems[startTime];
+        vec.push_back({ .entry = entry,
+                        .priority = index, // change this if we add a priority field
+                        .entryIndex = index,
+                        .ran = false,
+                        .startTime = startTime,
+                        .endTime = startTime });
+        ScheduledItem& newItem = vec.back();
+
+        if (!entry->playlist.empty()) {
+            // Old style schedule entry without a FPP Command
+            Json::Value args(Json::arrayValue);
+            args.append(entry->playlist);
+            args.append(entry->repeat ? "true" : "false");
+            args.append("false");
+
+            newItem.command = "Start Playlist";
+            newItem.isPlaylist = true;
+            newItem.args = std::move(args);
+            newItem.endTime = endTime;
+
+            // Check to see if this item already ran
+            if (auto it = m_ranItems.find(newItem.startTime); it != m_ranItems.end()) {
+                for (auto& item : it->second) {
+                    if ((newItem.command == item.command) &&
+                        (newItem.isPlaylist == item.isPlaylist) &&
+                        (newItem.startTime == item.startTime) &&
+                        (newItem.endTime == item.endTime) &&
+                        (newItem.args.size() == item.args.size()) &&
+                        SameFirstScheduleArg(newItem.args, item.args)) {
+                        LogDebug(VB_SCHEDULE, "Marking playlist item as already ran:\n");
+                        DumpScheduledItem(newItem.startTime, newItem);
+                        newItem.ran = true;
+                    }
+                }
+            }
+        } else {
+            // New style schedule entry with a FPP Command
+            newItem.command = entry->command;
+            newItem.args = entry->args;
+        }
+    }
 }
 
-void Scheduler::LoadNextScheduleInfo(void)
-{
-  char t[64];
-  char p[64];
+void Scheduler::DumpScheduledItem(const std::time_t itemTime, const ScheduledItem& item) {
+    char timeBuf[32];
+    std::string timeStr = ctime_r(&itemTime, timeBuf);
 
-  m_nextSchedulePlaylist.ScheduleEntryIndex = GetNextScheduleEntry(&m_nextSchedulePlaylist.weeklySecondIndex);
-  m_NextScheduleHasbeenLoaded = 1;
+    std::string argStr;
+    if (item.args.isArray()) {
+        for (const auto& a : item.args) {
+            argStr += "\"";
+            argStr += ScheduleArgToString(a);
+            argStr += "\" ";
+        }
+    } else {
+        argStr = ScheduleArgToString(item.args);
+    }
 
-  if (m_nextSchedulePlaylist.ScheduleEntryIndex >= 0)
-  {
-    GetNextPlaylistText(p);
-    GetNextScheduleStartText(t);
-    LogDebug(VB_SCHEDULE, "Next Scheduled Playlist is index %d: '%s' for %s\n", m_nextSchedulePlaylist.ScheduleEntryIndex, p, t);
-  }
+    LogDebug(VB_SCHEDULE, "%s: %2d '%s' - '%s'\n",
+             timeStr.substr(0, timeStr.length() - 1).c_str(),
+             item.priority,
+             item.command.c_str(),
+             argStr.c_str());
 }
 
-void Scheduler::GetSunInfo(int set, int &hour, int &minute, int &second)
-{
-	std::string latStr = getSetting("Latitude");
-	std::string lonStr = getSetting("Longitude");
+void Scheduler::DumpScheduledItems() {
+    LogDebug(VB_SCHEDULE, "DumpScheduledItems()\n");
 
-	if ((latStr == "") || (lonStr == ""))
-	{
-		latStr = "38.938524";
-		lonStr = "-104.600945";
-
-		LogErr(VB_SCHEDULE, "Error, Latitude/Longitude not filled in, using Falcon, Colorado coordinates!\n");
-	}
-
-	std::string::size_type sz;
-	double lat = std::stod(latStr, &sz);
-	double lon = std::stod(lonStr, &sz);
-	double sunOffset = 0;
-	time_t currTime = time(NULL);
-	struct tm utc;
-	struct tm local;
-
-	gmtime_r(&currTime, &utc);
-	localtime_r(&currTime, &local);
-
-	LogDebug(VB_SCHEDULE, "Lat/Lon: %.6f, %.6f\n", lat, lon);
-	LogDebug(VB_SCHEDULE, "Today (UTC) is %02d/%02d/%04d, UTC offset is %d hours\n",
-		utc.tm_mon + 1, utc.tm_mday, utc.tm_year + 1900, local.tm_gmtoff / 3600);
-
-	SunSet sun(lat, lon, local.tm_gmtoff / 3600);
-	sun.setCurrentDate(utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday);
-
-	if (set)
-		sunOffset = sun.calcSunset();
-	else
-		sunOffset = sun.calcSunrise();
-
-	LogDebug(VB_SCHEDULE, "SunRise/Set Time Offset: %.2f minutes\n", sunOffset);
-	hour = (int)sunOffset / 60;
-	minute = (int)sunOffset % 60;
-	second = (int)(((int)(sunOffset * 100) % 100) * 0.01 * 60);
-
-	if (set)
-		LogDebug(VB_SCHEDULE, "Sunset is at %02d:%02d:%02d\n", hour, minute, second);
-	else
-		LogDebug(VB_SCHEDULE, "Sunrise is at %02d:%02d:%02d\n", hour, minute, second);
+    for (const auto& itemTime : m_scheduledItems) {
+        for (const auto& item : itemTime.second) {
+            DumpScheduledItem(itemTime.first, item);
+        }
+    }
 }
 
-void Scheduler::SetScheduleEntrysWeeklyStartAndEndSeconds(ScheduleEntryStruct * entry)
-{
-	if (entry->dayIndex & INX_DAY_MASK)
-	{
-		int count = 0;
-		if (entry->dayIndex & INX_DAY_MASK_SUNDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_SUN,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_SUN,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+void Scheduler::doCountdown(const std::time_t now, const std::time_t itemTime, const std::vector<ScheduledItem>& items,
+                            std::vector<CountdownPreset>& presets) {
+    // Check to see if we should be counting down to the next item
+    bool logItems = false;
+    int diff = itemTime - now;
 
-		if (entry->dayIndex & INX_DAY_MASK_MONDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_MON,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_MON,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+    // Print the countdown more frequently as we get closer
+    if (((diff > 300) && ((diff % 300) == 0)) ||
+        ((diff > 60) && (diff <= 300) && ((diff % 60) == 0)) ||
+        ((diff > 10) && (diff <= 60) && ((diff % 10) == 0)) ||
+        ((diff <= 10))) {
+        logItems = true;
+    }
 
-		if (entry->dayIndex & INX_DAY_MASK_TUESDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_TUE,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_TUE,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+    if (logItems) {
+        LogDebug(VB_SCHEDULE, "Scheduled Item%s running in %d second%s:\n",
+                 items.size() == 1 ? "" : "s",
+                 diff,
+                 diff == 1 ? "" : "s");
 
-		if (entry->dayIndex & INX_DAY_MASK_WEDNESDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_WED,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_WED,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+        for (auto& item : items) {
+            if (item.isPlaylist &&
+                (diff < 1000)) {
+                char tmpStr[27];
+                snprintf(tmpStr, 26, "PLAYLIST_START_TMINUS_%03d", diff);
+                presets.push_back({ .name = tmpStr, .playlist = item.entry->playlist });
+            }
 
-		if (entry->dayIndex & INX_DAY_MASK_THURSDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_THU,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_THU,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+            DumpScheduledItem(itemTime, item);
+        }
+    }
+}
 
-		if (entry->dayIndex & INX_DAY_MASK_FRIDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_FRI,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_FRI,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+void Scheduler::RunCountdownPresets(const std::vector<CountdownPreset>& presets) {
+    for (const auto& preset : presets) {
+        std::map<std::string, std::string> keywords;
+        keywords["PLAYLIST_NAME"] = preset.playlist;
+        CommandManager::INSTANCE.TriggerPreset(preset.name, keywords);
+    }
+}
 
-		if (entry->dayIndex & INX_DAY_MASK_SATURDAY)
-		{
-			entry->weeklyStartSeconds[count] = GetWeeklySeconds(INX_SAT,entry->startHour,entry->startMinute,entry->startSecond);
-			entry->weeklyEndSeconds[count]   = GetWeeklySeconds(INX_SAT,entry->endHour,entry->endMinute,entry->endSecond);
-			count++;
-		}
+void Scheduler::RunPlayerActions(const std::vector<PlayerAction>& actions) {
+    for (const auto& action : actions) {
+        switch (action.type) {
+        case PlayerAction::Type::StopUntilIdle:
+            Player::INSTANCE.StopNowAllLevels(action.forceStop);
+            break;
+        case PlayerAction::Type::StopNow:
+            Player::INSTANCE.StopNow(action.forceStop);
+            break;
+        case PlayerAction::Type::StopGracefully:
+            Player::INSTANCE.StopGracefully(action.forceStop);
+            break;
+        case PlayerAction::Type::StopGracefullyAfterLoop:
+            Player::INSTANCE.StopGracefully(action.forceStop, 1);
+            break;
+        case PlayerAction::Type::StartPlaylist:
+            Player::INSTANCE.StartScheduledPlaylist(action.playlist, action.position,
+                                                    action.repeat, action.entryIndex,
+                                                    action.priority,
+                                                    action.startTime, action.endTime, action.stopType);
+            break;
+        }
+    }
+}
 
-		entry->weeklySecondCount = count;
-		return;
-	}
+static std::mutex s_commandThreadsLock;
+static std::condition_variable s_commandThreadsDone;
+static int s_commandThreads = 0;
 
-	switch(entry->dayIndex)
-  {
-		case INX_SUN:
-		case INX_MON:
-		case INX_TUE:
-		case INX_WED:
-		case INX_THU:
-		case INX_FRI:
+void Scheduler::WaitForCommandThreads(int timeoutMS) {
+    std::unique_lock<std::mutex> l(s_commandThreadsLock);
+    if (!s_commandThreadsDone.wait_for(l, std::chrono::milliseconds(timeoutMS), []() { return s_commandThreads == 0; })) {
+        LogWarn(VB_SCHEDULE, "%d scheduled command(s) still running at shutdown\n", s_commandThreads);
+    }
+}
+
+void Scheduler::doScheduledCommand(const std::time_t itemTime, const ScheduledItem& item) {
+    LogDebug(VB_SCHEDULE, "Running scheduled item:\n");
+    DumpScheduledItem(itemTime, item);
+    Json::Value cmd;
+    cmd["command"] = item.command;
+    cmd["args"] = item.args;
+    cmd["multisyncCommand"] = item.entry->multisyncCommand;
+    cmd["multisyncHosts"] = item.entry->multisyncHosts;
+
+    int entryIndex = item.entryIndex;
+    {
+        std::lock_guard<std::mutex> l(s_commandThreadsLock);
+        s_commandThreads++;
+    }
+    std::thread th([entryIndex](Json::Value cmd) {
+        SetThreadName("FPP-RunCmd");
+        // "id" rather than a row number: entryIndex is the 0-based index into
+        // the schedule vector, and that is exactly what the API reports as an
+        // entry's "id" (see BuildScheduleRangeItem / the scheduledItem["id"]
+        // below), so this is the value to cross-reference against.
+        LogDebug(VB_COMMAND, "Scheduler entry id %d running command \"%s\"\n", entryIndex, cmd["command"].asString().c_str());
+        // This thread is detached, so an exception escaping the command is not
+        // a failed command - it is std::terminate and the whole daemon goes
+        // down at whatever second the schedule fires.  Commands parse
+        // user-supplied arguments (and plugins supply their own), so catch
+        // everything here and let the show keep running.
+        try {
+            CommandManager::INSTANCE.run(cmd);
+        } catch (const std::exception& e) {
+            LogErr(VB_COMMAND, "Scheduler entry id %d command \"%s\" threw: %s\n",
+                   entryIndex, cmd["command"].asString().c_str(), e.what());
+            WarningHolder::AddWarningTimeout(60, 47, "Schedule: command '" + cmd["command"].asString() + "' failed: " + e.what());
+        } catch (...) {
+            LogErr(VB_COMMAND, "Scheduler entry id %d command \"%s\" threw an unknown exception\n",
+                   entryIndex, cmd["command"].asString().c_str());
+            WarningHolder::AddWarningTimeout(60, 47, "Schedule: command '" + cmd["command"].asString() + "' failed");
+        }
+        std::lock_guard<std::mutex> l(s_commandThreadsLock);
+        s_commandThreads--;
+        s_commandThreadsDone.notify_all();
+    },
+                   std::move(cmd));
+    th.detach();
+}
+
+bool Scheduler::doScheduledPlaylist(const std::time_t now, const std::time_t itemTime, ScheduledItem& item, bool restarted,
+                                    std::vector<PlayerAction>& actions) {
+    LogDebug(VB_SCHEDULE, "Checking scheduled 'Start Playlist'\n");
+    DumpScheduledItem(itemTime, item);
+
+    if (item.endTime <= now) {
+        SetItemRan(item, true);
+
+        // don't try to start if scheduled end has passed
+        return false;
+    }
+
+    // Don't restart a playlist if it was just force stopped
+    if ((Player::INSTANCE.GetForceStopped()) &&
+        (Player::INSTANCE.GetOrigStartTime() == item.startTime) &&
+        (Player::INSTANCE.GetForceStoppedPlaylist() == item.entry->playlist)) {
+        SetItemRan(item, true);
+        return false;
+    }
+
+    if (Player::INSTANCE.GetStatus() == FPP_STATUS_PLAYLIST_PLAYING) {
+        // If we are playing, check to see if we should be playing something else
+
+        // Check to see if we are already playing this item, for
+        // instance if we reloaded the schedule while a scheduled
+        // playlist was playing.
+        if ((Player::INSTANCE.GetPlaylistName() == item.entry->playlist) &&
+            (Player::INSTANCE.WasScheduled()) &&
+            (Player::INSTANCE.GetRepeat() == item.entry->repeat) &&
+            ((Player::INSTANCE.GetOrigStopTime() == item.endTime) ||
+             (Player::INSTANCE.GetStopTime() == item.endTime)) &&
+            (Player::INSTANCE.GetStopMethod() == item.entry->stopType)) {
+            SetItemRan(item, true);
+            return false;
+        }
+
+        if (!Player::INSTANCE.WasScheduled()) {
+            // Manually started playlist is running
+
+            // Check if playlist is protected from schedule override
+            if (!Player::INSTANCE.GetAllowScheduleOverride()) {
+                LogInfo(VB_SCHEDULE, "Manual playlist '%s' is protected from schedule override, not starting scheduled playlist '%s'\n",
+                        Player::INSTANCE.GetPlaylistName().c_str(), item.entry->playlist.c_str());
+                // Track this blocked scheduled item
+                m_lastBlockedPlaylist = item.entry->playlist;
+                m_lastBlockedTime = now;
+                return false;
+            }
+
+            if (item.startTime < Player::INSTANCE.GetStartTime()) {
+                // Due before the playlist was started by hand: waiting behind
+                // the scheduled one it replaced, or a repeating entry owed a
+                // restart.  It plays once that playlist ends.  Only an entry
+                // that comes due while it plays can pre-empt it.
+                LogDebug(VB_SCHEDULE, "Scheduled playlist '%s' was due before manual playlist '%s' started, waiting for it to end\n",
+                         item.entry->playlist.c_str(), Player::INSTANCE.GetPlaylistName().c_str());
+                return false;
+            }
+
+            // Check priority
+            if (Player::INSTANCE.GetPriority() > item.priority) {
+                // Scheduled playlist has higher priority, stop the manual one
+                LogInfo(VB_SCHEDULE, "Stopping manual playlist '%s' (priority %d) for scheduled playlist '%s' (priority %d)\n",
+                        Player::INSTANCE.GetPlaylistName().c_str(), Player::INSTANCE.GetPriority(),
+                        item.entry->playlist.c_str(), item.priority);
+                actions.push_back({ .type = PlayerAction::Type::StopUntilIdle,
+                                    .forceStop = 1 });
+            } else {
+                // Manual playlist has higher or equal priority, let it continue
+                LogDebug(VB_SCHEDULE, "Manual playlist '%s' (priority %d) has higher priority than scheduled playlist '%s' (priority %d), not overriding\n",
+                         Player::INSTANCE.GetPlaylistName().c_str(), Player::INSTANCE.GetPriority(),
+                         item.entry->playlist.c_str(), item.priority);
+                return false;
+            }
+        } else if (Player::INSTANCE.GetPriority() > item.priority) {
+            // Lower priority (higher number) playlist is running
+            // Reset the ran status on the schedule entry for the
+            // running playlist to false so it shows as 'next' again
+            std::time_t oldStartTime = Player::INSTANCE.GetOrigStartTime();
+            std::string playlistName = Player::INSTANCE.GetPlaylistName();
+            if (auto it = m_scheduledItems.find(oldStartTime); it != m_scheduledItems.end()) {
+                for (auto& oldItem : it->second) {
+                    if (oldItem.isPlaylist &&
+                        (oldItem.entry->playlist == playlistName)) {
+                        oldItem.ran = false;
+                        m_forcedNextPlaylist = oldItem.entryIndex;
+                        m_forcedNextPlaylistStart = oldItem.startTime;
+                    }
+                }
+            }
+
+            int forceStop = 0;
+            if (Player::INSTANCE.GetStopTime() < Player::INSTANCE.GetOrigStopTime()) {
+                forceStop = 1;
+            }
+
+            // Stop whatever is playing the way its entry says to, and start
+            // this item once the player is idle: a hard stop is idle by the
+            // rescan this pass does after its actions, a graceful one when the
+            // running playlist finishes.  This item is deliberately not marked
+            // ran.  It used to queue its start straight after the stop, and
+            // the start cut the stopping playlist off - every pre-emption was a
+            // hard stop whatever stop type the running entry had.
+            switch (Player::INSTANCE.GetStopMethod()) {
+            case 0:
+                actions.push_back({ .type = PlayerAction::Type::StopGracefully,
+                                    .forceStop = forceStop });
+                break;
+            case 2:
+                actions.push_back({ .type = PlayerAction::Type::StopGracefullyAfterLoop,
+                                    .forceStop = forceStop });
+                break;
+            case 1:
+            default:
+                actions.push_back({ .type = PlayerAction::Type::StopNow,
+                                    .forceStop = forceStop });
+                break;
+            }
+            return false;
+        } else {
+            // Need to wait for current Scheduled Higher-Priority
+            // item to end until we can play multiple playlists
+            // concurrently
+            return false;
+        }
+    } else if (Player::INSTANCE.GetStatus() != FPP_STATUS_IDLE) {
+        // We are either paused or stopping already so do nothing
+        return false;
+    }
+
+    LogDebug(VB_SCHEDULE, "Starting Scheduled Playlist:\n");
+    DumpScheduledItem(itemTime, item);
+
+    int position = 0;
+    if (restarted && (getSetting("resumePlaylist") == item.entry->playlist)) {
+        position = getSettingInt("resumePosition");
+
+        SetSetting("resumePlaylist", "");
+        SetSetting("resumePosition", 0);
+    }
+
+    if ((m_forcedNextPlaylist == item.entryIndex) &&
+        (m_forcedNextPlaylistStart == item.startTime)) {
+        // The pre-empted occurrence is getting its restart; that was the
+        // whole of what the force was for.
+        m_forcedNextPlaylist = SCHEDULE_INDEX_INVALID;
+    }
+
+    m_startsInFlight.insert({ item.startTime, item.entryIndex });
+    actions.push_back({ .type = PlayerAction::Type::StartPlaylist,
+                        .playlist = item.entry->playlist,
+                        .position = position,
+                        .repeat = item.entry->repeat,
+                        .entryIndex = item.entryIndex,
+                        .priority = item.entryIndex, // priority is entry index for now
+                        .startTime = item.startTime,
+                        .endTime = item.endTime,
+                        .stopType = item.entry->stopType });
+    return true;
+}
+
+// How far ahead of a scheduled playlist the audio output is brought up.
+static constexpr std::time_t MEDIA_PREWARM_LEAD_S = 5;
+
+void Scheduler::CheckScheduledItems(bool restarted) {
+    if (m_schedulerDisabled)
+        return;
+
+    std::time_t now = time(nullptr);
+    std::vector<PlayerAction> actions;
+    std::vector<CountdownPreset> presets;
+    // How long to hold the audio output up for a playlist about to start (0 =
+    // none due).  Opening it takes most of a second on slow boards, so do it
+    // ahead of time rather than when the first track starts.
+    int prewarmMs = 0;
+
+    // Longest a scheduled FPP command may fire after its second passed.  Bounds
+    // the (m_lastCommandCheckTime, now] catch-up window so a forward clock step
+    // does not replay a batch of stale commands; anything older is logged and
+    // marked ran instead of run.
+    constexpr std::time_t maxCommandCatchup = SCHEDULE_COMMAND_CATCHUP_S;
+
+    // Each pass decides what to do while holding m_scheduleLock and runs it
+    // after releasing the lock, since starting or stopping a playlist takes
+    // m_playlistMutex in the opposite order (see Scheduler.h).  A pass stops
+    // scanning as soon as it has an action so that the item after it is still
+    // judged against the player's real state rather than the state the player
+    // had before the action ran, which is what deciding for every item up
+    // front would do.
+    do {
+        actions.clear();
+        presets.clear();
+
+        {
+            std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+
+            // With the player idle and several playlists due, start the
+            // highest-priority one (lowest entry index) rather than whichever
+            // started earliest.  Starting the earlier, lower-priority one
+            // played the wrong show until the next pass pre-empted it; and
+            // after a graceful pre-emption the stopped entry is due again (it
+            // is owed a restart) and would win again, pre-empting forever.
+            int bestIdlePriority = INT_MAX;
+            if (Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) {
+                for (auto& due : m_scheduledItems) {
+                    if (due.first > now)
+                        break;
+                    for (auto& c : due.second) {
+                        if (!c.ran && c.isPlaylist && (c.endTime > now) &&
+                            (c.priority < bestIdlePriority) &&
+                            !m_startsInFlight.count({ c.startTime, c.entryIndex })) {
+                            bestIdlePriority = c.priority;
+                        }
+                    }
+                }
+            }
+
+            for (auto& itemTime : m_scheduledItems) {
+                if (itemTime.first > now) {
+                    doCountdown(now, itemTime.first, itemTime.second, presets);
+                    if (itemTime.first - now <= MEDIA_PREWARM_LEAD_S) {
+                        for (auto& item : itemTime.second) {
+                            if (!item.ran && item.isPlaylist) {
+                                // Through the start, plus the usual linger in
+                                // case the playlist opens with no media.
+                                prewarmMs = (int)((itemTime.first - now + MEDIA_PREWARM_LEAD_S) * 1000);
+                                break;
+                            }
+                        }
+                    }
+                    break; // no need to look at items that are further in the future
+                }
+
+                for (auto& item : itemTime.second) {
+                    if (item.ran)
+                        continue; // skip over any items that ran already
+
+                    if (item.isPlaylist) {
+                        // While any scheduled start is still being carried
+                        // out the player is busy, whatever its status says:
+                        // it reads idle until that playlist has loaded.
+                        // Guarding only the in-flight item let a concurrent
+                        // pass start the next, lower-priority item into the
+                        // same player and lose the higher one.  Skipped items
+                        // keep their ran flag clear, and the pass doing the
+                        // start rescans once it has finished.
+                        if (!m_startsInFlight.empty())
+                            continue;
+                        // Nor while one playlist is being replaced by another
+                        // (see Player::SwitchScope).
+                        if (Player::Switching())
+                            continue;
+                        if (item.priority > bestIdlePriority)
+                            continue; // a higher-priority playlist is due; it goes first
+                        if (!doScheduledPlaylist(now, itemTime.first, item, restarted, actions)) {
+                            continue;
+                        }
+                    } else {
+                        // An FPP Command has no duration to catch up to, so a
+                        // missed second would silently drop it.  Fire any
+                        // command whose second falls in the (lastCheck, now]
+                        // window this run has not examined yet, but never one
+                        // more than maxCommandCatchup seconds late so a large
+                        // clock step cannot replay a batch of stale commands.
+                        if (itemTime.first <= m_lastCommandCheckTime) {
+                            // A prior run already had its chance at this second.
+                            // A reload can reset item.ran (FPP-command ran-state
+                            // is not restored from m_ranItems), so gate on the
+                            // check window, not on item.ran, to avoid re-firing.
+                            SetItemRan(item, true);
+                            continue;
+                        }
+                        if ((now - itemTime.first) > maxCommandCatchup) {
+                            LogWarn(VB_SCHEDULE,
+                                    "Scheduled command '%s' skipped, %ld seconds late (catch-up cap is %ld s)\n",
+                                    item.command.c_str(), (long)(now - itemTime.first),
+                                    (long)maxCommandCatchup);
+                            SetItemRan(item, true);
+                            continue;
+                        }
+                        doScheduledCommand(itemTime.first, item);
+                    }
+
+                    SetItemRan(item, true);
+
+                    if (!actions.empty())
+                        break;
+                }
+
+                if (!actions.empty())
+                    break;
+            }
+
+            // A switch that began after the checks above read the player
+            // idle: a start now would replace the playlist being switched to.
+            // Drop this pass's actions, and leave its start to a later one.
+            if (!actions.empty() && Player::Switching()) {
+                LogDebug(VB_SCHEDULE, "A playlist switch began, dropping this pass's scheduled actions\n");
+                for (const auto& action : actions) {
+                    if (action.type != PlayerAction::Type::StartPlaylist)
+                        continue;
+                    m_startsInFlight.erase({ action.startTime, action.entryIndex });
+                    if (auto it = m_scheduledItems.find(action.startTime); it != m_scheduledItems.end()) {
+                        for (auto& item : it->second) {
+                            if (item.isPlaylist && (item.entryIndex == action.entryIndex))
+                                SetItemRan(item, false);
+                        }
+                    }
+                }
+                actions.clear();
+            }
+        }
+
+        {
+            // Clear this pass's in-flight marks however RunPlayerActions()
+            // leaves: every scheduled playlist start waits while any mark is
+            // set, so one leaked by an exception would stop the schedule.
+            struct InFlightGuard {
+                Scheduler* s;
+                const std::vector<PlayerAction>& actions;
+                ~InFlightGuard() {
+                    std::unique_lock<std::recursive_mutex> lock(s->m_scheduleLock);
+                    for (const auto& action : actions) {
+                        if (action.type == PlayerAction::Type::StartPlaylist)
+                            s->m_startsInFlight.erase({ action.startTime, action.entryIndex });
+                    }
+                }
+            } inFlightGuard{ this, actions };
+            RunPlayerActions(actions);
+        }
+        RunCountdownPresets(presets);
+    } while (!actions.empty());
+
+    if (prewarmMs > 0) {
+        PrewarmMediaOutput(prewarmMs);
+    }
+
+    // Advance the command catch-up window past every second this call examined.
+    // Done once, after all rescans, so each rescan judges commands against the
+    // same window; within a call the item.ran flag prevents a second firing.
+    // Left unchanged if the clock ran backwards so the window never moves ahead
+    // of the wall clock.
+    // Under the lock: this runs on the main loop and on API threads, and an
+    // unlocked read-compare-write could move the window backwards.
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+    if (now > m_lastCommandCheckTime)
+        m_lastCommandCheckTime = now;
+}
+
+void Scheduler::ClearScheduledItems() {
+    m_scheduledItems.clear();
+}
+
+void Scheduler::SetItemRan(ScheduledItem& item, bool ran) {
+    item.ran = ran;
+
+    auto& vec = m_ranItems[item.startTime];
+    auto it = std::find_if(vec.begin(), vec.end(), [&](const ScheduledItem& ranItem) {
+        return item.command == ranItem.command &&
+               item.isPlaylist == ranItem.isPlaylist &&
+               item.startTime == ranItem.startTime &&
+               item.endTime == ranItem.endTime &&
+               item.args.size() == ranItem.args.size() &&
+               SameFirstScheduleArg(item.args, ranItem.args);
+    });
+    if (it != vec.end()) {
+        it->ran = ran;
+    } else {
+        // Without the entry pointer: it points into m_Schedule, which the next
+        // reload frees, while ran-state outlives reloads.
+        vec.push_back({ .entry = nullptr,
+                        .priority = item.priority,
+                        .entryIndex = item.entryIndex,
+                        .ran = ran,
+                        .startTime = item.startTime,
+                        .endTime = item.endTime,
+                        .command = item.command,
+                        .args = item.args,
+                        .isPlaylist = item.isPlaylist });
+    }
+}
+
+void Scheduler::LoadScheduleFromFile(void) {
+    std::string SCHEDULE_FILE = FPP_DIR_CONFIG("/schedule.json");
+    LogDebug(VB_SCHEDULE, "Loading Schedule from %s\n", SCHEDULE_FILE.c_str());
+
+    m_loadSchedule = false;
+    // One clock reading for the whole load: every entry and every occurrence
+    // is placed relative to it, so a load that runs across midnight cannot
+    // anchor some of them to the old day (or week) and some to the new one.
+    // The load date comes from the same reading, so a load anchored to the
+    // old day is redone once the new day is seen.
+    const std::time_t loadTime = std::time(nullptr);
+    {
+        struct tm lt;
+        localtime_r(&loadTime, &lt);
+        m_lastLoadDate = (lt.tm_year + 1900) * 10000 + (lt.tm_mon + 1) * 100 + lt.tm_mday;
+    }
+    // Under the lock, like the AddScheduledItems() writes below and the read
+    // in GetSchedule(), which an API thread makes while this reloads.
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+    m_schedulesExtendBeyondDistance = false;
+    m_Schedule.clear();
+    ClearScheduledItems();
+
+    std::string playlistFile;
+
+    // A player that has never had a schedule has no schedule.json, which is a
+    // normal state and not worth reading a file for -- an absent file and an
+    // empty schedule are the same thing to everything below.
+    Json::Value sch;
+    if (FileExists(SCHEDULE_FILE)) {
+        sch = LoadJsonFromFile(SCHEDULE_FILE, JsonRoot::Array);
+    }
+    ClearScheduleLoadWarnings();
+    for (int i = 0; i < sch.size(); i++) {
+        ScheduleEntry scheduleEntry;
+        // jsoncpp throws on a wrong-typed field ("day":"7", an entry that is
+        // not an object).  This runs from the Scheduler constructor and from
+        // the main loop's reloads with nothing above it to catch, so one bad
+        // entry took fppd down -- and again on every restart.  Skip the entry.
+        try {
+            if (!scheduleEntry.LoadFromJson(sch[i]))
+                continue;
+        } catch (const std::exception& ex) {
+            std::string warning = "Schedule entry " + std::to_string(i + 1) + " is invalid and was skipped: " + ex.what();
+            LogErr(VB_SCHEDULE, "%s\n", warning.c_str());
+            ScheduleLoadWarning(47, warning);
+            continue;
+        }
+
+        std::string warning = missingEntryWarning(scheduleEntry);
+
+        if (scheduleEntry.sequence) {
+            playlistFile = FPP_DIR_SEQUENCE("/" + scheduleEntry.playlist);
+        } else {
+            playlistFile = FPP_DIR_PLAYLIST("/" + scheduleEntry.playlist + ".json");
+        }
+
+        if ((getFPPmode() != PLAYER_MODE) &&
+            (scheduleEntry.enabled) &&
+            (!scheduleEntry.playlist.empty())) {
+            std::string warning = std::string("Playlist '") + scheduleEntry.playlist +
+                                  "' was scheduled but system is running in Remote mode.";
+            LogWarn(VB_SCHEDULE, "%s\n", warning.c_str());
+            ScheduleLoadWarning(29, warning);
+            continue;
+        }
+
+        if ((scheduleEntry.enabled) &&
+            (!scheduleEntry.playlist.empty()) &&
+            (!FileExists(playlistFile))) {
+            LogErr(VB_SCHEDULE, "ERROR: Scheduled %s '%s' does not exist\n",
+                   scheduleEntry.sequence ? "Sequence" : "Playlist",
+                   scheduleEntry.playlist.c_str());
+            ScheduleLoadWarning(23, warning);
+            continue;
+        } else {
+            WarningHolder::RemoveWarning(23, warning);
+        }
+
+        m_Schedule.push_back(scheduleEntry);
+    }
+
+    for (int i = 0; i < m_Schedule.size(); i++) {
+        AddScheduledItems(&m_Schedule[i], i, loadTime);
+    }
+
+    SchedulePrint();
+
+    if (WillLog(LOG_EXCESSIVE, VB_SCHEDULE))
+        DumpScheduledItems();
+
+    lock.unlock();
+
+    return;
+}
+
+void Scheduler::SchedulePrint(void) {
+    int i = 0;
+    char stopTypes[4] = "GHL";
+    std::string dayStr;
+
+    if (m_schedulerDisabled)
+        LogInfo(VB_SCHEDULE, "WARNING: Scheduler is currently disabled\n");
+
+    LogInfo(VB_SCHEDULE, "Current Schedule: (Status: '+' = Enabled, '-' = Disabled, '!' = Outside Date Range, '*' = Repeat, Stop (G)raceful/(L)oop/(H)ard\n");
+    LogInfo(VB_SCHEDULE, "Stat Start & End Dates       Days          Start & End Times   Playlist/Command\n");
+    LogInfo(VB_SCHEDULE, "---- ----------------------- ------------- ------------------- ---------------------------------------------\n");
+    for (i = 0; i < m_Schedule.size(); i++) {
+        dayStr = GetDayTextFromDayIndex(m_Schedule[i].dayIndex);
+        LogInfo(VB_SCHEDULE, "%c%c%c%c %04d-%02d-%02d - %04d-%02d-%02d %-13.13s %-8.8s %c %-8.8s %s\n",
+                m_Schedule[i].enabled ? '+' : '-',
+                CurrentDateInRange(m_Schedule[i].startDate, m_Schedule[i].endDate) ? ' ' : '!',
+                m_Schedule[i].repeat ? '*' : ' ',
+                stopTypes[m_Schedule[i].stopType],
+                (int)(m_Schedule[i].startDate / 10000),
+                (int)(m_Schedule[i].startDate % 10000 / 100),
+                (int)(m_Schedule[i].startDate % 100),
+                (int)(m_Schedule[i].endDate / 10000),
+                (int)(m_Schedule[i].endDate % 10000 / 100),
+                (int)(m_Schedule[i].endDate % 100),
+                dayStr.c_str(),
+                m_Schedule[i].startTimeStr.c_str(),
+                m_Schedule[i].playlist.empty() ? ' ' : '-',
+                m_Schedule[i].playlist.empty() ? "" : m_Schedule[i].endTimeStr.c_str(),
+                m_Schedule[i].playlist.empty() ? m_Schedule[i].command.c_str() : m_Schedule[i].playlist.c_str());
+    }
+
+    LogDebug(VB_SCHEDULE, "//////////////////////////////////////////////////\n");
+}
+
+ScheduledItem* Scheduler::GetNextScheduledPlaylist() {
+    std::time_t now = time(nullptr);
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+
+    for (auto& itemTime : m_scheduledItems) {
+        for (auto& item : itemTime.second) {
+            if (item.ran)
+                continue; // skip over any items that ran already
+
+            if (item.isPlaylist)
+                return &item;
+        }
+    }
+
+    return nullptr;
+}
+
+std::string Scheduler::GetNextPlaylistName() {
+    if (m_schedulerDisabled)
+        return "Scheduler is disabled.";
+
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+    ScheduledItem* item = GetNextScheduledPlaylist();
+
+    if (!item)
+        return "No playlist scheduled.";
+
+    return item->entry->playlist;
+}
+
+std::string Scheduler::GetNextPlaylistStartStr() {
+    if (m_schedulerDisabled)
+        return "";
+
+    std::string timeFmt = getSetting("DateFormat") + " @ " + getSetting("TimeFormat");
+    std::string result;
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+    ScheduledItem* item = GetNextScheduledPlaylist();
+
+    if (!item)
+        return result;
+
+    char timeStr[32];
+    std::time_t timeT = 0;
+    struct tm timeStruct;
+    time_t currTime = time(NULL);
+
+    localtime_r(&item->startTime, &timeStruct);
+    FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+
+    // Thursday @ 11:00:00 - (Everyday)
+    result = timeStr;
+    result += " - (";
+    result += GetDayTextFromDayIndex(item->entry->dayIndex);
+    result += ")";
+
+    return result;
+}
+
+std::string Scheduler::GetDayTextFromDayIndex(const int index) {
+    if (index & INX_DAY_MASK) {
+        char tmpStr[15];
+        strcpy(tmpStr, "Mask: ");
+        strcat(tmpStr, (index & INX_DAY_MASK_SUNDAY) ? "S" : "-");
+        strcat(tmpStr, (index & INX_DAY_MASK_MONDAY) ? "M" : "-");
+        strcat(tmpStr, (index & INX_DAY_MASK_TUESDAY) ? "T" : "-");
+        strcat(tmpStr, (index & INX_DAY_MASK_WEDNESDAY) ? "W" : "-");
+        strcat(tmpStr, (index & INX_DAY_MASK_THURSDAY) ? "T" : "-");
+        strcat(tmpStr, (index & INX_DAY_MASK_FRIDAY) ? "F" : "-");
+        strcat(tmpStr, (index & INX_DAY_MASK_SATURDAY) ? "S" : "-");
+        return tmpStr;
+    }
+
+    switch (index) {
+    case INX_SUN:
+        return "Sunday";
+    case INX_MON:
+        return "Monday";
+    case INX_TUE:
+        return "Tuesday";
+    case INX_WED:
+        return "Wednesday";
+    case INX_THU:
+        return "Thursday";
+    case INX_FRI:
+        return "Friday";
     case INX_SAT:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(entry->dayIndex,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(entry->dayIndex,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 1;
-      break;
+        return "Saturday";
     case INX_EVERYDAY:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_SUN,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_MON,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[2] = GetWeeklySeconds(INX_TUE,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[3] = GetWeeklySeconds(INX_WED,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[4] = GetWeeklySeconds(INX_THU,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[5] = GetWeeklySeconds(INX_FRI,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[6] = GetWeeklySeconds(INX_SAT,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_SUN,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_MON,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[2] = GetWeeklySeconds(INX_TUE,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[3] = GetWeeklySeconds(INX_WED,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[4] = GetWeeklySeconds(INX_THU,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[5] = GetWeeklySeconds(INX_FRI,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[6] = GetWeeklySeconds(INX_SAT,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 7;
-      break;
+        return "Everyday";
     case INX_WKDAYS:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_MON,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_TUE,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[2] = GetWeeklySeconds(INX_WED,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[3] = GetWeeklySeconds(INX_THU,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[4] = GetWeeklySeconds(INX_FRI,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_MON,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_TUE,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[2] = GetWeeklySeconds(INX_WED,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[3] = GetWeeklySeconds(INX_THU,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[4] = GetWeeklySeconds(INX_FRI,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 5;
-
-      break;
+        return "Weekdays";
     case INX_WKEND:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_SAT,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_SUN,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_SAT,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_SUN,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 2;
-      break;
+        return "Weekends";
     case INX_M_W_F:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_MON,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_WED,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[2] = GetWeeklySeconds(INX_FRI,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_MON,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_WED,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[2] = GetWeeklySeconds(INX_FRI,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 3;
-      break;
+        return "Mon/Wed/Fri";
     case INX_T_TH:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_TUE,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_THU,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_TUE,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_THU,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 2;
-      break;
-		case INX_SUN_TO_THURS:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_SUN,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_MON,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[2] = GetWeeklySeconds(INX_TUE,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[3] = GetWeeklySeconds(INX_WED,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[4] = GetWeeklySeconds(INX_THU,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_SUN,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_MON,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[2] = GetWeeklySeconds(INX_TUE,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[3] = GetWeeklySeconds(INX_WED,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[4] = GetWeeklySeconds(INX_THU,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 5;
-			break;
-		case INX_FRI_SAT:
-      entry->weeklyStartSeconds[0] = GetWeeklySeconds(INX_FRI,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyStartSeconds[1] = GetWeeklySeconds(INX_SAT,entry->startHour,entry->startMinute,entry->startSecond);
-      entry->weeklyEndSeconds[0] = GetWeeklySeconds(INX_FRI,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklyEndSeconds[1] = GetWeeklySeconds(INX_SAT,entry->endHour,entry->endMinute,entry->endSecond);
-      entry->weeklySecondCount = 2;
-      break;
-		
-    default:
-      entry->weeklySecondCount = 0;
-  }
-
-  for (int x = 0; x < entry->weeklySecondCount; x++) {
-    if (entry->weeklyEndSeconds[x] < entry->weeklyStartSeconds[x]) {
-      // End is less than start, likely means crossing to next day, add 24hours.
-      // If Saturday, roll end around to Sunday morning.
-      if (entry->weeklyEndSeconds[x] < (24*60*60*6))
-        entry->weeklyEndSeconds[x] += 24*60*60;
-      else
-        entry->weeklyEndSeconds[x] -= 24*60*60*6;
+        return "Tues-Thurs";
+    case INX_SUN_TO_THURS:
+        return "Sun-Thurs";
+    case INX_FRI_SAT:
+        return "Fri/Sat";
+    case INX_ODD_DAY:
+        return "Odd Days";
+    case INX_EVEN_DAY:
+        return "Even Days";
     }
-  }
+
+    return "Error";
 }
 
+Json::Value Scheduler::GetInfo(void) {
+    Json::Value result;
 
+    std::string timeFmt = getSetting("DateFormat") + " @ " + getSetting("TimeFormat");
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+    Json::Value np;
+    ScheduledItem* nextItem = GetNextScheduledPlaylist();
+    np["playlistName"] = GetNextPlaylistName();
+    np["scheduledStartTime"] = nextItem ? (Json::UInt64)(nextItem->startTime) : 0;
+    np["scheduledStartTimeStr"] = GetNextPlaylistStartStr();
 
-void Scheduler::PlayListLoadCheck(void)
-{
-  time_t currTime = time(NULL);
-  struct tm now;
-  
-  localtime_r(&currTime, &now);
+    result["enabled"] = m_schedulerDisabled ? 0 : 1;
+    result["nextPlaylist"] = np;
 
-  int nowWeeklySeconds = GetWeeklySeconds(now.tm_wday, now.tm_hour, now.tm_min, now.tm_sec);
-  if (m_nowWeeklySeconds2 != nowWeeklySeconds)
-  {
-    m_nowWeeklySeconds2 = nowWeeklySeconds;
+    if ((Player::INSTANCE.GetStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+        (Player::INSTANCE.GetStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+        (Player::INSTANCE.GetStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
+        Json::Value cp;
 
-    int diff = m_currentSchedulePlaylist.startWeeklySeconds - nowWeeklySeconds;
-    int displayDiff = 0;
+        if (Player::INSTANCE.WasScheduled()) {
+            char timeStr[32];
+            std::time_t timeT = 0;
+            struct tm timeStruct;
+            time_t currTime = time(NULL);
 
-    if (diff < -600) // assume the schedule is actually next week for display
-      diff += (24 * 3600 * 7);
+            localtime_r(&currTime, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            cp["currentTime"] = (Json::UInt64)currTime;
+            cp["currentTimeStr"] = timeStr;
 
-    // If current schedule starttime is in the past and the item is not set
-    // for repeat, then reschedule.
-    if ((diff < -1) &&
-        (!m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].repeat))
-      ReLoadCurrentScheduleInfo();
+            timeT = Player::INSTANCE.GetOrigStartTime();
+            localtime_r(&timeT, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            cp["scheduledStartTime"] = (Json::UInt64)timeT;
+            cp["scheduledStartTimeStr"] = timeStr;
 
-    // Convoluted code to print the countdown more frequently as we get closer
-    if (((diff > 300) &&                  ((diff % 300) == 0)) ||
-        ((diff >  60) && (diff <= 300) && ((diff %  60) == 0)) ||
-        ((diff >  10) && (diff <=  60) && ((diff %  10) == 0)) ||
-        (                (diff <=  10)))
+            timeT = Player::INSTANCE.GetStartTime();
+            localtime_r(&timeT, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            cp["actualStartTime"] = (Json::UInt64)timeT;
+            cp["actualStartTimeStr"] = timeStr;
+
+            timeT = Player::INSTANCE.GetOrigStopTime();
+            localtime_r(&timeT, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            cp["scheduledEndTime"] = (Json::UInt64)timeT;
+            cp["scheduledEndTimeStr"] = timeStr;
+
+            timeT = Player::INSTANCE.GetStopTime();
+            localtime_r(&timeT, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            cp["actualEndTime"] = (Json::UInt64)timeT;
+            cp["actualEndTimeStr"] = timeStr;
+            cp["secondsRemaining"] = (int)(timeT - currTime);
+
+            int stopType = Player::INSTANCE.GetStopMethod();
+            cp["stopType"] = stopType;
+            cp["stopTypeStr"] = stopType == 2 ? "Graceful Loop" : stopType == 1 ? "Hard"
+                                                                                : "Graceful";
+
+            result["status"] = "playing";
+        } else {
+            result["status"] = "manual";
+        }
+
+        cp["playlistName"] = Player::INSTANCE.GetPlaylistName();
+
+        result["currentPlaylist"] = cp;
+    } else {
+        result["status"] = "idle";
+    }
+
+    // Add blocked schedule information
+    if (m_lastBlockedTime > 0) {
+        time_t now = time(NULL);
+        // Only report if blocked within last 5 minutes
+        if ((now - m_lastBlockedTime) < 300) {
+            result["blockedSchedule"]["playlistName"] = m_lastBlockedPlaylist;
+            result["blockedSchedule"]["blockedTime"] = (Json::UInt64)m_lastBlockedTime;
+        }
+    }
+
+    return result;
+}
+
+Json::Value Scheduler::GetSchedule() {
+    std::string timeFmt = getSetting("DateFormat") + " @ " + getSetting("TimeFormat");
+    Json::Value result;
+    Json::Value entries(Json::arrayValue);
+    Json::Value entry;
+    Json::Value items(Json::arrayValue);
+    Json::Value scheduledItem;
+    std::time_t now = time(nullptr);
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+
+    result["enabled"] = m_schedulerDisabled ? 0 : 1;
+
+    for (int i = 0; i < m_Schedule.size(); i++) {
+        entry = m_Schedule[i].GetJson();
+        entry["id"] = i;
+        entry["type"] = m_Schedule[i].playlist.empty() ? "command" : "playlist";
+        entry["dayStr"] = GetDayTextFromDayIndex(m_Schedule[i].dayIndex);
+
+        entries.append(entry);
+    }
+    result["entries"] = entries;
+
+    struct tm timeStruct;
+    char timeStr[32];
+    time_t tmpTime;
+
+    if ((Player::INSTANCE.GetStatus() != FPP_STATUS_IDLE) &&
+        (Player::INSTANCE.WasScheduled())) {
+        // If we are playing a scheduled playlist, then insert an item for
+        // it since it is already marked as ran and will get skipped by.
+        // We do this here instead of just using a more complicated if continue
+        // statement below because the player may have more up to date info
+        // on the end time than our old schedule entry if the end time has
+        // been extended or shortened.
+        scheduledItem["priority"] = Player::INSTANCE.GetPriority();
+        scheduledItem["id"] = Player::INSTANCE.GetScheduleEntry();
+
+        tmpTime = Player::INSTANCE.GetOrigStartTime();
+        localtime_r(&tmpTime, &timeStruct);
+        FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+        scheduledItem["startTimeStr"] = timeStr;
+        scheduledItem["startTime"] = (Json::UInt64)tmpTime;
+
+        FormatTime(timeStr, sizeof(timeStr), "%Y%m%d", &timeStruct);
+        scheduledItem["startDateStr"] = timeStr;
+        scheduledItem["startDateInt"] = atoi(timeStr);
+
+        tmpTime = Player::INSTANCE.GetStopTime();
+        localtime_r(&tmpTime, &timeStruct);
+        FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+        scheduledItem["endTimeStr"] = timeStr;
+        scheduledItem["endTime"] = (Json::UInt64)tmpTime;
+
+        FormatTime(timeStr, sizeof(timeStr), "%Y%m%d", &timeStruct);
+        scheduledItem["endDateStr"] = timeStr;
+        scheduledItem["endDateInt"] = atoi(timeStr);
+
+        scheduledItem["command"] = "Start Playlist";
+
+        Json::Value args(Json::arrayValue);
+        args.append(Player::INSTANCE.GetPlaylistName());
+        scheduledItem["args"] = args;
+
+        items.append(scheduledItem);
+    }
+
+    for (auto& itemTime : m_scheduledItems) {
+        for (auto& item : itemTime.second) {
+            if (item.ran)
+                continue;
+
+            scheduledItem["priority"] = item.priority;
+            scheduledItem["id"] = item.entryIndex;
+
+            localtime_r(&item.startTime, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            scheduledItem["startTimeStr"] = timeStr;
+            scheduledItem["startTime"] = (Json::UInt64)item.startTime;
+
+            FormatTime(timeStr, sizeof(timeStr), "%Y%m%d", &timeStruct);
+            scheduledItem["startDateStr"] = timeStr;
+            scheduledItem["startDateInt"] = atoi(timeStr);
+
+            localtime_r(&item.endTime, &timeStruct);
+            FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+            scheduledItem["endTimeStr"] = timeStr;
+            scheduledItem["endTime"] = (Json::UInt64)item.endTime;
+
+            FormatTime(timeStr, sizeof(timeStr), "%Y%m%d", &timeStruct);
+            scheduledItem["endDateStr"] = timeStr;
+            scheduledItem["endDateInt"] = atoi(timeStr);
+
+            scheduledItem["command"] = item.command;
+
+            scheduledItem["args"] = item.args;
+            scheduledItem["multisyncCommand"] = item.entry->multisyncCommand;
+            scheduledItem["multisyncHosts"] = item.entry->multisyncHosts;
+
+            items.append(scheduledItem);
+        }
+    }
+    result["items"] = items;
+    result["schedulesExtendBeyondDistance"] = m_schedulesExtendBeyondDistance;
+    result["scheduleDistance"] = getSettingInt("ScheduleDistance");
+
+    return result;
+}
+
+/*
+ * Expand the configured schedule across an arbitrary date range.
+ *
+ * GetSchedule() can only report the rolling window fppd actually schedules out
+ * (ScheduleDistance days, minus anything already run), which is enough for the
+ * list preview but not for a calendar the user can page through.  This walks
+ * the range a day at a time and asks each entry which occurrences land on it,
+ * so any month - past or future - can be rendered from the real schedule rules.
+ *
+ * Occurrences are advisory: they describe what the schedule says should happen,
+ * not what fppd has committed to running.
+ */
+Json::Value Scheduler::BuildScheduleRangeItem(const ScheduleEntry& entry,
+                                             const Occurrence& occurrence,
+                                             const std::string& timeFmt) {
+    struct tm timeStruct;
+    char timeStr[32];
+    Json::Value item;
+
+    item["id"] = occurrence.entryIndex;
+    item["priority"] = occurrence.entryIndex; // priority is entry index for now
+    item["enabled"] = entry.enabled;
+    item["overridden"] = occurrence.overridden;
+    item["type"] = entry.playlist.empty() ? "command" : (entry.sequence ? "sequence" : "playlist");
+
+    item["startTime"] = (Json::UInt64)occurrence.start;
+    item["endTime"] = (Json::UInt64)occurrence.end;
+
+    localtime_r(&occurrence.start, &timeStruct);
+    FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+    item["startTimeStr"] = timeStr;
+    FormatTime(timeStr, sizeof(timeStr), "%Y%m%d", &timeStruct);
+    item["startDateStr"] = timeStr;
+    item["startDateInt"] = atoi(timeStr);
+
+    localtime_r(&occurrence.end, &timeStruct);
+    FormatTime(timeStr, sizeof(timeStr), timeFmt.c_str(), &timeStruct);
+    item["endTimeStr"] = timeStr;
+    FormatTime(timeStr, sizeof(timeStr), "%Y%m%d", &timeStruct);
+    item["endDateStr"] = timeStr;
+    item["endDateInt"] = atoi(timeStr);
+
+    if (entry.playlist.empty()) {
+        item["command"] = entry.command;
+        item["args"] = entry.args;
+    } else {
+        Json::Value args(Json::arrayValue);
+        args.append(entry.playlist);
+        args.append(entry.repeat ? "true" : "false");
+        args.append("false");
+
+        item["command"] = "Start Playlist";
+        item["args"] = args;
+        item["playlist"] = entry.playlist;
+    }
+
+    item["multisyncCommand"] = entry.multisyncCommand;
+    item["multisyncHosts"] = entry.multisyncHosts;
+    item["stopTypeStr"] = entry.stopType == 0 ? "Graceful" : (entry.stopType == 1 ? "Hard" : "Graceful Loop");
+    item["repeat"] = entry.repeat;
+    item["repeatInterval"] = entry.repeatInterval;
+
+    return item;
+}
+
+Json::Value Scheduler::GetScheduleRange(time_t rangeStart, time_t rangeEnd,
+                                        bool includeDisabled, bool daySummary) {
+    std::string timeFmt = getSetting("DateFormat") + " @ " + getSetting("TimeFormat");
+    Json::Value result;
+    Json::Value entries(Json::arrayValue);
+    Json::Value items(Json::arrayValue);
+    std::vector<Occurrence> expanded;
+
+    // The walk below steps a day at a time from rangeStart; a start whose
+    // year doesn't fit in a struct tm makes localtime_r fail and leaves the
+    // cursor at -1, i.e. trillions of steps.  Keep both ends in 1970..9999
+    // here rather than trusting every caller to.
+    static constexpr time_t MAX_RANGE_TIME = 253402300799; // 9999-12-31 23:59:59 UTC
+    if (rangeStart < 0 || rangeEnd < rangeStart || rangeEnd > MAX_RANGE_TIME) {
+        result["entries"] = entries;
+        result["items"] = items;
+        return result;
+    }
+
+    // Work from a copy of the schedule so the expansion below never holds the
+    // scheduler lock.  ScheduleProc() takes the same lock to start and stop
+    // playlists, and expanding a large range takes long enough that holding it
+    // throughout would delay a show.  Copying a handful of entries is cheap.
+    std::vector<ScheduleEntry> schedule;
     {
-      displayDiff = diff;
+        std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+
+        result["enabled"] = m_schedulerDisabled ? 0 : 1;
+        schedule = m_Schedule;
     }
 
-    if (m_currentSchedulePlaylist.startWeeklySeconds && displayDiff)
-      LogDebug(VB_SCHEDULE, "NowSecs = %d, CurrStartSecs = %d (%d seconds away)\n",
-        nowWeeklySeconds,m_currentSchedulePlaylist.startWeeklySeconds, displayDiff);
+    for (int i = 0; i < schedule.size(); i++) {
+        Json::Value entry = schedule[i].GetJson();
+        entry["id"] = i;
+        entry["type"] = schedule[i].playlist.empty() ? "command" : "playlist";
+        entry["dayStr"] = GetDayTextFromDayIndex(schedule[i].dayIndex);
+        entries.append(entry);
+    }
+    result["entries"] = entries;
 
-    if(nowWeeklySeconds == m_currentSchedulePlaylist.startWeeklySeconds)
+    struct tm timeStruct;
+    char timeStr[32];
+
+    // An entry starting late in the day can run past midnight, so start a day
+    // early to catch occurrences that overlap into the requested range.  Walk
+    // the range from midday to midday: a 23 or 25 hour DST day would otherwise
+    // let a fixed 86400s step skip or repeat a calendar date.
+    if (!localtime_r(&rangeStart, &timeStruct)) {
+        result["items"] = items;
+        return result;
+    }
+    timeStruct.tm_hour = 12;
+    timeStruct.tm_min = 0;
+    timeStruct.tm_sec = 0;
+    timeStruct.tm_isdst = -1;
+    timeStruct.tm_mday -= 1;
+    time_t cursor = mktime(&timeStruct);
+
+    // This runs on an API thread for whatever range the calendar asks for;
+    // what the expansion finds wrong (a year past a lunar table) belongs in
+    // this response, not in the scheduler's load warnings.
+    SchedulePreviewScope previewScope;
+    for (; cursor <= (rangeEnd + SECONDS_PER_DAY); cursor += SECONDS_PER_DAY) {
+        localtime_r(&cursor, &timeStruct);
+        int year = timeStruct.tm_year + 1900;
+        int month = timeStruct.tm_mon + 1;
+        int mday = timeStruct.tm_mday;
+
+        for (int i = 0; i < schedule.size(); i++) {
+            ScheduleEntry& entry = schedule[i];
+
+            if (!entry.enabled && !includeDisabled)
+                continue;
+
+            std::vector<std::pair<time_t, time_t>> occurrences;
+            entry.GetOccurrencesOnDate(year, month, mday, occurrences);
+
+            int dayKey = (year * 10000) + (month * 100) + mday;
+
+            for (auto& occurrence : occurrences) {
+                // A command fires at a point in time - only playlists occupy the
+                // window up to their end time.  AddScheduledItems() makes the
+                // same distinction, so match it or the calendar would draw a
+                // repeating command as a block instead of a marker.
+                if (entry.playlist.empty())
+                    occurrence.second = occurrence.first;
+
+                if ((occurrence.second < rangeStart) || (occurrence.first > rangeEnd))
+                    continue;
+
+                expanded.push_back({ .entryIndex = i,
+                                     .dayKey = dayKey,
+                                     .start = occurrence.first,
+                                     .end = occurrence.second,
+                                     .overridden = false });
+            }
+        }
+    }
+
+    // Flag playlist occurrences the scheduler would skip because a
+    // higher-priority (lower index) playlist is already running at that point.
+    // Only playlists can override, and a schedule of repeating commands can run
+    // to tens of thousands of occurrences, so collect the playlist windows once
+    // rather than rescanning everything for every occurrence.
+    std::vector<Occurrence> playlistWindows;
+    for (const auto& occurrence : expanded) {
+        if (!schedule[occurrence.entryIndex].playlist.empty())
+            playlistWindows.push_back(occurrence);
+    }
+
+    for (auto& occurrence : expanded) {
+        if (schedule[occurrence.entryIndex].playlist.empty())
+            continue;
+
+        for (const auto& window : playlistWindows) {
+            if (window.entryIndex >= occurrence.entryIndex)
+                continue;
+
+            if ((window.start <= occurrence.start) && (window.end > occurrence.start)) {
+                occurrence.overridden = true;
+                break;
+            }
+        }
+    }
+
+    if (daySummary) {
+        // Coarse views cannot show hundreds of occurrences per cell and do not
+        // need to: what matters there is which entries are active on a day.
+        // Collapse to one item per entry per day and carry the occurrence count
+        // so the caller can label it; the detail views ask for the full list.
+        std::map<std::pair<int, int>, Occurrence> byDay;
+        std::map<std::pair<int, int>, int> counts;
+
+        for (const auto& occurrence : expanded) {
+            auto key = std::make_pair(occurrence.dayKey, occurrence.entryIndex);
+            counts[key]++;
+
+            auto it = byDay.find(key);
+            if (it == byDay.end()) {
+                byDay[key] = occurrence;
+            } else {
+                // Span the whole day's activity for this entry
+                it->second.start = std::min(it->second.start, occurrence.start);
+                it->second.end = std::max(it->second.end, occurrence.end);
+                it->second.overridden = it->second.overridden && occurrence.overridden;
+            }
+        }
+
+        for (const auto& [key, occurrence] : byDay) {
+            Json::Value item = BuildScheduleRangeItem(schedule[occurrence.entryIndex],
+                                                      occurrence, timeFmt);
+            item["count"] = counts[key];
+            item["summary"] = true;
+            items.append(item);
+        }
+    } else {
+        for (const auto& occurrence : expanded) {
+            Json::Value item = BuildScheduleRangeItem(schedule[occurrence.entryIndex],
+                                                      occurrence, timeFmt);
+            item["count"] = 1;
+            item["summary"] = false;
+            items.append(item);
+        }
+    }
+
+    result["items"] = items;
+    if (!previewScope.warnings().empty()) {
+        Json::Value warnings(Json::arrayValue);
+        for (const auto& w : previewScope.warnings())
+            warnings.append(w.second);
+        result["warnings"] = warnings;
+    }
+    result["rangeStart"] = (Json::UInt64)rangeStart;
+    result["rangeEnd"] = (Json::UInt64)rangeEnd;
+    result["daySummary"] = daySummary;
+    result["scheduleDistance"] = getSettingInt("ScheduleDistance");
+
+    return result;
+}
+
+void Scheduler::SetTimeDelta(int delta, int timeLimit) {
+    // Under the schedule lock: the load path reads and resets m_timeDelta
+    // there, and this runs on the command's thread.
+    std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
+    m_timeDelta = m_timeDelta + delta;
+    m_timeDeltaThreshold = time(NULL) + timeLimit;
+    // Trigger a reload the next time Scheduler::ScheduleProc() is called
+    m_loadSchedule = true;
+}
+
+bool Scheduler::StartNextScheduledItemNow() {
+    // Decide under the lock and copy everything the player calls need, then
+    // release it before calling the player.  See Scheduler.h for why.
+    std::vector<PlayerAction> actions;
+
     {
-      m_NextScheduleHasbeenLoaded = 0;
-      LogInfo(VB_SCHEDULE, "Schedule Entry: %02d:%02d:%02d - %02d:%02d:%02d - Starting Playlist %s for %d seconds\n",
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].startHour,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].startMinute,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].startSecond,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].endHour,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].endMinute,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].endSecond,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].playList,
-        m_currentSchedulePlaylist.endWeeklySeconds - m_currentSchedulePlaylist.startWeeklySeconds);
-      LogDebug(VB_SCHEDULE, "NowSecs = %d, CurrStartSecs = %d, CurrEndSecs = %d (%d seconds away)\n",
-        nowWeeklySeconds, m_currentSchedulePlaylist.startWeeklySeconds, m_currentSchedulePlaylist.endWeeklySeconds, displayDiff);
+        std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
 
-      if ((FPPstatus != FPP_STATUS_IDLE) && (!playlist->WasScheduled()))
-        playlist->StopNow(1);
+        ScheduledItem* item = GetNextScheduledPlaylist();
 
-      playlist->Play(m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].playList,
-        0, m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].repeat, 1);
-      playlist->Start();
-    }
-  }
-}
+        if (!item)
+            return false;
 
-void Scheduler::PlayListStopCheck(void)
-{
-  time_t currTime = time(NULL);
-  struct tm now;
-  
-  localtime_r(&currTime, &now);
+        if (Player::INSTANCE.GetStatus() != FPP_STATUS_IDLE) {
+            LogDebug(VB_SCHEDULE, "Force-Stopping running playlist\n");
+            actions.push_back({ .type = PlayerAction::Type::StopNow,
+                                .forceStop = 1 });
+        }
 
-  int nowWeeklySeconds = GetWeeklySeconds(now.tm_wday, now.tm_hour, now.tm_min, now.tm_sec);
+        LogDebug(VB_SCHEDULE, "Force-Starting next scheduled playlist now:\n");
+        DumpScheduledItem(item->startTime, *item);
 
-  if (m_nowWeeklySeconds2 != nowWeeklySeconds)
-  {
-    m_nowWeeklySeconds2 = nowWeeklySeconds;
-
-    int diff = m_currentSchedulePlaylist.endWeeklySeconds - nowWeeklySeconds;
-    int displayDiff = 0;
-
-    // Convoluted code to print the countdown more frequently as we get closer
-    if (((diff > 300) &&                  ((diff % 300) == 0)) ||
-        ((diff >  60) && (diff <= 300) && ((diff %  60) == 0)) ||
-        ((diff >  10) && (diff <=  60) && ((diff %  10) == 0)) ||
-        (                (diff <=  10)))
-    {
-      displayDiff = diff;
+        actions.push_back({ .type = PlayerAction::Type::StartPlaylist,
+                            .playlist = item->entry->playlist,
+                            .position = 0,
+                            .repeat = item->entry->repeat,
+                            .entryIndex = item->entryIndex,
+                            .priority = item->entryIndex, // priority is entry index for now
+                            .startTime = time(NULL),
+                            .endTime = item->endTime,
+                            .stopType = item->entry->stopType });
     }
 
-    if (displayDiff)
-      LogDebug(VB_SCHEDULE, "NowSecs = %d, CurrEndSecs = %d (%d seconds away)\n",
-        nowWeeklySeconds, m_currentSchedulePlaylist.endWeeklySeconds, displayDiff);
+    RunPlayerActions(actions);
 
-    // This check for 1 second ago is a hack rather than a more invasive
-    // patch to handle the race condition if we miss this check on the exact
-    // second the schedule should be ending.  The odds of us missing 2 in a row
-    // are much lower, so this will suffice for v1.0.
-	int stopPlaying = 0;
+    return true;
+}
 
-	if ((m_currentSchedulePlaylist.endWeeklySeconds < (24 * 60 * 60)) &&
-			 (m_currentSchedulePlaylist.startWeeklySeconds > (6 * 24 * 60 * 60)) &&
-			 (nowWeeklySeconds >= m_currentSchedulePlaylist.endWeeklySeconds) &&
-			 (nowWeeklySeconds < m_currentSchedulePlaylist.startWeeklySeconds))
-	{
-		stopPlaying = 1;
-	}
-	else if ((nowWeeklySeconds == m_currentSchedulePlaylist.endWeeklySeconds) ||
-			 (nowWeeklySeconds == (m_currentSchedulePlaylist.endWeeklySeconds + 1)))
-	{
-		stopPlaying = 1;
-	}
+class ScheduleCommand : public Command {
+public:
+    ScheduleCommand(const std::string& str, Scheduler* s) :
+        Command(str),
+        sched(s) {}
+    virtual ~ScheduleCommand() {}
 
-	if (stopPlaying)
-    {
-      LogInfo(VB_SCHEDULE, "Schedule Entry: %02d:%02d:%02d - %02d:%02d:%02d - Stopping Playlist Gracefully\n",
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].startHour,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].startMinute,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].startSecond,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].endHour,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].endMinute,
-        m_Schedule[m_currentSchedulePlaylist.ScheduleEntryIndex].endSecond);
-      m_CurrentScheduleHasbeenLoaded = 0;
-      playlist->StopGracefully();
+    Scheduler* sched;
+};
+
+class StartNextItemCommand : public ScheduleCommand {
+public:
+    StartNextItemCommand(Scheduler* s) :
+        ScheduleCommand("Start Next Scheduled Item", s) {
     }
-  }
+
+    virtual std::unique_ptr<Command::Result> run(const std::vector<std::string>& args) override {
+        if (sched->StartNextScheduledItemNow())
+            return std::make_unique<Command::Result>("Next scheduled item started");
+        else
+            return std::make_unique<Command::Result>("Unable to start next scheduled item");
+    }
+};
+
+// Command arguments arrive as strings after %VAR% replacement, so an unset
+// variable hands us "" and a typo hands us anything at all.  std::stoi() throws
+// on both, and these commands run on a detached scheduler thread.
+static bool ParseIntArg(const std::string& str, int& out) {
+    if (str.empty()) {
+        return false;
+    }
+
+    const char* start = str.c_str();
+    char* end = nullptr;
+    errno = 0;
+    long v = strtol(start, &end, 10);
+
+    // "Consumed nothing" has to be decided BEFORE the trailing-whitespace skip
+    // below moves `end`: strtol() skips leading whitespace itself, so an
+    // all-whitespace argument leaves end == start with v == 0, and skipping
+    // first walks end to the terminator and makes the test pass -- reporting a
+    // successful parse of 0 for an argument that held no number at all.
+    if (end == start) {
+        return false;
+    }
+
+    while ((*end == ' ') || (*end == '\t')) {
+        end++;
+    }
+
+    if ((*end != '\0') || (errno == ERANGE) ||
+        (v < INT_MIN) || (v > INT_MAX)) {
+        return false;
+    }
+
+    out = (int)v;
+    return true;
 }
 
-void Scheduler::LoadScheduleFromFile(void)
-{
-  FILE *fp;
-  char buf[512];
-  char *s;
-  m_ScheduleEntryCount=0;
-  int day;
+class ExtendScheduleCommand : public ScheduleCommand {
+public:
+    ExtendScheduleCommand(Scheduler* s) :
+        ScheduleCommand("Extend Schedule", s) {
+        args.push_back(CommandArg("Seconds", "int", "Extend for Seconds").setRange(-12 * 60 * 60, 12 * 60 * 60).setDefaultValue("300").setAdjustable());
+        args.push_back(CommandArg("Limit", "int", "For schedule events occurring in the next x Seconds").setRange(-12 * 60 * 60, 12 * 60 * 60).setDefaultValue("0").setAdjustable());
+    }
 
-  m_lastLoadDate = GetCurrentDateInt();
+    virtual std::unique_ptr<Command::Result> run(const std::vector<std::string>& args) override {
+        if (args.size() < 1) {
+            return std::make_unique<Command::ErrorResult>("Command needs at least 1 argument, found " + std::to_string(args.size()));
+        }
+        int seconds = 0;
+        if (!ParseIntArg(args[0], seconds)) {
+            return std::make_unique<Command::ErrorResult>("Seconds argument '" + args[0] + "' is not a number");
+        }
 
-  pthread_mutex_lock(&m_scheduleLock);
-  m_schedule.clear();
+        int limit = 0;
+        if ((args.size() > 1) && !args[1].empty() && !ParseIntArg(args[1], limit)) {
+            return std::make_unique<Command::ErrorResult>("Limit argument '" + args[1] + "' is not a number");
+        }
 
-  LogInfo(VB_SCHEDULE, "Loading Schedule from %s\n",getScheduleFile());
-  fp = fopen((const char *)getScheduleFile(), "r");
-  if (fp == NULL) 
-  {
-		return;
-  }
-  while(fgets(buf, 512, fp) != NULL)
-  {
-	ScheduleEntry scheduleEntry;
-	scheduleEntry.LoadFromString(buf);
-	m_schedule.push_back(scheduleEntry);
+        if (Player::INSTANCE.AdjustPlaylistStopTime(seconds)) {
+            if (limit != 0) {
+                scheduler->SetTimeDelta(seconds, limit);
+            }
+            return std::make_unique<Command::Result>("Schedule Updated");
+        }
+        return std::make_unique<Command::Result>("Error extending Schedule");
+    }
+};
 
-    while (isspace(buf[strlen(buf)-1]))
-        buf[strlen(buf)-1] = 0x0;
-
-    // Enable
-    s=strtok(buf,",");
-    m_Schedule[m_ScheduleEntryCount].enable = atoi(s);
-    // Playlist Name
-    s=strtok(NULL,",");
-    strcpy(m_Schedule[m_ScheduleEntryCount].playList,s);
-    // Start Day index
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].dayIndex = atoi(s);
-    // Start Hour
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].startHour = atoi(s);
-    // Start Minute
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].startMinute = atoi(s);
-    // Start Second
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].startSecond = atoi(s);
-    // End Hour
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].endHour = atoi(s);
-    // End Minute
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].endMinute = atoi(s);
-    // End Second
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].endSecond = atoi(s);
-		// Repeat
-    s=strtok(NULL,",");
-    m_Schedule[m_ScheduleEntryCount].repeat = atoi(s);
-
-    // Start Date
-    s=strtok(NULL,",");
-    if (s && strcmp(s, ""))
-      m_Schedule[m_ScheduleEntryCount].startDate = DateStrToInt(s);
-    else
-      m_Schedule[m_ScheduleEntryCount].startDate = 20140101;
-
-    // End Date
-    s=strtok(NULL,",");
-    if (s && strcmp(s, ""))
-      m_Schedule[m_ScheduleEntryCount].endDate = DateStrToInt(s);
-    else
-      m_Schedule[m_ScheduleEntryCount].endDate = 20991231;
-
-	// Check for sunrise/sunset flags
-	if (m_Schedule[m_ScheduleEntryCount].startHour == 25)
-		GetSunInfo( 0,
-					m_Schedule[m_ScheduleEntryCount].startHour,
-					m_Schedule[m_ScheduleEntryCount].startMinute,
-					m_Schedule[m_ScheduleEntryCount].startSecond);
-	else if (m_Schedule[m_ScheduleEntryCount].startHour == 26)
-		GetSunInfo( 1,
-					m_Schedule[m_ScheduleEntryCount].startHour,
-					m_Schedule[m_ScheduleEntryCount].startMinute,
-					m_Schedule[m_ScheduleEntryCount].startSecond);
-
-	if (m_Schedule[m_ScheduleEntryCount].endHour == 25)
-		GetSunInfo( 0,
-					m_Schedule[m_ScheduleEntryCount].endHour,
-					m_Schedule[m_ScheduleEntryCount].endMinute,
-					m_Schedule[m_ScheduleEntryCount].endSecond);
-	else if (m_Schedule[m_ScheduleEntryCount].endHour == 26)
-		GetSunInfo( 1,
-					m_Schedule[m_ScheduleEntryCount].endHour,
-					m_Schedule[m_ScheduleEntryCount].endMinute,
-					m_Schedule[m_ScheduleEntryCount].endSecond);
-
-    // Set WeeklySecond start and end times
-    SetScheduleEntrysWeeklyStartAndEndSeconds(&m_Schedule[m_ScheduleEntryCount]);
-    m_ScheduleEntryCount++;
-  }
-  fclose(fp);
-
-  pthread_mutex_unlock(&m_scheduleLock);
-
-  SchedulePrint();
-
-  return;
-}
-
-void Scheduler::SchedulePrint(void)
-{
-  int i=0;
-
-  LogInfo(VB_SCHEDULE, "Current Schedule: (Status: '+' = Enabled, '-' = Disabled, '!' = Outside Date Range, '*' = Repeat)\n");
-  LogInfo(VB_SCHEDULE, "St  Start & End Dates       Days         Start & End Times   Playlist\n");
-  LogInfo(VB_SCHEDULE, "--- ----------------------- ------------ ------------------- ---------------------------------------------\n");
-  for(i=0;i<m_ScheduleEntryCount;i++)
-  {
-    char dayStr[32];
-    GetDayTextFromDayIndex(m_Schedule[i].dayIndex, dayStr);
-    LogInfo(VB_SCHEDULE, "%c%c%c %04d-%02d-%02d - %04d-%02d-%02d %-12.12s %02d:%02d:%02d - %02d:%02d:%02d %s\n",
-      m_Schedule[i].enable ? '+': '-',
-      CurrentDateInRange(m_Schedule[i].startDate, m_Schedule[i].endDate) ? ' ': '!',
-      m_Schedule[i].repeat ? '*': ' ',
-      (int)(m_Schedule[i].startDate / 10000),
-      (int)(m_Schedule[i].startDate % 10000 / 100),
-      (int)(m_Schedule[i].startDate % 100),
-      (int)(m_Schedule[i].endDate / 10000),
-      (int)(m_Schedule[i].endDate % 10000 / 100),
-      (int)(m_Schedule[i].endDate % 100),
-      dayStr,
-      m_Schedule[i].startHour,m_Schedule[i].startMinute,m_Schedule[i].startSecond,
-      m_Schedule[i].endHour,m_Schedule[i].endMinute,m_Schedule[i].endSecond,
-      m_Schedule[i].playList);
-  }
-
-  //////////////////////////////////////////////////////////////////////////
-#if 0
-  LogDebug(VB_SCHEDULE, "//////////////////////////////////////////////////\n");
-  LogDebug(VB_SCHEDULE, "Now, the C++ version for comparison\n");
-  pthread_mutex_lock(&m_scheduleLock);
-  for (i = 0; i < m_schedule.size(); i++)
-  {
-    char dayStr[32];
-    GetDayTextFromDayIndex(m_schedule[i].m_dayIndex, dayStr);
-    LogInfo(VB_SCHEDULE, "%c%c%c %04d-%02d-%02d - %04d-%02d-%02d %-12.12s %02d:%02d:%02d - %02d:%02d:%02d %s\n",
-      m_schedule[i].m_enabled ? '+': '-',
-      CurrentDateInRange(m_schedule[i].m_startDate, m_schedule[i].m_endDate) ? ' ': '!',
-      m_schedule[i].m_repeating ? '*': ' ',
-      (int)(m_schedule[i].m_startDate / 10000),
-      (int)(m_schedule[i].m_startDate % 10000 / 100),
-      (int)(m_schedule[i].m_startDate % 100),
-      (int)(m_schedule[i].m_endDate / 10000),
-      (int)(m_schedule[i].m_endDate % 10000 / 100),
-      (int)(m_schedule[i].m_endDate % 100),
-      dayStr,
-      m_schedule[i].m_startHour,m_schedule[i].m_startMinute,m_schedule[i].m_startSecond,
-      m_schedule[i].m_endHour,m_schedule[i].m_endMinute,m_schedule[i].m_endSecond,
-      m_schedule[i].m_playlistName.c_str());
-  }
-  pthread_mutex_unlock(&m_scheduleLock);
-#endif
-  LogDebug(VB_SCHEDULE, "//////////////////////////////////////////////////\n");
-}
-
-int Scheduler::GetWeeklySeconds(int day, int hour, int minute, int second)
-{
-  int weeklySeconds = (day*SECONDS_PER_DAY) + (hour*SECONDS_PER_HOUR) + (minute*SECONDS_PER_MINUTE) + second;
-  return weeklySeconds;
-}
-
-int Scheduler::GetWeeklySecondDifference(int weeklySeconds1, int weeklySeconds2)
-{
-  int seconds = 0;
-  int i;
-  if(weeklySeconds1<weeklySeconds2)
-  {
-    seconds = weeklySeconds2-weeklySeconds1;
-  }
-  else if (weeklySeconds1 > weeklySeconds2)
-  {
-    seconds = (SECONDS_PER_WEEK - weeklySeconds1) + weeklySeconds2;
-  }
-
-  return seconds;
-}
-
-int Scheduler::GetDayFromWeeklySeconds(int weeklySeconds)
-{
-  return (int)(weeklySeconds/SECONDS_PER_DAY);
-}
-
-int Scheduler::FindNextStartingScheduleIndex(void)
-{
-	int i = 0;
-	int index = -1;
-	int currentDate = GetCurrentDateInt();
-	int schedDate = 99999999;
-	int weeklySecondStart = 999999;
-	for(i = 0; i < m_ScheduleEntryCount; i++)
-	{
-		if ((m_Schedule[i].enable) &&
-			(m_Schedule[i].startDate >= currentDate) &&
-			(m_Schedule[i].endDate < schedDate))
-		{
-			index = i;
-			schedDate = m_Schedule[i].endDate;
-		}
-	}
-
-	return index;
-}
-
-void Scheduler::GetNextScheduleStartText(char * txt)
-{
-	if (!m_NextScheduleHasbeenLoaded)
-		return;
-
-	if (m_nextSchedulePlaylist.ScheduleEntryIndex >= 0)
-	{
-		GetScheduleEntryStartText(m_nextSchedulePlaylist.ScheduleEntryIndex,m_nextSchedulePlaylist.weeklySecondIndex,txt);
-	}
-	else
-	{
-		char dayText[16];
-		int found = FindNextStartingScheduleIndex();
-		if (found >= 0)
-		{
-			GetDayTextFromDayIndex(m_Schedule[found].dayIndex,dayText);
-			sprintf(txt, "%04d-%02d-%02d @ %02d:%02d:%02d - (%s)\n",
-				(int)(m_Schedule[found].startDate / 10000),
-				(int)(m_Schedule[found].startDate % 10000 / 100),
-				(int)(m_Schedule[found].startDate % 100),
-				m_Schedule[found].startHour,
-				m_Schedule[found].startMinute,
-				m_Schedule[found].startSecond,
-				dayText);
-		}
-	}
-}
-
-void Scheduler::GetNextPlaylistText(char * txt)
-{
-	if (!m_NextScheduleHasbeenLoaded)
-		return;
-
-	if (m_nextSchedulePlaylist.ScheduleEntryIndex >= 0)
-	{
-		strcpy(txt,m_Schedule[m_nextSchedulePlaylist.ScheduleEntryIndex].playList);
-	}
-	else
-	{
-		int found = FindNextStartingScheduleIndex();
-
-		if (found >= 0)
-			strcpy(txt,m_Schedule[found].playList);
-	}
-}
-
-void Scheduler::GetScheduleEntryStartText(int index,int weeklySecondIndex, char * txt)
-{
-		char text[64];
-		char dayText[16];
-    int dayIndex = GetDayFromWeeklySeconds(m_Schedule[index].weeklyStartSeconds[weeklySecondIndex]);
-    GetDayTextFromDayIndex(dayIndex,text);
-		if(m_Schedule[index].dayIndex > INX_SAT)
-		{
-			GetDayTextFromDayIndex(m_Schedule[index].dayIndex,dayText);
-			sprintf(txt,"%s @ %02d:%02d:%02d - (%s)",
-							text,m_Schedule[index].startHour,m_Schedule[index].startMinute,m_Schedule[index].startSecond,dayText);
-		}
-		else
-		{
-			sprintf(txt,"%s @ %02d:%02d:%02d",
-							text,m_Schedule[index].startHour,m_Schedule[index].startMinute,m_Schedule[index].startSecond);
-		}		
-}
-
-void Scheduler::GetDayTextFromDayIndex(int index,char * txt)
-{
-	if (index & INX_DAY_MASK)
-	{
-		strcpy(txt,"Day Mask");
-		return;
-	}
-
-	switch(index)
-	{
-		case 0:
-			strcpy(txt,"Sunday");
-			break;		
-		case 1:
-			strcpy(txt,"Monday");
-			break;		
-		case 2:
-			strcpy(txt,"Tuesday");
-			break;		
-		case 3:
-			strcpy(txt,"Wednesday");
-			break;		
-		case 4:
-			strcpy(txt,"Thursday");
-			break;		
-		case 5:
-			strcpy(txt,"Friday");
-			break;		
-		case 6:
-			strcpy(txt,"Saturday");
-			break;		
-		case 7:
-			strcpy(txt,"Everyday");
-			break;	
-		case 8:
-			strcpy(txt,"Weekdays");
-			break;	
-		case 9:
-			strcpy(txt,"Weekends");
-			break;	
-		case 10:
-			strcpy(txt,"Mon/Wed/Fri");
-			break;	
-		case 11:
-			strcpy(txt,"Tues-Thurs");
-			break;	
-		case 12:
-			strcpy(txt,"Sun-Thurs");
-			break;	
-		case 13:
-			strcpy(txt,"Fri/Sat");
-			break;	
-		default:
-			strcpy(txt, "Error\0");
-			break;	
-	}
+void Scheduler::RegisterCommands() {
+    CommandManager::INSTANCE.addCategorizedCommand(new StartNextItemCommand(this), "Playlist", 1);
+    CommandManager::INSTANCE.addCategorizedCommand(new ExtendScheduleCommand(this), "Playlist", 1);
 }

@@ -1,0 +1,373 @@
+#!/usr/bin/php
+<?php
+
+$newFirmwareFile = '';
+$force = false;
+$resetDefaults = false;
+
+// Parse all flags and the firmware filename from command line arguments
+for ($i = 1; $i < $argc; $i++) {
+    if ($argv[$i] == 'force') {
+        $force = true;
+    } else if ($argv[$i] == 'resetDefaults') {
+        $resetDefaults = true;
+    } else {
+        $newFirmwareFile = $argv[$i];
+    }
+}
+
+$fppcapedetectFlags = $resetDefaults ? " -force-defaults" : "";
+
+// Walk the EEPROM data sections and locate the signature section (code 99)
+// and the end-of-data terminator.  Returns:
+//   sig_offset: byte offset of the code 99 length tag, or null if no signature
+//   end_offset: byte offset right after the trailing 0-length terminator
+function find_eeprom_offsets($data)
+{
+    $dataLen = strlen($data);
+    if ($dataLen < 64) {
+        return ['sig_offset' => null, 'end_offset' => $dataLen];
+    }
+
+    $pos = 58; // skip fixed header (format + capeName + capeVersion + capeSerial)
+    $sigOffset = null;
+    while ($pos + 8 <= $dataLen) {
+        $len = intval(substr($data, $pos, 6));
+        if ($len == 0) {
+            return ['sig_offset' => $sigOffset, 'end_offset' => $pos + 6];
+        }
+        $flag = intval(substr($data, $pos + 6, 2));
+        if ($sigOffset === null && $flag == 99) {
+            $sigOffset = $pos;
+        }
+        $advance = 8 + $len;
+        if ($flag < 50) {
+            // file sections include a 64-byte filename in addition to $len bytes of data
+            $advance += 64;
+        }
+        $pos += $advance;
+    }
+
+    return ['sig_offset' => $sigOffset, 'end_offset' => $dataLen];
+}
+
+// Mint a serial number for a cape whose EEPROM carries no identity of its own.
+//
+// A downloadable vendor image is one file written to every cape of that model,
+// so whatever serial it was built with is a SAMPLE, not this unit's identity --
+// every KulpLights and WiredWatts image carries one, and the two generic images
+// in capes/other/ show the shape (190517124410). Copying it verbatim onto a
+// blank EEPROM gives every cape built that way the same serial, which defeats
+// the one job a serial has.
+//
+// 'FPP-' + 12 hex is 16 bytes, exactly the field width. The prefix says plainly
+// that FPP generated this rather than a vendor assigning it, so a vendor
+// receiving one knows there is no order record behind it -- and it cannot be
+// confused with FPP-INTERNAL, which is compared by equality everywhere it is
+// used. 48 random bits: for a population in the hundreds of thousands the
+// chance of any collision is a few thousandths of a percent, where copying the
+// sample serial guarantees one.
+function mintCapeSerial()
+{
+    return 'FPP-' . strtoupper(bin2hex(random_bytes(6)));
+}
+
+// Blank the value of the 'cs' extra (a type 97 key/value record), in place and
+// without moving anything: the record keeps its length, so every offset after it
+// -- including the signature section and what the signature covers -- is
+// untouched. Returns the data; sets $cleared to whether there was one.
+function blankCapeChecksum($data, &$cleared)
+{
+    $cleared = false;
+    $pos = 58;
+    $dataLen = strlen($data);
+    while ($pos + 8 <= $dataLen) {
+        $len = intval(substr($data, $pos, 6));
+        if ($len == 0) {
+            break;
+        }
+        $flag = intval(substr($data, $pos + 6, 2));
+        if ($flag == 97 && $len >= 12) {
+            $key = trim(substr($data, $pos + 8, 12), "\0 \t\r\n");
+            if ($key === 'cs') {
+                $vOff = $pos + 8 + 12;
+                $vLen = $len - 12;
+                $data = substr_replace($data, str_repeat("\0", $vLen), $vOff, $vLen);
+                $cleared = true;
+            }
+        }
+        $pos += 8 + $len + ($flag < 50 ? 64 : 0);
+    }
+    return $data;
+}
+
+$eepromFile = "/sys/bus/i2c/devices/1-0050/eeprom";
+if (file_exists("/home/fpp/media/tmp/eeprom_location.txt")) {
+    $eepromFile = file_get_contents("/home/fpp/media/tmp/eeprom_location.txt");
+    if ($eepromFile == "/sys/bus/i2c/devices/1-0050/eeprom") {
+        file_put_contents("/sys/bus/i2c/devices/i2c-1/new_device", "24c256 0x50");
+    } else if ($eepromFile == "/sys/bus/i2c/devices/2-0050/eeprom") {
+        file_put_contents("/sys/bus/i2c/devices/i2c-2/new_device", "24c256 0x50");
+    }
+    usleep(100000);
+}
+if (!file_exists($eepromFile)) {
+    $eepromFile = '/home/fpp/media/config/cape-eeprom.bin';
+    if (!file_exists($eepromFile)) {
+        if (preg_match('/^\/opt\/fpp\/capes/', $newFirmwareFile)) {
+            echo "Installing new virtual EEPROM.\n";
+            copy($newFirmwareFile, $eepromFile);
+            chown($eepromFile, 'fpp');
+            chgrp($eepromFile, 'fpp');
+            chmod($eepromFile, 0644);
+
+            echo "======================\n";
+            echo "Running fppcapedetect:\n\n";
+
+            system("/opt/fpp/src/fppcapedetect" . $fppcapedetectFlags);
+            echo "\nFinished, please reboot.\n";
+            return 0;
+        } else {
+            echo "Could not find EEPROM.  Is Cape mounted and FPP rebooted?\n";
+            return 1;
+        }
+    }
+}
+
+//backup the old firmware
+$date = new DateTime();
+$timestamp = date_format($date, 'Ymd-His');
+$backupFile = "/home/fpp/media/upload/cape-eeprom-Backup-" . $timestamp . ".bin";
+
+//copy($newFirmwareFile, "/home/fpp/media/upload/cape-firmware-new.bin");
+
+$olddata = fopen($eepromFile, 'r+b');
+set_file_buffer($olddata, 32768);
+$oldheader = trim(fread($olddata, 6)); // should be FPP02 + null
+if ($oldheader != "FPP02") {
+    //first 4 bytes are 0xFF, assume blank eeprom and just write what we have
+    echo "Blank EEPROM, overwriting";
+    fclose($olddata);
+
+    // This is the one place a cape gets its identity: the EEPROM was blank, so
+    // there is no existing serial to preserve (the upgrade path below keeps
+    // whatever the cape already had). Give it its own, unless the image says
+    // otherwise:
+    //
+    //   FPP-INTERNAL is special. It marks a virtual EEPROM -- FPP's own generic
+    //   images for a Pi's GPIO header, which is not a cape and has no per-unit
+    //   identity to record. cape-info.php keys the licensing display off that
+    //   exact value, so replacing it would change what the signing UI shows.
+    //
+    // A signed image is NOT an exception, though it looks like it should be.
+    // The signature is computed from the byte AFTER the signature section to the
+    // terminator (CapeUtils.cpp DoSignatureVerify captures ftell() on entry), so
+    // the 58-byte header holding the serial is outside it -- which is also why
+    // the upgrade path below rewrites the cape name and version at offsets 6-41
+    // and still expects the signature to verify. Rewriting the serial keeps a
+    // signed image valid, and skipping signed images would have skipped exactly
+    // the case this exists for: the real vendor images are signed AND carry a
+    // sample serial.
+    //
+    // Nor does it disturb a cape that is signed and bound to hardware: for
+    // those the serial comes from the signed section 96 record, which overrides
+    // the header (CapeUtils.cpp case 96).
+    $newData = file_get_contents($newFirmwareFile);
+    if ($newData === false) {
+        echo "\nERROR: could not read $newFirmwareFile\n";
+        return 1;
+    }
+    $imageSerial = trim(substr($newData, 42, 16), "\0 \t\r\n");
+    if ($imageSerial === 'FPP-INTERNAL') {
+        echo " (virtual EEPROM, keeping FPP-INTERNAL)\n";
+    } else {
+        $minted = mintCapeSerial();
+        $newData = substr_replace($newData, pack('a16', $minted), 42, 16);
+        echo "\nAssigned this cape its own serial number: $minted\n";
+        echo "  The image shipped with '$imageSerial', which is a sample carried by every\n";
+        echo "  cape flashed from it -- using it would give them all the same identity.\n";
+
+        // The vendor's checksum authenticates THEIR serial, so it cannot travel
+        // with a different one: sending the two together would fail the vendor's
+        // check and look like tampering rather than what it is. Blanked here.
+        // FPP cannot compute a replacement that means anything -- anything this
+        // (open source) script could generate, anyone could generate, so it
+        // would prove nothing about provenance. The 'FPP-' prefix is what tells
+        // a vendor there is no order record behind this serial.
+        $newData = blankCapeChecksum($newData, $cleared);
+        if ($cleared) {
+            echo "  The image's 'cs' checksum belonged to that sample serial and has been\n";
+            echo "  cleared, since it cannot vouch for a serial it was not computed over.\n";
+        }
+    }
+    if (file_put_contents($eepromFile, $newData) === false) {
+        echo "\nERROR: could not write $eepromFile\n";
+        return 1;
+    }
+
+    if ($eepromFile == '/home/fpp/media/config/cape-eeprom.bin') {
+        chown($eepromFile, 'fpp');
+        chgrp($eepromFile, 'fpp');
+        chmod($eepromFile, 0644);
+    }
+
+    echo "======================\n";
+    echo "Running fppcapedetect:\n\n";
+    system("/opt/fpp/src/fppcapedetect" . $fppcapedetectFlags);
+    echo "\nFinished, please reboot.\n";
+    return 0;
+}
+
+// Capture the pre-upgrade EEPROM in memory now, before anything below modifies
+// it in place. The signature-preservation step used to re-read this from the
+// on-disk backup file instead, which made it silently no-op whenever that
+// copy() failed (e.g. a permissions hiccup writing to media/upload) -- a
+// previously-licensed cape would come out of the upgrade looking unlicensed
+// with nothing in the output to explain why.
+$origData = file_get_contents($eepromFile);
+$origInfo = find_eeprom_offsets($origData);
+$hadSignature = $origInfo['sig_offset'] !== null;
+
+$newdata = fopen($newFirmwareFile, 'rb');
+
+$oldcape = trim(fread($olddata, 26)); // cape name + nulls
+$oldcapev = trim(fread($olddata, 10)); // cape version + nulls
+
+$newheader = trim(fread($newdata, 6)); // should be FPP02 + null
+$newcape = trim(fread($newdata, 26)); // cape name + nulls
+$newcapev = trim(fread($newdata, 10)); // cape version + nulls
+
+$missmatch = false;
+if ($oldcape != $newcape || $oldcapev != $newcapev) {
+    if ($force) {
+        copy($eepromFile, $backupFile);
+        chown($backupFile, 'fpp');
+        chgrp($backupFile, 'fpp');
+        chmod($backupFile, 0644);
+
+        echo "Overwriting cape firmware.\n";
+        echo "Cape: " . $oldcape . "   Version: " . $oldcapev . "\n";
+        echo "Firmware: " . $newcape . "   Version: " . $newcapev . "\n";
+        $missmatch = true;
+        fseek($olddata, 6, SEEK_SET);
+        fwrite($olddata, pack("a26", $newcape));
+        fwrite($olddata, pack("a10", $newcapev));
+        fflush($olddata);
+    } else {
+        echo "Cape does not match new firmware.\n";
+        echo "Cape: " . $oldcape . "   Version: " . $oldcapev . "\n";
+        echo "Firmware: " . $newcape . "   Version: " . $newcapev . "\n";
+        return 1;
+    }
+} else {
+    echo "Found Cape: " . $oldcape . "   Version: " . $oldcapev . "\n";
+
+    copy($eepromFile, $backupFile);
+    chown($backupFile, 'fpp');
+    chgrp($backupFile, 'fpp');
+    chmod($backupFile, 0644);
+}
+
+//skip over the serial number
+$newcapesn = trim(fread($newdata, 16)); // cape serial# + nulls
+$oldcapesn = trim(fread($olddata, 16)); // cape serial# + nulls
+if (($eepromFile == '/home/fpp/media/config/cape-eeprom.bin') && preg_match('/^0*$/', $oldcapesn) && ($oldcape == $newcape)) {
+    fseek($olddata, -16, SEEK_CUR);
+    fwrite($olddata, pack("a16", $newcapesn));
+}
+
+$flen = fread($olddata, 6); //length of the section
+$flen = intval($flen);
+while ($flen != 0) {
+    $flags = fread($olddata, 2);
+    if ($flags == 97) {
+        fread($olddata, $flen);
+        $fpos = ftell($olddata);
+        $flen = fread($olddata, 6); //length of the section
+        $flen = intval($flen);
+        if ($flen == 0) {
+            fseek($olddata, $fpos, SEEK_SET);
+        }
+    } else {
+        fseek($olddata, -8, SEEK_CUR);
+        $flen = 0;
+    }
+}
+
+$flen = fread($newdata, 6); //length of the section
+$flen = intval($flen);
+while ($flen != 0) {
+    $flags = fread($newdata, 2);
+    if ($flags != 97) {
+        fwrite($olddata, pack("a6", $flen));
+        fwrite($olddata, pack("a2", $flags));
+        if ($flags < 50) {
+            $fname = fread($newdata, 64);
+            fwrite($olddata, $fname);
+        }
+
+        $data = fread($newdata, $flen);
+        fwrite($olddata, $data);
+    } else {
+        fread($newdata, $flen);
+    }
+    $flen = fread($newdata, 6); //length of the section
+    $flen = intval($flen);
+}
+fwrite($olddata, pack("a6", "0"));
+
+fclose($newdata);
+fclose($olddata);
+
+// Issue #1314: If the previous EEPROM was signed and the new EEPROM image does
+// not contain its own signature, inherit the signature section from the
+// previous EEPROM (captured in memory above as $origData/$origInfo, not
+// re-read from the backup file) so that the user does not need to re-sign
+// their cape after every EEPROM upgrade.  The signature only covers the bytes
+// within the signed section itself, so splicing those bytes verbatim into the
+// new EEPROM keeps the signature cryptographically valid.
+if ($hadSignature) {
+    $upgradedData = file_get_contents($eepromFile);
+    if ($upgradedData === false) {
+        echo "\n*** WARNING: could not re-read the upgraded EEPROM to check for a signature.\n";
+        echo "*** The previous license/signature was NOT carried across.  Restore $backupFile and re-sign the cape. ***\n\n";
+    } else {
+        $upgInfo = find_eeprom_offsets($upgradedData);
+        if ($upgInfo['sig_offset'] !== null) {
+            // The new firmware already brings its own signature; nothing to preserve.
+        } else if ($upgInfo['end_offset'] < 6) {
+            echo "\n*** WARNING: upgraded EEPROM data too short to carry the previous signature across.\n";
+            echo "*** Restore $backupFile and re-sign the cape. ***\n\n";
+        } else {
+            // Splice in the previous signature section in place of the
+            // upgraded EEPROM's terminator (which sits at end_offset - 6).
+            $insertPos = $upgInfo['end_offset'] - 6;
+            $signedTail = substr(
+                $origData,
+                $origInfo['sig_offset'],
+                $origInfo['end_offset'] - $origInfo['sig_offset']
+            );
+            $sfh = fopen($eepromFile, 'r+b');
+            if ($sfh) {
+                set_file_buffer($sfh, 32768);
+                fseek($sfh, $insertPos, SEEK_SET);
+                fwrite($sfh, $signedTail);
+                fflush($sfh);
+                fclose($sfh);
+                echo "Preserved signature section from previous EEPROM.\n";
+            } else {
+                echo "\n*** WARNING: could not open $eepromFile to carry the previous signature across.\n";
+                echo "*** Restore $backupFile and re-sign the cape. ***\n\n";
+            }
+        }
+    }
+}
+
+echo "Upgrade Complete\n\n";
+echo "======================\n";
+echo "Running fppcapedetect:\n\n";
+
+system("/opt/fpp/src/fppcapedetect" . $fppcapedetectFlags);
+
+echo "\nFinished, please reboot.\n";
+

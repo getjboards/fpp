@@ -1,185 +1,141 @@
 /*
- *   WS2801 SPI handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include "fpp-pch.h"
 
-#include "common.h"
-#include "log.h"
-#include "settings.h"
+#include "fpp-json.h"
+
+#include "../log.h"
 
 #include "SPIws2801.h"
+#include <fcntl.h>
 
-#ifdef USEWIRINGPI
-#   include "wiringPi.h"
-#   include "wiringPiSPI.h"
-#else
-#   define wiringPiSPISetup(a,b)    1
-#   define wiringPiSPIDataRW(a,b,c) 1
-#   define delayMicroseconds(a)     0
-#endif
+#define SPIWS2801_MAX_CHANNELS 1530
 
-#define SPIWS2801_MAX_CHANNELS  1530
+#include "Plugin.h"
+class SPIws2801Plugin : public FPPPlugins::Plugin, public FPPPlugins::ChannelOutputPlugin {
+public:
+    SPIws2801Plugin() :
+        FPPPlugins::Plugin("SPIws2801") {
+    }
+    virtual ChannelOutput* createChannelOutput(unsigned int startChannel, unsigned int channelCount) override {
+        return new SPIws2801Output(startChannel, channelCount);
+    }
+};
+
+extern "C" {
+FPPPlugins::Plugin* createPlugin() {
+    return new SPIws2801Plugin();
+}
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
-/*
- *
- */
-SPIws2801Output::SPIws2801Output(unsigned int startChannel, unsigned int channelCount)
-  : ThreadedChannelOutputBase(startChannel, channelCount),
-	m_port(-1),
-	m_pi36(0),
-	m_pi36Data(NULL),
-	m_pi36DataSize(0)
-{
-	LogDebug(VB_CHANNELOUT, "SPIws2801Output::SPIws2801Output(%u, %u)\n",
-		startChannel, channelCount);
-
-	m_maxChannels = SPIWS2801_MAX_CHANNELS;
+SPIws2801Output::SPIws2801Output(unsigned int startChannel, unsigned int channelCount) :
+    ThreadedChannelOutput(startChannel, channelCount),
+    m_port(-1),
+    m_pi36(0),
+    m_pi36Data(NULL),
+    m_pi36DataSize(0),
+    m_spi(nullptr) {
+    LogDebug(VB_CHANNELOUT, "SPIws2801Output::SPIws2801Output(%u, %u)\n",
+             startChannel, channelCount);
 }
 
-/*
- *
- */
-SPIws2801Output::~SPIws2801Output()
-{
-	LogDebug(VB_CHANNELOUT, "SPIws2801Output::~SPIws2801Output()\n");
+SPIws2801Output::~SPIws2801Output() {
+    LogDebug(VB_CHANNELOUT, "SPIws2801Output::~SPIws2801Output()\n");
+    if (m_spi) {
+        delete m_spi;
+    }
+    delete[] m_pi36Data;
 }
 
-/*
- *
- */
-int SPIws2801Output::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "SPIws2801Output::Init('%s')\n", configStr);
+int SPIws2801Output::Init(Json::Value config) {
+    LogDebug(VB_CHANNELOUT, "SPIws2801Output::Init()\n");
+    if (config.isMember("device")) {
+        std::string dev = config["device"].asString();
+        if (dev == "spidev0.0") {
+            m_port = 0;
+        } else if (dev == "spidev0.1") {
+            m_port = 1;
+        }
+    }
+    if (config.isMember("pi36")) {
+        if (config["pi36"].asInt() == 1) {
+            m_pi36 = 1;
+            m_pi36DataSize = m_channelCount >= 36 ? m_channelCount : 36;
+            m_pi36Data = new unsigned char[m_pi36DataSize];
+        }
+    }
+    if (m_port == -1) {
+        LogErr(VB_CHANNELOUT, "Invalid Config: No port\n");
+        return 0;
+    }
 
-	std::vector<std::string> configElems = split(configStr, ';');
-
-	for (int i = 0; i < configElems.size(); i++)
-	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
-
-		if (elem[0] == "device")
-		{
-			LogDebug(VB_CHANNELOUT, "Using %s for SPI output\n",
-				elem[1].c_str());
-
-			if (elem[1] == "spidev0.0")
-				m_port = 0;
-			else if (elem[1] == "spidev0.1")
-				m_port = 1;
-		}
-		else if ((elem[0] == "pi36") &&
-				 (elem[1] == "1"))
-		{
-			m_pi36 = 1;
-
-			m_pi36DataSize = m_channelCount >= 36 ? m_channelCount : 36;
-			m_pi36Data = new unsigned char[m_pi36DataSize];
-		}
-	}
-
-	if (m_port == -1)
-	{
-		LogErr(VB_CHANNELOUT, "Invalid Config String: %s\n", configStr);
-		return 0;
-	}
-
-	LogDebug(VB_CHANNELOUT, "Using SPI Port %d\n", m_port);
-
-	if (wiringPiSPISetup(m_port, 1000000) < 0)
-	{
-		LogErr(VB_CHANNELOUT, "Unable to open SPI device\n") ;
-		return 0;
-	}
-
-	return ThreadedChannelOutputBase::Init(configStr);
+    LogDebug(VB_CHANNELOUT, "Using SPI Port %d\n", m_port);
+    m_spi = new SPIUtils(m_port, 1000000);
+    if (!m_spi->isOk()) {
+        LogErr(VB_CHANNELOUT, "Unable to open SPI device\n");
+        delete m_spi;
+        m_spi = nullptr;
+        return 0;
+    }
+    return ThreadedChannelOutput::Init(config);
 }
 
+int SPIws2801Output::Close(void) {
+    LogDebug(VB_CHANNELOUT, "SPIws2801Output::Close()\n");
 
-/*
- *
- */
-int SPIws2801Output::Close(void)
-{
-	LogDebug(VB_CHANNELOUT, "SPIws2801Output::Close()\n");
-
-	return ThreadedChannelOutputBase::Close();
+    return ThreadedChannelOutput::Close();
 }
-void SPIws2801Output::GetRequiredChannelRange(int &min, int & max) {
-    min = m_startChannel;
-    max = min + m_channelCount - 1;
+void SPIws2801Output::GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) {
+    // the Pi36 layout always reads its 36 WS2803 channels, even when fewer
+    // are configured
+    int count = m_pi36 ? std::max((int)m_channelCount, 36) : (int)m_channelCount;
+    addRange(m_startChannel, m_startChannel + count - 1);
 }
 
-/*
- *
- */
-int SPIws2801Output::RawSendData(unsigned char *channelData)
-{
-	LogDebug(VB_CHANNELOUT, "SPIws2801Output::RawSendData(%p)\n", channelData);
+int SPIws2801Output::RawSendData(unsigned char* channelData) {
+    LogDebug(VB_CHANNELOUT, "SPIws2801Output::RawSendData(%p)\n", channelData);
 
-	if (m_pi36)
-	{
-		// Hanson Electronics Pi36 controller has 2x WS2803 onboard and a
-		// chained output for ws2801 pixels.  WS2803 pull data from the
-		// end of the stream while WS2801 pull from the beginning, so we
-		// need to swap some channels around before sending.
-		int ws2801Channels = m_pi36DataSize - 36;
+    if (!m_spi) {
+        return 0;
+    }
 
-		memcpy(m_pi36Data + ws2801Channels + 18, channelData     , 18);
-		memcpy(m_pi36Data + ws2801Channels     , channelData + 18, 18);
+    if (m_pi36) {
+        // Hanson Electronics Pi36 controller has 2x WS2803 onboard and a
+        // chained output for ws2801 pixels.  WS2803 pull data from the
+        // end of the stream while WS2801 pull from the beginning, so we
+        // need to swap some channels around before sending.
+        int ws2801Channels = m_pi36DataSize - 36;
 
-		if (ws2801Channels)
-			memcpy(m_pi36Data, channelData + 36, ws2801Channels);
+        memcpy(m_pi36Data + ws2801Channels + 18, channelData, 18);
+        memcpy(m_pi36Data + ws2801Channels, channelData + 18, 18);
 
-		wiringPiSPIDataRW(m_port, (unsigned char *)m_pi36Data, m_pi36DataSize);
-	}
-	else
-	{
-		wiringPiSPIDataRW(m_port, (unsigned char *)channelData, m_channelCount);
-	}
+        if (ws2801Channels)
+            memcpy(m_pi36Data, channelData + 36, ws2801Channels);
 
-	return m_channelCount;
+        m_spi->xfer(m_pi36Data, nullptr, m_pi36DataSize);
+    } else {
+        m_spi->xfer(channelData, nullptr, m_channelCount);
+    }
+
+    return m_channelCount;
 }
 
-/*
- *
- */
-void SPIws2801Output::DumpConfig(void)
-{
-	LogDebug(VB_CHANNELOUT, "SPIws2801Output::DumpConfig()\n");
+void SPIws2801Output::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "SPIws2801Output::DumpConfig()\n");
 
-	LogDebug(VB_CHANNELOUT, "    port    : %d\n", m_port);
+    LogDebug(VB_CHANNELOUT, "    port    : %d\n", m_port);
 
-	ThreadedChannelOutputBase::DumpConfig();
+    ThreadedChannelOutput::DumpConfig();
 }
-

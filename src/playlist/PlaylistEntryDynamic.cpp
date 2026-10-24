@@ -1,562 +1,573 @@
 /*
- *   PlaylistEntryDynamic Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include "Warnings.h" // WarningHolder -- needed directly for NOPCH builds
+
+#include <atomic>
+#include <chrono>
 #include <fstream>
-#include <sstream>
-#include <string>
+#include <thread>
 
-#include <boost/algorithm/string/replace.hpp>
+#include "../CurlManager.h"
+#include "../common.h"
+#include "../log.h"
 
-#include "common.h"
-#include "log.h"
+#include "Playlist.h"
 #include "PlaylistEntryBoth.h"
-#include "PlaylistEntryEffect.h"
-#include "PlaylistEntryEvent.h"
+#include "PlaylistEntryCommand.h"
+#include "PlaylistEntryDynamic.h"
 #include "PlaylistEntryMedia.h"
-#include "PlaylistEntryMQTT.h"
 #include "PlaylistEntryPause.h"
-#include "PlaylistEntryPixelOverlay.h"
 #include "PlaylistEntryRemap.h"
 #include "PlaylistEntryScript.h"
 #include "PlaylistEntrySequence.h"
 #include "PlaylistEntryURL.h"
-#include "PlaylistEntryVolume.h"
-#include "PlaylistEntryDynamic.h"
-#include "settings.h"
 
 /*
  *
  */
-PlaylistEntryDynamic::PlaylistEntryDynamic(PlaylistEntryBase *parent)
-  : PlaylistEntryBase(parent),
-	m_curl(NULL),
-	m_drainQueue(0),
-	m_currentEntry(-1)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::PlaylistEntryDynamic()\n");
+PlaylistEntryDynamic::PlaylistEntryDynamic(Playlist* playlist, PlaylistEntryBase* parent) :
+    PlaylistEntryBase(playlist, parent),
+    m_drainQueue(0),
+    m_currentEntry(-1) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::PlaylistEntryDynamic()\n");
 
-	m_type = "dynamic";
+    m_type = "dynamic";
+
+    static std::atomic<uint64_t> s_dynamicCounter{ 0 };
+    m_curlToken = "PlaylistEntryDynamic-" + std::to_string(s_dynamicCounter.fetch_add(1));
 }
 
 /*
  *
  */
-PlaylistEntryDynamic::~PlaylistEntryDynamic()
-{
-	ClearPlaylistEntries();
+// Longest a plugin or URL source may take to answer before the entry gives up.
+static constexpr long long DYNAMIC_FETCH_TIMEOUT_MS = 15000;
 
-	if (m_curl)
-		curl_easy_cleanup(m_curl);
+PlaylistEntryDynamic::~PlaylistEntryDynamic() {
+    // Ordering matters for UAF/lifecycle safety:
+    //  1) cancelRequests() removes this entry's in-flight handles from
+    //     CurlManager and destroys their callbacks (each captures `this`)
+    //     WITHOUT invoking them, so no callback can run against a half-torn-down
+    //     object. Safe from the dtor because processCurls() and this dtor both
+    //     run on the main loop, so no callback is executing right now.
+    //  2) only then release the cookie session: once the requests are gone, no
+    //     easy handle still points CURLOPT_SHARE at the share, so
+    //     curl_share_cleanup() is safe.
+    CurlManager::INSTANCE.cancelRequests(m_curlToken);
+    CurlManager::INSTANCE.releaseCookieSession(m_curlToken);
+
+    ClearPlaylistEntries();
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::Init(Json::Value &config)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Init()\n");
+int PlaylistEntryDynamic::Init(Json::Value& config) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Init()\n");
 
-	m_subType = config["subType"].asString();
-	m_data = config["data"].asString();
+    m_subType = config["subType"].asString();
 
-	m_drainQueue = config["drainQueue"].asInt();
+    m_drainQueue = config["drainQueue"].asInt();
 
-	if (config.isMember("pluginHost"))
-		m_pluginHost = config["pluginHost"].asString();
+    if (config.isMember("pluginHost"))
+        m_pluginHost = config["pluginHost"].asString();
 
-	if ((m_subType == "plugin") || (m_subType == "url"))
-	{
-		CURLcode status;
-		m_curl = curl_easy_init();
-		if (!m_curl)
-		{
-			LogErr(VB_PLAYLIST, "Unable to create curl instance\n");
-			return 0;
-		}
+    if (m_subType == "file")
+        m_data = config["dataFile"].asString();
+    else if (m_subType == "plugin")
+        m_data = config["pluginName"].asString();
+    else if (m_subType == "url")
+        m_data = config["url"].asString();
 
-		status = curl_easy_setopt(m_curl, CURLOPT_WRITEFUNCTION, &PlaylistEntryDynamic::write_data);
-		if (status != CURLE_OK)
-		{
-			LogErr(VB_PLAYLIST, "curl_easy_setopt() Error setting write callback function: %s\n", curl_easy_strerror(status));
-			return 0;
-		}
+    // The plugin/url HTTP requests go through CurlManager (see PrepPlugin()/
+    // FetchURL()); there is no per-instance curl handle to set up.
+    // Cookie persistence across the plugin's prep/load/started calls is provided
+    // by CurlManager's cookie session keyed on m_curlToken.
 
-		status = curl_easy_setopt(m_curl, CURLOPT_WRITEDATA, this);
-		if (status != CURLE_OK)
-		{
-			LogErr(VB_PLAYLIST, "curl_easy_setopt() Error setting class pointer: %s\n", curl_easy_strerror(status));
-			return 0;
-		}
-
-		curl_easy_setopt(m_curl, CURLOPT_COOKIEFILE, "");
-		if (status != CURLE_OK)
-		{
-			LogErr(VB_PLAYLIST, "curl_easy_setopt() Error initializing cookie jar: %s\n", curl_easy_strerror(status));
-			return 0;
-		}
-	}
-
-	return PlaylistEntryBase::Init(config);
+    return PlaylistEntryBase::Init(config);
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::StartPlaying(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::StartPlaying()\n");
+int PlaylistEntryDynamic::StartPlaying(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::StartPlaying()\n");
 
-	if (!CanPlay())
-	{
-		FinishPlay();
-		return 0;
-	}
+    if (!CanPlay()) {
+        FinishPlay();
+        return 0;
+    }
 
-	if (!IsPrepped() && !Prep())
-	{
-		FinishPlay();
-		return 0;
-	}
+    if ((m_subType == "plugin") || (m_subType == "url")) {
+        int started = (m_subType == "plugin") ? PrepPlugin() : FetchURL();
+        if (!started) {
+            FinishPlay();
+            return 0;
+        }
+        m_loading = true;
+        m_loadDeadline = GetMonotonicTimeMS() + DYNAMIC_FETCH_TIMEOUT_MS;
+        return PlaylistEntryBase::StartPlaying();
+    }
 
-	int res = 0;
-	if (m_subType == "command")
-		res = ReadFromCommand();
-	else if (m_subType == "file")
-		res = ReadFromFile();
-	else if (m_subType == "plugin")
-		res = ReadFromPlugin();
-	else if (m_subType == "url")
-		res = ReadFromURL(m_data);
+    int res = 0;
+    if (m_subType == "command")
+        res = ReadFromCommand();
+    else if (m_subType == "file")
+        res = ReadFromFile();
 
-	if (!res)
-	{
-		FinishPlay();
-		return 0;
-	}
+    if (!BeginEntries(res)) {
+        FinishPlay();
+        return 0;
+    }
 
-	m_isPrepped = 0;
+    return PlaylistEntryBase::StartPlaying();
+}
 
-	if (m_currentEntry >= 0)
-	{
-		m_playlistEntries[m_currentEntry]->StartPlaying();
-		Started();
-	}
-	else
-	{
-		FinishPlay();
-		return 0;
-	}
+bool PlaylistEntryDynamic::BeginEntries(int loaded) {
+    if (!loaded || (m_currentEntry < 0))
+        return false;
 
-	return PlaylistEntryBase::StartPlaying();;
+    m_isPrepped = 0;
+    m_playlistEntries[m_currentEntry]->StartPlayingOrFinish();
+    Started();
+    return true;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::Process(void)
-{
-	if ((m_currentEntry >= 0) && (m_playlistEntries[m_currentEntry]))
-	{
-		m_playlistEntries[m_currentEntry]->Process();
-		if (m_playlistEntries[m_currentEntry]->IsFinished())
-		{
-			if (m_currentEntry < (m_playlistEntries.size() - 1))
-			{
-				m_currentEntry++;
-				m_playlistEntries[m_currentEntry]->StartPlaying();
-			}
-			else if (m_drainQueue)
-			{
-				// Check for more entries to play, if there are none,
-				// then StartPlaying() will call FinishPlay().
-				StartPlaying();
-			}
-			else
-			{
-				FinishPlay();
-			}
-		}
+int PlaylistEntryDynamic::Process(void) {
+    if (m_loading) {
+        PluginPrep state;
+        std::string item;
+        {
+            std::lock_guard<std::mutex> g(m_pluginMutex);
+            state = m_pluginPrep;
+            if (state == PluginPrep::Ready) {
+                item = std::move(m_pluginItem);
+                m_pluginItem.clear();
+                m_pluginPrep = PluginPrep::Idle; // consumed; the next start re-fetches
+            }
+        }
+        if (state == PluginPrep::Ready) {
+            m_loading = false;
+            if (!BeginEntries(ReadFromString(item)))
+                FinishPlay();
+        } else if ((state == PluginPrep::Failed) || (GetMonotonicTimeMS() >= m_loadDeadline)) {
+            m_loading = false;
+            if (state != PluginPrep::Failed) {
+                LogErr(VB_PLAYLIST, "Dynamic playlist %s request did not complete in time\n", m_subType.c_str());
+                WarningHolder::AddWarningTimeout(60, 32, "Dynamic playlist " + m_subType + " request timed out");
+            }
+            FinishPlay();
+        }
+        return PlaylistEntryBase::Process();
+    }
 
-		return 1;
-	}
+    if ((m_currentEntry >= 0) && (m_playlistEntries[m_currentEntry])) {
+        // Only a child that is playing gets Process(), as in
+        // Playlist::Process().  One that finished inside StartPlaying() (a
+        // disabled entry, a failed start) was never set up for it: a disabled
+        // command entry has no result, and processing it dereferenced null.
+        if (m_playlistEntries[m_currentEntry]->IsPlaying())
+            m_playlistEntries[m_currentEntry]->Process();
+        if (m_playlistEntries[m_currentEntry]->IsFinished()) {
+            if ((m_parentPlaylist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+                (m_parentPlaylist->getPlaylistStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
+                FinishPlay();
+            } else if (m_currentEntry < (m_playlistEntries.size() - 1)) {
+                m_currentEntry++;
+                m_playlistEntries[m_currentEntry]->StartPlayingOrFinish();
+            } else if (m_drainQueue) {
+                // Check for more entries to play, if there are none,
+                // then StartPlaying() will call FinishPlay().
+                StartPlaying();
+            } else {
+                FinishPlay();
+            }
+        }
 
-	return 0;
+        return 1;
+    }
+
+    return 0;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::Stop(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Stop()\n");
+int PlaylistEntryDynamic::Stop(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Stop()\n");
+    m_loading = false;
 
-	if ((m_currentEntry >= 0) && (m_playlistEntries[m_currentEntry]))
-	{
-		m_playlistEntries[m_currentEntry]->Stop();
-		return 1;
-	}
+    if ((m_currentEntry >= 0) && (m_playlistEntries[m_currentEntry])) {
+        m_playlistEntries[m_currentEntry]->Stop();
+        return 1;
+    }
 
-	return 0;
+    return PlaylistEntryBase::Stop();
 }
 
 /*
  *
  */
-void PlaylistEntryDynamic::Dump(void)
-{
-	LogDebug(VB_PLAYLIST, "SubType    : %s\n", m_subType.c_str());
-	LogDebug(VB_PLAYLIST, "Data       : %s\n", m_data.c_str());
-	LogDebug(VB_PLAYLIST, "Drain Queue: %d\n", m_drainQueue);
-	LogDebug(VB_PLAYLIST, "Plugin Host: %s\n", m_pluginHost.c_str());
+void PlaylistEntryDynamic::Dump(void) {
+    LogDebug(VB_PLAYLIST, "SubType    : %s\n", m_subType.c_str());
+    LogDebug(VB_PLAYLIST, "Data       : %s\n", m_data.c_str());
+    LogDebug(VB_PLAYLIST, "Drain Queue: %d\n", m_drainQueue);
+    LogDebug(VB_PLAYLIST, "Plugin Host: %s\n", m_pluginHost.c_str());
 }
 
 /*
  *
  */
-Json::Value PlaylistEntryDynamic::GetConfig(void)
-{
-	Json::Value result = PlaylistEntryBase::GetConfig();
+Json::Value PlaylistEntryDynamic::GetConfig(void) {
+    Json::Value result = PlaylistEntryBase::GetConfig();
 
-	result["subType"] = m_subType;
-	result["data"] = m_data;
-	result["pluginHost"] = m_pluginHost;
-	result["drainQueue"] = m_drainQueue;
-	if ((m_currentEntry >= 0) && (m_playlistEntries[m_currentEntry]))
-		result["dynamic"] = m_playlistEntries[m_currentEntry]->GetConfig();
+    result["subType"] = m_subType;
+    result["data"] = m_data;
 
-	return result;
+    if (m_subType == "file") {
+        result["dataFile"] = m_data;
+    } else if (m_subType == "plugin") {
+        result["pluginName"] = m_data;
+        result["pluginHost"] = m_pluginHost;
+    } else if (m_subType == "url") {
+        result["url"] = m_data;
+    }
+
+    result["drainQueue"] = m_drainQueue;
+    if ((m_currentEntry >= 0) && (m_playlistEntries[m_currentEntry]))
+        result["dynamic"] = m_playlistEntries[m_currentEntry]->GetConfig();
+
+    return result;
+}
+PlaylistEntryBase* PlaylistEntryDynamic::GetCurrentEntry() {
+    if ((m_currentEntry >= 0) && (m_currentEntry < m_playlistEntries.size()) && (m_playlistEntries[m_currentEntry])) {
+        return m_playlistEntries[m_currentEntry];
+    }
+    return nullptr;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::ReadFromCommand(void)
-{
-	LogDebug(VB_PLAYLIST, "ReadFromCommand: %s\n", m_data.c_str());
+int PlaylistEntryDynamic::ReadFromCommand(void) {
+    LogDebug(VB_PLAYLIST, "ReadFromCommand: %s\n", m_data.c_str());
 
-	// FIXME, implement this and change return to 1
-	return 0;
+    // FIXME, implement this and change return to 1
+    return 0;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::ReadFromFile(void)
-{
-	LogDebug(VB_PLAYLIST, "ReadFromFile: %s\n", m_data.c_str());
+int PlaylistEntryDynamic::ReadFromFile(void) {
+    LogDebug(VB_PLAYLIST, "ReadFromFile: %s\n", m_data.c_str());
 
-	if (!FileExists(m_data.c_str()))
-	{
-		LogErr(VB_PLAYLIST, "Filename %s does not exist\n", m_data.c_str());
-		return 0;
-	}
+    if (!FileExists(m_data.c_str())) {
+        LogErr(VB_PLAYLIST, "Filename %s does not exist\n", m_data.c_str());
+        WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist source file does not exist: " + m_data);
+        return 0;
+    }
 
-	std::ifstream t(m_data.c_str());
-	std::stringstream buffer;
+    std::ifstream t(m_data.c_str());
+    std::stringstream buffer;
 
-	buffer << t.rdbuf();
+    buffer << t.rdbuf();
 
-	return ReadFromString(buffer.str());
+    return ReadFromString(buffer.str());
+}
+
+/*
+ * The "url" source: one async GET whose response is consumed by Process().
+ * rc==0 means the transfer never got an HTTP response (connect/timeout).
+ */
+int PlaylistEntryDynamic::FetchURL(void) {
+    LogDebug(VB_PLAYLIST, "FetchURL: %s\n", m_data.c_str());
+    {
+        std::lock_guard<std::mutex> g(m_pluginMutex);
+        if (m_pluginPrep == PluginPrep::Running) {
+            return 1; // the previous start's request is still out; use it
+        }
+        m_pluginPrep = PluginPrep::Running;
+        m_pluginItem.clear();
+    }
+    std::string url = m_data;
+    CurlManager::INSTANCE.addGet(
+        url,
+        [this, url](int rc, const std::string& resp) {
+            std::lock_guard<std::mutex> g(m_pluginMutex);
+            if (rc == 0) {
+                LogErr(VB_PLAYLIST, "Dynamic playlist URL request failed (%s): %s\n", url.c_str(), resp.c_str());
+                WarningHolder::AddWarningTimeout(60, 32, "Dynamic playlist URL request failed (" + url + "): " + resp);
+                m_pluginPrep = PluginPrep::Failed;
+            } else {
+                m_pluginItem = resp;
+                m_pluginPrep = PluginPrep::Ready;
+            }
+        },
+        m_curlToken, m_curlToken);
+    return 1;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::ReadFromPlugin(void)
-{
-	LogDebug(VB_PLAYLIST, "ReadFromPlugin: %s\n", m_data.c_str());
+int PlaylistEntryDynamic::ReadFromString(std::string jsonStr) {
+    Json::Value root;
+    PlaylistEntryBase* playlistEntry = NULL;
 
-	std::string url;
+    LogDebug(VB_PLAYLIST, "ReadFromString(): String:\n%s\n", jsonStr.c_str());
 
-	url = "http://";
-	if (m_pluginHost != "")
-		url += m_pluginHost;
-	else
-		url += "127.0.0.1";
-	url += "/plugin.php?plugin=" + m_data + "&page=playlistCallback.php&nopage=1&command=loadNextItem";
+    if (jsonStr.empty()) {
+        LogDebug(VB_PLAYLIST, "Empty string in ReadFromString()\n");
+        return 0;
+    }
 
-	return ReadFromURL(url);
+    if (!LoadJsonFromString(jsonStr, root, JsonRoot::Object)) {
+        LogErr(VB_PLAYLIST, "Error parsing JSON: %s\n", jsonStr.c_str());
+        WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist data is not valid JSON");
+        return 0;
+    }
+
+    ClearPlaylistEntries();
+
+    Json::Value entries;
+    if (JsonHas(root, "mainPlaylist"))
+        entries = root["mainPlaylist"];
+    else if (JsonHas(root, "leadIn"))
+        entries = root["leadIn"];
+    else if (JsonHas(root, "leadOut"))
+        entries = root["leadOut"];
+    else if (JsonHas(root, "playlistEntries"))
+        entries = root["playlistEntries"];
+    else
+        return 0;
+
+    if (!entries.isArray()) {
+        LogErr(VB_PLAYLIST, "Expected a JSON array of dynamic playlist entries, got something else\n");
+        WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist data is not valid JSON");
+        return 0;
+    }
+
+    for (int i = 0; i < entries.size(); i++) {
+        Json::Value pe = entries[i];
+        if (!pe.isObject()) {
+            LogErr(VB_PLAYLIST, "Invalid dynamic playlist entry: expected a JSON object\n");
+            WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist data is not valid JSON");
+            continue;
+        }
+        playlistEntry = NULL;
+
+        // Plugins, URLs and files supply this data.  jsoncpp throws on a
+        // wrong-typed value ("type" an object, "enabled":"1", ...) and nothing
+        // above StartPlaying() catches, so an escape terminated fppd.  Treat a
+        // throw exactly like a failed Init().
+        try {
+            std::string type = pe["type"].asString();
+            if (type == "both")
+                playlistEntry = new PlaylistEntryBoth(m_parentPlaylist);
+            else if (type == "command")
+                playlistEntry = new PlaylistEntryCommand(m_parentPlaylist);
+            else if (type == "media")
+                playlistEntry = new PlaylistEntryMedia(m_parentPlaylist);
+            else if (type == "pause")
+                playlistEntry = new PlaylistEntryPause(m_parentPlaylist);
+            else if (type == "remap")
+                playlistEntry = new PlaylistEntryRemap(m_parentPlaylist);
+            else if (type == "script")
+                playlistEntry = new PlaylistEntryScript(m_parentPlaylist);
+            else if (type == "sequence")
+                playlistEntry = new PlaylistEntrySequence(m_parentPlaylist);
+            else if (type == "url")
+                playlistEntry = new PlaylistEntryURL(m_parentPlaylist);
+            else {
+                LogErr(VB_PLAYLIST, "Invalid Playlist Entry Type: %s\n", pe["type"].asString().c_str());
+                WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist contains an invalid entry type: " + pe["type"].asString());
+                ClearPlaylistEntries();
+                return 0;
+            }
+
+            if (!playlistEntry->Init(pe)) {
+                LogErr(VB_PLAYLIST, "Error initializing %s Playlist Entry\n", pe["type"].asString().c_str());
+                WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist entry failed to initialize: " + pe["type"].asString());
+                // Not yet pushed into m_playlistEntries (that happens only after a
+                // successful Init below), so ClearPlaylistEntries() won't free it.
+                delete playlistEntry;
+                ClearPlaylistEntries();
+                return 0;
+            }
+        } catch (const std::exception& ex) {
+            LogErr(VB_PLAYLIST, "Invalid dynamic playlist entry: %s\n", ex.what());
+            WarningHolder::AddWarningTimeout(60, 33, std::string("Dynamic playlist entry is invalid: ") + ex.what());
+            delete playlistEntry;
+            ClearPlaylistEntries();
+            return 0;
+        }
+
+        m_playlistEntries.push_back(playlistEntry);
+    }
+
+    if (!m_playlistEntries.size()) {
+        LogErr(VB_PLAYLIST, "Error, no valid playlistEntries in dynamic data!\n");
+        WarningHolder::AddWarningTimeout(60, 33, "Dynamic playlist data contained no valid entries");
+        return 0;
+    }
+
+    m_currentEntry = 0;
+
+    return 1;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::ReadFromURL(std::string url)
-{
-	LogDebug(VB_PLAYLIST, "ReadFromURL: %s\n", url.c_str());
+int PlaylistEntryDynamic::Started(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Started()\n");
 
-	m_response = "";
+    int res = 1;
+    if (m_subType == "plugin")
+        res = StartedPlugin();
 
-	if (!m_curl)
-	{
-		LogErr(VB_PLAYLIST, "m_curl is null\n");
-		return 0;
-	}
+    if (!res) {
+        return 0;
+    }
 
-	CURLcode status = curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
-	if (status != CURLE_OK)
-	{
-		LogErr(VB_PLAYLIST, "curl_easy_setopt() Error setting URL: %s\n", curl_easy_strerror(status));
-		return 0;
-	}
-
-	status = curl_easy_perform(m_curl);
-	if (status != CURLE_OK)
-	{
-		LogErr(VB_PLAYLIST, "curl_easy_perform() failed: %s\n", curl_easy_strerror(status));
-		return 0;
-	}
-
-	return ReadFromString(m_response);
+    return res;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::ReadFromString(std::string jsonStr)
-{
-	Json::Value root;
-	Json::Reader reader;
-	PlaylistEntryBase *playlistEntry = NULL;
-
-	LogDebug(VB_PLAYLIST, "ReadFromString(): String:\n%s\n", jsonStr.c_str());
-
-	if (jsonStr.empty())
-	{
-		LogDebug(VB_PLAYLIST, "Empty string in ReadFromString()\n");
-		return 0;
-	}
-
-	bool success = reader.parse(jsonStr, root);
-	if (!success)
-	{
-		LogErr(VB_PLAYLIST, "Error parsing JSON: %s\n", jsonStr.c_str());
-		return 0;
-	}
-
-	ClearPlaylistEntries();
-
-	if (!root.isMember("playlistEntries"))
-	{
-		return 0;
-	}
-
-	for (int i = 0; i < root["playlistEntries"].size(); i++)
-	{
-		Json::Value pe = root["playlistEntries"][i];
-		playlistEntry = NULL;
-
-		if (pe["type"].asString() == "both")
-			playlistEntry = new PlaylistEntryBoth();
-		else if (pe["type"].asString() == "effect")
-			playlistEntry = new PlaylistEntryEffect();
-		else if (pe["type"].asString() == "event")
-			playlistEntry = new PlaylistEntryEvent();
-		else if (pe["type"].asString() == "media")
-			playlistEntry = new PlaylistEntryMedia();
-		else if (pe["type"].asString() == "mqtt")
-			playlistEntry = new PlaylistEntryMQTT();
-		else if (pe["type"].asString() == "pause")
-			playlistEntry = new PlaylistEntryPause();
-		else if (pe["type"].asString() == "pixelOverlay")
-			playlistEntry = new PlaylistEntryPixelOverlay();
-		else if (pe["type"].asString() == "remap")
-			playlistEntry = new PlaylistEntryRemap();
-		else if (pe["type"].asString() == "script")
-			playlistEntry = new PlaylistEntryScript();
-		else if (pe["type"].asString() == "sequence")
-			playlistEntry = new PlaylistEntrySequence();
-		else if (pe["type"].asString() == "url")
-			playlistEntry = new PlaylistEntryURL();
-		else if (pe["type"].asString() == "volume")
-			playlistEntry = new PlaylistEntryVolume();
-		else
-		{
-			LogErr(VB_PLAYLIST, "Invalid Playlist Entry Type: %s\n", pe["type"].asString().c_str());
-			ClearPlaylistEntries();
-			return 0;
-		}
-
-		if (!playlistEntry->Init(pe))
-		{
-			LogErr(VB_PLAYLIST, "Error initializing %s Playlist Entry\n", pe["type"].asString().c_str());
-			ClearPlaylistEntries();
-			return 0;
-		}
-
-		m_playlistEntries.push_back(playlistEntry);
-	}
-
-	if (!m_playlistEntries.size())
-	{
-		LogErr(VB_PLAYLIST, "Error, no valid playlistEntries in dynamic data!\n");
-		return 0;
-	}
-
-	m_currentEntry = 0;
-
-	return 1;
+int PlaylistEntryDynamic::StartedPlugin(void) {
+    // Fire-and-forget notification. The response is discarded and the entry does
+    // not wait on it, so it runs async through CurlManager. It uses the same
+    // cookie session (m_curlToken) so the plugin sees one PHP session, and it is
+    // ordered after loadNextItem because we only get here once the buffered item
+    // has been consumed and started. The callback captures nothing (no `this`),
+    // so it is safe even if this entry is destroyed before it completes; the
+    // owner tag still lets the dtor's cancelRequests() reclaim it.
+    std::string url = PluginCommandURL("startedNextItem");
+    CurlManager::INSTANCE.addGet(
+        url, [](int rc, const std::string& resp) {}, m_curlToken, m_curlToken);
+    return 1;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::Started(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Started()\n");
+int PlaylistEntryDynamic::Prep(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Prep()\n");
 
-	int res = 1;
-	if (m_subType == "plugin")
-		res = StartedPlugin();
+    int res = 1;
+    if (m_subType == "plugin")
+        res = PrepPlugin();
 
-	if (!res)
-	{
-		return 0;
-	}
+    if (!res) {
+        return 0;
+    }
 
-	return res;
+    return PlaylistEntryBase::Prep();
+    ;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::StartedPlugin(void)
-{
-	std::string url;
+int PlaylistEntryDynamic::PrepPlugin(void) {
+    // Idempotent: if a prep/load chain is already running or has already buffered
+    // an item (an earlier Prep() primed it), leave it be. Only fire when
+    // Idle or after a prior Failed attempt (an inline-prep retry).
+    {
+        std::lock_guard<std::mutex> g(m_pluginMutex);
+        if (m_pluginPrep == PluginPrep::Running || m_pluginPrep == PluginPrep::Ready) {
+            return 1;
+        }
+        m_pluginPrep = PluginPrep::Running;
+        m_pluginItem.clear();
+    }
 
-	url = "http://";
-	if (m_pluginHost != "")
-		url += m_pluginHost;
-	else
-		url += "127.0.0.1";
-	url += "/plugin.php?plugin=" + m_data + "&page=playlistCallback.php&nopage=1&command=startedNextItem";
+    std::string url = PluginCommandURL("prepNextItem");
+    LogDebug(VB_PLAYLIST, "PrepPlugin URL: %s\n", url.c_str());
 
-	CURLcode status = curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
-	if (status != CURLE_OK)
-	{
-		LogErr(VB_PLAYLIST, "curl_easy_setopt() Error setting URL: %s\n", curl_easy_strerror(status));
-		return 0;
-	}
+    // prepNextItem's response is a notification (discarded). Its completion
+    // callback chains loadNextItem, guaranteeing the stateful prep->load order
+    // over the shared cookie session. rc==0 means the transfer never reached the
+    // host (connect/timeout) -> abort the chain and mark Failed.
+    CurlManager::INSTANCE.addGet(
+        url,
+        [this](int rc, const std::string& resp) {
+            if (rc == 0) {
+                std::lock_guard<std::mutex> g(m_pluginMutex);
+                m_pluginPrep = PluginPrep::Failed;
+                return;
+            }
+            FireLoadNextItem();
+        },
+        m_curlToken, m_curlToken);
 
-	status = curl_easy_perform(m_curl);
-	if (status != CURLE_OK)
-	{
-		LogErr(VB_PLAYLIST, "curl_easy_perform returned an error: %d\n", status);
-		return 0;
-	}
-
-	return 1;
+    return 1;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::Prep(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryDynamic::Prep()\n");
+void PlaylistEntryDynamic::FireLoadNextItem(void) {
+    std::string url = PluginCommandURL("loadNextItem");
+    LogDebug(VB_PLAYLIST, "FireLoadNextItem URL: %s\n", url.c_str());
 
-	int res = 1;
-	if (m_subType == "plugin")
-		res = PrepPlugin();
-
-	if (!res)
-	{
-		return 0;
-	}
-
-	return PlaylistEntryBase::Prep();;
+    // loadNextItem's response IS the next item's JSON; buffer it for
+    // Process() to consume. Runs on the main-loop thread (processCurls()),
+    // same as the consumer, so the lock only guards against the defensive case
+    // of a callback landing on another processCurls() call site.
+    CurlManager::INSTANCE.addGet(
+        url,
+        [this](int rc, const std::string& resp) {
+            std::lock_guard<std::mutex> g(m_pluginMutex);
+            if (rc == 0) {
+                m_pluginPrep = PluginPrep::Failed;
+            } else {
+                m_pluginItem = resp;
+                m_pluginPrep = PluginPrep::Ready;
+            }
+        },
+        m_curlToken, m_curlToken);
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::PrepPlugin(void)
-{
-	std::string url;
-
-	url = "http://";
-	if (m_pluginHost != "")
-		url += m_pluginHost;
-	else
-		url += "127.0.0.1";
-	url += "/plugin.php?plugin=" + m_data + "&page=playlistCallback.php&nopage=1&command=prepNextItem";
-
-	LogDebug(VB_PLAYLIST, "URL: %s\n", url.c_str());
-
-	CURLcode status = curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
-	if (status != CURLE_OK)
-	{
-		LogErr(VB_PLAYLIST, "curl_easy_setopt() Error setting URL: %s\n", curl_easy_strerror(status));
-		return 0;
-	}
-
-	status = curl_easy_perform(m_curl);
-	if (status != CURLE_OK)
-	{
-		LogErr(VB_PLAYLIST, "curl_easy_perform returned an error: %d\n", status);
-		return 0;
-	}
-
-	return 1;
+std::string PlaylistEntryDynamic::PluginCommandURL(const char* command) const {
+    std::string url = "http://";
+    url += (m_pluginHost != "") ? m_pluginHost : "127.0.0.1";
+    url += "/plugin.php?plugin=" + m_data + "&page=playlistCallback.php&nopage=1&command=";
+    url += command;
+    return url;
 }
 
 /*
  *
  */
-int PlaylistEntryDynamic::ProcessData(void *buffer, size_t size, size_t nmemb)
-{
-	LogDebug(VB_PLAYLIST, "ProcessData( %p, %d, %d)\n", buffer, size, nmemb);
+void PlaylistEntryDynamic::ClearPlaylistEntries(void) {
+    while (!m_playlistEntries.empty()) {
+        delete m_playlistEntries.back();
+        m_playlistEntries.pop_back();
+    }
 
-	m_response.append(static_cast<const char*>(buffer), size * nmemb);
-
-	LogDebug(VB_PLAYLIST, "m_response length: %d\n", m_response.size());
-
-	return size * nmemb;
+    m_currentEntry = -1;
 }
-
-/*
- *
- */
-void PlaylistEntryDynamic::ClearPlaylistEntries(void)
-{
-	while (!m_playlistEntries.empty())
-	{
-		delete m_playlistEntries.back();
-		m_playlistEntries.pop_back();
-	}
-
-	m_currentEntry = -1;
-}
-
-/*
- *
- */
-size_t PlaylistEntryDynamic::write_data(void *buffer, size_t size, size_t nmemb, void *userp)
-{
-	PlaylistEntryDynamic *peDynamic = (PlaylistEntryDynamic*)userp;
-
-	return static_cast<PlaylistEntryDynamic*>(userp)->ProcessData(buffer, size, nmemb);
-}
-

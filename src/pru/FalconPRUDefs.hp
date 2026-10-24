@@ -2,7 +2,13 @@
 #define _FalconPRUDefs_HP_
 
 
+#ifndef AM62X 
+#ifndef AM33XX
 #define AM33XX
+#endif
+#endif
+
+
 
 // ***************************************
 // *      Global Macro definitions       *
@@ -24,6 +30,25 @@
 #define CONST_L3RAM     C30
 #define CONST_DDR       C31
 
+
+/** Mappings of the GPIO devices */
+#define GPIO0 (0x44E07000 + 0x100)
+#define GPIO1 (0x4804c000 + 0x100)
+#define GPIO2 (0x481AC000 + 0x100)
+#define GPIO3 (0x481AE000 + 0x100)
+
+/** Offsets for the clear and set registers in the devices.
+ * Since the offsets can only be 0xFF, we deliberately add offsets
+ */
+#define GPIO_DATAOUT    (0x13C - 0x100)
+#define GPIO_CLRDATAOUT (0x190 - 0x100)
+#define GPIO_SETDATAOUT (0x194 - 0x100)
+#define GPIO_DATAIN     GPIO_DATAOUT
+
+#define GPIO_CLR_FIRST 1
+#define GPIO_SETCLRDATAOUT  GPIO_CLRDATAOUT
+
+
 // Address for the Constant table Programmable Pointer Register 0(CTPPR_0)
 #define CTBIR_0         0x22020
 // Address for the Constant table Programmable Pointer Register 0(CTPPR_0)
@@ -33,6 +58,72 @@
 #define CTPPR_0         0x22028
 // Address for the Constant table Programmable Pointer Register 1(CTPPR_1)
 #define CTPPR_1         0x2202C
+
+#define NSPERCLK  5
+#define NS2CLK(ns) ((ns) / 5)
+
+#define SHM_SIZE (12 * 1024)
+
+
+#elif defined(AM62X)
+
+// Refer to this mapping in the file - \prussdrv\include\pruss_intc_mapping.h
+#define PRU0_PRU1_INTERRUPT     17
+#define PRU1_PRU0_INTERRUPT     18
+#define PRU0_ARM_INTERRUPT      19
+#define PRU1_ARM_INTERRUPT      20
+#define ARM_PRU0_INTERRUPT      21
+#define ARM_PRU1_INTERRUPT      22
+
+#define CONST_PRUDRAM   C24
+#define CONST_OTHERPRUDRAM   C25
+#define CONST_SHAREDRAM C28
+#define CONST_L3RAM     C30
+#define CONST_DDR       C31
+
+
+/* Mappings of the GPIO devices */
+/* for AM26x, point directly to the "OUT" reg */
+#define GPIO0 0x04201014
+#define GPIO1 0x0060003C
+#define GPIO2 0x00600064
+#define GPIO3 0x00601014
+
+
+#define GPIO_DATAOUT    0
+#define GPIO_SETDATAOUT 4
+#define GPIO_CLRDATAOUT 8
+#define GPIO_DATAIN     12
+
+#define GPIO_SETCLRDATAOUT  GPIO_SETDATAOUT
+
+
+// Address for the Constant table Programmable Pointer Register 0(CTPPR_0)
+#define CTBIR_0         0x22020
+// Address for the Constant table Programmable Pointer Register 0(CTPPR_0)
+#define CTBIR_1         0x22024
+
+// Address for the Constant table Programmable Pointer Register 0(CTPPR_0)
+#define CTPPR_0         0x22028
+// Address for the Constant table Programmable Pointer Register 1(CTPPR_1)
+#define CTPPR_1         0x2202C
+
+// For now, we run the AM62x PRU's at 250Mhz because DDR latency is too
+// high when running at 333Mhz.   Issue is known at TI, no solution yet.
+// (Measured: a 32 byte LBBO from DDR costs 77.5 cycles synchronous to VBUSP
+// and 748 cycles on the async 333MHz core clock.  The PRU's own data RAM and
+// the shared RAM are NOT affected - identical cycle counts either way - so an
+// output whose data path is entirely SMEM, such as the BBShiftPanel shift
+// path, gains the full 33%.  See SMEMRing.hp.)
+//
+// These two must track the core clock: at 333MHz they become 3 and (ns)/3.
+// Anything that switches the clock has to rebuild every ns-denominated PRU
+// program.  Note SLEEPNS packs NS2CLK(ns/2) into a 16 bit LDI, so the longest
+// sleeps in BBShiftString.asm (500000ns) overflow at /3 and need LDI32.
+#define NSPERCLK  4
+#define NS2CLK(ns) ((ns) / 4)
+
+#define SHM_SIZE (32 * 1024)
 
 #else
 
@@ -55,68 +146,11 @@
 // Address for the Constant table Programmable Pointer Register 1(CTPPR_1)      
 #define CTPPR_1         0x702C
 
+#define NSPERCLK  5
+#define NS2CLK(ns) (ns / 5)
+
 #endif
 
-.macro  LD32
-.mparam dst,src
-    LBBO    dst,src,#0x00,4
-.endm
-
-.macro  LD16
-.mparam dst,src
-    LBBO    dst,src,#0x00,2
-.endm
-
-.macro  LD8
-.mparam dst,src
-    LBBO    dst,src,#0x00,1
-.endm
-
-.macro ST32
-.mparam src,dst
-    SBBO    src,dst,#0x00,4
-.endm
-
-.macro ST16
-.mparam src,dst
-    SBBO    src,dst,#0x00,2
-.endm
-
-.macro ST8
-.mparam src,dst
-    SBBO    src,dst,#0x00,1
-.endm
-
-
-#define sp r0
-#define lr r23
-#define STACK_TOP       (0x2000 - 4)
-#define STACK_BOTTOM    (0x2000 - 0x200)
-
-.macro stack_init
-    mov     sp, STACK_BOTTOM
-.endm
-
-.macro push
-.mparam reg, cnt
-    sbbo    reg, sp, 0, 4*cnt
-    add     sp, sp, 4*cnt
-.endm
-
-.macro pop
-.mparam reg, cnt
-    sub     sp, sp, 4*cnt
-    lbbo    reg, sp, 0, 4*cnt
-.endm
-
-// ***************************************
-// *    Global Structure Definitions     *
-// ***************************************
-
-
-// ***************************************
-// *     Global Register Assignments     *
-// ***************************************
 
 
 #endif 

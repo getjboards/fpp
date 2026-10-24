@@ -1,0 +1,450 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "command.h"
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <array>
+#include <cstring>
+#include <ctime>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <unistd.h>
+
+#include "Player.h"
+#include "Scheduler.h"
+#include "Sequence.h"
+#include "Warnings.h"
+#include "common.h"
+#include "effects.h"
+#include "fpp.h"
+#include "gpio.h"
+#include "log.h"
+#include "settings.h"
+#include "channeltester/ChannelTester.h"
+#include "commands/Commands.h"
+#include "mediaoutput/MediaOutputBase.h"
+#include "mediaoutput/MediaOutputStatus.h"
+#include "mediaoutput/RTSPOutputManager.h"
+#include "mediaoutput/VideoInputManager.h"
+#include "mediaoutput/VideoOutputManager.h"
+#include "mediaoutput/mediaoutput.h"
+#include "playlist/Playlist.h"
+#include "util/GPIOUtils.h"
+#include "SysSocket.h"
+
+constexpr int MAX_RESPONSE_SIZE = 1501;
+
+int socket_fd = -1;
+struct sockaddr_un server_address;
+int integer_buffer;
+int fppdStartTime = 0;
+
+// SIGINT and SIGTERM are not handled here. They used to be, by a handler
+// that logged, closed media and ran ShutdownFPPD() inside the signal handler,
+// none of which is async-signal-safe. fppd's own handler (installed with the
+// HTTP server) only clears the main-loop flag; before that the default action
+// simply terminates the process, which is safe this early in startup.
+// A startup failure here leaves fppd half started, with threads running
+// (the volume worker, the warnings notifier) that the static destructors
+// exit() would run can block on or free memory under.  Leave without them,
+// as fppd's own ExitWithoutTeardown() does.
+[[noreturn]] static void ExitEarly(int code) {
+    fflush(nullptr);
+    _exit(code);
+}
+
+int Command_Initialize() {
+    mode_t old_umask;
+
+    LogInfo(VB_COMMAND, "Initializing Command Module\n");
+
+    if ((socket_fd = OpenSocket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
+        perror("server: socket");
+        ExitEarly(1);
+    }
+
+    mkdir(FPP_SOCKET_PATH, 0777);
+    chmod(FPP_SOCKET_PATH, 0777);
+
+    fcntl(socket_fd, F_SETFL, O_NONBLOCK);
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sun_family = AF_UNIX;
+    strcpy(server_address.sun_path, FPP_SERVER_SOCKET);
+    unlink(FPP_SERVER_SOCKET);
+
+    old_umask = umask(0011);
+
+    if (bind(socket_fd, (const struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
+        close(socket_fd);
+        perror("command socket bind");
+        ExitEarly(1);
+    }
+
+    symlink(FPP_SERVER_SOCKET, FPP_SERVER_SOCKET_OLD);
+    umask(old_umask);
+
+    fppdStartTime = time(NULL);
+
+    return socket_fd;
+}
+
+void CloseCommand() {
+    if (socket_fd >= 0) {
+        close(socket_fd);
+        unlink(FPP_SERVER_SOCKET);
+        socket_fd = -1;
+    }
+}
+
+char* ProcessCommand(char* command, char* response) {
+    char* s;
+    char* s2;
+    char* s3;
+    char* s4;
+    char* response2 = NULL;
+    int i;
+    std::string NextPlaylist = "No playlist scheduled.";
+    std::string NextPlaylistStart = "";
+    char CommandStr[64];
+    char* saveptr = nullptr; // for thread-safe strtok_r below
+    LogExcess(VB_COMMAND, "CMD: %s\n", command);
+    s = strtok_r(command, ",", &saveptr);
+    if (!s) {
+        s = command; // empty/all-delimiter command; graceful "Invalid command" path below
+    }
+    strncpy(CommandStr, s, sizeof(CommandStr)); // s can be 256 bytes long
+    CommandStr[sizeof(CommandStr) - 1] = '\0';
+
+    if ((!strcmp(CommandStr, "d")) ||
+        (!strcmp(CommandStr, "StopNow"))) {
+        if ((Player::INSTANCE.GetStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+            (Player::INSTANCE.GetStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+            (Player::INSTANCE.GetStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
+            Player::INSTANCE.StopNow(1);
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Playlist Stopping Now,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+        } else if ((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) &&
+                   (sequence->IsSequenceRunning())) {
+            sequence->CloseSequenceFile();
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Sequence Stopping Now,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+        } else {
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Not playing,,,,,,,,,,\n", getFPPmode(), COMMAND_FAILED);
+        }
+    } else if (!strcmp(CommandStr, "R")) {
+        scheduler->ReloadScheduleFile();
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Reloading Schedule,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+    } else if (!strcmp(CommandStr, "v")) {
+        s = strtok_r(NULL, ",", &saveptr);
+        if (s) {
+            setVolume(atoi(s));
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Setting Volume,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+        } else {
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Invalid Volume,,,,,,,,,,\n", getFPPmode(), COMMAND_FAILED);
+        }
+    } else if (!strcmp(CommandStr, "q")) {
+        // Quit/Shutdown fppd
+        if ((Player::INSTANCE.GetStatus() == FPP_STATUS_PLAYLIST_PLAYING) ||
+            (Player::INSTANCE.GetStatus() == FPP_STATUS_STOPPING_GRACEFULLY) ||
+            (Player::INSTANCE.GetStatus() == FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP)) {
+            Player::INSTANCE.StopNow(1);
+            sleep(2);
+        }
+
+        ShutdownFPPD();
+        // fpp waits for a non-empty reply, so an empty one stalls it until
+        // its ~2s timeout.
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Shutting Down,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+    } else if (!strcmp(CommandStr, "restart")) {
+        ShutdownFPPD(true);
+    } else if (!strcmp(CommandStr, "GetTestMode")) {
+        // GetConfig() is the full SetTestMode JSON (API-controlled, unbounded);
+        // strcpy/strcat would smash the 1501-byte stack reply. snprintf keeps
+        // the exact "config\n" shape for fitting values and truncates the rest.
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "%s\n", ChannelTester::INSTANCE.GetConfig().c_str());
+    } else if (!strcmp(CommandStr, "SetTestMode")) {
+        // The test config is everything after the first comma, which is where
+        // strtok_r left saveptr (NULL or "" when there was no comma).  It used
+        // to be s + strlen(s) + 1, which with no comma pointed past the end of
+        // the command into stale receive-buffer bytes.
+        if (ChannelTester::INSTANCE.SetupTest(std::string(saveptr ? saveptr : ""))) {
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "0,%d,Test Mode Activated,,,,,,,,,\n",
+                     COMMAND_SUCCESS);
+        } else {
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "0,%d,Test Mode Deactivated,,,,,,,,,\n",
+                     COMMAND_SUCCESS);
+        }
+    } else if (!strcmp(CommandStr, "LogLevel")) {
+        s = strtok_r(NULL, ",", &saveptr);
+        s2 = NULL;
+        if (s != NULL)
+            s2 = strtok_r(NULL, ",", &saveptr);
+
+        if (FPPLogger::INSTANCE.SetLevel(s, s2)) {
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Log Level Updated,%s,%s,,,,,,,,,\n",
+                     getFPPmode(), COMMAND_SUCCESS, s, s2);
+
+            WarningHolder::UpdateLogLevelWarnings();
+        } else {
+            snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Error Updating Log Level,%s,%s,,,,,,,,,\n",
+                     getFPPmode(), COMMAND_FAILED, s ? s : "", s2 ? s2 : "");
+        }
+        /*
+    } else if (!strcmp(CommandStr, "LogMask")) {
+        s = strtok_r(NULL,",", &saveptr);
+
+        if ((s && SetLogMask(s)) || SetLogMask("")) {
+            snprintf(response,MAX_RESPONSE_SIZE-1,"%d,%d,Log Mask Updated,%d,%d,,,,,,,,,\n",
+                getFPPmode(),COMMAND_SUCCESS,logLevel,logMask);
+        } else {
+            snprintf(response,MAX_RESPONSE_SIZE-1,"%d,%d,Error Updating Log Mask,%d,%d,,,,,,,,,\n",
+                getFPPmode(),COMMAND_FAILED,logLevel,logMask);
+        }
+*/
+    } else if (!strcmp(CommandStr, "reloadVideoOutputs")) {
+        VideoOutputManager::Instance().Reload();
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Video outputs reloaded,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+    } else if (!strcmp(CommandStr, "reloadVideoInputs")) {
+        VideoInputManager::Instance().RequestReload();
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Video inputs reloaded,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+#ifdef HAS_RTSP_OUTPUT_GSTREAMER
+    } else if (!strcmp(CommandStr, "reloadRTSPOutputs")) {
+        RTSPOutputManager::INSTANCE.ApplyConfig();
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,RTSP outputs reloaded,,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS);
+#endif
+    } else if (!strcmp(CommandStr, "SetSetting")) {
+        char name[128];
+
+        s = strtok_r(NULL, ",", &saveptr);
+        if (s) {
+            // Bounded copy - the token can be longer than the 128-byte buffer.
+            snprintf(name, sizeof(name), "%s", s);
+            // Don't use strtok_r for the value: it skips empty fields, so a
+            // command clearing a setting to "" (e.g. "SetSetting,foo,,")
+            // would otherwise never call SetSetting() at all. saveptr points
+            // at the start of the value here; split it on the next comma
+            // manually so an empty value still comes through.
+            // With no comma after the name ("SetSetting,foo") glibc leaves
+            // saveptr at the terminating NUL but BSD/macOS strtok_r sets it to
+            // NULL, so treat a NULL saveptr as an empty value.
+            static char emptyValue[1] = { 0 };
+            char* value = saveptr ? saveptr : emptyValue;
+            char* comma = strchr(value, ',');
+            if (comma)
+                *comma = '\0';
+            SetSetting(name, value);
+        }
+    } else if (!strcmp(CommandStr, "StartSequence")) {
+        if ((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) &&
+            (!sequence->IsSequenceRunning())) {
+            s = strtok_r(NULL, ",", &saveptr);
+            s2 = strtok_r(NULL, ",", &saveptr);
+            if (s && s2) {
+                i = atoi(s2);
+                // Start only what this request opened.  A refused name leaves
+                // any sequence already open but not started (a remote's,
+                // waiting for its master) in place, and StartSequence() would
+                // start that one instead.
+                if (sequence->OpenSequenceFile(s, 0, i) > 0) {
+                    sequence->StartSequence();
+                } else {
+                    LogWarn(VB_COMMAND, "Not starting sequence %s: it could not be opened\n", s);
+                }
+            } else {
+                LogDebug(VB_COMMAND, "Invalid command: %s\n", command);
+            }
+        } else {
+            LogErr(VB_COMMAND, "Tried to start a sequence when a playlist or "
+                               "sequence is already running\n");
+        }
+    } else if (!strcmp(CommandStr, "StopSequence")) {
+        if ((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) &&
+            (sequence->IsSequenceRunning())) {
+            sequence->CloseSequenceFile();
+        } else {
+            LogDebug(VB_COMMAND,
+                     "Tried to stop a sequence when no sequence is running\n");
+        }
+    } else if (!strcmp(CommandStr, "ToggleSequencePause")) {
+        if ((sequence->IsSequenceRunning()) &&
+            ((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) ||
+             ((Player::INSTANCE.GetStatus() != FPP_STATUS_IDLE) &&
+              (Player::INSTANCE.GetInfo()["currentEntry"]["type"] == "sequence")))) {
+            sequence->ToggleSequencePause();
+        }
+    } else if (!strcmp(CommandStr, "SingleStepSequence")) {
+        if ((sequence->IsSequenceRunning()) &&
+            (sequence->SequenceIsPaused()) &&
+            ((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) ||
+             ((Player::INSTANCE.GetStatus() != FPP_STATUS_IDLE) &&
+              (Player::INSTANCE.GetInfo()["currentEntry"]["type"] == "sequence")))) {
+            sequence->SingleStepSequence();
+        }
+        // Has been broken for some time issue #986
+        //    } else if (!strcmp(CommandStr, "SingleStepSequenceBack")) {
+        //        if ((sequence->IsSequenceRunning()) &&
+        //            (sequence->SequenceIsPaused()) &&
+        //            ((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) ||
+        //             ((Player::INSTANCE.GetStatus() != FPP_STATUS_IDLE) &&
+        //              (Player::INSTANCE.GetInfo()["currentEntry"]["type"] == "sequence")))) {
+        //            sequence->SingleStepSequenceBack();
+        //        }
+    } else if (!strcmp(CommandStr, "SetupExtGPIO")) {
+        // Configure the given GPIO to the given mode
+        s = strtok_r(NULL, ",", &saveptr);
+        s2 = strtok_r(NULL, ",", &saveptr);
+        if (s && s2) {
+            const PinCapabilities* pin = PinCapabilities::getPinByName(s).ptr();
+            if (!pin) {
+                pin = PinCapabilities::getPinByGPIO(0, atoi(s)).ptr();
+            }
+            bool OK = false;
+            if (pin) {
+                OK = true;
+                std::string mode = s2;
+                if (mode == "Input") {
+                    pin->configPin("gpio", false);
+                } else if (mode == "Output") {
+                    pin->configPin("gpio", true);
+                } else if (mode == "SoftPWM" || mode == "PWM") {
+                    if (pin->supportPWM()) {
+                        pin->setupPWM(10000);
+                    } else {
+                        LogDebug(VB_GPIO, "GPIO %s does not support PWM\n", pin->name.c_str());
+                        OK = false;
+                    }
+                }
+            }
+            if (OK) {
+                snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Configuring GPIO,%s,%s,,,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS, s, s2);
+            } else {
+                snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Configuring GPIO,%s,%s,,,,,,,,,\n", getFPPmode(), COMMAND_FAILED, s, s2);
+            }
+        }
+    } else if (!strcmp(CommandStr, "ExtGPIO")) {
+        s = strtok_r(NULL, ",", &saveptr);
+        s2 = strtok_r(NULL, ",", &saveptr);
+        s3 = strtok_r(NULL, ",", &saveptr);
+        if (s && s2 && s3) {
+            const PinCapabilities* pin = PinCapabilities::getPinByName(s).ptr();
+            if (!pin) {
+                pin = PinCapabilities::getPinByGPIO(0, atoi(s)).ptr();
+            }
+            int i = 0;
+            if (pin) {
+                std::string mode = s2;
+                if (mode == "Input") {
+                    pin->configPin("gpio", false);
+                    i = pin->getValue();
+                } else if (mode == "Output") {
+                    pin->configPin("gpio", true);
+                    pin->setValue(atoi(s3));
+                } else if (mode == "SoftPWM" || mode == "PWM") {
+                    if (pin->supportPWM()) {
+                        pin->setPWMValue(100 * atoi(s3)); // Convert to percentage
+                    } else {
+                        LogDebug(VB_GPIO, "GPIO %s does not support PWM\n", pin->name.c_str());
+                    }
+                }
+            }
+            if (i >= 0) {
+                snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Setting GPIO,%s,%s,%s,%d,,,,,,,\n", getFPPmode(), COMMAND_SUCCESS, s, s2, s3, i);
+            } else {
+                snprintf(response, MAX_RESPONSE_SIZE - 1, "%d,%d,Setting GPIO,%s,%s,%s,,,,,,,,\n", getFPPmode(), COMMAND_FAILED, s, s2, s3);
+            }
+        }
+    } else {
+        snprintf(response, MAX_RESPONSE_SIZE - 1, "Invalid command: '%s'\n", CommandStr);
+    }
+
+    return response2;
+}
+
+void CommandProc() {
+    constexpr int MAX_COMMAND_SIZE = 4096;
+    std::array<char, MAX_COMMAND_SIZE> command;
+
+    struct sockaddr_un client_address;
+    int bytes_received, bytes_sent;
+    socklen_t address_length;
+
+    // recvfrom() shrinks address_length to the sender's address size, so it
+    // (and the address itself) must be reset before every call: otherwise a
+    // short sender address truncates the next sender's path, or leaves the
+    // previous sender's bytes behind it, and the reply goes nowhere.
+    address_length = sizeof(client_address);
+    memset(&client_address, 0, sizeof(client_address));
+    memset(&command[0], 0, MAX_COMMAND_SIZE);
+    bytes_received = recvfrom(socket_fd, &command[0], MAX_COMMAND_SIZE - 1, 0,
+                              (struct sockaddr*)&(client_address),
+                              &address_length);
+
+    if (bytes_received <= 0) {
+        LogWarn(VB_COMMAND, "Command socket received but no bytes\n");
+    }
+
+    while (bytes_received > 0) {
+        command[bytes_received] = 0;
+
+        std::array<char, MAX_RESPONSE_SIZE> response;
+        response[0] = 0;
+        response[MAX_RESPONSE_SIZE - 1] = '\n';
+        // The socket protocol carries no caller identity (no PID/process info
+        // is sent with the datagram), so this can't say which local caller it
+        // was - only that it was local. A native C++ plugin calling
+        // CommandManager in-process never reaches this socket at all, but a
+        // plugin's own PHP page using commandsocket.php's SendCommand() looks
+        // identical to any other FPP UI page here - hence "plugin web page"
+        // rather than a bare "plugin", which would invite exactly the wrong
+        // inference when tracking down what a C++ plugin did. Realistic
+        // callers: the FPP UI, a plugin's own PHP page, the "fpp" CLI tool, or
+        // a local script talking to the socket directly.
+        //
+        // Naming the real caller is possible but not free: the receiver would
+        // set SO_PASSCRED on the socket and switch the recvfrom() calls below
+        // to recvmsg() to read the sender's pid out of SCM_CREDENTIALS, then
+        // resolve /proc/<pid>/comm. Worth doing; deliberately not done here.
+        //
+        // command is NUL-terminated and bounded by MAX_COMMAND_SIZE (4096), so
+        // this can't run away - but 4095 chars is still ~17 crash-ring slots,
+        // so truncate for the log like every other caller-supplied string.
+        LogDebug(VB_COMMAND, "Local command socket (FPP UI, plugin web page, fpp CLI, script, etc) running \"%s\"\n",
+                 TruncateForLog(&command[0]).c_str());
+        char* response2 = ProcessCommand(&command[0], &response[0]);
+        errno = 0;
+        if (response2) {
+            bytes_sent = sendto(socket_fd, response2, strlen(response2), 0,
+                                (struct sockaddr*)&(client_address), sizeof(struct sockaddr_un));
+            LogDebug(VB_COMMAND, "%s - (%d %d %s) %s", &command[0], bytes_sent, errno, FPPstrerror(errno), response2);
+            free(response2);
+            response2 = NULL;
+        } else {
+            bytes_sent = sendto(socket_fd, &response[0], strlen(&response[0]), 0,
+                                (struct sockaddr*)&(client_address), sizeof(struct sockaddr_un));
+            LogDebug(VB_COMMAND, "%s - (%d %d %s) %s",
+                     &command[0], bytes_sent, errno, FPPstrerror(errno), &response[0]);
+        }
+
+        address_length = sizeof(client_address);
+        memset(&client_address, 0, sizeof(client_address));
+        memset(&command[0], 0, MAX_COMMAND_SIZE);
+        bytes_received = recvfrom(socket_fd, &command[0], MAX_COMMAND_SIZE - 1, 0,
+                                  (struct sockaddr*)&(client_address),
+                                  &address_length);
+    }
+}

@@ -24,8 +24,9 @@ v2.0 spec
 14-17 - number of frames
 18  - step time in ms, usually 25 or 50
 19  - bit flags/reserved should be 0
-20  - compression type 0 for uncompressed, 1 for zstd, 2 for libz/gzip
-21  - number of compression blocks, 0 if uncompressed
+20 bits 0-3 - compression type 0 for uncompressed, 1 for zstd, 2 for libz/gzip
+20 bits 4-7 - number of compression blocks, upper 4 bits - introduced in FSEQ 2.1
+21  - number of compression blocks, 0 if uncompressed, lower 8 bits.  Total 12 bits.
 22  - number of sparse ranges, 0  if none
 23  - bit flags/reserved, unused right now, should be 0
 24-31 - 64bit unique identifier, likely a timestamp or uuid
@@ -53,3 +54,27 @@ Variable Length Headers in FSEQ  spec
     vh[2] = 'm'
     vh[3] = 'f'
     vh[4-Len] = NULL terminated media filename
+  - 'sp' - Sequence Producer
+    vh[0] = low byte of variable header length
+    vh[1] = high byte of variable header length
+    vh[2] = 's'
+    vh[3] = 'p'
+    vh[4-Len] = NULL terminated string of producer of the fseq file
+               ex: "xLights Macintosh 2019.22"
+With FSEQ files, the total header length is limitted to 65535 bytes
+(two bytes in the headaer for the sequence data offset). This needs
+to include all the variable headers, the sparse range table, the
+compressed block index table, etc...   Thus, to accomodate larger
+and more variable headers, starting in FSEQ 2.2, if the "code" for
+the header is ED, the actual data for the header is stored elsewhere.
+  - 'ED' - Extended Data
+    vh[0] = 18
+    vh[1] = 00
+    vh[2] = 'E';
+    vh[3] = 'D';
+    vh[4] = code0 (ex: 's')
+    vh[5] = code1 (ex: 'p')
+    vh[6-13] = uint64_t offset into the file of the actual data
+    vh[14-17] = uint32_t length of header data
+Normally, the actual data of for the header is written to the
+file immediately after the channel data.

@@ -1,0 +1,197 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <ctype.h>
+#include <errno.h>
+#include <netdb.h>
+#include <signal.h>
+
+#include "../Warnings.h"
+#include "ChannelOutputSetup.h"
+#include "../log.h"
+
+#include "KiNet.h"
+
+#define KINET_V1_PACKET_HEADERLEN 21
+#define KINET_V2_PACKET_HEADERLEN 24
+
+#define KINET_V1_TYPE 6
+#define KINET_V2_TYPE 7
+
+static const uint8_t V1_HEADER[KINET_V1_PACKET_HEADERLEN] = {
+    0x04, 0x01, 0xdc, 0x4a, // magic[4] 0401dc4a
+    0x01, 0x00,             // ver[2]  0100
+    0x01, 0x01,             // type[2]
+    0x00, 0x00, 0x00, 0x00, // seq[4]
+    0x00,                   // port
+    0x00,                   // padding
+    0x00, 0x00,             // flags
+    0xFF, 0xFF, 0xFF, 0xFF, // time
+    0x00                    // uni
+};
+static const uint8_t V2_HEADER[KINET_V2_PACKET_HEADERLEN] = {
+    0x04, 0x01, 0xdc, 0x4a, // magic[4] 0401dc4a
+    0x01, 0x00,             // ver[2]  0100
+    0x08, 0x01,             // type[2]
+    0x00, 0x00, 0x00, 0x00, // seq[4]
+    0xFF, 0xFF, 0xFF, 0xFF, // time
+    0x00,                   // port
+    0x00,                   // sequenceNum
+    0x00, 0x00,             // flags?
+    0x00, 0x02,
+    0x00, 0x00
+};
+
+static const std::string KINETTYPE = "KiNet";
+
+const std::string& KiNetOutputData::GetOutputTypeString() const {
+    return KINETTYPE;
+}
+
+KiNetOutputData::KiNetOutputData(const Json::Value& config) :
+    UDPOutputData(config) {
+    memset((char*)&kinetAddress, 0, sizeof(sockaddr_in));
+    kinetAddress.sin_family = AF_INET;
+    kinetAddress.sin_port = htons(KINET_PORT);
+    if (active) {
+        kinetAddress.sin_addr.s_addr = toInetAddr(ipAddress, valid);
+        if (!valid) {
+            AddOutputConfigWarning(14, "Could not resolve host name " + ipAddress + " - disabling output");
+            active = false;
+        }
+    }
+
+    port = config["id"].asInt();
+    if (config.isMember("universeCount")) {
+        portCount = config["universeCount"].asInt();
+    }
+    if (portCount < 1) {
+        portCount = 1;
+    }
+    if (portCount > 255) {
+        portCount = 255;
+    }
+    if (channelCount > 512) {
+        channelCount = 512;
+    }
+
+    sentSequence.assign(portCount, 0);
+    pendingSequence.assign(portCount, 0);
+    kinetIovecs = (struct iovec*)calloc(portCount * 2, sizeof(struct iovec));
+    kinetBuffers = (unsigned char**)calloc(portCount, sizeof(unsigned char*));
+
+    int chan = startChannel - 1;
+    for (int x = 0; x < portCount; x++) {
+        if (type == KINET_V1_TYPE) {
+            kinetBuffers[x] = (unsigned char*)malloc(KINET_V1_PACKET_HEADERLEN);
+            memcpy(kinetBuffers[x], V1_HEADER, KINET_V1_PACKET_HEADERLEN);
+            kinetBuffers[x][12] = port + x;
+        } else {
+            kinetBuffers[x] = (unsigned char*)malloc(KINET_V2_PACKET_HEADERLEN);
+            memcpy(kinetBuffers[x], V2_HEADER, KINET_V2_PACKET_HEADERLEN);
+            kinetBuffers[x][16] = port + x;
+        }
+
+        // use scatter/gather for the packet.   One IOV will contain
+        // the header, the second will point into the raw channel data
+        // and will be set at output time.   This avoids any memcpy.
+        kinetIovecs[x * 2].iov_base = kinetBuffers[x];
+        kinetIovecs[x * 2].iov_len = type == KINET_V1_TYPE ? KINET_V1_PACKET_HEADERLEN : KINET_V2_PACKET_HEADERLEN;
+        kinetIovecs[x * 2 + 1].iov_base = nullptr;
+        kinetIovecs[x * 2 + 1].iov_len = channelCount;
+
+        chan += channelCount;
+    }
+}
+KiNetOutputData::~KiNetOutputData() {
+    for (int x = 0; x < portCount; x++) {
+        free(kinetBuffers[x]);
+    }
+    free(kinetBuffers);
+    free(kinetIovecs);
+}
+
+void KiNetOutputData::GetRequiredChannelRange(int& min, int& max) {
+    min = startChannel - 1;
+    max = startChannel + (channelCount * portCount) - 1;
+}
+
+void KiNetOutputData::PrepareData(unsigned char* channelData, UDPOutputMessages& msgs) {
+    if (valid && active) {
+        int start = 0;
+        struct mmsghdr msg;
+        memset(&msg, 0, sizeof(msg));
+
+        msg.msg_hdr.msg_name = &kinetAddress;
+        msg.msg_hdr.msg_namelen = sizeof(sockaddr_in);
+        bool anySkipped = false;
+        bool allSkipped = true;
+        for (int p = 0; p < portCount; p++) {
+            bool nto = NeedToOutputFrame(channelData, startChannel - 1, start, kinetIovecs[p * 2 + 1].iov_len);
+            if (nto) {
+                msg.msg_hdr.msg_iov = &kinetIovecs[p * 2];
+                msg.msg_hdr.msg_iovlen = 2;
+                msg.msg_len = kinetIovecs[p * 2 + 1].iov_len + kinetIovecs[p * 2].iov_len;
+
+                msgs[kinetAddress.sin_addr.s_addr].push_back(msg);
+
+                if (type == KINET_V2_TYPE) {
+                    // Numbered from the last packet sent, not the last one
+                    // prepared: a frame prepared twice before it went out (as
+                    // one is when playback starts) skipped a number on the wire.
+                    uint32_t seq = sentSequence[p] + 1;
+                    pendingSequence[p] = seq;
+                    kinetBuffers[p][8] = seq & 0xFF;
+                    kinetBuffers[p][9] = (seq >> 8) & 0xFF;
+                    kinetBuffers[p][10] = (seq >> 16) & 0xFF;
+                    kinetBuffers[p][11] = (seq >> 24) & 0xFF;
+                }
+                // set the pointer to the channelData for the universe
+                kinetIovecs[p * 2 + 1].iov_base = (void*)(&channelData[startChannel - 1 + start]);
+                allSkipped = false;
+            } else {
+                anySkipped = true;
+            }
+            start += kinetIovecs[p * 2 + 1].iov_len;
+        }
+        if (anySkipped) {
+            skippedFrames++;
+        } else {
+            skippedFrames = 0;
+        }
+        if (!allSkipped) {
+            SaveFrame(&channelData[startChannel - 1], start);
+        }
+    }
+}
+void KiNetOutputData::FrameSent() {
+    sentSequence = pendingSequence;
+}
+
+void KiNetOutputData::DumpConfig() {
+    LogDebug(VB_CHANNELOUT, "KiNet: %s   %d:%d:%d:%d  %s\n",
+             description.c_str(),
+             active,
+             startChannel,
+             channelCount,
+             type,
+             ipAddress.c_str());
+}

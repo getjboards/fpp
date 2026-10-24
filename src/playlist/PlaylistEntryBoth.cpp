@@ -1,177 +1,322 @@
 /*
- *   Playlist Entry Both Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include "log.h"
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <thread>
+
+#include "../common.h"
+#include "../log.h"
+
 #include "PlaylistEntryBoth.h"
+#include "mediadetails.h"
+#include "../MultiSync.h"
 
-PlaylistEntryBoth::PlaylistEntryBoth(PlaylistEntryBase *parent)
-  : PlaylistEntryBase(parent),
-	m_duration(0),
-	m_mediaEntry(NULL),
-	m_sequenceEntry(NULL)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::PlaylistEntryBoth()\n");
+// Longest the sequence waits for the media to become audible.  Covers a cold
+// audio output (~0.6 s on an AM335x, a PipeWire output stream gives up at 3 s)
+// with margin; past it the sequence starts and the sync servo takes over.
+static constexpr long long AUDIO_START_HOLD_MS = 4000;
 
-	m_type = "both";
+PlaylistEntryBoth::PlaylistEntryBoth(Playlist* playlist, PlaylistEntryBase* parent) :
+    PlaylistEntryBase(playlist, parent),
+    m_duration(0),
+    m_mediaEntry(NULL),
+    m_sequenceEntry(NULL) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::PlaylistEntryBoth()\n");
+
+    m_type = "both";
 }
 
-PlaylistEntryBoth::~PlaylistEntryBoth()
-{
+PlaylistEntryBoth::~PlaylistEntryBoth() {
+    if (m_sequenceEntry) {
+        delete m_sequenceEntry;
+    }
+    if (m_mediaOwned) {
+        delete m_mediaOwned;
+    }
 }
 
 /*
  *
  */
-int PlaylistEntryBoth::Init(Json::Value &config)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::Init()\n");
+int PlaylistEntryBoth::Init(Json::Value& config) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::Init()\n");
 
-	m_sequenceEntry = new PlaylistEntrySequence(this);
-	if (!m_sequenceEntry)
-		return 0;
+    m_sequenceEntry = new PlaylistEntrySequence(m_parentPlaylist, this);
+    if (!m_sequenceEntry)
+        return 0;
 
-	m_mediaEntry = new PlaylistEntryMedia(this);
-	if (!m_mediaEntry)
-		return 0;
-    
+    m_mediaOwned = new PlaylistEntryMedia(m_parentPlaylist, this);
+    m_mediaEntry = m_mediaOwned;
 
     if (!m_mediaEntry->Init(config)) {
-        delete m_mediaEntry;
+        // Media init failed — run sequence-only.  The rest of this class
+        // already null-checks m_mediaEntry; the unconditional GetMediaName()
+        // call that used to sit below this branch dereferenced the pointer
+        // just nulled here.
+        delete m_mediaOwned;
+        m_mediaOwned = nullptr;
         m_mediaEntry = nullptr;
+    } else {
+        m_mediaName = m_mediaEntry->GetMediaName();
     }
-    m_mediaName = m_mediaEntry->GetMediaName();
 
-	if (!m_sequenceEntry->Init(config))
-		return 0;
+    if (!m_sequenceEntry->Init(config))
+        return 0;
 
-	return PlaylistEntryBase::Init(config);
+    m_sequenceName = m_sequenceEntry->GetSequenceName();
+    return PlaylistEntryBase::Init(config);
 }
 
 /*
  *
  */
-int PlaylistEntryBoth::StartPlaying(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::StartPlaying()\n");
+int PlaylistEntryBoth::StartPlaying(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::StartPlaying()\n");
 
-	if (!CanPlay())
-	{
-		FinishPlay();
-		return 0;
-	}
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (!CanPlay()) {
+        FinishPlay();
+        return 0;
+    }
 
+    // The sequence may start later than this (held until the media is
+    // audible, or after a media offset), and Process() acts on whether it is
+    // started or finished.  On a repeating playlist's next pass it still
+    // carries the last pass's "started and finished" -- which ended the entry
+    // at once, so a repeating playlist ran through every entry in a fraction
+    // of a second at the wrap and never played again.
+    m_sequenceEntry->ResetPlayState();
+
+    // Each pass decides afresh whether it has media.
+    m_mediaEntry = m_mediaOwned;
     if (m_mediaEntry && !m_mediaEntry->PreparePlay()) {
-        delete m_mediaEntry;
-		m_mediaEntry = nullptr;
+        m_mediaEntry = nullptr;
     }
     if (!m_mediaEntry) {
         LogDebug(VB_PLAYLIST, "Skipping media playlist entry, likely blacklisted audio: %s\n", m_mediaName.c_str());
     }
-
-	if (!m_sequenceEntry->StartPlaying())
-	{
-        if (m_mediaEntry) {
-            m_mediaEntry->Stop();
-        }
-		return 0;
-	}
-    if (m_mediaEntry && !m_mediaEntry->StartPlaying()) {
-        delete m_mediaEntry;
-        m_mediaEntry = nullptr;
-        m_sequenceEntry->Stop();
-        return 0;
+    // The media drives the timing when there is media; without it this pass,
+    // the sequence has to keep its own time.
+    m_sequenceEntry->setAdjustTiming(m_mediaEntry == nullptr);
+    if (!m_sequenceEntry->PreparePlay()) {
+        LogDebug(VB_PLAYLIST, "Problems starting sequence: %s\n", m_sequenceEntry->GetSequenceName().c_str());
     }
 
-	return PlaylistEntryBase::StartPlaying();
+    if (multiSync->isMultiSyncEnabled() && m_mediaEntry && m_mediaEntry->m_openTime) {
+        long long st = GetMonotonicTimeMS() - m_mediaEntry->m_openTime;
+        if (st < PlaylistEntryMedia::m_openStartDelay) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(PlaylistEntryMedia::m_openStartDelay - st - 2));
+        }
+    }
+
+    // With media, the sequence normally starts from Process() once the media
+    // is audible rather than here.  Starting both together put the lights
+    // ahead of the sound by however long the audio output took to come up --
+    // most of a second on slow boards -- and they only caught up as the sync
+    // servo slowed them, which looks like the first second of audio is missing.
+    m_holdingForAudio = m_mediaEntry && m_mediaEntry->GetMediaOffsetMS() <= 0;
+    if (!m_mediaEntry) {
+        if (!m_sequenceEntry->StartPlaying()) {
+            LogDebug(VB_PLAYLIST, "Could not start sequence: %s\n", m_sequenceEntry->GetSequenceName().c_str());
+            FinishPlay();
+            return 0;
+        }
+    }
+    if (m_mediaEntry && !m_mediaEntry->StartPlaying()) {
+        LogDebug(VB_PLAYLIST, "Could not start media: %s\n", m_mediaName.c_str());
+        m_mediaEntry->Stop();
+        m_mediaEntry = nullptr;
+        m_holdingForAudio = false;
+        m_sequenceEntry->Stop();
+        FinishPlay();
+        return 0;
+    }
+    m_holdStartMS = GetMonotonicTimeMS();
+
+    return PlaylistEntryBase::StartPlaying();
 }
 
 /*
  *
  */
-int PlaylistEntryBoth::Process(void)
-{
-	if (m_mediaEntry) m_mediaEntry->Process();
-	m_sequenceEntry->Process();
+int PlaylistEntryBoth::Process(void) {
+    LogExcess(VB_PLAYLIST, "PlaylistEntryBoth::Process()\n");
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
 
-	if (m_mediaEntry && m_mediaEntry->IsFinished())
-	{
-		FinishPlay();
-		m_sequenceEntry->Stop();
-	}
+    if (m_mediaEntry)
+        m_mediaEntry->Process();
 
-	if (m_sequenceEntry->IsFinished())
-	{
-		FinishPlay();
-		if (m_mediaEntry) m_mediaEntry->Stop();
-	}
+    if (m_holdingForAudio && m_mediaEntry) {
+        long long held = GetMonotonicTimeMS() - m_holdStartMS;
+        if (m_mediaEntry->IsAudible() || held >= AUDIO_START_HOLD_MS) {
+            m_holdingForAudio = false;
+            if (held >= AUDIO_START_HOLD_MS) {
+                LogWarn(VB_PLAYLIST, "No sound from %s after %lld ms, starting sequence %s anyway\n",
+                        m_mediaName.c_str(), held, m_sequenceEntry->GetSequenceName().c_str());
+            } else {
+                LogDebug(VB_PLAYLIST, "Media audible after %lld ms, starting sequence %s\n",
+                         held, m_sequenceEntry->GetSequenceName().c_str());
+            }
+            if (!m_sequenceEntry->StartPlaying()) {
+                LogDebug(VB_PLAYLIST, "Could not start sequence: %s\n", m_sequenceEntry->GetSequenceName().c_str());
+                m_mediaEntry->Stop();
+                FinishPlay();
+                return PlaylistEntryBase::Process();
+            }
+        }
+    }
 
-	// FIXME PLAYLIST, handle sync in here somehow
+    if (m_mediaEntry && m_mediaEntry->GetMediaOffsetMS() > 0) {
+        long long ct = GetMonotonicTimeMS();
+        long long df = ct - m_mediaEntry->m_startTime;
+        if (df > (m_mediaEntry->GetMediaOffsetMS() - m_sequenceEntry->GetSequenceFrameTime())) {
+            if (!m_sequenceEntry->IsStarted()) {
+                m_sequenceEntry->StartPlaying();
+            }
+        }
+    }
+    if (m_sequenceEntry->IsStarted()) {
+        m_sequenceEntry->Process();
+    }
 
-	return PlaylistEntryBase::Process();
+    if (m_mediaEntry && m_mediaEntry->IsFinished()) {
+        FinishPlay();
+        if (!m_sequenceEntry->IsFinished()) {
+            m_sequenceEntry->Stop();
+        }
+    }
+
+    if (m_sequenceEntry->IsFinished() && (!m_mediaEntry || !m_mediaEntry->HasExtraAtEnd())) {
+        FinishPlay();
+        if (m_mediaEntry)
+            m_mediaEntry->Stop();
+    }
+
+    // FIXME PLAYLIST, handle sync in here somehow
+
+    return PlaylistEntryBase::Process();
 }
 
 /*
  *
  */
-int PlaylistEntryBoth::Stop(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::Stop()\n");
+int PlaylistEntryBoth::Stop(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntryBoth::Stop()\n");
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    m_holdingForAudio = false;
 
-	if (m_mediaEntry) m_mediaEntry->Stop();
-	m_sequenceEntry->Stop();
+    if (m_mediaEntry)
+        m_mediaEntry->Stop();
+    m_sequenceEntry->Stop();
 
-	return PlaylistEntryBase::Stop();
+    return PlaylistEntryBase::Stop();
 }
 
 /*
  *
  */
-void PlaylistEntryBoth::Dump(void)
-{
-	PlaylistEntryBase::Dump();
+void PlaylistEntryBoth::Dump(void) {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    PlaylistEntryBase::Dump();
 
-	if (m_mediaEntry) m_mediaEntry->Dump();
-	m_sequenceEntry->Dump();
+    if (m_mediaEntry)
+        m_mediaEntry->Dump();
+    m_sequenceEntry->Dump();
+}
+
+uint64_t PlaylistEntryBoth::GetLengthInMS() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    uint64_t m = m_mediaEntry ? m_mediaEntry->GetLengthInMS() : 0;
+    uint64_t s = m_sequenceEntry ? m_sequenceEntry->GetLengthInMS() : 0;
+    if (m && m < s) {
+        // media drives it, when media completes, we stop
+        return m;
+    }
+    return s;
+}
+uint64_t PlaylistEntryBoth::GetElapsedMS() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry) {
+        return m_mediaEntry->GetElapsedMS();
+    }
+    if (m_sequenceEntry) {
+        return m_sequenceEntry->GetElapsedMS();
+    }
+    return 0;
 }
 
 /*
  *
  */
-Json::Value PlaylistEntryBoth::GetConfig(void)
-{
-	Json::Value result = PlaylistEntryBase::GetConfig();
+Json::Value PlaylistEntryBoth::GetConfig(void) {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    Json::Value result = PlaylistEntryBase::GetConfig();
 
     if (m_mediaEntry) {
         result["media"] = m_mediaEntry->GetConfig();
     } else {
-        //fake it so the display will display the times
-        //where the sequence is
+        // fake it so the display will display the times
+        // where the sequence is
         result["media"] = m_sequenceEntry->GetConfig();
     }
-	result["sequence"] = m_sequenceEntry->GetConfig();
+    result["sequence"] = m_sequenceEntry->GetConfig();
 
-	return result;
+    return result;
 }
 
+Json::Value PlaylistEntryBoth::GetMqttStatus(void) {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    Json::Value result = PlaylistEntryBase::GetMqttStatus();
+    if (m_mediaEntry) {
+        uint64_t l = m_mediaEntry->GetLengthInMS();
+        uint64_t e = m_mediaEntry->GetElapsedMS();
+        result["secondsRemaining"] = (int)((l - e) / 1000);
+        result["secondsTotal"] = (int)(l / 1000);
+        result["secondsElapsed"] = (int)(e / 1000);
+        result["mediaName"] = m_mediaEntry->GetMediaName();
+    }
+    if (m_sequenceEntry) {
+        Json::Value se = m_sequenceEntry->GetMqttStatus();
+        result["sequenceName"] = se["sequenceName"];
+        result["secondsRemaining"] = se["secondsRemaining"];
+        result["secondsTotal"] = se["secondsTotal"];
+        result["secondsElapsed"] = se["secondsElapsed"];
+    }
+
+    result["mediaTitle"] = MediaDetails::INSTANCE.title;
+    result["mediaArtist"] = MediaDetails::INSTANCE.artist;
+
+    return result;
+}
+
+void PlaylistEntryBoth::Pause() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry)
+        m_mediaEntry->Pause();
+    m_sequenceEntry->Pause();
+}
+bool PlaylistEntryBoth::IsPaused() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry) {
+        return m_mediaEntry->IsPaused();
+    }
+    return m_sequenceEntry->IsPaused();
+}
+void PlaylistEntryBoth::Resume() {
+    std::unique_lock<std::recursive_mutex> seqLock(m_mutex);
+    if (m_mediaEntry)
+        m_mediaEntry->Resume();
+    m_sequenceEntry->Resume();
+}

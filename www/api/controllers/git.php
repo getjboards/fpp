@@ -1,0 +1,851 @@
+<?
+/**
+ * Get origin commits
+ *
+ * Returns a list of commits present in the `origin` (GitHub) but not in the local repository.
+ *
+ * @route GET /api/git/originLog
+ * @response 200 Commits in origin not yet in local
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "rows": [
+ *     {
+ *       "hash": "95ccb370e45272d8aed76aabfa55e60d489a8280",
+ *       "author": "GithubUser1",
+ *       "date": "2024-03-14",
+ *       "msg": "Use our SaveJsonToString() when generating MQTT warnings JSON message."
+ *     },
+ *     {
+ *       "hash": "2fad5ad941baea49edaab834429343b42981bcc5",
+ *       "author": "GithubUser2",
+ *       "date": "2024-03-12",
+ *       "msg": "Move Playlist initialization into main() via Player::Init()"
+ *     }
+ *   ]
+ * }
+ * ```
+ */
+function GetGitOriginLog()
+{
+    $rows = array();
+    global $fppDir;
+
+    exec("$fppDir/scripts/git_fetch", $log);
+    unset($log);
+    exec("$fppDir/scripts/git_origin_log", $log);
+
+    foreach ($log as $line) {
+        if (str_starts_with($line, "Git changes") || str_starts_with($line, "=========")) {
+            continue;
+        }
+        $pos = strpos($line, "~~~~");
+        // Limit the split so a "~~~~" inside the subject stays part of the message.
+        $elements = explode("~~~~", $line, 4);
+        if ($pos > 0 && count($elements) == 4) {
+            $h = $elements[0];
+            $a = $elements[1];
+            $d = $elements[2];
+            $msg = $elements[3];
+            $row = array("hash" => $h, "author" => $a, "date" => $d, "msg" => $msg);
+            array_push($rows, $row);
+        }
+    }
+
+    $rc = array("status" => "OK", "rows" => $rows);
+
+    return json($rc);
+}
+
+/**
+ * Discard local changes
+ * Performs a hard reset on the current branch, discarding any local changes.
+ *
+ * @route POST /api/git/reset
+ * @route GET /api/git/reset deprecated
+ * @response 200 Reset complete
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "log": [
+ *     "HEAD is now at a1b65d43 Git Reset moved - #944",
+ *     "Entering 'external/RF24'",
+ *     "HEAD is now at ebc3abe Fix typo, missing space."
+ *   ]
+ * }
+ * ```
+ */
+function GitReset()
+{
+    global $fppDir;
+    exec("$fppDir/scripts/git_reset", $log);
+
+    $rc = array("status" => "OK", "log" => $log);
+    return json($rc);
+}
+
+/**
+ * Get local repo status
+ *
+ * Returns the status of the local git branch, including any dirty files.
+ *
+ * @route GET /api/git/status
+ * @response 200 Local repository status
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "log": "On branch master\nYour branch is up to date with 'origin/master'."
+ * }
+ * ```
+ */
+function GitStatus()
+{
+    global $fppDir;
+
+    $fullLog = "";
+    exec("$fppDir/scripts/git_status", $log);
+    $fullLog .= implode("\n", $log);
+
+    $rc = array("status" => "OK", "log" => $fullLog);
+
+    return json($rc);
+}
+
+/**
+ * Get releases for OS
+ *
+ * Returns lists of `.fppos` files available locally or on GitHub for the current platform.
+ * If the `{All}` path parameter is `"all"`, returns all releases regardless of platform.
+ *
+ * @route GET /api/git/releases/os/{All}
+ * @response 200 Available OS release assets
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "downloaded": ["Pi-v4.4.fppos", "Pi-5.0-alpha1.fppos"],
+ *   "files": [
+ *     {
+ *       "tag": "5.1",
+ *       "release_name": "5.1",
+ *       "filename": "Pi-5.1.1.fppos",
+ *       "url": "https://github.com/FalconChristmas/fpp/releases/download/5.1/Pi-5.1.1.fppos",
+ *       "asset_id": 42917234,
+ *       "downloaded": false,
+ *       "size": 0,
+ *       "prerelease": false
+ *     }
+ *   ]
+ * }
+ * ```
+ */
+function GitOSReleases()
+{
+    global $settings;
+    global $uploadDirectory;
+    $platforms = params('All');
+
+    $existingFiles = getFileList($uploadDirectory, "fppos");
+
+    $curl = curl_init();
+    curl_setopt($curl, CURLOPT_URL, "https://api.github.com/repos/FalconChristmas/fpp/releases?per_page=100");
+    curl_setopt($curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 6.2; WOW64; rv:17.0) Gecko/20100101 Firefox/17.0");
+    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 4000);
+    $request_content = curl_exec($curl);
+    $request_error = curl_error($curl);
+    curl_close($curl);
+
+    $rc = array('status' => 'ERROR');
+    $releases = array();
+    $githubOk = false;
+
+    if ($request_content !== false) {
+        $githubOk = true;
+        $data = json_decode($request_content, true);
+        foreach ($data as $r) {
+            if (isset($r["assets"]) && $settings['OSImagePrefix'] != "") {
+                foreach ($r["assets"] as $file) {
+                    $name = $file["name"];
+                    if (str_ends_with($name, ".fppos")) {
+                        if ($platforms == "all" || MatchesDeviceOSImage($name, $settings)) {
+                            $row = array();
+                            $row["tag"] = $r["tag_name"];
+                            $row["release_name"] = $r["name"];
+                            $row["filename"] = $name;
+                            $row["url"] = $file["browser_download_url"];
+                            $row["asset_id"] = $file["id"];
+                            $row["downloaded"] = in_array($name, $existingFiles);
+                            $row["size"] = $file["size"];
+                            $row["prerelease"] = $r["prerelease"];
+                            array_push($releases, $row);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // When an "Upgrade Source" other than github.com is configured (another FPP
+    // instance on the LAN), also list the .fppos images that FPP actually has in
+    // its uploads dir, so images can be pulled from the LAN instead of GitHub --
+    // including images GitHub has since rolled past (e.g. an older nightly). This
+    // is done in addition to the GitHub list; entries present in both are tagged
+    // with their source and pointed at the mirror.
+    $upgradeSource = isset($settings['UpgradeSource']) ? $settings['UpgradeSource'] : 'github.com';
+    if ($upgradeSource != '' && $upgradeSource != 'github.com') {
+        $srcCurl = curl_init();
+        curl_setopt($srcCurl, CURLOPT_URL, "http://" . fppUrlHost($upgradeSource) . "/api/files/uploads");
+        curl_setopt($srcCurl, CURLOPT_FAILONERROR, true);
+        curl_setopt($srcCurl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($srcCurl, CURLOPT_CONNECTTIMEOUT_MS, 4000);
+        curl_setopt($srcCurl, CURLOPT_TIMEOUT, 8);
+        $srcContent = curl_exec($srcCurl);
+        curl_close($srcCurl);
+        $srcData = ($srcContent !== false) ? json_decode($srcContent, true) : null;
+        if (isset($srcData["files"]) && is_array($srcData["files"])) {
+            // Index the GitHub entries by filename so a source copy annotates the
+            // existing entry rather than adding a duplicate row.
+            $indexByName = array();
+            foreach ($releases as $i => $rel) {
+                $indexByName[$rel["filename"]] = $i;
+            }
+            foreach ($srcData["files"] as $sf) {
+                $name = isset($sf["name"]) ? $sf["name"] : "";
+                if (!str_ends_with($name, ".fppos")) {
+                    continue;
+                }
+                if ($platforms != "all" && !MatchesDeviceOSImage($name, $settings)) {
+                    continue;
+                }
+                $srcUrl = "http://" . fppUrlHost($upgradeSource) . "/api/file/uploads/" . $name;
+                if (isset($indexByName[$name])) {
+                    // Available from the source too -- pull it from the LAN and
+                    // flag the origin so the UI can label it.
+                    $releases[$indexByName[$name]]["source"] = $upgradeSource;
+                    $releases[$indexByName[$name]]["url"] = $srcUrl;
+                } else {
+                    // Source-only image (GitHub no longer offers it).
+                    $lname = strtolower($name);
+                    $row = array();
+                    $row["tag"] = "";
+                    $row["release_name"] = "From " . $upgradeSource;
+                    $row["filename"] = $name;
+                    $row["url"] = $srcUrl;
+                    // Synthetic, positive-integer asset id so about.php's numeric
+                    // option-cleanup (parseInt(value) > 0) still clears it on reload.
+                    $row["asset_id"] = sprintf("%u", crc32($name));
+                    $row["downloaded"] = in_array($name, $existingFiles);
+                    $row["size"] = isset($sf["sizeBytes"]) ? intval($sf["sizeBytes"]) : 0;
+                    $row["prerelease"] = (strpos($lname, "nightly") !== false || strpos($lname, "alpha") !== false || strpos($lname, "beta") !== false);
+                    $row["source"] = $upgradeSource;
+                    array_push($releases, $row);
+                    $indexByName[$name] = count($releases) - 1;
+                }
+            }
+        }
+    }
+
+    if ($githubOk || !empty($releases)) {
+        $rc['status'] = 'OK';
+        $rc['downloaded'] = $existingFiles;
+        $rc['files'] = $releases;
+    } else {
+        $rc['status'] = "Error";
+        $rc['message'] = $request_error;
+    }
+
+    return json($rc);
+}
+
+/**
+ * Get OS release notes for a tag
+ *
+ * Proxies the GitHub `FalconChristmas/fpp` release-by-tag API so the browser does
+ * not call api.github.com directly (same pattern/UA/timeout as GitOSReleases).
+ * Returns the raw GitHub release object on success; a non-200 status otherwise so
+ * the caller's error handler fires.
+ *
+ * @route GET /api/git/releases/notes/{tag}
+ * @response 200 GitHub release object for the tag
+ * @response 400 Invalid tag
+ * @response 404 Release not found for the tag
+ */
+function GitOSReleaseNotes()
+{
+    $tag = params('tag');
+
+    // Release tags are simple (e.g. "9.5", "10.0-beta2"); reject anything else
+    // before it reaches the GitHub URL.
+    if (!preg_match('/^[A-Za-z0-9._-]+$/', $tag)) {
+        http_response_code(400);
+        return json(array('status' => 'ERROR', 'message' => 'Invalid tag'));
+    }
+
+    $curl = curl_init();
+    curl_setopt($curl, CURLOPT_URL, "https://api.github.com/repos/FalconChristmas/fpp/releases/tags/" . rawurlencode($tag));
+    curl_setopt($curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 6.2; WOW64; rv:17.0) Gecko/20100101 Firefox/17.0");
+    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 4000);
+    $request_content = curl_exec($curl);
+    $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    curl_close($curl);
+
+    if ($request_content === false || $http_code >= 400) {
+        http_response_code(404);
+        return json(array('status' => 'ERROR', 'message' => 'Release notes not found'));
+    }
+
+    $data = json_decode($request_content, true);
+    if ($data === null) {
+        http_response_code(502);
+        return json(array('status' => 'ERROR', 'message' => 'Invalid response from GitHub'));
+    }
+
+    return json($data);
+}
+
+/**
+ * Get release asset sizes
+ *
+ * Returns release asset size information from the GitHub `FalconChristmas/fpp` releases API.
+ *
+ * @route GET /api/git/releases/sizes
+ * @response 200 Release asset sizes
+ * ```json
+ * [
+ *   "BBB-nightly_2026-05.fppos,1161494528",
+ *   "BBB-10.0-alpha_2026-02.fppos,884658176"
+ * ]
+ * ```
+ */
+function GitOSReleaseSizes()
+{
+    global $settings;
+
+    $curl = curl_init();
+    curl_setopt($curl, CURLOPT_URL, "https://api.github.com/repos/FalconChristmas/fpp/releases?per_page=100");
+    curl_setopt($curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 6.2; WOW64; rv:17.0) Gecko/20100101 Firefox/17.0");
+    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 4000);
+    $request_content = curl_exec($curl);
+    curl_close($curl);
+
+    $rc = "";
+
+    if ($request_content != false) {
+        $data = json_decode($request_content, true);
+        foreach ($data as $r) {
+            if (isset($r["assets"]) && $settings['OSImagePrefix'] != "") {
+                foreach ($r["assets"] as $file) {
+                    $name = $file["name"];
+                    if (MatchesDeviceOSImage($name, $settings)) {
+                        $rc = $rc . $name . "," . $file["size"] . "\n";
+                    }
+                }
+            }
+        }
+
+    } else {
+        $rc = "Error: " . curl_error($curl) . "\n";
+    }
+
+    return $rc;
+}
+
+/**
+ * Fetch branch names for a user's fpp fork via the GitHub API.
+ *
+ * Shared fallback for GitBranches() when the fork remote has no local
+ * tracking refs yet (or its fetch failed). Applies the same obsolete /
+ * dependabot filtering as the local branch listing. Returns an empty array
+ * when GitHub is unreachable, the repo does not exist, or credentials fail.
+ */
+function GitHubForkBranchNames($user, $pat)
+{
+    $branches = array();
+    if (preg_match('/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/', $user) !== 1 || preg_match('/[\r\n]/', $pat)) {
+        return $branches;
+    }
+    $ch = curl_init('https://api.github.com/repos/' . rawurlencode($user) . '/fpp/branches?per_page=100');
+    $headers = array('User-Agent: FPP', 'Accept: application/vnd.github.v3+json');
+    if ($pat !== '') {
+        $headers[] = 'Authorization: token ' . $pat;
+    }
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_FAILONERROR, false);
+    $body = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($body === false || $code < 200 || $code >= 300) {
+        return $branches;
+    }
+    $data = json_decode($body, true);
+    if (!is_array($data)) {
+        return $branches;
+    }
+    foreach ($data as $b) {
+        if (!isset($b['name'])) {
+            continue;
+        }
+        $branch = $b['name'];
+        if (
+            preg_match("*v[01]\.[0-9x]*", $branch)
+            || preg_match("*v2\.[0-9x]*", $branch)
+            || preg_match("*v3\.[0-9x]*", $branch)
+            || preg_match("*v4\.[0-9x]*", $branch)
+            || preg_match("*v5\.[0-9x]*", $branch)
+            || preg_match("*v6\.[0-9x]*", $branch)
+            || str_starts_with($branch, "dependabot/")
+            || str_starts_with($branch, "HEAD ")
+        ) {
+            continue;
+        }
+        $branches[] = $branch;
+    }
+    sort($branches);
+    return $branches;
+}
+
+/**
+ * Get local branches
+ *
+ * Returns an array of branches available to switch to, filtering out obsolete version branches
+ * and Dependabot branches.
+ *
+ * @route GET /api/git/branches
+ * @response 200 Available local branches
+ * ```json
+ * ["master", "v7.3", "v7.2", "v7.1", "v7.0"]
+ * ```
+ */
+function GitBranches()
+{
+    $rows = array();
+    global $fppDir, $settings, $SUDO, $mediaDirectory;
+
+    // Get the remote parameter from the query string, default to 'origin'
+    $remote = isset($_GET['remote']) ? $_GET['remote'] : (isset($settings['gitRemote']) ? $settings['gitRemote'] : 'origin');
+    // Pull Requests is synthetic – not a real git remote; fall back to origin for branch listings
+    if ($remote === 'pull-requests') {
+        $remote = 'origin';
+    }
+
+    // Validate remote name to prevent injection
+    if (!preg_match('/^[a-zA-Z0-9_-]+$/', $remote)) {
+        $remote = 'origin';
+    }
+
+    // A fork remote only has local tracking refs once the git remote exists
+    // and has been fetched. That remote is created lazily at branch-switch
+    // time (see www/changebranch.php), so a freshly-entered username/PAT
+    // would otherwise list zero branches here. Ensure it now so the
+    // Developer settings branch dropdown populates on first selection.
+    $forkUser = isset($settings['gitHubUser']) ? trim($settings['gitHubUser']) : '';
+    $forkPat = isset($settings['gitHubPAT']) ? trim($settings['gitHubPAT']) : '';
+    // Never treat the reserved remotes as a fork: a username matching one of
+    // these (case-insensitively) must not rewrite the real origin/newfeatures
+    // remote URL below.
+    $forkUserReserved = in_array(strtolower($forkUser), array('origin', 'newfeatures', 'pull-requests'), true);
+    $isForkRemote = (!$forkUserReserved && $forkUser !== '' && preg_match('/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/', $forkUser) === 1
+        && strcasecmp($remote, $forkUser) === 0 && !preg_match('/[\r\n]/', $forkPat));
+    if ($isForkRemote) {
+        // Canonical casing for git remote operations
+        $remote = $forkUser;
+        $gitDir = escapeshellarg($fppDir . "/.git");
+        $sudo = isset($SUDO) ? $SUDO : 'sudo';
+        exec("$sudo git --git-dir=$gitDir remote get-url " . escapeshellarg($remote) . " 2>&1", $chkOut, $chkRet);
+        if ($chkRet != 0) {
+            if ($forkPat !== '') {
+                $remoteUrl = "https://" . rawurlencode($forkUser) . ":" . rawurlencode($forkPat) . "@github.com/" . rawurlencode($forkUser) . "/fpp.git";
+            } else {
+                $remoteUrl = "https://github.com/" . rawurlencode($forkUser) . "/fpp.git";
+            }
+            exec("$sudo git --git-dir=$gitDir remote add " . escapeshellarg($remote) . " " . escapeshellarg($remoteUrl) . " 2>&1", $addOut, $addRet);
+        } elseif ($forkPat !== '') {
+            // Keep private-fork fetches authenticated
+            $remoteUrl = "https://" . rawurlencode($forkUser) . ":" . rawurlencode($forkPat) . "@github.com/" . rawurlencode($forkUser) . "/fpp.git";
+            exec("$sudo git --git-dir=$gitDir remote set-url " . escapeshellarg($remote) . " " . escapeshellarg($remoteUrl) . " 2>&1", $updOut, $updRet);
+        }
+        unset($chkOut); unset($addOut); unset($updOut);
+        // Fetch just this remote under the shared git lock so we can't race
+        // a running upgrade (same lock as scripts/functions runGitLocked).
+        $mediaDir = isset($mediaDirectory) ? $mediaDirectory : (isset($settings['mediaDirectory']) ? $settings['mediaDirectory'] : "/tmp");
+        $gitLock = escapeshellarg($mediaDir . "/tmp/fpp-git-repo.lock");
+        $fetchInner = "git --git-dir=$gitDir fetch " . escapeshellarg($remote) . " 2>&1";
+        if (is_executable("/usr/bin/flock")) {
+            exec("$sudo flock -w 60 -x $gitLock bash -c " . escapeshellarg($fetchInner) . " 2>&1", $forkFetchOut, $forkFetchRet);
+        } else {
+            exec("$sudo bash -c " . escapeshellarg($fetchInner) . " 2>&1", $forkFetchOut, $forkFetchRet);
+        }
+        unset($forkFetchOut);
+    }
+
+    exec("$fppDir/scripts/git_fetch", $log);
+    unset($log);
+    exec("git -C " . escapeshellarg($fppDir) . " branch -l --remotes", $log);
+
+    foreach ($log as $line) {
+        $line = trim($line);
+        if (str_starts_with($line, "$remote/")) {
+            $branch = substr($line, strlen($remote) + 1);
+
+            if (
+                !(preg_match("*v[01]\.[0-9x]*", $branch)   // very very old v0.x and v1.x branches
+                    || preg_match("*v2\.[0-9x]*", $branch)   // old v2.x branchs, that can no longer work (wrong lib versions)
+                    || preg_match("*v3\.[0-9x]*", $branch)   // old v3.x branchs, that can no longer work (wrong libhttp versions)
+                    || preg_match("*v4\.[0-9x]*", $branch)   // old v4.x branchs, that can no longer work (wrong vlc versions)
+                    || preg_match("*v5\.[0-9x]*", $branch)   // old v5.x branchs, that can no longer work (wrong OS versions)
+                    || preg_match("*v6\.[0-9x]*", $branch)   // old v6.x branchs, below the FPP7 support floor
+                    || str_starts_with($branch, "dependabot/")    // dependabot created branches
+                    || str_starts_with($branch, "HEAD ")
+                )
+            ) {
+                array_push($rows, $branch);
+            }
+
+        }
+    }
+
+    // Newly-added fork remotes (or a failed fetch, e.g. private fork over
+    // https without a working credential) can still yield zero local refs.
+    // Fall back to the GitHub branches API so the dropdown still populates.
+    if ($isForkRemote && empty($rows)) {
+        $rows = GitHubForkBranchNames($forkUser, $forkPat);
+    }
+
+    return json($rows);
+}
+
+/**
+ * Get fork branches
+ *
+ * Returns branches from the authenticated user's fork of FPP (github.com/<user>/fpp)
+ * if that fork exists. Used by the Developer settings page to offer a "switch to
+ * fork branch" dropdown. The fork is probed via the GitHub API using the saved
+ * gitHubUser / gitHubPAT credentials; an unreachable GitHub or a missing repo
+ * returns hasFork false rather than an error.
+ *
+ * @route GET /api/git/forkBranches
+ * @response 200 Fork branch list
+ * ```json
+ * {
+ *   "hasFork": true,
+ *   "user": "myuser",
+ *   "branches": ["master", "my-feature"]
+ * }
+ * ```
+ */
+function GitForkBranches()
+{
+    global $settings, $fppDir;
+
+    $user = isset($settings['gitHubUser']) ? trim($settings['gitHubUser']) : '';
+    $pat = isset($settings['gitHubPAT']) ? trim($settings['gitHubPAT']) : '';
+
+    // Reject header-injection payloads in PAT (would otherwise allow CRLF injection
+    // into the Authorization header). Username is already constrained by regex below.
+    if (preg_match('/[\r\n]/', $pat)) {
+        return json(array('hasFork' => false, 'user' => $user, 'branches' => array()));
+    }
+
+    // GitHub usernames: 1-39 chars, alphanumeric and hyphens, cannot begin/end with hyphen
+    $validUser = (preg_match('/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/', $user) === 1);
+    if (!$validUser || $user === '' || $pat === '') {
+        return json(array('hasFork' => false, 'user' => $user, 'branches' => array()));
+    }
+
+    // Helper to perform a GitHub API GET with optional PAT auth
+    $doCurl = function ($url) use ($pat) {
+        $ch = curl_init($url);
+        $headers = array('User-Agent: FPP', 'Accept: application/vnd.github.v3+json');
+        if ($pat !== '') {
+            // GitHub accepts both "token <PAT>" and "Bearer <PAT>"; use token for classic PATs
+            $headers[] = 'Authorization: token ' . $pat;
+        }
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_FAILONERROR, false);
+        $body = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        return array('body' => $body, 'code' => $code, 'err' => $err);
+    };
+
+    // 1. Check if repo exists and is a fork (or at least exists)
+    $repoUrl = 'https://api.github.com/repos/' . rawurlencode($user) . '/fpp';
+    $repoResp = $doCurl($repoUrl);
+    if ($repoResp['body'] === false || $repoResp['code'] == 0) {
+        // Network unreachable - fallback to local git remote check (useful for offline tests
+        // or environments where github is blocked). If a remote named after the user exists
+        // locally, treat it as a fork and list its branches via git branch -r.
+        global $fppDir;
+        $fppDirEsc = escapeshellarg($fppDir);
+        exec("git -C $fppDirEsc remote get-url " . escapeshellarg($user) . " 2>&1", $chkOut, $chkRet);
+        if ($chkRet == 0) {
+            $branches = array();
+            exec("git -C $fppDirEsc branch -r 2>&1", $allLines);
+            foreach ($allLines as $line) {
+                $line = trim($line);
+                if (str_starts_with($line, "$user/") && strpos($line, '->') === false) {
+                    $branch = substr($line, strlen($user) + 1);
+                    if (
+                        preg_match("*v[01]\.[0-9x]*", $branch)
+                        || preg_match("*v2\.[0-9x]*", $branch)
+                        || preg_match("*v3\.[0-9x]*", $branch)
+                        || preg_match("*v4\.[0-9x]*", $branch)
+                        || preg_match("*v5\.[0-9x]*", $branch)
+                        || preg_match("*v6\.[0-9x]*", $branch)
+                        || str_starts_with($branch, "dependabot/")
+                        || str_starts_with($branch, "HEAD ")
+                    ) {
+                        continue;
+                    }
+                    $branches[] = $branch;
+                }
+            }
+            sort($branches);
+            return json(array('hasFork' => true, 'user' => $user, 'branches' => $branches));
+        }
+        return json(array('hasFork' => false, 'user' => $user, 'branches' => array()));
+    }
+    if ($repoResp['code'] == 404) {
+        // Also check local fallback - a locally-configured fork remote should still count
+        global $fppDir;
+        $fppDirEsc = escapeshellarg($fppDir);
+        exec("git -C $fppDirEsc remote get-url " . escapeshellarg($user) . " 2>&1", $chkOut, $chkRet);
+        if ($chkRet == 0) {
+            $branches = array();
+            exec("git -C $fppDirEsc branch -r 2>&1", $allLines);
+            foreach ($allLines as $line) {
+                $line = trim($line);
+                if (str_starts_with($line, "$user/") && strpos($line, '->') === false) {
+                    $branch = substr($line, strlen($user) + 1);
+                    if (
+                        preg_match("*v[01]\.[0-9x]*", $branch)
+                        || preg_match("*v2\.[0-9x]*", $branch)
+                        || preg_match("*v3\.[0-9x]*", $branch)
+                        || preg_match("*v4\.[0-9x]*", $branch)
+                        || preg_match("*v5\.[0-9x]*", $branch)
+                        || preg_match("*v6\.[0-9x]*", $branch)
+                        || str_starts_with($branch, "dependabot/")
+                        || str_starts_with($branch, "HEAD ")
+                    ) {
+                        continue;
+                    }
+                    $branches[] = $branch;
+                }
+            }
+            sort($branches);
+            if (!empty($branches)) {
+                return json(array('hasFork' => true, 'user' => $user, 'branches' => $branches));
+            }
+        }
+        return json(array('hasFork' => false, 'user' => $user, 'branches' => array()));
+    }
+    if ($repoResp['code'] < 200 || $repoResp['code'] >= 300) {
+        return json(array('hasFork' => false, 'user' => $user, 'branches' => array()));
+    }
+    $repoData = json_decode($repoResp['body'], true);
+    if (!is_array($repoData) || !isset($repoData['full_name'])) {
+        return json(array('hasFork' => false, 'user' => $user, 'branches' => array()));
+    }
+    // Optionally ensure it's a fork of FalconChristmas/fpp - but allow any repo named fpp
+    // If repoData indicates not a fork but still exists, treat as fork (user may have created manually)
+    // Uncomment strict check if needed:
+    // if (empty($repoData['fork'])) { return json(array('hasFork'=>false,...)); }
+
+    // 2. Fetch branches
+    $branchesUrl = 'https://api.github.com/repos/' . rawurlencode($user) . '/fpp/branches?per_page=100';
+    $brResp = $doCurl($branchesUrl);
+    if ($brResp['code'] < 200 || $brResp['code'] >= 300 || $brResp['body'] === false) {
+        // Repo exists but GitHub branch listing failed (network/rate-limit). Fall back to
+        // local git remote branches if the remote is already configured locally.
+        global $fppDir;
+        $fppDirEsc = escapeshellarg($fppDir);
+        $branches = array();
+        exec("git -C $fppDirEsc branch -r 2>&1", $allLines);
+        foreach ($allLines as $line) {
+            $line = trim($line);
+            if (str_starts_with($line, "$user/") && strpos($line, '->') === false) {
+                $branch = substr($line, strlen($user) + 1);
+                if (
+                    preg_match("*v[01]\.[0-9x]*", $branch)
+                    || preg_match("*v2\.[0-9x]*", $branch)
+                    || preg_match("*v3\.[0-9x]*", $branch)
+                    || preg_match("*v4\.[0-9x]*", $branch)
+                    || preg_match("*v5\.[0-9x]*", $branch)
+                    || preg_match("*v6\.[0-9x]*", $branch)
+                    || str_starts_with($branch, "dependabot/")
+                    || str_starts_with($branch, "HEAD ")
+                ) {
+                    continue;
+                }
+                $branches[] = $branch;
+            }
+        }
+        sort($branches);
+        return json(array('hasFork' => true, 'user' => $user, 'branches' => $branches));
+    }
+    $brData = json_decode($brResp['body'], true);
+    if (!is_array($brData)) {
+        return json(array('hasFork' => true, 'user' => $user, 'branches' => array()));
+    }
+
+    $branches = array();
+    foreach ($brData as $b) {
+        if (!isset($b['name'])) continue;
+        $branch = $b['name'];
+        // Apply same filtering as GitBranches for consistency (hide obsolete version branches etc)
+        if (
+            preg_match("*v[01]\.[0-9x]*", $branch)
+            || preg_match("*v2\.[0-9x]*", $branch)
+            || preg_match("*v3\.[0-9x]*", $branch)
+            || preg_match("*v4\.[0-9x]*", $branch)
+            || preg_match("*v5\.[0-9x]*", $branch)
+            || preg_match("*v6\.[0-9x]*", $branch)
+            || str_starts_with($branch, "dependabot/")
+            || str_starts_with($branch, "HEAD ")
+        ) {
+            continue;
+        }
+        $branches[] = $branch;
+    }
+    sort($branches);
+    return json(array('hasFork' => true, 'user' => $user, 'branches' => $branches));
+}
+
+/**
+ * Get open pull requests
+ *
+ * Returns open pull requests on FalconChristmas/fpp via GitHub API,
+ * proxied so the browser does not call api.github.com directly. Each
+ * entry contains the PR number, title, author, head ref/repo, and
+ * draft flag. The Developer settings page maps this to the Branch
+ * dropdown when Git Remote is Pull Requests (#NUM - USER).
+ *
+ * @route GET /api/git/pullRequests
+ * @response 200 Open PR list
+ * ```json
+ * [
+ *   {
+ *     "number": 1842,
+ *     "title": "Fix pixel overlay race",
+ *     "user": "pixelpilot123",
+ *     "headRef": "fix/overlay-race",
+ *     "headRepo": "pixelpilot123/fpp",
+ *     "headSha": "abc123",
+ *     "htmlUrl": "https://github.com/FalconChristmas/fpp/pull/1842",
+ *     "draft": false
+ *   }
+ * ]
+ * ```
+ */
+function GitPullRequests()
+{
+    global $settings;
+
+    $pat = isset($settings['gitHubPAT']) ? trim($settings['gitHubPAT']) : '';
+    if (preg_match('/[\r\n]/', $pat)) {
+        $pat = '';
+    }
+
+    // Cache 60s (grace 10s) – unauth GitHub is 60 req/hour per public IP shared
+    // across every FPP behind one NAT, and the endpoint fires on every PR-mode page load.
+    $cached = file_cache('git_pull_requests', function () use ($pat) {
+        $url = 'https://api.github.com/repos/FalconChristmas/fpp/pulls?state=open&per_page=100&sort=updated&direction=desc';
+
+        $doFetch = function ($usePat) use ($url, $pat) {
+            $ch = curl_init($url);
+            $headers = array('User-Agent: FPP', 'Accept: application/vnd.github.v3+json');
+            if ($usePat && $pat !== '') {
+                $headers[] = 'Authorization: token ' . $pat;
+            }
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, 4000);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            curl_setopt($ch, CURLOPT_FAILONERROR, false);
+            $body = curl_exec($ch);
+            $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            return array('body' => $body, 'code' => $code);
+        };
+
+        $res = $doFetch(true);
+        // Expired/revoked PAT returns 401/403 but the public PR list is still
+        // available unauthenticated – retry without token so an auth failure
+        // doesn't masquerade as "no open PRs".
+        if (($res['code'] == 401 || $res['code'] == 403) && $pat !== '') {
+            $res = $doFetch(false);
+        }
+
+        if ($res['body'] === false || $res['code'] < 200 || $res['code'] >= 300) {
+            return null;
+        }
+
+        $data = json_decode($res['body'], true);
+        if (!is_array($data)) {
+            return null;
+        }
+
+        $out = array();
+        foreach ($data as $pr) {
+            if (!isset($pr['number']) || !isset($pr['head'])) {
+                continue;
+            }
+            // head.repo can be null if fork deleted
+            $headRepo = '';
+            if (isset($pr['head']['repo']) && is_array($pr['head']['repo']) && isset($pr['head']['repo']['full_name'])) {
+                $headRepo = $pr['head']['repo']['full_name'];
+            }
+            $user = '';
+            if (isset($pr['user']['login'])) {
+                $user = $pr['user']['login'];
+            } elseif (isset($pr['head']['user']['login'])) {
+                $user = $pr['head']['user']['login'];
+            }
+            // Fallback to headRepo owner if user missing
+            if ($user === '' && $headRepo !== '' && strpos($headRepo, '/') !== false) {
+                $user = substr($headRepo, 0, strpos($headRepo, '/'));
+            }
+
+            $out[] = array(
+                'number' => intval($pr['number']),
+                'title' => isset($pr['title']) ? $pr['title'] : '',
+                'user' => $user,
+                'headRef' => isset($pr['head']['ref']) ? $pr['head']['ref'] : '',
+                'headRepo' => $headRepo,
+                'headSha' => isset($pr['head']['sha']) ? $pr['head']['sha'] : '',
+                'htmlUrl' => isset($pr['html_url']) ? $pr['html_url'] : ('https://github.com/FalconChristmas/fpp/pull/' . intval($pr['number'])),
+                'draft' => !empty($pr['draft'])
+            );
+        }
+
+        return json_encode($out);
+    }, 60, 10);
+
+    if ($cached === '' || $cached === null) {
+        return json(array());
+    }
+    $decoded = json_decode($cached, true);
+    if (!is_array($decoded)) {
+        return json(array());
+    }
+    return json($decoded);
+}
+?>

@@ -1,0 +1,16 @@
+[Unit]
+Description=FPP Post Network Setup
+After=network.target generic-board-startup.service remote-fs.target
+Wants=network.target
+DefaultDependencies=no
+
+[Service]
+Type=notify
+NotifyAccess=all
+RemainAfterExit=yes
+TimeoutStartSec=120
+WatchdogSec=60
+ExecStart=/opt/fpp/src/fppinit postNetwork
+
+[Install]
+WantedBy=multi-user.target

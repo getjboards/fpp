@@ -1,182 +1,344 @@
+#pragma once
 /*
- *   Playlist Entry Base Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _PLAYLIST_H
-#define _PLAYLIST_H
-
+#include <atomic>
+#include "AtomicSharedPtr.h"
+#include "fpp-json.h"
+#include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include <jsoncpp/json/json.h>
-
 #include "PlaylistEntryBase.h"
 
-// Use these to make code more readable
-#define PLAYLIST_STARTING				true
-#define PLAYLIST_STOPPING				false
-
-// FIXME PLAYLIST, get rid of this and use playlist/PlaylistEntryBase.h
-// temporarily copied from old Playlist.h during transition to new playlist
-#define PL_TYPE_BOTH            0
-#define PL_TYPE_MEDIA           1
-#define PL_TYPE_SEQUENCE        2
-#define PL_TYPE_PAUSE           3
-#define PL_TYPE_VIDEO           4 // deprecated, legacy v0.2.0 implementation
-#define PL_TYPE_EVENT           5
-#define PL_TYPE_PLUGIN_NEXT     6
-#define PL_MAX_ENTRIES        128
-
-// FIXME PLAYLIST, get rid of this and use playlist/PlaylistEntryBase.h
-// temporarily copied from old Playlist.h during transition to new playlist
-typedef struct {
-	unsigned char type;
-	char cType;
-	char seqName[256];
-	char songName[256];
-	char eventID[6];
-	unsigned int pauselength;
-	char data[256];
-} PlaylistEntry;
-
-// FIXME PLAYLIST, get rid of this and use playlist/PlaylistEntryBase.h
-// temporarily copied from old Playlist.h during transition to new playlist
-typedef struct {
-	PlaylistEntry playList[PL_MAX_ENTRIES];
-	char currentPlaylist[128];
-	char currentPlaylistFile[128];
-	int  playListCount;
-	int  currentPlaylistEntry;
-	int  StopPlaylist;
-	int  ForceStop;
-	int  playlistStarting;
-	int  first;
-	int  last;
-	int  repeat;
-} PlaylistDetails;
-
-
-class Playlist {
-  public:
-	Playlist(void *parent = NULL, int subPlaylist = 0);
-	~Playlist();
-
-	////////////////////////////////////////
-	int m_playlistAction;
-	PlaylistDetails m_playlistDetails;
-	int m_numberOfSecondsPaused;
-	////////////////////////////////////////
-
-	// New methods
-	Json::Value        LoadJSON(const char *filename);
-	int                Load(Json::Value &config);
-	int                Load(const char *filename);
-	PlaylistEntryBase *LoadPlaylistEntry(Json::Value entry);
-	int                LoadJSONIntoPlaylist(std::vector<PlaylistEntryBase*> &playlistPart, const Json::Value &entries);
-
-	int                Start(void);
-	int                StopNow(int forceStop = 0);
-	int                StopGracefully(int forceStop = 0, int afterCurrentLoop = 0);
-
-	int                IsPlaying(void);
-
-	int                Process(void);
-	void               ProcessMedia(void);
-	int                Cleanup(void);
-
-	void               SetIdle(void);
-
-	int                Play(const char *filename, const int position = -1, const int repeat = -1, const int scheduled = 0);
-
-	void               SetPosition(int position);
-	void               SetRepeat(int repeat);
-
-	void               Dump(void);
-
-	void               NextItem(void);
-	void               PrevItem(void);
-
-	Json::Value        GetCurrentEntry(void);
-	Json::Value        GetInfo(void);
-	std::string        GetPlaylistName(void) { return m_name; }
-	int                GetRepeat(void) { return m_repeat; }
-	int                GetPosition(void);
-	int                GetSize(void);
-	std::string        GetConfigStr(void);
-	Json::Value        GetConfig(void);
-	uint64_t           GetFileTime(void) { return (Json::UInt64)m_fileTime; }
-	int                GetForceStop(void) { return m_forceStop; }
-	int                WasScheduled(void) { return m_scheduled; }
-
-	int                MQTTHandler(std::string topic, std::string msg);
-
-	int                FileHasBeenModified(void);
-	std::string        ReplaceMatches(std::string in);
-
-  private:
-	int                ReloadPlaylist(void);
-	void               ReloadIfNeeded(void);
-	void               SwitchToMainPlaylist(void);
-	void               SwitchToLeadOut(void);
-
-	void                *m_parent;
-	std::string          m_filename;
-  	std::string          m_name;
-	std::string          m_desc;
-	int                  m_repeat;
-	int                  m_loop;
-	int                  m_loopCount;
-	int                  m_random;
-	int                  m_blankBetweenSequences;
-	int                  m_blankBetweenIterations;
-	int                  m_blankAtEnd;
-	long long            m_startTime;
-	int                  m_subPlaylistDepth;
-	int                  m_subPlaylist;
-	int                  m_scheduled;
-	int                  m_forceStop;
-
-	time_t               m_fileTime;
-	Json::Value          m_config;
-	time_t               m_configTime;
-	Json::Value          m_playlistInfo;
-
-	std::string          m_currentState;
-	std::string          m_currentSectionStr;
-	int                  m_sectionPosition;
-	int                  m_startPosition;
-
-	std::recursive_mutex m_playlistMutex;
-
-	std::vector<PlaylistEntryBase*>  m_leadIn;
-	std::vector<PlaylistEntryBase*>  m_mainPlaylist;
-	std::vector<PlaylistEntryBase*>  m_leadOut;
-	std::vector<PlaylistEntryBase*> *m_currentSection;
+enum PlaylistStatus {
+    FPP_STATUS_IDLE = 0,
+    FPP_STATUS_PLAYLIST_PLAYING,
+    FPP_STATUS_STOPPING_GRACEFULLY,
+    FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP,
+    FPP_STATUS_STOPPING_NOW,
+    FPP_STATUS_PLAYLIST_PAUSED
 };
 
-// Temporary singleton during conversion
-extern Playlist *playlist;
+// True while a PLAYLIST_STOPPED preset runs for an inserted playlist that has
+// handed the player back to the one it interrupted (see Playlist.cpp).
+bool InHandedBackStoppedPreset();
 
-#endif
+// Owned through Player::CreatePlaylist(); weak_from_this() hands an inserted
+// child an owning reference to the level it interrupted.
+class Playlist : public std::enable_shared_from_this<Playlist> {
+public:
+    Playlist(std::shared_ptr<Playlist> parent = nullptr);
+    ~Playlist();
+
+    PlaylistStatus getPlaylistStatus();
+
+    // New methods
+    Json::Value LoadJSON(const std::string& filename);
+    int Load(Json::Value& config);
+    int Load(const std::string& filename);
+    PlaylistEntryBase* LoadPlaylistEntry(Json::Value entry);
+    int LoadJSONIntoPlaylist(std::vector<PlaylistEntryBase*>& playlistPart, const Json::Value& entries, int startPos, int& maxEntries);
+
+    int Start(void);
+    int StopNow(int forceStop = 0);
+    int StopGracefully(int forceStop = 0, int afterCurrentLoop = 0);
+    void SetIdle(bool exit = true);
+
+    void Pause();
+    void Resume();
+
+    int IsPlaying(void);
+
+    int Process(void);
+    // Free retired playlists and entries.  Main thread only; see Playlist.cpp.
+    static void ReleaseRetired(void);
+    void ProcessMedia(void);
+    int Cleanup(void);
+    // Cleanup(), but only if the playlist is idle when checked under
+    // m_playlistMutex.  For callers outside a transition that decided to
+    // clean up from an unlocked status read: another thread may have started
+    // a new playlist in between, and Cleanup() would wipe it mid-play.
+    int CleanupIfIdle(void);
+
+    // Refresh the lock-free snapshot the crash handler reads (see
+    // PlaylistDumpCrashState).  Called at the points where the section or
+    // position can change; cheap enough to not need gating.
+    void UpdateCrashSnapshot(void);
+
+    int Play(const std::string& filename, const int position = -1, const int repeat = -1, const int scheduleEntry = -1, const int endPosition = -1);
+
+    void InsertPlaylistAsNext(const std::string& filename, const int startPosition = -1, const int endPos = -1);
+    void InsertPlaylistImmediate(const std::string& filename, const int startPosition = -1, const int endPos = -1);
+
+    void SetPosition(int position);
+    void SetRepeat(int repeat);
+
+    void RandomizeMainPlaylist();
+    int ShuffleMainPlaylistFrom(int position);
+
+    void Dump(void);
+
+    // Helper method for global pause between sequences
+    void StartPlayingWithGlobalPause(PlaylistEntryBase* entry);
+
+    void NextItem(void);
+    void RestartItem(void);
+    void PrevItem(void);
+
+    void GetCurrentStatus(Json::Value& result);
+    Json::Value GetCurrentEntry(void);
+    Json::Value GetInfo(void);
+    void GetInfo(Json::Value& v);
+    std::string GetPlaylistName(void);
+    // These getters are called from the scheduler, status, MQTT and API
+    // threads without m_playlistMutex, so the members behind them are atomic.
+    int GetRepeat(void) { return m_repeat.load(std::memory_order_relaxed); }
+    int GetPosition(void);
+    int GetResumePosition(void);
+    int GetSize(void);
+    int GetLoopNumber(void) { return (m_loop.load(std::memory_order_relaxed) + 1); }
+    std::string GetConfigStr(void);
+    Json::Value GetConfig(void);
+    uint64_t GetFileTime(void) { return (Json::UInt64)m_fileTime.load(std::memory_order_relaxed); }
+    int GetForceStop(void) { return m_forceStop.load(std::memory_order_relaxed); }
+    int WasScheduled(void) { return (GetScheduleEntry() != -1) ? 1 : 0; }
+    int GetScheduleEntry(void) { return m_scheduleEntry.load(std::memory_order_relaxed); }
+
+    // these Positions are 0 based and includes the leadIn entries
+    uint64_t GetCurrentPosInMS();
+    uint64_t GetCurrentPosInMS(int& pos, uint64_t& posms, bool itemDefinedOnly = false);
+    uint64_t GetPosStartInMS(int pos);
+    int FindPosForMS(uint64_t& ms, bool itemDefinedOnly = false); // ms will be updated with how far into Pos it would be
+    void GetFilenamesForPos(int pos, std::string& seq, std::string& med);
+
+    int MQTTHandler(std::string topic, std::string msg);
+
+    int FileHasBeenModified(void);
+    std::string ReplaceMatches(std::string in);
+    Json::Value GetMqttStatusJSON(); // Returns Status as JSON
+
+    // Single source of truth for the human-facing status string.  Derived from
+    // m_status so the string and the enum can never disagree: a paused playlist
+    // used to report "playing" because Pause() moved only the enum while the
+    // old m_currentState string mirror had no paused value.
+    static const char* PlaylistStatusToString(PlaylistStatus status);
+
+    // Number of playlists on the chain: 1 plus each one an insertion
+    // interrupted (the m_parent chain).
+    int GetLevelCount();
+
+private:
+    void GetParentPlaylistNames(std::list<std::string>& names);
+    int ReloadPlaylist(void);
+    void ReloadIfNeeded(void);
+    void SwitchToMainPlaylist(void);
+    void SwitchToLeadOut(void);
+
+    bool WillStopAfterCurrent();
+
+    // LoadJSONIntoPlaylist(), recording where each of the section's rows (as
+    // the playlist file and editor number them) starts in the loaded entries.
+    int LoadSection(std::vector<PlaylistEntryBase*>& part, const Json::Value& entries, int startPos,
+                    int& maxEntries, std::vector<int>* rowStart);
+    const std::vector<int>& CurrentSectionRows() const;
+    static int RowToSectionPosition(const std::vector<int>& rows, int row, int sectionSize);
+    static int SectionPositionToRow(const std::vector<int>& rows, int pos);
+    int FileRowToPosition(int row);
+
+    // A command reaches a playlist through a snapshot of the current one taken
+    // before it gets this playlist's lock.  If the player switched playlists in
+    // between -- an inserted playlist started or finished -- the command is for
+    // whichever playlist is current now: a stop landing on the parent that was
+    // just paused, or a Next Item starting the parent's next entry alongside
+    // the inserted one.  Returns that playlist, or null if it is this one.
+    // The current playlist only changes while the outgoing playlist's lock is
+    // held, so called under m_playlistMutex the answer can't go stale.  Every
+    // public command method checks it first and forwards.
+    std::shared_ptr<Playlist> CurrentIfNotThis(void);
+    int StopGracefullyImpl(int forceStop, int afterCurrentLoop);
+    Playlist* SwitchToInsertedPlaylist(bool isStopping = false);
+
+    // The entry at the current section position, or nullptr if there is none.
+    // "None" is a normal state, not an error: m_sectionPosition is allowed to
+    // sit at exactly m_currentSection->size() while the playlist is between
+    // items, and m_currentSection is null until a playlist is loaded.  Every
+    // access to the current entry goes through here so that single guard has
+    // one home.  Caller must hold m_playlistMutex.
+    PlaylistEntryBase* CurrentEntry();
+
+    // Written under m_playlistMutex, but read by unlocked getters from other
+    // threads (status paths, the scheduler) -- atomic so those reads are
+    // well-defined; volatile never made them so.
+    std::atomic<PlaylistStatus> m_status;
+
+    // The level this one interrupted, owned: a thread holding a snapshot of a
+    // level can walk to every parent it still links to (status breadcrumbs,
+    // SetIdle's hand-back, a graceful stop) while the main loop releases
+    // levels, and each parent stays alive until the last level linking to it
+    // lets go.  A level is cut loose (nulled) when it is retired, so a retired
+    // level doesn't keep its parent alive either.
+    AtomicSharedPtr<Playlist> m_parent;
+    std::string m_filename;
+    std::string m_name;
+    std::string m_desc;
+    // True when this playlist was synthesized on the fly from a bare media
+    // file -- Playlist::Load(filename) with a .fseq/.mp3/... name builds a
+    // one-entry playlist NAMED after the file.  Set under m_playlistMutex in
+    // Load(filename) and Cleanup(), alongside m_name; read under the same
+    // lock in GetCurrentStatus(), which publishes it as
+    // current_playlist.generated so the UI can tell "user pressed Play on a
+    // file" apart from "a saved playlist is playing".  Never true for a
+    // playlist loaded from a .json file.
+    bool m_generatedOnTheFly = false;
+    // Atomic, read lock-free by the inline getters above.  Each is the same
+    // size and in the same place as the plain field it replaces, so a plugin
+    // built against the old header still reads the right value.
+    std::atomic<int> m_repeat;
+    std::atomic<int> m_loop;
+    int m_loopCount;
+    int m_random;
+    int m_blankAtEnd;
+    long long m_startTime;
+    int m_subPlaylistDepth;
+    std::atomic<int> m_scheduleEntry;
+    std::atomic<int> m_forceStop;
+    int m_stopAtPos;
+    int m_loadStartPos;
+    int m_loadEndPos;
+
+    std::atomic<time_t> m_fileTime;
+    Json::Value m_config;
+    time_t m_configTime;
+    Json::Value m_playlistInfo;
+
+    std::string m_currentSectionStr;
+    int m_sectionPosition;
+    int m_startPosition;
+
+    // Global pause between sequences feature
+    int m_globalPauseBetweenSequencesMS;
+    bool m_isInGlobalPause;
+    bool m_shouldStartGlobalPause;
+    long long m_globalPauseStartTime;
+
+    // A repeating main playlist whose every entry finishes at once (command
+    // entries only) used to restart on every main loop pass, about a
+    // thousand times a second. A pass shorter than MIN_INSTANT_PASS_MS holds
+    // the next one until m_loopHoldUntilMS (see the repeat in Process()).
+    // A command entry that navigates its own playlist (Next Playlist Item
+    // alone in a repeating list) restarts through Start() instead, which this
+    // does not cover; the notification cascade limit bounds that one.
+    long long m_loopStartMS = 0;
+    long long m_loopHoldUntilMS = 0;
+    bool m_warnedInstantLoop = false;
+
+    std::string m_insertedPlaylist;
+    int m_insertedPlaylistPosition;
+    int m_insertedPlaylistEndPosition;
+
+    // NOTE: the old startNewPlaylist* members (deferred re-entrant start
+    // requests) moved to file-scope state in Playlist.cpp — the request
+    // belongs to the player, not to one Playlist instance, since the active
+    // instance can be swapped/queued for cleanup between defer and replay.
+
+    // The body of Play(); public Play() defers re-entrant calls, PlayImpl
+    // executes.  Also called directly by SwitchToInsertedPlaylist(), which
+    // must start the inserted child inline within the parent's transition.
+    int PlayImpl(const std::string& filename, const int position, const int repeat, const int scheduleEntry, const int endPosition);
+    // The body of StopNow(); same public-defers / Impl-executes split.
+    int StopNowImpl(int forceStop = 0);
+
+    std::recursive_mutex m_playlistMutex;
+
+    std::vector<PlaylistEntryBase*> m_leadIn;
+    std::vector<PlaylistEntryBase*> m_mainPlaylist;
+    std::vector<PlaylistEntryBase*> m_leadOut;
+    std::vector<PlaylistEntryBase*>* m_currentSection;
+
+    // Members below are appended rather than grouped with their relatives so
+    // that the offsets of everything above stay put for already-built plugins.
+
+    // The status Pause() replaced, restored by Resume().  A playlist paused
+    // while stopping gracefully must keep stopping once resumed.
+    PlaylistStatus m_statusBeforePause = FPP_STATUS_PLAYLIST_PLAYING;
+
+    // m_name is written under m_playlistMutex (Load, Cleanup) but read by the
+    // scheduler and status threads through GetPlaylistName() without it --
+    // a copy racing the assignment read a freed buffer.  Writers hold both;
+    // GetPlaylistName() takes only this one, so it never waits on a playlist
+    // transition and never orders this lock against the scheduler's.
+    mutable std::mutex m_nameLock;
+
+    // For each section, the index in m_leadIn / m_mainPlaylist / m_leadOut
+    // where each row of the playlist file starts (-1 for rows not loaded).
+    // A sub-playlist row expands to several entries, so file rows -- what a
+    // Branch's item number, a resume position and Start At Item count -- and
+    // loaded positions differ once one appears.
+    std::vector<int> m_leadInRows;
+    std::vector<int> m_mainRows;
+    std::vector<int> m_leadOutRows;
+};
+
+// Source-compatibility façade for the old `extern Playlist* playlist;` global.
+//
+// The player now owns its playlists through shared_ptr (see Player.h), so
+// nothing in-tree touches this: FPP's own code calls Player::INSTANCE, which
+// snapshots the current playlist per call.  External plugins, however, were
+// written against a raw global and dereference it as `playlist->Method(...)`.
+//
+// That expression still compiles, through two chained operator->s: PlaylistRef
+// hands back a PlaylistHandle holding a snapshot, and the handle's operator->
+// yields the raw pointer.  The handle is a temporary of the full expression, so
+// the snapshot — and therefore the instance — outlives the call even if the
+// main loop retires that playlist mid-call.  That makes the old plugin
+// expression lifetime-safe rather than merely still-compiling.
+//
+// ABI is NOT preserved (this used to be a pointer object). That was safe only
+// because it landed before 10.0 shipped, inside the plugin API 6 development
+// window, so no released API-6 plugin saw the old form. Plugins are not
+// rebuilt after an FPPOS reflash, and prebuilt ones never are, so
+// PlaylistHandle's layout (one shared_ptr, used inline by plugin code) is
+// plugin ABI now: changing it needs an FPP_PLUGIN_API_VERSION bump
+// (Plugin.h). See .claude/PLUGIN-ABI.md.
+//
+// Before Player::Init() the snapshot is empty and `playlist->` dereferences
+// null, exactly as the old NULL-initialized global did.  It is deliberately not
+// papered over with a dummy instance: constructing a Playlist needs Events,
+// PluginManager and CommandManager, so a plugin calling this from its own
+// static initialization has a startup-order bug that a stand-in would hide.
+class PlaylistHandle {
+public:
+    Playlist* operator->() const { return p.get(); }
+    std::shared_ptr<Playlist> p;
+};
+
+class PlaylistRef {
+public:
+    PlaylistHandle operator->() const;
+    // So `if (playlist)` in external code still compiles and still means
+    // "is there a playlist to talk to".
+    explicit operator bool() const;
+};
+
+extern PlaylistRef playlist;
+
+// Write the last-known playing state to fd for a crash report.
+//
+// Reads a snapshot of plain scalars rather than the live Playlist, on purpose:
+// the crash handler cannot take m_playlistMutex (the faulting thread may hold
+// it, and blocking there hangs the process instead of producing a report), and
+// it cannot walk a std::string or vector that another thread is mid-update.
+// A field may be one update stale or torn; that is worth far more than nothing.
+void PlaylistDumpCrashState(int fd);

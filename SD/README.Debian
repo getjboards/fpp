@@ -1,0 +1,96 @@
+Installing FPP on existing Debian / Ubuntu / x86_64
+====================================================
+
+This document covers installing FPP on top of an already-running Debian or
+Ubuntu system (NUC, x86 server, generic SBC, etc.) -- as opposed to building
+a complete SD card image, which is what the SD/build-image-*.sh scripts do.
+For image builds see SD/README.md.
+
+Supported releases
+------------------
+
+- Debian 13 (Trixie)
+- Ubuntu 24.04 LTS
+- Armbian built on either of the above (see also SD/README.Armbian)
+
+Older releases (Debian 12 / Bookworm, Bookworm-based Armbian, Ubuntu 22.04,
+LinuxMint 21) are no longer supported. Earlier than that has been broken
+for a long time. Use the smallest available Debian image (Debian's "netinst"
+or rcn-ee's "minimal" / "iot" variants); desktop images install fine but
+waste a lot of disk.
+
+Two install modes
+-----------------
+
+FPP_Install.sh has two modes that differ significantly in how invasive they
+are. Pick based on what the device is for.
+
+`--img` mode (image / dedicated-device install)
+  - Renames the host to "FPP", takes over networking via systemd-networkd
+  - Disables a long list of Debian services (gdm, dhcp-helper, hostapd, etc.)
+  - Removes packages FPP doesn't need (nginx, network-manager, fake-hwclock)
+  - Disables stock pi/debian/odroid users; creates the fpp user at UID 1000
+  - Enables firstboot rootfs expand on the next boot
+  - Suitable for: dedicated FPP players (the device exists to run FPP).
+
+Default mode (no `--img`, "side install" / desktop)
+  - Installs all packages and FPP itself, but leaves your hostname,
+    networking, user accounts, and existing services alone.
+  - Adds an `fpp` user (UID 1000 if free, otherwise the next free UID)
+    but doesn't reshape root or disable other users.
+  - Suitable for: NUCs / desktops where FPP is one of several things the
+    machine does, dev workstations, Docker containers.
+
+Quick install
+-------------
+
+```bash
+# Make sure the system is up to date first.
+sudo apt-get update
+sudo apt-get -y upgrade
+sudo reboot   # if a kernel/glibc upgrade landed
+
+# Run the installer.
+wget -O ./FPP_Install.sh https://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
+chmod 700 ./FPP_Install.sh
+
+# Dedicated FPP player:
+sudo ./FPP_Install.sh --img
+
+# Side-install on a desktop / Docker / multi-purpose machine:
+sudo ./FPP_Install.sh
+```
+
+Useful flags
+------------
+
+  --yes / -y            Non-interactive; skip the "do you wish to proceed" prompt.
+                        Equivalent to setting FPP_INSTALL_YES=1.
+
+  --branch BRANCH       Install a non-master branch of FPP source.
+
+  --skip-clone          Don't `git clone` to /opt/fpp. Use when /opt/fpp is
+                        already populated (Docker images that pre-stage source,
+                        or local-source CI flows).
+
+  --skip-apt-install    Don't run `apt-get install $PACKAGE_LIST`. Use when the
+                        Dockerfile / build script has already pre-installed
+                        the dependency set.
+
+Thermal note (low-power SBCs)
+-----------------------------
+
+The compile pegs all CPU cores near 100% for a long time. Headless SBCs
+without a heatsink/fan can hit thermal-shutdown in the middle of the
+install -- recovery means starting over from a fresh image. If you're
+hitting thermals, lock the CPU lower before starting:
+
+    cpufreq-set -u 800000   # lock to 800 MHz max
+
+Container installs
+------------------
+
+For Docker / OCI images, see Docker/Dockerfile in the repo root. The
+installer is invoked with `--skip-apt-install` because the
+Dockerfile pre-installs the dependency set as separate layers (so the
+expensive parts cache properly across builds).

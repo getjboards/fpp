@@ -1,31 +1,18 @@
+#pragma once
 /*
- *   Playlist Entry Both Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _PLAYLISTENTRYBOTH_H
-#define _PLAYLISTENTRYBOTH_H
-
+#include <mutex>
+#include "fpp-json-fwd.h"
 #include <string>
 
 #include "PlaylistEntryBase.h"
@@ -33,31 +20,49 @@
 #include "PlaylistEntrySequence.h"
 
 class PlaylistEntryBoth : public PlaylistEntryBase {
-  public:
-	PlaylistEntryBoth(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryBoth();
+public:
+    PlaylistEntryBoth(Playlist* playlist, PlaylistEntryBase* parent = NULL);
+    virtual ~PlaylistEntryBoth();
 
-	int  Init(Json::Value &config);
+    virtual int Init(Json::Value& config) override;
 
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+    virtual int StartPlaying(void) override;
+    virtual int Process(void) override;
+    virtual int Stop(void) override;
 
-	void Dump(void);
+    virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+    virtual Json::Value GetConfig(void) override;
+    virtual Json::Value GetMqttStatus(void) override;
 
-	std::string GetSequenceName(void) { return m_sequenceName; }
-	std::string GetMediaName(void)    { return m_mediaName; }
+    std::string GetSequenceName(void) { return m_sequenceName; }
+    std::string GetMediaName(void) { return m_mediaName; }
 
-  private:
-	int                  m_duration;
+    virtual uint64_t GetLengthInMS() override;
+    virtual uint64_t GetElapsedMS() override;
 
-	std::string          m_sequenceName;
-	std::string          m_mediaName;
+    virtual void Pause() override;
+    virtual bool IsPaused() override;
+    virtual void Resume() override;
 
-	PlaylistEntryMedia     *m_mediaEntry;
-	PlaylistEntrySequence  *m_sequenceEntry;
+private:
+    int m_duration;
+
+    std::string m_sequenceName;
+    std::string m_mediaName;
+
+    // m_mediaEntry is the media for the current pass, null when this pass is
+    // running lights-only; m_mediaOwned owns the child.  A media start that
+    // fails once (an audio output not up yet) used to delete the child, so
+    // every later pass of a repeating playlist played without sound.
+    PlaylistEntryMedia* m_mediaEntry;
+    PlaylistEntryMedia* m_mediaOwned = nullptr;
+    PlaylistEntrySequence* m_sequenceEntry;
+
+    // The sequence is held until the media is audible, so the lights don't
+    // run ahead while the audio output starts up.  Process() starts it.
+    bool m_holdingForAudio = false;
+    long long m_holdStartMS = 0;
+
+    std::recursive_mutex m_mutex;
 };
-
-#endif

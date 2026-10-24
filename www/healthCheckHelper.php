@@ -1,0 +1,8 @@
+<?
+$skipJSsettings = 1;
+require_once ("common.php");
+
+DisableOutputBuffering();
+
+system($settings["fppDir"] . "/scripts/healthCheck --php " . intval($_GET['timestamp']));
+?>

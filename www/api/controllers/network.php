@@ -1,0 +1,1521 @@
+<?
+
+require_once "../common.php";
+
+/**
+ * Get network interface details
+ *
+ * Returns detailed information about network interfaces, their IP addresses,
+ * and Wi-Fi signal strength.
+ *
+ * @route GET /api/network/interface
+ * @response 200 Network interface details
+ * ```json
+ * [
+ *   {
+ *     "ifindex": 2,
+ *     "ifname": "wlan0",
+ *     "flags": ["BROADCAST", "MULTICAST", "UP", "LOWER_UP"],
+ *     "mtu": 1500,
+ *     "operstate": "UP",
+ *     "addr_info": [
+ *       {"family": "inet", "local": "192.168.50.146", "prefixlen": 24},
+ *       {"family": "inet6", "local": "2001:db8::146", "prefixlen": 64}
+ *     ],
+ *     "wifi": {
+ *       "interface": "wlan0",
+ *       "link": 52,
+ *       "level": -58,
+ *       "noise": -256,
+ *       "desc": "good"
+ *     }
+ *   }
+ * ]
+ * ```
+ */
+function network_list_interfaces()
+{
+    return json(network_list_interfaces_obj());
+}
+
+/**
+ * Get all wifi signal strenths
+ *
+ * Returns signal strength information for wireless network interfaces.
+ *
+ * @route GET /api/network/wifi/strength
+ * @response 200 Wi-Fi signal strength per interface
+ * ```json
+ * [
+ *   {
+ *     "interface": "wlan0",
+ *     "link": 45,
+ *     "level": -65,
+ *     "noise": -256
+ *   }
+ * ]
+ * ```
+ */
+function network_wifi_strength()
+{
+    return json(network_wifi_strength_obj());
+}
+
+/**
+ * Get discoverable wifi networks
+ *
+ * Returns information about Wi-Fi networks discoverable via the specified
+ * `{interface}`. Networks without an SSID may appear in the list.
+ *
+ * @route GET /api/network/wifi/scan/{interface}
+ * @response 200 Discoverable Wi-Fi networks
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "networks": [
+ *     {
+ *       "lastSeen": "0 ms ago",
+ *       "freq": 2437,
+ *       "signal": "-61.00 dBm",
+ *       "SSID": "Christmas"
+ *     }
+ *   ]
+ * }
+ * ```
+ * If the scan could not run (the interface is an AP-mode hotspot with clients
+ * connected, which scanning would disconnect) or produced nothing, the last
+ * successful scan is returned instead, with `status` set to `Cached` and a
+ * message giving its age:
+ * ```json
+ * {
+ *   "status": "Cached",
+ *   "networks": [{"freq": 2437, "signal": "-61.00 dBm", "SSID": "Christmas"}],
+ *   "message": "wlan0 is currently running the FPP hotspot with 2 device(s) connected. Scanning would disconnect them, so it's blocked while the hotspot has active clients. Showing the last scan, from 4 minutes ago."
+ * }
+ * ```
+ * With no cached scan to fall back on, a hotspot with clients returns
+ * `"status": "Blocked"` and the same explanation with an empty network list.
+ */
+/**
+ * Parse `iw dev <iface> scan` output into an array of network descriptors.
+ * Each BSS begins a new entry; only entries that yielded at least an SSID or
+ * BSSID are kept so a leading/empty block is never returned.
+ */
+function network_parse_iw_scan($output)
+{
+    $networks = array();
+    $current = array();
+
+    $flush = function () use (&$networks, &$current) {
+        if (isset($current['SSID']) || isset($current['bssid'])) {
+            array_push($networks, $current);
+        }
+        $current = array();
+    };
+
+    foreach ($output as $row) {
+        if (preg_match('/^BSS ([0-9a-fA-F:]{17})/', $row, $matches)) {
+            $flush();
+            $current['bssid'] = strtoupper($matches[1]);
+        } else if (preg_match('/freq: (.*)/', $row, $matches)) {
+            $current['freq'] = intval($matches[1]);
+        } else if (preg_match('/last seen: (.*)/', $row, $matches)) {
+            $current['lastSeen'] = $matches[1];
+        } else if (preg_match('/SSID: (.*)/', $row, $matches)) {
+            $current['SSID'] = $matches[1];
+        } else if (preg_match('/signal: (.*)/', $row, $matches)) {
+            $current['signal'] = $matches[1];
+        } else if (preg_match('/capability:.*Privacy/', $row)) {
+            // Basic encryption detection (WEP or WPA/WPA2)
+            $current['encrypted'] = true;
+        } else if (preg_match('/RSN:/', $row)) {
+            // WPA2/WPA3 detected
+            $current['encrypted'] = true;
+            $current['security'] = isset($current['security']) ? $current['security'] . ' WPA2' : 'WPA2';
+        } else if (preg_match('/WPA:/', $row)) {
+            // WPA detected
+            $current['encrypted'] = true;
+            $current['security'] = isset($current['security']) ? $current['security'] . ' WPA' : 'WPA';
+        } else if (preg_match('/Authentication suites:.*PSK/', $row)) {
+            // Personal/PSK authentication
+            $current['auth'] = 'PSK';
+        } else if (preg_match('/Authentication suites:.*802\.1x/', $row)) {
+            // Enterprise authentication
+            $current['auth'] = 'Enterprise';
+        } else if (preg_match('/Group cipher: (.*)/', $row, $matches)) {
+            $current['cipher'] = trim($matches[1]);
+        }
+    }
+    $flush();
+
+    return $networks;
+}
+
+/**
+ * Parse legacy `iwlist <iface> scan` (WEXT) output into the same descriptor
+ * shape as network_parse_iw_scan(). Used as a fallback for out-of-tree
+ * drivers whose nl80211 scan support is missing or broken.
+ */
+function network_parse_iwlist_scan($output)
+{
+    $networks = array();
+    $current = array();
+
+    $flush = function () use (&$networks, &$current) {
+        if (isset($current['SSID']) || isset($current['bssid'])) {
+            array_push($networks, $current);
+        }
+        $current = array();
+    };
+
+    foreach ($output as $row) {
+        if (preg_match('/Cell \d+ - Address: ([0-9a-fA-F:]{17})/', $row, $matches)) {
+            $flush();
+            $current['bssid'] = strtoupper($matches[1]);
+        } else if (preg_match('/Frequency:([\d.]+) GHz/', $row, $matches)) {
+            // iwlist reports GHz; normalise to MHz to match the `iw` path.
+            $current['freq'] = intval(round(floatval($matches[1]) * 1000));
+        } else if (preg_match('/ESSID:"(.*)"/', $row, $matches)) {
+            $current['SSID'] = $matches[1];
+        } else if (preg_match('/Signal level=(-?\d+) dBm/', $row, $matches)) {
+            $current['signal'] = $matches[1] . '.00 dBm';
+        } else if (preg_match('/Encryption key:on/', $row)) {
+            $current['encrypted'] = true;
+        } else if (preg_match('/IE:.*WPA2/', $row)) {
+            $current['encrypted'] = true;
+            $current['security'] = isset($current['security']) ? $current['security'] . ' WPA2' : 'WPA2';
+        } else if (preg_match('/IE:.*WPA Version/', $row)) {
+            $current['encrypted'] = true;
+            $current['security'] = isset($current['security']) ? $current['security'] . ' WPA' : 'WPA';
+        } else if (preg_match('/Authentication Suites.*PSK/', $row)) {
+            $current['auth'] = 'PSK';
+        } else if (preg_match('/Authentication Suites.*802\.1x/', $row)) {
+            $current['auth'] = 'Enterprise';
+        } else if (preg_match('/Group Cipher : (.*)/', $row, $matches)) {
+            $current['cipher'] = trim($matches[1]);
+        }
+    }
+    $flush();
+
+    return $networks;
+}
+
+/**
+ * Parse `wpa_cli -i <iface> scan_results` output into the same descriptor
+ * shape as network_parse_iw_scan(). This reads wpa_supplicant's own BSS cache,
+ * which it fills from the background scans it already runs while associated,
+ * so it costs the live link nothing at all.
+ *
+ * Rows are tab separated:
+ *   bssid / frequency / signal level / flags / ssid
+ *   aa:bb:cc:dd:ee:ff   2437   -61   [WPA2-PSK-CCMP][ESS]   Christmas
+ */
+function network_parse_wpa_scan_results($output)
+{
+    $networks = array();
+
+    foreach ($output as $row) {
+        $cols = explode("\t", rtrim($row, "\r\n"));
+        if (count($cols) < 4 || !preg_match('/^[0-9a-fA-F:]{17}$/', $cols[0])) {
+            // "Selected interface ...", the header row, and any error text.
+            continue;
+        }
+
+        $flags = $cols[3];
+        $current = array(
+            'bssid' => strtoupper($cols[0]),
+            'freq' => intval($cols[1]),
+            'signal' => sprintf('%.2f dBm', floatval($cols[2])),
+            // Hidden APs report an empty SSID here, same as `iw` does.
+            'SSID' => isset($cols[4]) ? $cols[4] : ''
+        );
+
+        if (preg_match('/\[(WPA|WPA2|RSN|WEP)/', $flags)) {
+            $current['encrypted'] = true;
+        }
+        $security = array();
+        // SAE (and its WPA2 transition mode) is what makes an AP WPA3.
+        if (preg_match('/\[(?:WPA2|RSN)[^\]]*\bSAE\b/', $flags)) {
+            $security[] = 'WPA3';
+        }
+        // SAE-only APs are WPA3 and nothing else; a transition-mode AP
+        // advertises a PSK/EAP suite alongside it and is both.
+        if (preg_match('/\[(?:WPA2|RSN)[^\]]*-(?:PSK|EAP)/', $flags)) {
+            $security[] = 'WPA2';
+        }
+        if (preg_match('/\[WPA-/', $flags)) {
+            $security[] = 'WPA';
+        }
+        if (preg_match('/\[WEP\]/', $flags)) {
+            $security[] = 'WEP';
+        }
+        if (count($security)) {
+            $current['security'] = implode(' ', array_unique($security));
+        }
+        if (preg_match('/-(PSK|SAE)/', $flags)) {
+            $current['auth'] = 'PSK';
+        } else if (preg_match('/-EAP/', $flags)) {
+            $current['auth'] = 'Enterprise';
+        }
+        // Mixed-cipher APs list "CCMP+TKIP"; report the stronger one they lead with.
+        if (preg_match('/-(CCMP|TKIP)/', $flags, $m)) {
+            $current['cipher'] = $m[1];
+        }
+
+        array_push($networks, $current);
+    }
+
+    return $networks;
+}
+
+/**
+ * Determine whether a wifi interface currently has a live association that a
+ * disruptive active scan would interrupt:
+ *   - AP mode (hostapd) with station(s) connected - scanning stops beaconing
+ *     and would drop all of them.
+ *   - Managed mode, associated to an AP - scanning forces the radio
+ *     off-channel and can degrade/drop that link.
+ *
+ * Returns array("mode" => "AP"|"station"|"idle", "clientCount" => int, "ssid" => string)
+ */
+function network_interface_in_use($interface)
+{
+    $iface = escapeshellarg($interface);
+
+    $infoOut = array();
+    exec("/sbin/iw dev $iface info 2>/dev/null", $infoOut);
+    $iftype = "";
+    foreach ($infoOut as $line) {
+        if (preg_match('/^\s*type\s+(\S+)/', $line, $m)) {
+            $iftype = $m[1];
+            break;
+        }
+    }
+
+    if ($iftype === "AP") {
+        $staOut = array();
+        exec("sudo /sbin/iw dev $iface station dump 2>/dev/null", $staOut);
+        $clientCount = 0;
+        foreach ($staOut as $line) {
+            if (preg_match('/^Station /', $line)) {
+                $clientCount++;
+            }
+        }
+        if ($clientCount > 0) {
+            return array("mode" => "AP", "clientCount" => $clientCount, "ssid" => "");
+        }
+        return array("mode" => "idle", "clientCount" => 0, "ssid" => "");
+    }
+
+    if ($iftype === "managed") {
+        // Ask the kernel (nl80211) rather than wpa_supplicant's control socket:
+        // all that matters here is "associated, and to what", and iw answers
+        // that however the link was brought up. network_wifi_status() below
+        // still uses wpa_cli, because it needs the association *states* that
+        // only wpa_supplicant knows.
+        $linkOut = array();
+        exec("/sbin/iw dev $iface link 2>/dev/null", $linkOut);
+        $associated = false;
+        $ssid = "";
+        foreach ($linkOut as $line) {
+            if (preg_match('/^Connected to/', $line)) {
+                $associated = true;
+            } else if (preg_match('/^\s*SSID:\s*(.*)$/', $line, $m)) {
+                $ssid = trim($m[1]);
+            }
+        }
+        if ($associated) {
+            return array("mode" => "station", "clientCount" => 0, "ssid" => $ssid);
+        }
+    }
+
+    return array("mode" => "idle", "clientCount" => 0, "ssid" => "");
+}
+
+/**
+ * Where the last successful scan for an interface is remembered.
+ *
+ * A scan can be impossible at the exact moment the page asks for one - the
+ * hotspot is up with clients on it, or the driver refuses a scan while one of
+ * wpa_supplicant's own is already in flight - and an empty table tells the
+ * user nothing. Remembering the last list lets the page still show something
+ * to pick from, clearly labelled with its age.
+ */
+function network_wifi_scan_cache_file($interface)
+{
+    return "/tmp/fpp_wifi_scan_" . preg_replace('/[^A-Za-z0-9_.-]/', '', $interface) . ".json";
+}
+
+function network_wifi_scan_cache_save($interface, $networks)
+{
+    if (!count($networks)) {
+        return;
+    }
+    @file_put_contents(network_wifi_scan_cache_file($interface), json_encode(array(
+        "time" => time(),
+        "networks" => $networks
+    )));
+}
+
+/**
+ * Returns array("networks" => array(...), "age" => seconds) for a usable
+ * cached scan, or null when there isn't one. Anything older than a day is
+ * treated as gone; by then the device has very likely moved or the APs around
+ * it have changed.
+ */
+function network_wifi_scan_cache_load($interface)
+{
+    $file = network_wifi_scan_cache_file($interface);
+    if (!file_exists($file)) {
+        return null;
+    }
+    $cache = json_decode(@file_get_contents($file), true);
+    if (!isset($cache['networks']) || !count($cache['networks'])) {
+        return null;
+    }
+    $age = time() - intval($cache['time']);
+    if ($age < 0 || $age > 86400) {
+        return null;
+    }
+    return array("networks" => $cache['networks'], "age" => $age);
+}
+
+function network_wifi_scan_age_desc($age)
+{
+    if ($age < 90) {
+        return $age . " second" . ($age == 1 ? "" : "s") . " ago";
+    }
+    if ($age < 5400) {
+        $mins = intval(round($age / 60));
+        return $mins . " minute" . ($mins == 1 ? "" : "s") . " ago";
+    }
+    $hours = intval(round($age / 3600));
+    return $hours . " hour" . ($hours == 1 ? "" : "s") . " ago";
+}
+
+/**
+ * Run the available scan backends in order and return the first list that came
+ * back with anything in it.
+ *
+ * Scanning while associated is routine rather than dangerous: before it leaves
+ * the channel the station tells its AP to buffer traffic (a null-data frame
+ * with PM set), which is exactly what wpa_supplicant already does for its own
+ * background and roaming scans. The low-priority hint is still preferred when
+ * the driver offers it, but its absence is not a reason to refuse - most
+ * in-kernel drivers, the Pi's onboard brcmfmac radio included, simply never
+ * advertise NL80211_FEATURE_LOW_PRIORITY_SCAN.
+ */
+function network_wifi_run_scan($interface, $connected)
+{
+    $iface = escapeshellarg($interface);
+    $attempts = array();
+
+    if ($connected) {
+        // Kindest to the live link where the driver implements it.
+        $attempts[] = array("sudo /sbin/iw dev $iface scan low-priority 2>/dev/null", 'network_parse_iw_scan');
+    }
+
+    // Preferred path: nl80211 via `iw`. Works on modern in-kernel drivers
+    // and Wi-Fi 7 hardware where the old wireless extensions are gone.
+    $attempts[] = array("sudo /sbin/iw dev $iface scan 2>/dev/null", 'network_parse_iw_scan');
+
+    if ($connected) {
+        // wpa_supplicant's own BSS cache. Costs the link nothing, and it is
+        // the only thing that answers when the driver returns -EBUSY because
+        // a supplicant scan is already running on this radio.
+        $attempts[] = array("sudo wpa_cli -i $iface scan_results 2>/dev/null", 'network_parse_wpa_scan_results');
+    }
+
+    // Fallback: some out-of-tree Realtek USB drivers (e.g. RTL8812BU /
+    // RTL8822BU on the 88x2bu driver) advertise no working nl80211 scan
+    // support, so `iw` returns an empty list even with APs in range. Those
+    // drivers still scan fine over the legacy WEXT `iwlist` path.
+    $attempts[] = array("sudo /sbin/iwlist $iface scan 2>/dev/null", 'network_parse_iwlist_scan');
+
+    foreach ($attempts as $attempt) {
+        $output = array();
+        exec($attempt[0], $output);
+        $networks = $attempt[1]($output);
+        if (count($networks)) {
+            return $networks;
+        }
+    }
+
+    return array();
+}
+
+function network_wifi_scan()
+{
+    $interface = params('interface');
+
+    # Validate interface.   -- Important because of SUDO
+    $interfaces = json_decode(network_list_interfaces(), true);
+    $found = false;
+
+    foreach ($interfaces as $row) {
+        if ($row["ifname"] == $interface) {
+            $found = true;
+        }
+    }
+
+    if (!$found) {
+        return json(array("status" => "Invalid Interface", "networks" => array()));
+    }
+
+    $inUse = network_interface_in_use($interface);
+
+    // A hotspot with clients on it is the one case with no way through: a
+    // single-radio adapter stops beaconing to scan, dropping every connected
+    // device. Hand back the last known list instead of an empty table.
+    if ($inUse["mode"] === "AP") {
+        $cached = network_wifi_scan_cache_load($interface);
+        $why = "$interface is currently running the FPP hotspot with " . $inUse["clientCount"] .
+            " device(s) connected. Scanning would disconnect them, so it's blocked while the hotspot has active clients.";
+        if ($cached !== null) {
+            return json(array(
+                "status" => "Cached",
+                "networks" => $cached["networks"],
+                "message" => $why . " Showing the last scan, from " . network_wifi_scan_age_desc($cached["age"]) . "."
+            ));
+        }
+        return json(array("status" => "Blocked", "networks" => array(), "message" => $why));
+    }
+
+    exec("sudo /sbin/ip link set " . escapeshellarg($interface) . " up");
+
+    $networks = network_wifi_run_scan($interface, $inUse["mode"] === "station");
+
+    if (count($networks)) {
+        network_wifi_scan_cache_save($interface, $networks);
+        return json(array("status" => "OK", "networks" => $networks));
+    }
+
+    // Nothing came back from any backend. A stale list still beats nothing,
+    // and is what lets someone switch networks from a device whose radio only
+    // scans cleanly while it is idle.
+    $cached = network_wifi_scan_cache_load($interface);
+    if ($cached !== null) {
+        return json(array(
+            "status" => "Cached",
+            "networks" => $cached["networks"],
+            "message" => "No networks came back from this scan. Showing the last successful scan, from " .
+                network_wifi_scan_age_desc($cached["age"]) . "."
+        ));
+    }
+
+    return json(array("status" => "OK", "networks" => array()));
+}
+
+/**
+ * Get WiFi connection status / diagnostics
+ *
+ * Returns the wpa_supplicant association state for the given wireless
+ * `{interface}` plus a human-readable reason describing why it is (not)
+ * connected (wrong password, SSID not in range, waiting for DHCP, etc).
+ *
+ * @route GET /api/network/wifi/status/{interface}
+ * @response 200 WiFi connection status
+ * ```json
+ * {"status":"OK","connected":false,"wpa_state":"SCANNING","ssid":"","configuredSSID":"MyNet","ip":"","signal":null,"ssidVisible":false,"reason":"Network 'MyNet' not found in range (or it is hidden)."}
+ * ```
+ */
+/////////////////////////////////////////////////////////////////////////////
+// Is FPP's own WiFi hotspot (hostapd) broadcasting right now?
+//
+// This asks the running system rather than reading EnableTethering, because
+// the setting alone can't answer the question: mode 0 ("If no connection")
+// only brings the hotspot up some of the time. hostapd's actual unit state
+// covers every tethering mode at once.
+//
+// Pass $interface to additionally require that the hotspot is running on that
+// specific interface (per /etc/hostapd/hostapd.conf); omit it to ask only
+// whether a hotspot is up at all.
+function WifiHotspotIsActive($interface = "")
+{
+    $hostapdConf = "/etc/hostapd/hostapd.conf";
+    if (!file_exists($hostapdConf)) {
+        return false;
+    }
+    if ($interface !== "") {
+        $hc = file_get_contents($hostapdConf);
+        if (!preg_match('/^interface=(.+)$/m', $hc, $m) || trim($m[1]) !== $interface) {
+            return false;
+        }
+    }
+    $activeOut = array();
+    exec("systemctl is-active hostapd 2>/dev/null", $activeOut);
+    return (isset($activeOut[0]) && trim($activeOut[0]) === "active");
+}
+
+function network_wifi_status()
+{
+    global $settings;
+    $interface = params('interface');
+
+    # Validate interface. -- Important because of SUDO
+    $interfaces = json_decode(network_list_interfaces(), true);
+    $found = false;
+    foreach ($interfaces as $row) {
+        if ($row["ifname"] == $interface) {
+            $found = true;
+            break;
+        }
+    }
+    if (!$found) {
+        return json(array("status" => "Invalid Interface"));
+    }
+    $iface = escapeshellarg($interface);
+
+    // Configured SSID from the saved interface config
+    $configuredSSID = "";
+    $cfgFile = $settings['configDirectory'] . "/interface." . $interface;
+    if (file_exists($cfgFile)) {
+        $cfg = parse_ini_file($cfgFile);
+        if (isset($cfg['SSID'])) {
+            $configuredSSID = $cfg['SSID'];
+        }
+    }
+
+    // Is this interface currently running as FPP's own setup/tether hotspot
+    // (hostapd) rather than as a wifi client? If so, wpa_supplicant/iw below
+    // won't reflect a real connection attempt at all - the config was saved
+    // but won't take effect until tethering is turned off and networking is
+    // restarted (or the device reboots).
+    $apActive = WifiHotspotIsActive($interface);
+    $tetheringMode = isset($settings['EnableTethering']) ? intval($settings['EnableTethering']) : 0;
+    $tetheringEnabled = ($tetheringMode === 1);
+    $tetheringDisabled = ($tetheringMode === 2);
+
+    // Association state via wpa_supplicant's control socket. This one keeps
+    // using wpa_cli deliberately: the whole point of this endpoint is to say
+    // WHY a connection is failing, and the intermediate states it reports
+    // (4WAY_HANDSHAKE, INACTIVE, SCANNING, ...) have no nl80211 equivalent --
+    // iw can only say associated or not. The iw/ip fallbacks below keep the
+    // page useful if the socket is ever unreachable.
+    $wpaState = "";
+    $ssid = "";
+    $ip = "";
+    $out = array();
+    exec("sudo wpa_cli -i $iface status 2>/dev/null", $out);
+    foreach ($out as $line) {
+        if (preg_match('/^wpa_state=(.*)$/', $line, $m)) {
+            $wpaState = trim($m[1]);
+        } else if (preg_match('/^ssid=(.*)$/', $line, $m)) {
+            $ssid = trim($m[1]);
+        } else if (preg_match('/^ip_address=(.*)$/', $line, $m)) {
+            $ip = trim($m[1]);
+        }
+    }
+
+    // Signal strength (only meaningful while associated)
+    $signal = null;
+    $out = array();
+    exec("/sbin/iw dev $iface link 2>/dev/null", $out);
+    foreach ($out as $line) {
+        if (preg_match('/signal:\s*(-?\d+)\s*dBm/', $line, $m)) {
+            $signal = intval($m[1]);
+        }
+        if ($ssid == "" && preg_match('/SSID:\s*(.+)/', $line, $m)) {
+            $ssid = trim($m[1]);
+        }
+        // Fallback when the control socket gave us nothing: the kernel still
+        // knows whether we are associated, just not how we got there.
+        if ($wpaState === "" && preg_match('/^Connected to/', $line)) {
+            $wpaState = "COMPLETED";
+        }
+    }
+    // Same fallback for the address. wpa_supplicant reports ip_address, but
+    // only while its socket answers; the kernel always knows.
+    if ($ip === "") {
+        $ipOut = array();
+        exec("ip -4 -o addr show dev $iface scope global 2>/dev/null", $ipOut);
+        if (isset($ipOut[0]) && preg_match('/inet\s+(\d+\.\d+\.\d+\.\d+)/', $ipOut[0], $m)) {
+            $ip = $m[1];
+        }
+    }
+
+    $connected = ($wpaState === "COMPLETED" && $ip !== "" && $ip !== "0.0.0.0");
+
+    // Is the configured SSID currently visible? Use cached scan results
+    // ("scan dump") so we do NOT trigger a disruptive scan on every poll.
+    $ssidVisible = null;
+    if ($configuredSSID !== "") {
+        $scanOut = array();
+        exec("sudo /sbin/iw dev $iface scan dump 2>/dev/null", $scanOut);
+        $ssidVisible = false;
+        foreach ($scanOut as $line) {
+            if (preg_match('/^\s*SSID:\s*(.+)$/', $line, $m) && trim($m[1]) === $configuredSSID) {
+                $ssidVisible = true;
+                break;
+            }
+        }
+    }
+
+    // Recent wpa_supplicant log lines for failure reason codes
+    $jout = array();
+    exec("sudo journalctl -u wpa_supplicant@$iface -n 40 --no-pager 2>/dev/null", $jout);
+    $journal = implode("\n", $jout);
+    $wrongKey = (stripos($journal, "WRONG_KEY") !== false) ||
+        (stripos($journal, "4-Way Handshake failed") !== false) ||
+        (stripos($journal, "pre-shared key may be incorrect") !== false);
+    $authTimeout = ((stripos($journal, "authentication") !== false || stripos($journal, "association") !== false)
+        && stripos($journal, "timed out") !== false);
+
+    // Derive a human-readable reason (most specific first)
+    if ($apActive) {
+        if ($tetheringEnabled) {
+            $reason = "This device is currently broadcasting its own setup hotspot because tethering is enabled." .
+                ($configuredSSID !== ""
+                    ? " Turn off tethering to have it try connecting to '" . $configuredSSID . "' instead."
+                    : "");
+        } else if ($tetheringDisabled) {
+            $reason = "This device is currently broadcasting its own setup hotspot. Tethering was just set to Disabled," .
+                " but that only takes effect once networking is restarted.";
+        } else {
+            $reason = "This device is currently broadcasting its own setup hotspot." .
+                ($configuredSSID !== ""
+                    ? " It will try to connect to '" . $configuredSSID . "' the next time networking is restarted (or the device is rebooted)."
+                    : " No wireless network is configured yet, so it will keep broadcasting the hotspot until one is set up.");
+        }
+    } else if ($connected) {
+        $reason = "Connected to " . $ssid . ($ip !== "" ? " (" . $ip . ")" : "") .
+            ($configuredSSID === ""
+                ? " (saved config has no network configured - this will disconnect on the next network restart)"
+                : "");
+    } else if ($configuredSSID === "") {
+        $reason = "No wireless network is configured.";
+    } else if ($wpaState === "COMPLETED") {
+        $reason = "Associated - waiting for an IP address (DHCP).";
+    } else if ($wrongKey || $wpaState === "4WAY_HANDSHAKE") {
+        $reason = "Authentication failed - the WiFi password is likely incorrect.";
+    } else if ($ssidVisible === false) {
+        $reason = "Network '" . $configuredSSID . "' not found in range (or it is hidden).";
+    } else if ($authTimeout) {
+        $reason = "The access point did not respond (out of range or busy).";
+    } else if ($ssidVisible === true) {
+        $reason = "Found '" . $configuredSSID . "' but could not connect - check the password and security type.";
+    } else if ($wpaState === "INACTIVE") {
+        $reason = "WiFi is inactive - no configured network is available.";
+    } else if ($wpaState === "" ) {
+        $reason = "The WiFi connection service is not running for this interface. Try 'Restart Network'; if that doesn't help, reboot the device.";
+    } else {
+        $reason = "Connecting to '" . $configuredSSID . "'... (" . $wpaState . ")";
+    }
+
+    return json(array(
+        "status" => "OK",
+        "connected" => $connected,
+        // Whether a hotspot is up on ANY interface - deliberately unqualified,
+        // unlike the per-interface $apActive behind "reason" below, so a caller
+        // editing some other interface still knows a tethered client is at risk.
+        "hotspotActive" => WifiHotspotIsActive(),
+        "wpa_state" => $wpaState,
+        "ssid" => $ssid,
+        "configuredSSID" => $configuredSSID,
+        "ip" => $ip,
+        "signal" => $signal,
+        "ssidVisible" => $ssidVisible,
+        "reason" => $reason
+    ));
+}
+
+/**
+ * Delete interface persistent names
+ *
+ * Removes interface persistent names by deleting systemd `.link` files and
+ * restoring any USB ethernet adapter config files back to `eth*` names.
+ *
+ * @route DELETE /api/network/persistentNames
+ * @response 200 Persistent names removed
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function network_persistentNames_delete()
+{
+    global $settings;
+
+    shell_exec("sudo rm -f /etc/systemd/network/5?-fpp-*.link");
+    shell_exec("sudo ln -sf /dev/null /etc/systemd/network/99-default.link");
+    shell_exec("sudo ln -sf /dev/null /etc/systemd/network/73-usb-net-by-mac.link");
+
+    // Rename any enx* interface config files back to eth* names
+    // This restores configs when clearing persistent names for USB ethernet adapters
+    $configDir = $settings['configDirectory'];
+    $interfaces = network_list_interfaces_array();
+
+    foreach ($interfaces as $iface) {
+        $iface = preg_replace("/:$/", "", $iface);
+
+        // Check if this is a USB ethernet adapter with an enx name
+        if (substr_compare($iface, "enx", 0, 3) == 0) {
+            $enxConfigFile = $configDir . "/interface." . $iface;
+            if (file_exists($enxConfigFile)) {
+                // Find the next available eth number
+                $ethNum = 1; // Start with eth1 since eth0 is usually built-in
+                while (file_exists($configDir . "/interface.eth" . $ethNum)) {
+                    $ethNum++;
+                }
+
+                $newName = "eth" . $ethNum;
+                $ifaceConfig = file_get_contents($enxConfigFile);
+                $ifaceConfig = str_replace($iface, $newName, $ifaceConfig);
+                file_put_contents($configDir . "/interface." . $newName, $ifaceConfig);
+                unlink($enxConfigFile);
+            }
+        }
+    }
+
+    $output = array("status" => "OK");
+    return json($output);
+}
+
+/**
+ * Set interface persistent names
+ *
+ * Creates interface persistent names by writing systemd `.link` files that
+ * pin each interface's name to its MAC address.
+ *
+ * @route POST /api/network/persistentNames
+ * @response 200 Persistent names created
+ * ```json
+ * {"status": "OK", "interfaceCnt": 2}
+ * ```
+ */
+function network_persistentNames_create()
+{
+    global $settings;
+    network_persistentNames_delete();
+
+    $interfaces = network_list_interfaces_array();
+    $count = 0;
+    foreach ($interfaces as $iface) {
+        $iface = preg_replace("/:$/", "", $iface);
+        $cmd = "ip link show " . $iface . " | grep ether | awk '{split($0, a,\" \"); print a[2];}'";
+        exec($cmd, $output, $return_val);
+        $macAddress = $output[0];
+
+        $cont = "[Match]\nMACAddress=" . $macAddress;
+        $cont = $cont . "\nPermanentMACAddress=" . $macAddress;
+        if (substr($iface, 0, strlen("wl")) === "wl") {
+            $cont = $cont . "\nOriginalName=wl*";
+        }
+
+        $mod = shell_exec("cat /sys/class/net/" . $iface . "/device/modalias");
+        if (substr_compare($iface, "eth", 0, 3) == 0 && substr_compare($mod, "usb", 0, 3) == 0) {
+            //USB ethernet adapter, the iface name is going to end up changing, we need to rename the
+            //FPP config file
+            $new_iface = "enx" . str_replace(':', '', $macAddress);
+            if (file_exists($settings['configDirectory'] . "/interface." . $iface)) {
+                $ifaceConfig = file_get_contents($settings['configDirectory'] . "/interface." . $iface);
+                $ifaceConfig = str_replace($iface, $new_iface, $ifaceConfig);
+                file_put_contents($settings['configDirectory'] . "/interface." . $new_iface, $ifaceConfig);
+            }
+            $cont = $cont . "\n\n[Link]\nNamePolicy=\nName=" . $new_iface . "\n";
+        } else {
+            $cont = $cont . "\n\n[Link]\nNamePolicy=\nName=" . $iface . "\n";
+        }
+        file_put_contents("/tmp/5" . strval($count) . "-fpp-" . $iface . ".link", $cont);
+        shell_exec("sudo mv /tmp/5" . strval($count) . "-fpp-" . $iface . ".link /etc/systemd/network/");
+
+        unset($output);
+        $count = $count + 1;
+    }
+    shell_exec("sudo  rm -f /etc/systemd/network/99-default.link");
+    shell_exec("sudo  rm -f /etc/systemd/network/73-usb-net-by-mac.link");
+
+    $output = array("status" => "OK", "interfaceCnt" => $count);
+    return json($output);
+
+}
+
+/**
+ * Get DNS configuration
+ *
+ * Returns the current DNS configuration. If not configured, `status` will
+ * be `Not Configured`.
+ *
+ * @route GET /api/network/dns
+ * @response 200 Current DNS configuration
+ * ```json
+ * {
+ *   "DNS1": "192.168.50.1",
+ *   "DNS2": "192.168.1.1",
+ *   "status": "OK"
+ * }
+ * ```
+ */
+function network_get_dns()
+{
+    global $settings;
+
+    $cfgFile = $settings['configDirectory'] . "/dns";
+    if (file_exists($cfgFile)) {
+        $obj = parse_ini_file($cfgFile);
+        $obj['status'] = "OK";
+        return json($obj);
+    }
+    return json(array("status" => "Not Configured"));
+}
+
+/**
+ * Set DNS configuration
+ *
+ * Updates the DNS configuration.
+ *
+ * @route POST /api/network/dns
+ * @body {"DNS1": "192.168.50.1", "DNS2": "192.168.1.1"}
+ * @response 200 DNS configuration updated
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "DNS": {
+ *     "DNS1": "192.168.50.1",
+ *     "DNS2": "192.168.1.1"
+ *   }
+ * }
+ * ```
+ */
+function network_save_dns()
+{
+    global $settings;
+
+    $data = json_decode(file_get_contents('php://input'), true);
+
+    $cfgFile = $settings['configDirectory'] . "/dns";
+
+    // Empty clears the server (the UI sends "" explicitly); anything else must
+    // be a dotted quad -- these lines are later parsed as plain KEY=VALUE.
+    $dns1 = isset($data['DNS1']) ? $data['DNS1'] : '';
+    $dns2 = isset($data['DNS2']) ? $data['DNS2'] : '';
+    if (($dns1 !== '' && !network_is_valid_ipv4($dns1)) ||
+        ($dns2 !== '' && !network_is_valid_ipv4($dns2))) {
+        return json(array("status" => "ERROR: invalid DNS address"));
+    }
+
+    $f = fopen($cfgFile, "w");
+    if ($f == false) {
+        return;
+    }
+
+    fprintf(
+        $f,
+        "DNS1=\"%s\"\n" .
+        "DNS2=\"%s\"\n",
+        $dns1,
+        $dns2
+    );
+    fclose($f);
+
+    //Trigger a JSON Configuration Backup
+    GenerateBackupViaAPI('DNS Configuration was modified.');
+
+    return json(array("status" => "OK", "DNS" => $data));
+}
+
+/**
+ * Get default gateway
+ *
+ * Returns the currently configured default gateway IP address. May be empty
+ * when using DHCP.
+ *
+ * @route GET /api/network/gateway
+ * @response 200 Current default gateway
+ * ```json
+ * {"GATEWAY": "192.168.1.1"}
+ * ```
+ */
+function network_get_gateway()
+{
+    global $settings;
+
+    $cfgFile = $settings['configDirectory'] . "/gateway";
+    $result = array("GATEWAY" => "");
+
+    if (file_exists($cfgFile)) {
+        $content = file_get_contents($cfgFile);
+        $lines = explode("\n", $content);
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (strpos($line, 'GATEWAY=') === 0) {
+                $result['GATEWAY'] = trim(str_replace('GATEWAY=', '', $line), '"');
+                break;
+            }
+        }
+    }
+
+    return json($result);
+}
+
+/**
+ * Set default gateway
+ *
+ * Saves the default gateway IP address to the `gateway` configuration file.
+ *
+ * @route POST /api/network/gateway
+ * @body {"GATEWAY": "192.168.1.1"}
+ * @response 200 Default gateway saved
+ * ```json
+ * {"status": "OK", "GATEWAY": "192.168.1.1"}
+ * ```
+ */
+function network_save_gateway()
+{
+    global $settings;
+
+    $data = json_decode(file_get_contents('php://input'), true);
+
+    $cfgFile = $settings['configDirectory'] . "/gateway";
+
+    // Empty clears the gateway; anything else must be a dotted quad.
+    $gateway = isset($data['GATEWAY']) ? $data['GATEWAY'] : '';
+    if ($gateway !== '' && !network_is_valid_ipv4($gateway)) {
+        return json(array("status" => "ERROR", "message" => "Invalid gateway address"));
+    }
+
+    $f = fopen($cfgFile, "w");
+    if ($f == false) {
+        return json(array("status" => "ERROR", "message" => "Unable to create gateway configuration file"));
+    }
+
+    fprintf(
+        $f,
+        "GATEWAY=\"%s\"\n",
+        $gateway
+    );
+    fclose($f);
+
+    //Trigger a JSON Configuration Backup
+    GenerateBackupViaAPI('Global Gateway Configuration was modified.');
+
+    return json(array("status" => "OK", "GATEWAY" => $gateway));
+}
+
+/**
+ * Shared interface-name allow-list for endpoints that pass `{interface}` to
+ * shells or build config file paths from it (see network_wifi_scan(),
+ * network_delete_interface()). Kernel names are at most IFNAMSIZ-1 (15)
+ * chars; requiring alnum-first with no '/' keeps values inside
+ * configDirectory and unusable as command options or flags.
+ */
+function network_is_valid_interface_name($interface)
+{
+    return is_string($interface) && preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$/', $interface);
+}
+
+/**
+ * Strict IPv4 check for config-file values (addresses, masks, DNS, gateways,
+ * lease IPs). Empty is allowed separately by callers that accept it; anything
+ * else must be a dotted quad -- these files have no escape mechanism, so a
+ * malformed value would otherwise corrupt the whole file.
+ */
+function network_is_valid_ipv4($v)
+{
+    return is_string($v) && filter_var($v, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
+/**
+ * Free-form wifi strings (SSID/PSK and backups) legitimately contain spaces,
+ * punctuation, and unicode, so they cannot be allow-listed -- but the config
+ * files are line-oriented with no escape processing on either reader (PHP
+ * parse_ini_file, C++ loadSettingsFile), so quote/newline/CR/NUL would break
+ * out into forged keys. Reject just those bytes.
+ */
+function network_is_safe_config_string($v)
+{
+    return is_string($v) && strpos($v, "\0") === false && strpbrk($v, "\"\r\n") === false;
+}
+
+/**
+ * Strict MAC check for static lease entries (colon or dash separators, as the
+ * UI accepts both styles).
+ */
+function network_is_valid_mac($v)
+{
+    return is_string($v) && preg_match('/^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$/', $v);
+}
+
+/**
+ * Get network interface configuration
+ *
+ * Retrieves the current network interface configuration.
+ *
+ * @route GET /api/network/interface/{interface}
+ * @response 200 Network interface configuration
+ * ```json
+ * {
+ *   "INTERFACE": "eth0",
+ *   "PROTO": "static",
+ *   "ADDRESS": "192.168.1.149",
+ *   "NETMASK": "255.255.255.0",
+ *   "status": "OK",
+ *   "CurrentAddress": "192.168.1.149",
+ *   "CurrentNetmask": "255.255.255.0"
+ * }
+ * ```
+ */
+function network_get_interface()
+{
+    global $settings;
+
+    $interface = params('interface');
+
+    // Same validation as network_delete_interface() below: the value reaches
+    // shells (ip/iw/networkctl/arp, sudo fppinit) and config file paths, so it
+    // must be a plausible kernel name. IFNAMSIZ-1 chars, no '/' and no leading
+    // '.'/'-', so it can neither escape configDirectory nor become an option.
+    // Deliberately NOT restricted to currently-present interfaces (unlike the
+    // wifi endpoints): this is a status query that also serves saved configs
+    // for down/absent devices.
+    if (!network_is_valid_interface_name($interface)) {
+        return json(array("status" => "ERROR: Interface not found"));
+    }
+
+    $result = array("status" => "ERROR: Interface not found");
+
+    $cfgFile = $settings['configDirectory'] . "/interface." . $interface;
+    if (file_exists($cfgFile)) {
+        $result = network_redact_interface_config(parse_ini_file($cfgFile));
+        $result['status'] = 'OK';
+
+        // Remove GATEWAY from interface configuration since it's now handled globally
+        if (isset($result['GATEWAY'])) {
+            unset($result['GATEWAY']);
+        }
+    }
+
+    // Use `ip` (netlink) rather than ifconfig to avoid WEXT calls on
+    // wireless interfaces. Each value is one shell word (see validator above).
+    exec("/sbin/ip -o -4 addr show dev " . escapeshellarg($interface) . " 2>/dev/null", $output);
+    foreach ($output as $line) {
+        if (preg_match('/\binet (\d+\.\d+\.\d+\.\d+)\/(\d+)/', $line, $m)) {
+            $result['CurrentAddress'] = $m[1];
+            $result['CurrentNetmask'] = long2ip(~((1 << (32 - $m[2])) - 1));
+        }
+    }
+    unset($output);
+    exec("/sbin/ip -o link show dev " . escapeshellarg($interface) . " 2>/dev/null", $output);
+    foreach ($output as $line) {
+        if (preg_match('/<[^>]*UP[^>]*>/', $line)) {
+            $result['status'] = 'OK';
+        }
+    }
+    unset($output);
+
+    if (substr($interface, 0, 2) == "wl") {
+        exec("/sbin/iw dev " . escapeshellarg($interface) . " link 2>/dev/null", $output);
+        foreach ($output as $line) {
+            if (preg_match('/SSID: (.+)/', $line, $m)) {
+                $result['CurrentSSID'] = $m[1];
+            }
+            // For Legacy Purpose (TX Bitrate)
+            if (preg_match('/^\s*tx bitrate:\s*([0-9\.]+)\s*MBit\/s/', $line, $m)) {
+                $result['CurrentRate'] = $m[1];
+            }
+            // TX bitrate
+            if (preg_match('/^\s*tx bitrate:\s*([0-9\.]+)\s*MBit\/s/', $line, $m)) {
+                $result['CurrentTXRate'] = $m[1];
+            }
+
+            // RX bitrate
+            if (preg_match('/^\s*rx bitrate:\s*([0-9\.]+)\s*MBit\/s/', $line, $m)) {
+                $result['CurrentRXRate'] = $m[1];
+            }
+        }
+        unset($output);
+    }
+    if (isset($result["DHCPSERVER"]) && $result["DHCPSERVER"] == "1") {
+        $result["StaticLeases"] = array();
+        $result["CurrentLeases"] = array();
+        $leasesFile = $settings['configDirectory'] . "/leases." . $interface;
+        if (file_exists($leasesFile)) {
+            $handle = fopen($leasesFile, "r");
+            if ($handle) {
+                $mac = "";
+                $ip = "";
+                while (($line = fgets($handle)) !== false) {
+                    $line = trim($line);
+                    if ($line == "[DHCPServerStaticLease]") {
+                        $mac = "";
+                        $ip = "";
+                    } else if (str_starts_with($line, "MACAddress=")) {
+                        $mac = substr($line, 11);
+                    } else if (str_starts_with($line, "Address=")) {
+                        $ip = substr($line, 8);
+                    }
+                    if ($mac != "" && $ip != "") {
+                        $result["StaticLeases"][$ip] = $mac;
+                        $mac = "";
+                        $ip = "";
+                    }
+                }
+            }
+
+            fclose($handle);
+        }
+
+        $out = shell_exec("networkctl --no-legend -l -n 0 status " . escapeshellarg($interface));
+        $lines = explode("\n", trim($out));
+        $inLeases = false;
+        $result["CurrentLeases"] = array();
+        foreach ($lines as $line) {
+            $line = trim($line);
+            //echo $line . "\n";
+
+            if (!$inLeases && str_starts_with($line, "Offered DHCP leases")) {
+                $inLeases = true;
+                $line = trim(substr($line, 20));
+            }
+            if ($inLeases) {
+                $pos = strpos($line, "(to ");
+                if ($pos === false) {
+                    $inLeases = false;
+                } else {
+                    $ip = trim(substr($line, 0, $pos));
+
+                    // $ip is parsed out of networkctl output (DHCP-provided data),
+                    // so quote it rather than trusting it to be a plain address.
+                    $mac = trim(shell_exec("arp -a  " . escapeshellarg($ip) . " | awk '{print $4;}'"));
+                    if (!isset($result["StaticLeases"][$ip]) || $result["StaticLeases"][$ip] != $mac) {
+                        $result["CurrentLeases"][$ip] = $mac;
+                    }
+                }
+            }
+        }
+    }
+
+    return json($result);
+}
+
+/**
+ * Create DHCP interface
+ *
+ * Creates a new blank DHCP interface configuration file for the specified
+ * network interface (e.g. `eth1`, `wlan0`).
+ *
+ * @route POST /api/network/interface/add/{interface}
+ * @route GET /api/network/interface/add/{interface} deprecated
+ * @response 200 DHCP interface created
+ * ```json
+ * {"status": "New Blank Interface created"}
+ * ```
+ */
+function network_add_interface()
+{
+    global $settings;
+
+    $interface = params('interface');
+
+    if (preg_match('/^[a-z]+[0-9]+$/', $interface)) {
+        $cfgFile = $settings['configDirectory'] . "/interface." . $interface;
+        if (!file_exists($cfgFile)) {
+            $contents = "INTERFACE=" . $interface . "\nPROTO=dhcp\n";
+            if (file_put_contents($cfgFile, $contents)) {
+                $result = array("status" => "New Blank Interface created");
+            } else {
+                $result = array("status" => "ERROR: could not create new Interface");
+            }
+        } else {
+            $result = array("status" => "ERROR: Interface already exists");
+        }
+    } else {
+        $result = array("status" => "ERROR: must be in format <a-z><0-9> eg wlan0 or eth1 etc");
+    }
+
+    return json($result);
+}
+
+/**
+ * Delete a network interface configuration
+ *
+ * Removes the saved configuration for `{interface}` -- `config/interface.<name>`
+ * plus any static-lease file and cached wifi scan. The generated
+ * `/etc/systemd/network/10-<name>.network` is left in place for `setupNetwork`
+ * to reap (it already removes any file it no longer needs, and disables the
+ * matching `wpa_supplicant@` unit), so follow this with
+ * `POST /api/network/interface/{interface}/apply` or a reboot for the deletion
+ * to take effect on the running system.
+ *
+ * Refuses to delete an interface backed by hardware that is currently present,
+ * or the interface this request arrived on: either would leave the box with an
+ * unmanaged NIC and no address, with no way to put it back from the UI.
+ *
+ * @route DELETE /api/network/interface/{interface}
+ * @response 200 Interface configuration deleted
+ * ```json
+ * {"status": "OK", "deleted": ["interface.eth9"], "restartNetwork": true}
+ * ```
+ * @response 400 Invalid interface name
+ * @response 404 No saved configuration for that interface
+ * @response 409 Interface is present hardware, or is serving this request
+ */
+function network_delete_interface()
+{
+    global $settings;
+
+    $interface = params('interface');
+
+    // Shared allow-list (see network_is_valid_interface_name): IFNAMSIZ-1
+    // characters, no '/' and no leading '.', so a name can never escape
+    // configDirectory.
+    if (!network_is_valid_interface_name($interface)) {
+        status(400);
+        return json(array("status" => "ERROR: invalid interface name"));
+    }
+
+    $configDir = $settings['configDirectory'];
+    $cfgFile = $configDir . "/interface." . $interface;
+    if (!file_exists($cfgFile)) {
+        status(404);
+        return json(array("status" => "ERROR: no saved configuration for " . $interface));
+    }
+
+    if (network_interface_is_hardware($interface)) {
+        status(409);
+        return json(array("status" => "ERROR: " . $interface . " is a hardware interface that is present on this system. It can be reconfigured but not deleted. Unplug the adapter first if it is removable."));
+    }
+
+    // Last line of defence for an interface that is absent or virtual but is
+    // nonetheless carrying this session -- an adapter unplugged after the
+    // address came up, or a bridge. Deleting it would cut the request's own
+    // path back. Skipped when REMOTE_ADDR isn't a usable IPv4 (a proxy, IPv6),
+    // where the answer would be about the proxy rather than the client.
+    $remote = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+    if (filter_var($remote, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $route = trim(shell_exec("/sbin/ip -o route get " . escapeshellarg($remote) . " 2>/dev/null"));
+        if (preg_match('/\bdev\s+(\S+)/', $route, $m) && $m[1] === $interface) {
+            status(409);
+            return json(array("status" => "ERROR: " . $interface . " is serving this connection. Deleting it would disconnect you."));
+        }
+    }
+
+    $deleted = array();
+    foreach (array("interface." . $interface, "leases." . $interface) as $name) {
+        $path = $configDir . "/" . $name;
+        if (file_exists($path) && unlink($path)) {
+            $deleted[] = $name;
+        }
+    }
+    @unlink(network_wifi_scan_cache_file($interface));
+
+    if (!in_array("interface." . $interface, $deleted)) {
+        status(500);
+        return json(array("status" => "ERROR: could not delete configuration for " . $interface));
+    }
+
+    return json(array("status" => "OK", "deleted" => $deleted, "restartNetwork" => true));
+}
+
+/**
+ * Set network interface configuration
+ *
+ * Updates the saved configuration for the specified `{interface}` but does
+ * not restart the network.
+ *
+ * @route POST /api/network/interface/{interface}
+ * @body {"INTERFACE": "eth0", "PROTO": "static", "ADDRESS": "192.168.1.149", "NETMASK": "255.255.255.0", "GATEWAY": "192.168.1.1"}
+ * @response 200 Interface configuration saved
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function network_set_interface()
+{
+    global $settings;
+
+    $interface = params('interface');
+    $raw = file_get_contents('php://input');
+    $data = json_decode($raw, true);
+    if (!isset($data['INTERFACE'])) {
+        echo ("WTF");
+        return json(array("status" => "Invalid Name is required", "debug" => $raw));
+    }
+
+    // $data['INTERFACE'] becomes config/interface.<name> and leases.<name> below;
+    // without validation "../" escapes configDirectory on write.
+    if (!network_is_valid_interface_name($data['INTERFACE'])) {
+        return json(array("status" => "ERROR: invalid interface name"));
+    }
+
+    $cfgFile = $settings['configDirectory'] . "/interface." . $data['INTERFACE'];
+    $leasesFile = $settings['configDirectory'] . "/leases." . $data['INTERFACE'];
+
+    // Static lease entries are written verbatim below; validate first so a bad
+    // MAC/IP fails the save instead of corrupting the leases file. The UI
+    // already enforces IPv4 client-side; MACs accept both separator styles.
+    if (isset($data['Leases'])) {
+        if (!is_array($data['Leases'])) {
+            return json(array("status" => "ERROR: invalid leases"));
+        }
+        foreach ($data['Leases'] as $lip => $lmac) {
+            if (!network_is_valid_ipv4((string)$lip) || !network_is_valid_mac($lmac)) {
+                return json(array("status" => "ERROR: invalid static lease entry"));
+            }
+        }
+    }
+
+    // GETs never return WiFi keys (network_redact_interface_config()), so a
+    // request without one keeps the key already saved.  Read before the file
+    // is truncated below.
+    if (!array_key_exists('PSK', $data) || !array_key_exists('BACKUPPSK', $data)) {
+        // RAW: the default mode expands ${...} inside values, which would
+        // rewrite a kept passphrase that happens to contain one.
+        $saved = file_exists($cfgFile) ? @parse_ini_file($cfgFile, false, INI_SCANNER_RAW) : array();
+        foreach (array('PSK', 'BACKUPPSK') as $k) {
+            if (!array_key_exists($k, $data)) {
+                $data[$k] = (is_array($saved) && isset($saved[$k])) ? $saved[$k] : '';
+            }
+        }
+    }
+
+    $f = fopen($cfgFile, "w");
+    if ($f == false) {
+        return json(array("status" => "Unable to create file for interface"));
+    }
+
+    if ($data['PROTO'] == "static") {
+        $address = isset($data['ADDRESS']) ? $data['ADDRESS'] : '';
+        $netmask = isset($data['NETMASK']) ? $data['NETMASK'] : '';
+        if (($address !== '' && !network_is_valid_ipv4($address)) ||
+            ($netmask !== '' && !network_is_valid_ipv4($netmask))) {
+            fclose($f);
+            return json(array("status" => "ERROR: invalid static address or netmask"));
+        }
+        fprintf(
+            $f,
+            "INTERFACE=\"%s\"\n" .
+            "PROTO=\"static\"\n" .
+            "ADDRESS=\"%s\"\n" .
+            "NETMASK=\"%s\"\n",
+            $data['INTERFACE'],
+            $address,
+            $netmask
+        );
+
+    } else if ($data['PROTO'] == "dhcp") {
+        fprintf(
+            $f,
+            "INTERFACE=%s\n" .
+            "PROTO=dhcp\n",
+            $data['INTERFACE']
+        );
+    }
+
+    if (substr($data['INTERFACE'], 0, 2) == "wl") {
+        // SSID/PSK are free-form (spaces, punctuation, unicode all occur in
+        // the wild) but land in double-quoted file lines, so only the
+        // format-breaking bytes are refused. Flags arrive as JSON booleans
+        // from the UI and are written verbatim below -- anything else is.
+        foreach (array('SSID', 'PSK', 'BACKUPSSID', 'BACKUPPSK') as $k) {
+            if (isset($data[$k]) && !network_is_safe_config_string($data[$k])) {
+                fclose($f);
+                return json(array("status" => "ERROR: invalid characters in " . $k));
+            }
+        }
+        foreach (array('HIDDEN', 'WPA3', 'BACKUPHIDDEN', 'BACKUPWPA3') as $k) {
+            // Booleans from the UI pass through verbatim (fprintf %s renders
+            // true as "1", false as ""); the loose scalars below cover API
+            // clients. Anything else (notably strings with newlines/quotes)
+            // would inject file lines.
+            if (isset($data[$k]) && !is_bool($data[$k]) && $data[$k] !== 0 && $data[$k] !== 1 &&
+                $data[$k] !== "0" && $data[$k] !== "1" && $data[$k] !== "" &&
+                strcasecmp((string)$data[$k], "true") !== 0 && strcasecmp((string)$data[$k], "false") !== 0) {
+                fclose($f);
+                return json(array("status" => "ERROR: invalid value for " . $k));
+            }
+        }
+        fprintf(
+            $f,
+            "SSID=\"%s\"\n" .
+            "PSK=\"%s\"\n" .
+            "HIDDEN=%s\n" .
+            "WPA3=%s\n",
+            $data['SSID'],
+            $data['PSK'],
+            $data['HIDDEN'],
+            $data['WPA3']
+        );
+        fprintf(
+            $f,
+            "BACKUPSSID=\"%s\"\n" .
+            "BACKUPPSK=\"%s\"\n" .
+            "BACKUPHIDDEN=%s\n" .
+            "BACKUPWPA3=%s\n",
+            $data['BACKUPSSID'],
+            $data['BACKUPPSK'],
+            $data['BACKUPHIDDEN'],
+            $data['BACKUPWPA3']
+        );
+    }
+    if (isset($data['DHCPSERVER'])) {
+        fprintf($f, "DHCPSERVER=%d\n", $data['DHCPSERVER'] ? "1" : 0);
+        if ($data['DHCPSERVER']) {
+            if (isset($data['Leases'])) {
+                // Entries validated above; non-array input rejected there too.
+                $lf = fopen($leasesFile, "w");
+                foreach ($data['Leases'] as $ip => $mac) {
+                    fprintf($lf, "[DHCPServerStaticLease]\n");
+                    fprintf($lf, "MACAddress=%s\n", $mac);
+                    fprintf($lf, "Address=%s\n\n", $ip);
+                }
+                fclose($lf);
+            } else if (file_exists($leasesFile)) {
+                unlink($leasesFile);
+            }
+        }
+    }
+    // Numeric options render through %d below, where array input would fatal
+    // mid-save (leaving a truncated file). Empty string keeps its historical
+    // meaning (writes 0, as before); UI numeric fields send numbers.
+    foreach (array('DHCPOFFSET', 'DHCPPOOLSIZE', 'ROUTEMETRIC', 'IPFORWARDING') as $k) {
+        if (isset($data[$k]) && $data[$k] !== "" && !is_numeric($data[$k])) {
+            fclose($f);
+            return json(array("status" => "ERROR: invalid value for " . $k));
+        }
+    }
+    if (isset($data['DHCPOFFSET'])) {
+        fprintf($f, "DHCPOFFSET=%d\n", $data['DHCPOFFSET']);
+    }
+    if (isset($data['DHCPPOOLSIZE'])) {
+        fprintf($f, "DHCPPOOLSIZE=%d\n", $data['DHCPPOOLSIZE']);
+    }
+    if (isset($data['ROUTEMETRIC'])) {
+        fprintf($f, "ROUTEMETRIC=%d\n", $data['ROUTEMETRIC']);
+    }
+    if (isset($data['IPFORWARDING'])) {
+        fprintf($f, "IPFORWARDING=%d\n", $data['IPFORWARDING']);
+    }
+    fclose($f);
+
+    return json(array("status" => "OK"));
+
+}
+
+/**
+ * Set networking configuration
+ *
+ * Applies the networking settings for the specified `{interface}` at the OS
+ * level and restarts the interface.
+ *
+ * @route POST /api/network/interface/{interface}/apply
+ * @response 200 Networking configuration applied
+ * ```json
+ * {"status": "OK", "output": []}
+ * ```
+ */
+function network_apply_interface()
+{
+    global $settings, $SUDO;
+
+    $interface = params('interface');
+
+    // This runs root fppinit -- same validation as the read path.
+    if (!network_is_valid_interface_name($interface)) {
+        status(400);
+        return json(array("status" => "ERROR: invalid interface name"));
+    }
+
+    exec($SUDO . " " . $settings['fppDir'] . "/src/fppinit setupNetwork " . escapeshellarg($interface), $output);
+    return json(array("status" => "OK", "output" => $output));
+}

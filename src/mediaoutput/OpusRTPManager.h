@@ -1,0 +1,298 @@
+#pragma once
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2025 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+// OpusRTPManager -- GStreamer-based Opus RTP audio send/receive
+//
+// Provides WiFi-friendly compressed audio streaming using the Opus codec
+// over RTP, as an alternative to AES67 (uncompressed L24) which requires
+// wired Ethernet.  Supports both unicast and multicast destinations.
+//
+// Features:
+//   - Send: pipewiresrc -> audioconvert -> opusenc -> rtpopuspay -> udpsink
+//   - Receive: udpsrc -> rtpjitterbuffer -> rtpopusdepay -> opusdec -> audioconvert -> pipewiresink
+//   - Configurable bitrate, DTX, in-band FEC
+//   - Unicast or multicast destination
+//   - Config format: pipewire-opus-rtp-instances.json
+
+#if __has_include(<gst/gst.h>)
+#define HAS_OPUS_RTP_GSTREAMER
+
+#include <gst/gst.h>
+
+#include "fpphttp_types.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Opus RTP Protocol Constants
+// ──────────────────────────────────────────────────────────────────────────────
+namespace OpusRTP {
+
+constexpr int RTP_PAYLOAD_TYPE      = 96;
+constexpr int AUDIO_RATE            = 48000;     // Opus native rate
+constexpr int DEFAULT_PORT          = 5005;      // avoid AES67's 5004
+constexpr int DEFAULT_CHANNELS      = 2;
+constexpr int DEFAULT_LATENCY_MS    = 50;        // higher default for WiFi
+constexpr int DEFAULT_BITRATE       = 128000;    // 128 kbps
+constexpr int DEFAULT_PACKET_LOSS   = 5;         // 5% expected loss
+constexpr int MULTICAST_TTL         = 4;
+
+// DSCP codepoint for the RTP audio stream (udpsink qos-dscp).  AF41, the same
+// marking AES67 audio uses.  It matters more here than there: this is the WiFi
+// transport, and WiFi maps DSCP onto WMM access categories (AF41 -> AC_VI), so
+// the marking decides how the stream contends on a busy AP.
+constexpr int AUDIO_DSCP            = 34;      // AF41
+
+constexpr const char* DEFAULT_DEST_IP = "239.69.1.1";
+
+// Valid bitrates (bps)
+inline bool IsValidBitrate(int br) {
+    return br >= 6000 && br <= 512000;
+}
+
+} // namespace OpusRTP
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Instance configuration -- mirrors the JSON schema
+// ──────────────────────────────────────────────────────────────────────────────
+struct OpusRTPInstance {
+    int id = 0;
+    std::string name;
+    bool enabled = true;
+    std::string mode = "send";               // "send" | "receive" | "both"
+    std::string destIP = OpusRTP::DEFAULT_DEST_IP;   // unicast or multicast
+    int port = OpusRTP::DEFAULT_PORT;
+    int channels = OpusRTP::DEFAULT_CHANNELS;
+    std::string interface;                   // network interface (e.g., "wlan0")
+    int latency = OpusRTP::DEFAULT_LATENCY_MS;
+    int bitrate = OpusRTP::DEFAULT_BITRATE;
+    bool dtx = false;                        // Discontinuous Transmission
+    bool fec = true;                         // In-band Forward Error Correction
+    int packetLoss = OpusRTP::DEFAULT_PACKET_LOSS;  // expected packet loss %
+};
+
+struct OpusRTPConfig {
+    std::vector<OpusRTPInstance> instances;
+
+    // Hold a sender idle until something in the audio graph actually feeds it.
+    //
+    // A send instance is a PipeWire *sink*: its pipewiresrc is created with
+    // node.autoconnect=false, so nothing links into it unless an Audio Output
+    // Group member names it as node.target.  With nothing linked the pipeline
+    // cannot preroll, and gst_element_set_state() sits there for 30 seconds
+    // before returning FAILURE -- per instance, on every Apply.  That is the
+    // chicken and egg a new instance walks straight into: it cannot be added
+    // to a group until it has been saved, and saving it costs half a minute of
+    // dead UI and a "stream failed to start" warning for a stream the user has
+    // not finished configuring yet.
+    //
+    // So when nothing feeds it, do not start it at all: the instance stays
+    // configured, ApplyConfig() returns promptly, GetStatus() reports it as
+    // waiting rather than failed, and the next apply -- which the Audio Output
+    // Groups page performs anyway, by restarting the stack -- starts it for
+    // real.  See PipeWireGraphFeedsNode().
+    //
+    // Set false in pipewire-opus-rtp-instances.json for a graph FPP did not
+    // generate (a hand-written PipeWire conf, or nodes linked by hand with
+    // pw-link), where the group config cannot answer the question.
+    bool requireGroupSource = true;
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pipeline wrapper -- one per send or receive direction of an instance
+// ──────────────────────────────────────────────────────────────────────────────
+struct OpusRTPPipeline {
+    int instanceId = 0;
+    bool isSend = true;
+    GstElement* pipeline = nullptr;
+    GstBus* bus = nullptr;
+
+    bool running = false;
+    std::string errorMessage;
+
+    // Buffer-drop probe for flush between tracks
+    std::atomic<int> dropCounter = 0;
+    GstPad* probePad = nullptr;
+    gulong probeId = 0;
+
+    // Zombie detection
+    uint64_t lastByteCount = 0;
+    int stallCount = 0;
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OpusRTPManager -- singleton managing all Opus RTP GStreamer pipelines
+// ──────────────────────────────────────────────────────────────────────────────
+class OpusRTPManager {
+public:
+    static OpusRTPManager& INSTANCE;
+
+    // HTTP API endpoint (registered at /opusrtp)
+    HttpResponsePtr render_GET(const HttpRequestPtr& req);
+
+    // Lifecycle
+    bool Init();
+    void Shutdown();
+
+    // Apply configuration -- reads JSON and rebuilds pipelines
+    bool ApplyConfig();
+
+    // Cleanup -- stop all pipelines
+    void Cleanup();
+
+    // Status query
+    struct Status {
+        struct PipelineStatus {
+            int instanceId;
+            std::string name;
+            std::string mode;
+            bool running;
+            std::string error;
+            // Configured and enabled, but deliberately not started because
+            // nothing in the audio graph feeds it -- see
+            // OpusRTPConfig::requireGroupSource.  Not an error: `note` carries
+            // the reason for the UI to render as guidance rather than a
+            // failure.
+            bool waitingForSource = false;
+            std::string note;
+        };
+        std::vector<PipelineStatus> pipelines;
+    };
+    Status GetStatus();
+
+    // Check if manager is active
+    bool IsActive() const { return m_active.load(); }
+
+    // Flush send pipelines (media playback integration)
+    void FlushSendPipelines();
+
+    // Apply the master volume to every send pipeline (see
+    // AES67Manager::SetMasterVolume()).
+    void SetMasterVolume(int volume);
+
+    OpusRTPManager();
+    virtual ~OpusRTPManager();
+
+private:
+    // Config
+    OpusRTPConfig m_config;
+    std::string m_configPath;
+    bool LoadConfig();
+
+    // Guards every access to m_config.
+    //
+    // LoadConfig() clears and refills m_config.instances, which reallocates
+    // the vector and reassigns its std::strings.  ApplyConfig() is safe (it
+    // holds m_applyMutex and joins the watchdog first), but GetStatus() runs
+    // on an HTTP thread and iterates the same vector -- and UIs poll status,
+    // so a reload landing mid-poll is a use-after-free.
+    //
+    // Held only for the duration of a read or the final swap in LoadConfig(),
+    // and NEVER together with m_pipelineMutex -- GetStatus() snapshots the
+    // config, releases, then takes the pipeline lock.  The two locks are
+    // therefore never held at once and cannot deadlock against each other.
+    std::mutex m_configMutex;
+    OpusRTPConfig GetConfigSnapshot();
+
+    // Pipeline watchdog -- polls bus messages and recovers crashed pipelines
+    bool PollPipelinesWatchdog();
+    // Streams whose pipeline failed to build or start in the last apply
+    // (PipeWire not up yet, say).  Nothing else would try them again, so the
+    // watchdog rebuilds for them, waiting 30s, 60s, ... up to 8 minutes
+    // between tries: a rebuild restarts every stream.  m_failedStarts is set
+    // by ApplyConfig() under m_pipelineMutex; the rest is watchdog thread only.
+    int m_failedStarts = 0;
+    int m_failedStartRebuilds = 0;
+    std::chrono::steady_clock::time_point m_lastFailedStartRebuild{};
+
+    // Watchdog thread
+    std::thread m_watchdogThread;
+    std::atomic<bool> m_watchdogRunning{false};
+    void WatchdogLoop();
+
+    // Deferred pipeline-rebuild thread -- spawned by WatchdogLoop()'s rebuild
+    // path to call ApplyConfig() from a thread other than the one
+    // ApplyConfig() needs to join (m_watchdogThread).  Tracked as a member
+    // (rather than detached) so Shutdown() can join it before tearing
+    // anything else down -- a detached thread could otherwise call
+    // ApplyConfig() and resurrect pipelines after Shutdown() has already run,
+    // and a detached thread racing Shutdown()'s own join of m_watchdogThread
+    // is undefined behavior.
+    std::thread m_rebuildThread;
+
+    // Rebuild bookkeeping.  m_rebuildMutex guards m_rebuildThread.  A rebuild
+    // is scheduled with the apply generation it was asked for and runs only
+    // if nothing has applied, cleaned up or shut down since (see
+    // ScheduleRebuild()); m_stopping is set once by Shutdown() and keeps
+    // ApplyConfig() from bringing anything back after it.
+    std::mutex m_rebuildMutex;
+    std::atomic<bool> m_rebuildRunning{false};
+    std::atomic<bool> m_stopping{false};
+    std::atomic<uint64_t> m_applyGeneration{0};
+    void ScheduleRebuild();
+    bool ApplyConfigLocked();
+
+    // Serializes the whole tear-down/rebuild sequence in ApplyConfig(),
+    // Shutdown() and Cleanup().  ApplyConfig() joins the watchdog thread at
+    // the top and re-creates it ~50 lines later, after loading config and
+    // building pipelines; that window is wide, and ApplyConfig() has three
+    // independent callers (the boot sequence, OpusRTPApplyCommand::run on a
+    // command thread, and m_rebuildThread from the watchdog).  Two overlapping calls both pass the join, then both assign
+    // m_watchdogThread -- and assigning over a still-joinable std::thread is
+    // an unconditional std::terminate().
+    //
+    // Shutdown() must join m_rebuildThread BEFORE taking this lock: that
+    // thread calls ApplyConfig(), so holding the lock across the join would
+    // deadlock.
+    std::mutex m_applyMutex;
+
+    // Pipeline management
+    std::map<int, OpusRTPPipeline> m_sendPipelines;
+    std::map<int, OpusRTPPipeline> m_recvPipelines;
+    std::mutex m_pipelineMutex;
+
+    // Send instances ApplyConfig() chose not to start because nothing feeds
+    // them -- see OpusRTPConfig::requireGroupSource.  Instance ID to the
+    // reason, which is shown to the user, so phrase it as guidance rather than
+    // as an error.  Guarded by m_pipelineMutex alongside the pipeline maps, so
+    // a status reader sees the whole picture -- running, failed and waiting --
+    // under one lock.
+    std::map<int, std::string> m_deferredSenders;
+
+    bool CreateSendPipeline(const OpusRTPInstance& inst);
+    bool CreateRecvPipeline(const OpusRTPInstance& inst);
+    void StopPipeline(OpusRTPPipeline& p);
+    void StopAllPipelines();
+
+    // Get source IP for the network interface
+    std::string GetInterfaceIP(const std::string& iface);
+
+    // Check if destination IP is multicast
+    static bool IsMulticast(const std::string& ip);
+
+    // Safe node name
+    static std::string SafeNodeName(const std::string& name);
+
+    // State
+    std::atomic<bool> m_active{false};
+    std::atomic<bool> m_initialized{false};
+};
+
+#endif // HAS_OPUS_RTP_GSTREAMER

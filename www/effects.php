@@ -1,119 +1,263 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
 <head>
-<?php
-require_once('config.php');
-include 'common/menuHead.inc';
-?>
-<script>
-    $(function() {
-    $('#tblEffectLibrary').on('mousedown', 'tr', function(event,ui){
-          $('#tblEffectLibrary tr').removeClass('effectSelectedEntry');
-          $(this).addClass('effectSelectedEntry');
-          var items = $('#tblEffectLibrary tr');
-          EffectNameSelected  = $(this).find('td:first').text();
-          SetButtonState('#btnPlayEffect','enable');
-    });
+  <?php
+  require_once('config.php');
+  include 'common/htmlMeta.inc';
 
-    $('#tblRunningEffects').on('mousedown', 'tr', function(event,ui){
-          $('#tblRunningEffects tr').removeClass('effectSelectedEntry');
-          $(this).addClass('effectSelectedEntry');
-          var items = $('#tblRunningEffects tr');
-          RunningEffectSelected  = $(this).find('td:first').text();
-          SetButtonState('#btnStopEffect','enable');
-    });
-  });
-</script>
-
-<title><? echo $pageTitle; ?></title>
-</head>
-<body onLoad="GetFPPDmode();setInterval(updateFPPStatus,1000);GetRunningEffects();">
-<div id="bodyWrapper">
-<?php
-  include 'menu.inc';
-
-  function PrintEffectRows()
-  {
-    global $effectDirectory;
-    foreach(scandir($effectDirectory) as $seqFile)
-    {
-      if($seqFile != '.' && $seqFile != '..' && preg_match('/.eseq$/', $seqFile))
-      {
-        $seqFile = preg_replace('/.eseq$/', '', $seqFile);
-        
-        echo "<tr id='effect_" . $seqFile . "'><td width='1000%'>" . $seqFile . "</td></tr>\n";
-      }
-    }
+  if (file_exists(__DIR__ . "/fppdefines.php")) {
+    include_once __DIR__ . '/fppdefines.php';
+  } else {
+    include_once __DIR__ . '/fppdefines_unknown.php';
   }
 
+  require_once "common.php";
+  include 'common/menuHead.inc';
   ?>
-<br/>
-<div id="top" class="settings">
-  <fieldset>
-    <legend>Player Status</legend>
-    <div id="daemonControl">
-      <table width= "100%">
-        <tr>
-          <td class='controlHeader'> FPPD Mode: </td>
-          <td><div id='textFPPDmode'>Player Mode</div>
-        </tr>
-        <tr>
-          <td class='controlHeader'> FPPD Status: </td>
-          <td id="daemonStatus"></td>
-        </tr>
-        <tr>
-          <td class='controlHeader'> FPP Time: </td>
-          <td id="fppTime"></td>
-        </tr>
-      </table>
-    </div>
-  </fieldset>
 
-  <br />
-  <fieldset class="fs">
-	  <legend> Effects </legend>
-      <div id= "divEffectLibrary">
-          <div id="effectLibrary">
-            <table id="tblEffectListHeader" width="100%">
-              <tr class="effectListHeader">
-                <td width="100%" class='fppTableHeader'>Effects Library</td>
-              </tr>
-            </table>
-            <div>
-              <table id="tblEffectLibrary"   width="100%">
-<? PrintEffectRows(); ?>
-              </table>
+  <link rel="stylesheet" href="bootstrap-table/css/bootstrap-table.min.css?ref=<?= filemtime('bootstrap-table/css/bootstrap-table.min.css'); ?>">
+  <link rel="stylesheet" href="bootstrap-table/extensions/bootstrap-table-filter-control.min.css?ref=<?= filemtime('bootstrap-table/extensions/bootstrap-table-filter-control.min.css'); ?>">
+  <script src="bootstrap-table/js/bootstrap-table.min.js?ref=<?= filemtime('bootstrap-table/js/bootstrap-table.min.js'); ?>"></script>
+  <script src="bootstrap-table/extensions/bootstrap-table-filter-control.min.js?ref=<?= filemtime('bootstrap-table/extensions/bootstrap-table-filter-control.min.js'); ?>"></script>
+
+  <script>
+    var EffectSelectedName = "";
+    var EffectSelectedType = "";
+    var RunningEffectSelectedId = -1;
+    var RunningEffectSelectedName = "";
+
+    $(function () {
+      $('#tblEffectLibraryBody').on('click', '.buttons', function (event, ui) {
+        $('#tblEffectLibraryBody tr').removeClass('effectSelectedEntry');
+        var $selectedEntry = $(this).parent().parent();
+        $selectedEntry.addClass('effectSelectedEntry');
+        EffectSelectedName = $selectedEntry.find('td:first').text();
+        EffectSelectedType = $selectedEntry.find('td:nth-child(2)').text();
+
+        var body = "Loop Effect: <input type='checkbox' id='loopEffect'><br>Run in Background: <input type='checkbox' id='backgroundEffect'><br>Start Channel Override: ";
+        body += "<input id='effectStartChannel' class='default-value' type='number' value='' min='1' max='<? echo FPPD_MAX_CHANNELS; ?>' />";
+
+        DoModalDialog({
+          id: "StartEffectDialog",
+          title: 'Start Effect ' + $selectedEntry.find('td:first').text(),
+          backdrop: true,
+          keyboard: true,
+          class: "modal-sm",
+          body: body,
+          buttons: {
+            "Start": {
+              click: function () {
+                StartSelectedEffect();
+                CloseModalDialog("StartEffectDialog");
+              },
+              class: 'btn-success'
+            },
+            "Cancel": function () { CloseModalDialog("StartEffectDialog"); },
+          }
+        });
+      });
+
+      $('#tblRunningEffectsBody').on('click', '.buttons', function (event, ui) {
+        $('#tblRunningEffectsBody tr').removeClass('effectSelectedEntry');
+        var $selectedEntry = $(this).parent().parent();
+        $selectedEntry.addClass('effectSelectedEntry');
+        RunningEffectSelectedId = $selectedEntry.find('td:first').text();
+        RunningEffectSelectedName = $selectedEntry.find('td:nth-child(2)').text();
+        StopEffect();
+        console.log('stopping')
+        //SetButtonState('#btnStopEffect','enable');
+      });
+    });
+
+    $(document).on('click', '.stop-overlay-effects', function () {
+      const model = $(this).data('model');
+      SelectedOverlayModel = model;
+
+      const $btn = $(this).prop('disabled', true);
+
+      PostCommand('Overlay Model Effect', [model, 'Enabled', 'Stop Effects'])
+        .done(() => {
+          $.jGrowl('Stopped all effects on ' + model, { themeState: 'success' });
+          GetRunningOverlayEffects();
+        })
+        .fail(() => {
+          DialogError('Error', 'Error stopping effects on ' + model);
+          GetRunningOverlayEffects();
+        });
+    });
+
+
+    function StartSelectedEffect() {
+      var row = $('#tblEffectLibraryBody tr').find('.effectSelectedEntry');
+      var startChannel = $('#effectStartChannel').val();
+      var loop = 0;
+      var background = 0;
+
+      if (startChannel == undefined || startChannel == '')
+        startChannel = 0;
+      else
+        startChannel = parseInt(startChannel);
+
+      if ($('#loopEffect').is(':checked'))
+        loop = 1;
+
+      if ($('#backgroundEffect').is(':checked'))
+        background = 1;
+
+      var req;
+      if (EffectSelectedType == 'eseq') {
+        req = PostCommand('Effect Start', [EffectSelectedName, startChannel, loop, background]);
+      } else {
+        req = PostCommand('FSEQ Effect Start', [EffectSelectedName, loop, background]);
+      }
+
+      req.done(function () {
+        $.jGrowl('Effect Started', { themeState: 'success' });
+        GetRunningEffects();
+      }).fail(function () {
+        DialogError('Error Starting Effect', 'Error Starting ' + name + ' Effect');
+      });
+    }
+
+    function pageSpecific_PageLoad_DOM_Setup() {
+      var $table = $('#tblEffectLibrary');
+
+      $table.bootstrapTable({
+        sortName: 'name',
+        sortOrder: 'asc',
+        filterControl: true,
+        striped: true,
+        showColumns: false,
+        undefinedText: ''
+      });
+
+    }
+
+  </script>
+
+
+  <title><? echo $pageTitle; ?></title>
+</head>
+
+<body onLoad="GetRunningEffects(); GetRunningOverlayEffects();">
+  <div id="bodyWrapper">
+    <?php
+    $activeParentMenuItem = 'status';
+    include 'menu.inc';
+
+    function PrintEffectRows()
+    {
+      $files = array();
+
+      global $effectDirectory;
+      foreach (scandir($effectDirectory) as $seqFile) {
+        if ($seqFile != '.' && $seqFile != '..' && preg_match('/.eseq$/', $seqFile)) {
+          $seqFile = preg_replace('/.eseq$/', '', $seqFile);
+          $files[$seqFile] = "eseq";
+        }
+      }
+
+      global $sequenceDirectory;
+      foreach (scandir($sequenceDirectory) as $seqFile) {
+        if ($seqFile != '.' && $seqFile != '..' && preg_match('/.fseq$/', $seqFile)) {
+          $seqFile = preg_replace('/.fseq$/', '', $seqFile);
+          $files[$seqFile] = "fseq";
+        }
+      }
+
+      ksort($files);
+
+      foreach ($files as $f => $t) {
+        echo "<tr id='effect_" . $f . "'><td><img src='images/redesign/icon-" . $t . ".svg' alt=" . $t . " class='icon-effect-type'/>" . $f . "</td><td>" . $t . "</td><td><button class='buttons btn-success'>Start</button></td></tr>\n";
+      }
+    }
+
+    ?>
+
+    <div class="mainContainer">
+      <h1 class="title">Effects</h1>
+      <div class="pageContent">
+
+
+        <div class="row">
+          <div class="col">
+            <h2>Effects Library</h2>
+            <div id="divEffectLibrary">
+              <div class='fppTableWrapper'>
+                <div class='fppTableContents'>
+                  <table id="tblEffectLibrary" class="fppActionTable" width="100%" cellpadding=1 cellspacing=0>
+                    <thead>
+                      <tr>
+                        <th data-field="name" data-sortable="true" data-filter-control="input">Effect Name</th>
+                        <th data-field="type" data-sortable="true" data-filter-control="input">Type</th>
+                        <th data-field="action" width='15%'></th>
+                      </tr>
+                    </thead>
+                    <tbody id='tblEffectLibraryBody'>
+                      <? PrintEffectRows(); ?>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+          </div>
+          <div class="col pin-parent">
+            <div id="divRunningEffects" class="backdrop-disabled">
+              <h2>Running Effects</h2>
+              <!-- <input id="btnStopEffect" type="button" class="disableButtons" value="Stop Effect" onclick="StopEffect();" /><br> -->
+              <div class='fppTableWrapper'>
+                <div class='fppTableContents'>
+                  <table id="tblRunningEffects" class="fppActionTable fppActionTable-success" width="100%" cellpadding=1
+                    cellspacing=0>
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Running Effects</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody id='tblRunningEffectsBody'></tbody>
+                  </table>
+                  <div class="tblRunningEffectsPlaceholder">
+                    There are currently no effects running
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div style="height: 20px;"></div>
+
+            <div id="divOverlayEffects" class="divOverlayEffectsDisabled">
+              <h2 id="overlayEffectsTitle">Overlay Model Effects</h2>
+              <!-- <input id="btnStopEffect" type="button" class="disableButtons" value="Stop Effect" onclick="StopEffect();" /><br> -->
+              <div class='fppTableWrapper'>
+                <div class='fppTableContents'>
+                  <table id="tblOverlayEffects" class="fppActionTable fppActionTable-success" width="100%" cellpadding=1
+                    cellspacing=0>
+                    <thead>
+                      <tr>
+                        <th>Model</th>
+                        <th>Running Effects</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody id='tblOverlayEffectsBody'></tbody>
+                  </table>
+                  <div class="tblOverlayEffectsPlaceholder">
+                    There are currently no overlay model effects running
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
-          <div class='right'>
-            <div>
-              <table width="100%">
-                <tr><td>Start Channel Override: <input id="effectStartChannel" class="default-value" type="text" value="" size="5" maxlength="5" /></td></tr>
-              </table>
-            </div>
-            <input id= "btnPlayEffect" type="button" class ="disableButtons" value="Play Effect" onClick="PlayEffect($('#effectStartChannel').val());">
-          </div>
+        </div>
       </div>
-      <div id= "divRunningEffects">
-          <div id="runningEffects">
-            <table id="tblEffectListHeader" width="100%">
-              <tr class="effectListHeader">
-                <td width="5%" class="fppTableHeader">ID</td>
-                <td width="95%" class="fppTableHeader">Running Effects</td>
-              </tr>
-            </table>
-            <div>
-              <table id="tblRunningEffects"   width="100%">
-              </table>
-            </div>
-          </div>
-          <div class='right'>
-            <input id="btnStopEffect" type="button" class="disableButtons" value="Stop Effect" onclick="StopEffect();" />
-          </div>
-      </div>
-   </fieldset>
-</div>
-<?php include 'common/footer.inc'; ?>
-</div>
+    </div>
+
+    <?php include 'common/footer.inc'; ?>
+  </div>
 </body>
+
 </html>

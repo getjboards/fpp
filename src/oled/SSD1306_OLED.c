@@ -57,16 +57,19 @@ int LED_DISPLAY_TYPE = LED_DISPLAY_TYPE_SSD1306;
 
 /* static Variables */
 static unsigned char _rotation = 0,textsize = 0;
-static short _width = LED_DISPLAY_WIDTH;
-static short _height = LED_DISPLAY_HEIGHT;
+static short _width = 128;
+static short _height = 64;
 static short cursor_x = 0, cursor_y = 0, textcolor = 0, textbgcolor = 0;
 static bool _cp437 = false, wrap = true;
 
 
-
-
 /* static struct objects */
-static GFXfontPtr gfxFont;
+static const GFXfont *gfxFont = 0;
+
+void setTextFont(const GFXfont *font) {
+    gfxFont = font;
+}
+
 
 /* Externs - I2C.c */
 extern I2C_DeviceT I2C_DEV_2;
@@ -75,10 +78,10 @@ extern I2C_DeviceT I2C_DEV_2;
 #define MAX_CHUNK_SIZE 129
 static unsigned char chunk[MAX_CHUNK_SIZE] = {0};
 
-// max we do is 128x64 at this point
-#define DISPLAY_BUFF_SIZE  ((64*128/8)+MAX_CHUNK_SIZE)
+// max we do is 128x128 at this point
+#define DISPLAY_BUFF_SIZE  ((128*128/2)+MAX_CHUNK_SIZE)
 
-/* Memory buffer for displaying data on LCD - This is an Apple - Fruit */
+/* Memory buffer for displaying data on LCD */
 static unsigned char screen[DISPLAY_BUFF_SIZE] ={0};
 
 /* Static Functions */
@@ -370,30 +373,40 @@ int display_Init_seq()
 {
     /* Add the reset code, If needed */
 
-    /* Send display OFF command */
-    if(i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_DISPLAY_OFF) != I2C_TWO_BYTES) {
-#ifdef SSD1306_DBG
-        printf("Display OFF Command Failed\r\n");
-#endif
-        return 1;
-    }
-    /* Set display multiplex */
-    if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_MULTIPLEX) != I2C_TWO_BYTES) {
-#ifdef SSD1306_DBG
-        printf("Display MULT Command Failed\r\n");
-#endif
-        return 1;
-    }
-    /* Send display MULT command parameter */
-    if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_MULT_DAT) != I2C_TWO_BYTES) {
-#ifdef SSD1306_DBG
-        printf("Display MULT Command Parameter Failed\r\n");
-#endif
-        return 1;
-    }
+    /* The drawing routines clip and mirror against _width/_height, so those
+     * have to track the geometry of the panel that is actually attached.
+     * Left at the 128x64 default, a rotated 180 128x32 panel has every pixel
+     * mirrored about row 63, putting the whole image in GDDRAM pages 4-7 -
+     * which a 32 row panel never scans out, so the display just stays dark.
+     * A 128x128 SSD1327 has the opposite problem: everything below row 63
+     * gets clipped away. */
+    _width = LED_DISPLAY_WIDTH;
+    _height = LED_DISPLAY_HEIGHT;
 
     
     if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SSD1306) {
+        /* Send display OFF command */
+        if(i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_DISPLAY_OFF) != I2C_TWO_BYTES) {
+#ifdef SSD1306_DBG
+            printf("Display OFF Command Failed\r\n");
+#endif
+            return 1;
+        }
+        /* Set display multiplex */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_MULTIPLEX) != I2C_TWO_BYTES) {
+#ifdef SSD1306_DBG
+            printf("Display MULT Command Failed\r\n");
+#endif
+            return 1;
+        }
+        /* Send display MULT command parameter */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_MULT_DAT) != I2C_TWO_BYTES) {
+#ifdef SSD1306_DBG
+            printf("Display MULT Command Parameter Failed\r\n");
+#endif
+            return 1;
+        }
+
         /* Set display clock frequency */
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_DISP_CLK) != I2C_TWO_BYTES) {
     #ifdef SSD1306_DBG
@@ -546,7 +559,29 @@ int display_Init_seq()
     #endif
             return 1;
         }
-    } else {
+    } else if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SH1106) {
+        /* Send display OFF command */
+        if(i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_DISPLAY_OFF) != I2C_TWO_BYTES) {
+#ifdef SSD1306_DBG
+            printf("Display OFF Command Failed\r\n");
+#endif
+            return 1;
+        }
+        /* Set display multiplex */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_MULTIPLEX) != I2C_TWO_BYTES) {
+#ifdef SSD1306_DBG
+            printf("Display MULT Command Failed\r\n");
+#endif
+            return 1;
+        }
+        /* Send display MULT command parameter */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_MULT_DAT) != I2C_TWO_BYTES) {
+#ifdef SSD1306_DBG
+            printf("Display MULT Command Parameter Failed\r\n");
+#endif
+            return 1;
+        }
+
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x02) != I2C_TWO_BYTES) { return 1; }
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x10) != I2C_TWO_BYTES) { return 1; }
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_DISP_OFFSET) != I2C_TWO_BYTES) { return 1; }
@@ -567,6 +602,101 @@ int display_Init_seq()
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x12) != I2C_TWO_BYTES) { return 1; }
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_VCOMDETECT) != I2C_TWO_BYTES) { return 1; }
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x40) != I2C_TWO_BYTES) { return 1; }
+    } else if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SH1107) {
+        /* The SH1107 is a 128x128 1bpp controller.  It is close enough to the
+         * SSD1306 to share the page based framebuffer and every drawing routine,
+         * but it differs in two ways that matter.  It has no 0x21/0x22 column and
+         * page range commands - 0x21 selects vertical addressing instead - so the
+         * frame is pushed a page at a time in transfer().  And its panel supply is
+         * enabled with 0xAD 0x8A, not the SSD1306 charge pump: get that one byte
+         * wrong and the controller ACKs every command and reports itself as on
+         * while the glass stays completely dark. */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_DISPLAY_OFF) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_DISP_CLK) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x51) != I2C_TWO_BYTES) { return 1; }
+        /* 0x20 on its own selects page addressing */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_MEM_ADDR_MODE) != I2C_TWO_BYTES) { return 1; }
+        /* Not SSD1306_SEG_REMAP: that is the pre-mirrored 0xA1.  The flipped
+         * variant of this display is handled in software by setRotation(). */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xA0) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xC0) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_MULTIPLEX) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_MULT_DAT) != I2C_TWO_BYTES) { return 1; }
+        /* Offset 0, not the 0x60 the widely copied SH1107 init recipes use:
+         * those are written for the 128x64 boards, where 96 lines of offset
+         * are correct.  On a full height 128x128 panel it rotates the frame
+         * by 32 columns and the right hand edge wraps around to the left. */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_DISP_OFFSET) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; }
+        /* DC-DC converter on, internal */
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xAD) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x8A) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_PRECHARGE) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x22) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_SET_VCOMDETECT) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x35) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_DISPLAYALLON_RESUME) != I2C_TWO_BYTES) { return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, SSD1306_NORMAL_DISPLAY) != I2C_TWO_BYTES) { return 1; }
+    } else if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SSD1327) {
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xae) != I2C_TWO_BYTES) { return 1; } //--turn off oled panel
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x15) != I2C_TWO_BYTES) { return 1; };    //   set column address
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; };    //  start column   0
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x7f) != I2C_TWO_BYTES) { return 1; };    //  end column   127
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x75) != I2C_TWO_BYTES) { return 1; };    //   set row address
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; };    //  start row   0
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x7f) != I2C_TWO_BYTES) { return 1; };    //  end row   127
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x81) != I2C_TWO_BYTES) { return 1; };  // set contrast control
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x80) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xa0) != I2C_TWO_BYTES) { return 1; };    // gment remap
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x51) != I2C_TWO_BYTES) { return 1; };   //51
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xa1) != I2C_TWO_BYTES) { return 1; };  // start line
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xa2) != I2C_TWO_BYTES) { return 1; };  // display offset
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xa4) != I2C_TWO_BYTES) { return 1; };    // rmal display
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xa8) != I2C_TWO_BYTES) { return 1; };    // set multiplex ratio
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x7f) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xb1) != I2C_TWO_BYTES) { return 1; };  // set phase leghth
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xf1) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xb3) != I2C_TWO_BYTES) { return 1; };  // set dclk
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; };  //80Hz:0xc1 90Hz:0xe1   100Hz:0x00   110Hz:0x30 120Hz:0x50   130Hz:0x70     01
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xab) != I2C_TWO_BYTES) { return 1; };  //
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x01) != I2C_TWO_BYTES) { return 1; };  //
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xb6) != I2C_TWO_BYTES) { return 1; };  // set phase leghth
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x0f) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xbe) != I2C_TWO_BYTES) { return 1; };
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x0f) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xbc) != I2C_TWO_BYTES) { return 1; };
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x08) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xd5) != I2C_TWO_BYTES) { return 1; };
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x62) != I2C_TWO_BYTES) { return 1; };
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xfd) != I2C_TWO_BYTES) { return 1; };
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x12) != I2C_TWO_BYTES) { return 1; };
+        
+        //----
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xb9) != I2C_TWO_BYTES) { return 1; };
+
+        //if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xa0) != I2C_TWO_BYTES) { return 1; };    // gment remap
+        //if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x46) != I2C_TWO_BYTES) { return 1; };   //51
+
+        //if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xaf) != I2C_TWO_BYTES) { return 1; };   //on
+        //return 0;
     }
     
     /* Set display CONTRAST */
@@ -617,6 +747,18 @@ int display_Init_seq()
  ****************************************************************/
 int transfer()
 {
+    /* Debugging code */
+    /*
+    int ww = (_width * _height) / 8;
+    for (int y = 0; y < ww; y++) {
+        printf("0x%02X, ", screen[y]);
+        if (y % 32 == 31) {
+            printf("\n");
+        }
+    }
+    printf("\n\n");
+    */
+
     short loop_1 = 0, loop_2 = 0;
     short index = 0x00;
     int max = _height * _width / 8;
@@ -637,6 +779,37 @@ int transfer()
             if (index == max)
                 break;
         }
+    } else if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SSD1327) {
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x15) != I2C_TWO_BYTES) { printf("1\n"); return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0) != I2C_TWO_BYTES) { printf("2\n"); return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 127) != I2C_TWO_BYTES) { printf("3\n"); return 1; }
+        
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x75) != I2C_TWO_BYTES) { printf("4\n"); return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0) != I2C_TWO_BYTES) { printf("5\n"); return 1; }
+        if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 127) != I2C_TWO_BYTES) { printf("6\n"); return 1; }
+        
+        int max = _height * _width / 2;
+        for (loop_1 = 0; loop_1 < 8*1024; loop_1++) {
+            memset(chunk,0x00,MAX_CHUNK_SIZE);
+            chunk[0] = 0x40;
+            for(loop_2 = 1; loop_2 < MAX_CHUNK_SIZE; ) {
+                int i = screen[index];
+                chunk[loop_2] = i;
+                index++;
+                loop_2++;
+                
+                if (index == max)
+                    break;
+            }
+            if (loop_2 > 1) {
+                if (i2c_multiple_writes(I2C_DEV_2.fd_i2c, loop_2, chunk) != loop_2) {
+                    printf("Chunk written to RAM - Failed\r\n");
+                    return 1;
+                }
+            }
+            if (index == max)
+                break;
+        }
     } else {
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x00) != I2C_TWO_BYTES) { return 1; }
         if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x10) != I2C_TWO_BYTES) { return 1; }
@@ -644,13 +817,19 @@ int transfer()
         
         chunk[0] = 0x40;
         
-        for (uint8_t k=0; k < 8; k++) {
+        /* One page is 8 rows, so a 64 row SH1106 walks 8 of them and a 128 row
+         * SH1107 walks 16.  The SH1106 is a 132 column controller behind a 128
+         * column panel and its framebuffer therefore starts at column 2; the
+         * SH1107 is a true 128 columns and starts at 0. */
+        int pages = LED_DISPLAY_HEIGHT / 8;
+        unsigned char colLow = (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SH1107) ? 0x00 : 0x02;
+        for (uint8_t k=0; k < pages; k++) {
             //set page addressSSD_Data_Mode;
             if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0xB0+k) != I2C_TWO_BYTES) {
                 return 1;
             }
             //set lower column address
-            if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, 0x02) != I2C_TWO_BYTES) {
+            if (i2c_write_register(I2C_DEV_2.fd_i2c, SSD1306_CNTRL_CMD, colLow) != I2C_TWO_BYTES) {
                 return 1;
             }
             //set higher column address
@@ -684,9 +863,14 @@ int transfer()
  ****************************************************************/
 int Display()
 {
-    if (Init_Col_PG_addrs(SSD1306_COL_START_ADDR,SSD1306_COL_END_ADDR,
-                           SSD1306_PG_START_ADDR,SSD1306_PG_END_ADDR) ) {
-        return 1;
+    /* The SSD1327 sets its own window inside transfer().  The SH1107 has to be
+     * skipped too: 0x21 is not a column range command there, it switches the
+     * controller into vertical addressing and would break the page walk. */
+    if (LED_DISPLAY_TYPE != LED_DISPLAY_TYPE_SSD1327 && LED_DISPLAY_TYPE != LED_DISPLAY_TYPE_SH1107) {
+        if (Init_Col_PG_addrs(SSD1306_COL_START_ADDR,SSD1306_COL_END_ADDR,
+                               SSD1306_PG_START_ADDR,SSD1306_PG_END_ADDR) ) {
+            return 1;
+        }
     }
     return transfer();
 }
@@ -805,19 +989,6 @@ int Init_Col_PG_addrs(unsigned char col_start_addr, unsigned char col_end_addr,
 void setRotation(unsigned char x)
 {
     _rotation = x & 3;
-    switch(_rotation)
-    {
-    case 0:
-    case 2:
-        _width = LED_DISPLAY_WIDTH;
-        _height = LED_DISPLAY_HEIGHT;
-        break;
-    case 1:
-    case 3:
-        _width = LED_DISPLAY_HEIGHT;
-        _height = LED_DISPLAY_WIDTH;
-        break;
-    }
 }
 
 /****************************************************************
@@ -1465,25 +1636,31 @@ signed char drawPixel(short x, short y, short color)
     switch(_rotation)
     {
     case 1:
-        SWAP(x,y);
         x = _width - x - 1;
         break;
     case 2:
         x = _width - x - 1;
         y = _height - y - 1;
         break;
-    case 3:
-        SWAP(x,y);
-        y = _height - y - 1;
-        break;
     }
-
     /* x is the column */
-    switch(color)
-    {
-    case WHITE:   screen[x+ (y/8)*LED_DISPLAY_WIDTH] |=  (1 << (y&7)); break;
-    case BLACK:   screen[x+ (y/8)*LED_DISPLAY_WIDTH] &= ~(1 << (y&7)); break;
-    case INVERSE: screen[x+ (y/8)*LED_DISPLAY_WIDTH] ^=  (1 << (y&7)); break;
+    if (LED_DISPLAY_TYPE == LED_DISPLAY_TYPE_SSD1327) {
+        int idx = y * LED_DISPLAY_WIDTH/2 + x / 2;
+        uint8_t val = 0xF0;
+        if (x % 2) {
+            val = 0x0F;
+        }
+        switch(color) {
+            case WHITE:   screen[idx] |= val; break;
+            case BLACK:   screen[idx] &= ~val; break;
+            case INVERSE: screen[idx] ^= val; break;
+        }
+    } else {
+        switch(color) {
+            case WHITE:   screen[x+ (y/8)*LED_DISPLAY_WIDTH] |=  (1 << (y&7)); break;
+            case BLACK:   screen[x+ (y/8)*LED_DISPLAY_WIDTH] &= ~(1 << (y&7)); break;
+            case INVERSE: screen[x+ (y/8)*LED_DISPLAY_WIDTH] ^=  (1 << (y&7)); break;
+        }
     }
     return 0;
 }
@@ -2099,6 +2276,37 @@ unsigned char getRotation()
     return _rotation;
 }
 
+short getTextWidth(const char *strPtr) {
+    short maxW = 0;
+    short w = 0;
+    const char *p = strPtr;
+    while (*p) {
+        if (*p == '\n') {
+            if (maxW < w) {
+                maxW = w;
+            }
+            w = 0;
+        } else if (*p != '\r') {
+            if (!gfxFont) {
+                if(!_cp437 && (*p >= 176))
+                    p++;
+                w += 5 * textsize;
+            } else {
+                unsigned char c = *p;
+                c -= (unsigned char)pgm_read_byte(&gfxFont->first);
+                GFXglyphPtr glyph = &(((GFXglyph *)pgm_read_pointer(&gfxFont->glyph))[c]);
+                w += glyph->xAdvance;
+            }
+        }
+        p++;
+    }
+    if (maxW < w) {
+        maxW = w;
+    }
+    return maxW;
+}
+
+
 /****************************************************************
  * Function Name : drawBitmap
  * Description   : Draw a character
@@ -2113,7 +2321,7 @@ unsigned char getRotation()
 void drawChar(short x, short y, unsigned char c, short color, short bg, unsigned char size)
 {
     unsigned char line = 0, *bitmap = NULL, w = 0, h = 0, xx = 0, yy = 0, bits = 0, bit = 0;
-    char i = 0, j = 0, xo = 0, yo = 0;
+    int8_t i = 0, j = 0, xo = 0, yo = 0;
     short bo = 0, xo16 = 0, yo16 = 0;
     GFXglyphPtr glyph;
     if(!gfxFont)
@@ -2165,15 +2373,17 @@ void drawChar(short x, short y, unsigned char c, short color, short bg, unsigned
         // Character is assumed previously filtered by write() to eliminate
         // newlines, returns, non-printable characters, etc.  Calling
         // drawChar() directly with 'bad' characters of font may cause mayhem!
-
+        unsigned char cOrig = c;
         c -= (unsigned char)pgm_read_byte(&gfxFont->first);
-        glyph  = &(((GFXglyphT *)pgm_read_pointer(&gfxFont->glyph))[c]);
+        glyph  = &(((GFXglyph *)pgm_read_pointer(&gfxFont->glyph))[c]);
         bitmap = (unsigned char *)pgm_read_pointer(&gfxFont->bitmap);
         bo = pgm_read_word(&glyph->bitmapOffset);
         w  = pgm_read_byte(&glyph->width);
         h  = pgm_read_byte(&glyph->height);
         xo = pgm_read_byte(&glyph->xOffset);
         yo = pgm_read_byte(&glyph->yOffset);
+        
+        y += gfxFont->yMaxAscent;
 
         if(size > 1)
         {
@@ -2270,7 +2480,7 @@ short oled_write(unsigned char c)
             first = pgm_read_byte(&gfxFont->first);
             if((c >= first) && (c <= (unsigned char)pgm_read_byte(&gfxFont->last)))
             {
-                glyph = &(((GFXglyphT*)pgm_read_pointer(&gfxFont->glyph))[c - first]);
+                glyph = &(((GFXglyphPtr)pgm_read_pointer(&gfxFont->glyph))[c - first]);
                 w     = pgm_read_byte(&glyph->width);
                 h     = pgm_read_byte(&glyph->height);
                 if((w > 0) && (h > 0))

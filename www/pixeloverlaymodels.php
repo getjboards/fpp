@@ -1,222 +1,1235 @@
 <!DOCTYPE html>
-<html>
-<?php
-require_once("common.php");
+<html lang="en">
+
+<head>
+    <?php
+    include 'common/htmlMeta.inc';
+    require_once "common.php";
+    include 'common/menuHead.inc'; ?>
+
+    <script language="Javascript">
+        var FBDevices = new Array();
+        var FBInfo = {};
+<?
+$showAddFBButton = 0;
+
+exec($SUDO . " " . $settings["fppBinDir"] . "/fpp -FB", $output, $return_val);
+$js = json_decode($output[0]);
+foreach ($js as $fileName) {
+    echo "FBDevices['$fileName'] = '$fileName';\n";
+    echo "FBInfo['$fileName'] = {};\n";
+    $showAddFBButton = 1;
+
+    if ($settings["Platform"] == "MacOS" || !file_exists("/dev/$fileName")) {
+        echo "FBInfo['$fileName'].Width = 150;\n";
+        echo "FBInfo['$fileName'].Height = 100;\n";
+    } else {
+        $geometry = exec("fbset -i -fb /dev/$fileName | grep geometry", $output, $return_val);
+        if ($return_val == 0) {
+            $parts = preg_split("/\s+/", preg_replace('/^ *geometry */', '', $geometry));
+            if (count($parts) > 3) {
+                echo "FBInfo['$fileName'].Width = " . $parts[0] . ";\n";
+                echo "FBInfo['$fileName'].Height = " . $parts[1] . ";\n";
+            }
+        }
+    }
+}
+
+if (($settings['Platform'] == "Linux") && (file_exists('/usr/include/X11/Xlib.h'))) {
+    ?>
+            FBDevices['x11'] = 'x11';
+            FBInfo['x11'] = {};
+            FBInfo['x11'].Width = 640;
+            FBInfo['x11'].Height = 480;
+            <?
+}
 
 ?>
-<head>
-<?php include 'common/menuHead.inc'; ?>
-<script language="Javascript">
 
-function GetOrientationInput(currentValue) {
-	var options = {
-		horizontal: "Horizontal",
-		vertical:   "Vertical"
-		};
-	var str = "<select class='orientation'>";
+        var PixelOverlayModels = new Array();
+        <?
+        $json = file_get_contents('http://localhost/api/models?simple=true');
+        $models = json_decode($json, true);
+        foreach ($models as $model) {
+            // User data inside a script: see co-other-modules.php.
+            $jsName = json_encode($model, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
+            echo "PixelOverlayModels[" . $jsName . "] = " . $jsName . ";";
+        }
 
-	for (var key in options) {
-		str += "<option value='" + key + "'";
-		if (currentValue == key)
-			str += "selected";
+        ?>
 
-		str += ">" + options[key] + "</option>";
-	}
-
-	str += "</select>";
-
-	return str;
-}
-
-function GetStartingCornerInput(currentValue) {
-	var options = {
-		TL: "Top Left",
-		TR: "Top Right",
-		BL: "Bottom Left",
-		BR: "Bottom Right"
-		};
-	var str = "<select class='corner'>";
-
-	for (var key in options) {
-		str += "<option value='" + key + "'";
-		if (currentValue == key)
-			str += "selected";
-
-		str += ">" + options[key] + "</option>";
-	}
-
-	str += "</select>";
-
-	return str;
-}
-
-function PopulateChannelMemMapTable(data) {
-	$('#channelMemMaps tbody').html("");
-    
-	for (var i = 0; i < data["models"].length; i++) {
-		$('#channelMemMaps tbody').append("<tr id='row'" + i + " class='fppTableRow'>" +
-			"<td><input class='blk' type='text' size='31' maxlength='31' value='" + data["models"][i].Name + "'></td>" +
-			"<td><input class='start' type='text' size='6' maxlength='6' value='" + data["models"][i].StartChannel + "'></td>" +
-			"<td><input class='cnt' type='text' size='6' maxlength='6' value='" + data["models"][i].ChannelCount + "'></td>" +
-			"<td>" + GetOrientationInput(data["models"][i].Orientation) + "</td>" +
-			"<td>" + GetStartingCornerInput(data["models"][i].StartCorner) + "</td>" +
-			"<td><input class='strcnt' type='text' size='3' maxlength='3' value='" + data["models"][i].StringCount + "'></td>" +
-			"<td><input class='strands' type='text' size='2' maxlength='2' value='" + data["models"][i].StrandsPerString + "'></td>" +
-			"</tr>");
-	}
-}
-
-function GetChannelMemMaps() {
-	$.getJSON("fppjson.php?command=getChannelMemMaps", function(data) {
-		PopulateChannelMemMapTable(data);
-	});
-}
-
-function SetChannelMemMaps() {
-    var postData = "";
-	var dataError = 0;
-
-	$('#channelMemMaps tbody tr').each(function() {
-		$this = $(this);
-
-		var memmap = {
-			Name: $this.find("input.blk").val(),
-			StartChannel: parseInt($this.find("input.start").val()),
-			ChannelCount: parseInt($this.find("input.cnt").val()),
-			Orientation: $this.find("select.orientation").val(),
-			StartCorner: $this.find("select.corner").val(),
-			StringCount: parseInt($this.find("input.strcnt").val()),
-			StrandsPerString: parseInt($this.find("input.strands").val())
-			};
-
-		if ((memmap.Name != "") &&
-			(memmap.StartChannel > 0) &&
-			(memmap.ChannelCount > 0) &&
-			(memmap.StringCount > 0) &&
-			(memmap.StrandsPerString > 0))
-		{
-			if (postData != "") {
-				postData += ", ";
-            } else {
-                postData = "{ \"models\": [";
+        var xlightsSubModels = {};
+        <?
+        // Lightweight per-parent submodel list (names/dims only, no grids) from
+        // the digested xlights-submodels.json.  Full grid data is fetched on
+        // demand via the API so the page stays light.  See
+        // docs/PixelOverlaySubModels.md.
+        $subFile = $settings['configDirectory'] . '/xlights-submodels.json';
+        if (file_exists($subFile)) {
+            $subData = json_decode(file_get_contents($subFile), true);
+            if (isset($subData['submodels']) && is_array($subData['submodels'])) {
+                $byParent = [];
+                foreach ($subData['submodels'] as $sm) {
+                    if (!isset($sm['Parent'])) {
+                        continue;
+                    }
+                    $byParent[$sm['Parent']][] = [
+                        'Name' => $sm['Name'],
+                        'DisplayName' => isset($sm['DisplayName']) ? $sm['DisplayName'] : $sm['Name'],
+                        'Width' => isset($sm['Width']) ? (int) $sm['Width'] : 0,
+                        'Height' => isset($sm['Height']) ? (int) $sm['Height'] : 0,
+                    ];
+                }
+                foreach ($byParent as $parent => $list) {
+                    echo "xlightsSubModels[" . json_encode($parent) . "] = " . json_encode($list) . ";\n";
+                }
             }
-			postData += JSON.stringify(memmap);
-		} else {
-			dataError = 1;
-			// FIXME, put in some more info here, highlight bad field, etc.
-			alert("MemMap '" + memmap.BlockName + "' starting at channel '" + memmap.StartChannel + "' containing '" + memmap.ChannelCount + "' channel(s) is not valid.");
-			return;
-		}
-	});
+        }
+        ?>
 
-	if (dataError != 0)
-		return;
+        function normalizeModelName(name) {
+            return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        }
 
-    postData += "]}";
-	postData = "command=setChannelMemMaps&data=[ " + postData + " ]";
+        function getSubModels(modelName) {
+            if (xlightsSubModels.hasOwnProperty(modelName)) {
+                return xlightsSubModels[modelName];
+            }
+            return null;
+        }
 
-	$.post("fppjson.php", postData).done(function(data) {
-		$.jGrowl("Pixel Overlay Models saved.");
-		PopulateChannelMemMapTable(data);
-		SetRestartFlag();
-	}).fail(function() {
-		DialogError("Save Pixel Overlay Models", "Save Failed!");
-	});
-}
+        // xLights submodels and model groups are lazily materialized when an
+        // effect runs on them, which makes them show up in /api/overlays/models.
+        // They are NOT standalone overlay models — they're listed (read-only) in
+        // their own tables below — so keep them out of the main editable table.
+        var _xlOverlayNames = null;
+        function isXlightsOverlayName(name) {
+            if (_xlOverlayNames === null) {
+                _xlOverlayNames = {};
+                Object.keys(xlightsSubModels).forEach(function (parent) {
+                    (xlightsSubModels[parent] || []).forEach(function (sm) {
+                        _xlOverlayNames[normalizeModelName(sm.Name)] = true;
+                    });
+                });
+                (xlightsModelGroups || []).forEach(function (g) {
+                    _xlOverlayNames[normalizeModelName(g.Name)] = true;
+                });
+            }
+            return !!_xlOverlayNames[normalizeModelName(name)];
+        }
 
-function AddNewMemMap() {
-	var currentRows = $("#channelMemMaps > tbody > tr").length
+        var xlightsModelGroups = [];
+        <?
+        // Lightweight model-group list from the digested xlights-modelgroups.json
+        // (no grids inline). See docs/PixelOverlaySubModels.md.
+        $grpFile = $settings['configDirectory'] . '/xlights-modelgroups.json';
+        if (file_exists($grpFile)) {
+            $grpData = json_decode(file_get_contents($grpFile), true);
+            if (isset($grpData['modelgroups']) && is_array($grpData['modelgroups'])) {
+                $glist = [];
+                foreach ($grpData['modelgroups'] as $g) {
+                    $glist[] = [
+                        'Name' => $g['Name'],
+                        'DisplayName' => isset($g['DisplayName']) ? $g['DisplayName'] : $g['Name'],
+                        'MemberCount' => isset($g['MemberCount']) ? (int) $g['MemberCount'] : 0,
+                        'PixelCount' => isset($g['PixelCount']) ? (int) $g['PixelCount'] : 0,
+                        'Width' => isset($g['Width']) ? (int) $g['Width'] : 0,
+                        'Height' => isset($g['Height']) ? (int) $g['Height'] : 0,
+                        // A model whose buffer axes already mean something --
+                        // see PixelOverlayModel::getBufferStyle(). Listed apart
+                        // from the xLights groups below, because "a group of
+                        // models" and "a polar view of one" are different kinds
+                        // of thing to drive even though both are channelgrid Subs.
+                        'BufferStyle' => isset($g['BufferStyle']) ? $g['BufferStyle'] : '',
+                        'SourceName' => isset($g['PolarSourceName']) ? $g['PolarSourceName'] : '',
+                    ];
+                }
+                echo "xlightsModelGroups = " . json_encode($glist) . ";\n";
+            }
+        }
+        ?>
 
-	$('#channelMemMaps tbody').append(
-		"<tr id='row'" + currentRows + " class='fppTableRow'>" +
-			"<td><input class='blk' type='text' size='31' maxlength='31' value=''></td>" +
-			"<td><input class='start' type='text' size='6' maxlength='6' value=''></td>" +
-			"<td><input class='cnt' type='text' size='6' maxlength='6' value=''></td>" +
-			"<td>" + GetOrientationInput('') + "</td>" +
-			"<td>" + GetStartingCornerInput('') + "</td>" +
-			"<td><input class='strcnt' type='text' size='3' maxlength='3' value='1'></td>" +
-			"<td><input class='strands' type='text' size='2' maxlength='2' value='1'></td>" +
-			"</tr>");
-}
+        function PopulateModelGroups() {
+            if (!xlightsModelGroups || xlightsModelGroups.length == 0) {
+                return;
+            }
+            // Pull fresh running-effect status first (this runs at page load,
+            // before GetChannelMemMaps' async fetch has populated the map), so
+            // effects active on a group — e.g. started from a cue — are shown.
+            $.get("api/overlays/models", function (data) {
+                updateOverlayEffectMap(data);
+            }).always(function () {
+                renderModelGroups();
+            });
+        }
 
-var tableInfo = {
-	tableName: "channelMemMaps",
-	selected:  -1,
-	enableButtons: [ "btnDelete" ],
-	disableButtons: []
-	};
+        function isPolarBuffer(g) {
+            return (g.BufferStyle || '') === 'polar';
+        }
 
-function DeleteSelectedMemMap() {
-	if (tableInfo.selected >= 0) {
-		$('#channelMemMaps tbody tr:nth-child(' + (tableInfo.selected+1) + ')').remove();
-		tableInfo.selected = -1;
-		SetButtonState("#btnDelete", "disable");
-	}
-}
+        function renderModelGroups() {
+            renderPolarBuffers();
+            var $tbody = $('#modelGroupsTable tbody');
+            var html = "";
+            var shown = 0;
+            for (var i = 0; i < xlightsModelGroups.length; i++) {
+                var g = xlightsModelGroups[i];
+                if (isPolarBuffer(g)) continue;
+                shown++;
+                var fx = overlayEffectByName[g.Name];
+                var fxCell = fx
+                    ? "<span style='color:#4caf50;'><i class='fas fa-circle' style='font-size:0.6em;vertical-align:middle;'></i> " + fx + "</span>"
+                    : "<span style='color:#666;'>&mdash;</span>";
+                html += "<tr>"
+                    + "<td style='text-align:left;'>" + g.DisplayName + "</td>"
+                    + "<td style='text-align:center;'>" + g.MemberCount + "</td>"
+                    + "<td style='text-align:center;'>" + g.PixelCount + "</td>"
+                    + "<td style='text-align:center;'>" + g.Width + " x " + g.Height + "</td>"
+                    + "<td><code style='font-size:0.85em;'>" + g.Name + "</code></td>"
+                    + "<td style='text-align:center;'>" + fxCell + "</td>"
+                    + "</tr>";
+            }
+            $tbody.html(html);
+            $('#modelGroupsCount').text("(" + shown + ")");
+            if (shown > 0) {
+                $('#modelGroupsSection').show();
+            }
+        }
 
-$(document).ready(function(){
-	SetupSelectableTableRow(tableInfo);
-	GetChannelMemMaps();
-});
+        // Models declaring BufferStyle "polar": their X/Y are radius and angle
+        // rather than wiring order, so the useful columns are the polar shape
+        // and what they are a view OF, not a member count.
+        function renderPolarBuffers() {
+            var rows = (xlightsModelGroups || []).filter(isPolarBuffer);
+            if (rows.length == 0) {
+                return;
+            }
+            var html = "";
+            for (var i = 0; i < rows.length; i++) {
+                var g = rows[i];
+                var fx = overlayEffectByName[g.Name];
+                var fxCell = fx
+                    ? "<span style='color:#4caf50;'><i class='fas fa-circle' style='font-size:0.6em;vertical-align:middle;'></i> " + fx + "</span>"
+                    : "<span style='color:#666;'>&mdash;</span>";
+                html += "<tr>"
+                    + "<td style='text-align:left;'>" + g.DisplayName + "</td>"
+                    + "<td style='text-align:left;'><code style='font-size:0.85em;'>" + (g.SourceName || "&mdash;") + "</code></td>"
+                    + "<td style='text-align:center;'>" + g.PixelCount + "</td>"
+                    + "<td style='text-align:center;'>" + g.Width + " x " + g.Height + "</td>"
+                    + "<td><code style='font-size:0.85em;'>" + g.Name + "</code></td>"
+                    + "<td style='text-align:center;'>" + fxCell + "</td>"
+                    + "</tr>";
+            }
+            $('#polarBuffersTable tbody').html(html);
+            $('#polarBuffersCount').text("(" + rows.length + ")");
+            $('#polarBuffersSection').show();
+        }
 
-$(document).tooltip();
+        // Fetch a model's per-pixel preview coordinates ([[x,y,z],...]) on
+        // demand from the overlay API.  The coordinates come from the
+        // virtualdisplaymap and can be hundreds of thousands of points per
+        // model, so they are never inlined into the page — see issue #2731.
+        // cb receives the pixel array (or null on error/none).
+        function fetchModelPreviewPixels(modelName, cb) {
+            $.getJSON("api/overlays/model/" + encodeURIComponent(modelName) + "/preview", function (resp) {
+                cb(resp && resp.pixels && resp.pixels.length ? resp.pixels : null);
+            }).fail(function () {
+                cb(null);
+            });
+        }
 
-</script>
+        function GetOrientationInput(currentValue, attr) {
 
-<title><? echo $pageTitle; ?></title>
+            var options = {
+                horizontal: "Horizontal",
+                vertical: "Vertical"
+            };
+            var str = "";
+            const is_custom = (currentValue || "").toLowerCase().startsWith("custom");
+            if (is_custom) {
+                str = "<b>" + currentValue + "</b>"; //allow descriptive text following
+            }
+            str += "<select class='form-select orientation'";
+            str += attr;
+            if (is_custom) {
+                str += " style='visibility: hidden;'><option value='custom' selected>Custom</option";
+            }
+            str += ">";
+            for (var key in options) {
+                str += "<option value='" + key + "'";
+                if (currentValue == key)
+                    str += "selected";
+
+                str += ">" + options[key] + "</option>";
+            }
+
+            str += "</select>";
+
+            return str;
+        }
+
+        // 1, 3 and 4 are the node widths FPP's outputs actually produce - a plain
+        // 1-4 spinner also offers 2, which no output can drive and which silently
+        // discards the blue channel.  A width already saved in the config is kept
+        // as an extra choice rather than quietly rewritten.
+        function GetChannelsPerNodeInput(currentValue, attr) {
+            var options = [1, 3, 4];
+            var current = parseInt(currentValue);
+            if (isNaN(current) || current < 1) {
+                current = 3;
+            }
+            if (options.indexOf(current) == -1) {
+                options.push(current);
+                options.sort(function (a, b) { return a - b; });
+            }
+
+            var str = "<select class='form-select cpn'" + attr + ">";
+            for (var i = 0; i < options.length; i++) {
+                str += "<option value='" + options[i] + "'";
+                if (current == options[i])
+                    str += " selected";
+                str += ">" + options[i] + "</option>";
+            }
+            str += "</select>";
+
+            return str;
+        }
+
+        function GetStartingCornerInput(currentValue, attr) {
+            var options = {
+                TL: "Top Left",
+                TR: "Top Right",
+                BL: "Bottom Left",
+                BR: "Bottom Right"
+            };
+            var str = "<select class='form-select corner'" + attr + ">";
+
+            for (var key in options) {
+                str += "<option value='" + key + "'";
+                if (currentValue == key)
+                    str += "selected";
+
+                str += ">" + options[key] + "</option>";
+            }
+
+            str += "</select>";
+
+            return str;
+        }
+        function PopulatePixelOverlaySettings(data) {
+            if (data != null) {
+                $("#AutoCreatePixelOverlays").prop('checked', data["autoCreate"]);
+            }
+        }
+
+        function DeviceChanged(item) {
+            var type = $(item).parent().parent().find('span.type').html();
+
+            if (type == 'FB') {
+                var device = $(item).val();
+
+                if (FBInfo.hasOwnProperty(device)) {
+                    $(item).parent().parent().find('input.width').val(FBInfo[device].Width);
+                    $(item).parent().parent().find('input.height').val(FBInfo[device].Height);
+                }
+
+                if (device == 'x11')
+                    $(item).parent().parent().find('.X11input').show();
+                else
+                    $(item).parent().parent().find('.X11input').hide();
+            }
+        }
+
+        function WidthOrHeightModified(item) {
+            var width = parseInt($(item).parent().parent().find('input.width').val());
+            var height = parseInt($(item).parent().parent().find('input.height').val());
+            var channels = width * height * 3;
+
+            if ($(item).parent().parent().find('input.pixelSize').length) {
+                var pixelSize = parseInt($(item).parent().parent().find('input.pixelSize').val());
+                if (!pixelSize || pixelSize < 1) {
+                    pixelSize = 1;
+                }
+
+                var pWidth = parseInt(width / pixelSize);
+                var pHeight = parseInt(height / pixelSize);
+                channels = pWidth * pHeight * 3;
+            }
+
+            $(item).parent().parent().find('td.channels').html(channels);
+        }
+
+        function PopulateChannelMemMapTable(data) {
+            $('#channelMemMaps tbody').html("");
+            $('#channelMemMapsAutoCreate tbody').html("");
+            if (data == null) {
+                return;
+            }
+
+            for (var i = 0; i < data.length; i++) {
+                var model = data[i];
+                // Skip lazily-materialized xLights submodels / model groups —
+                // they belong to their own tables, not the editable model list.
+                if (isXlightsOverlayName(model.Name)) {
+                    continue;
+                }
+                var ChannelCountPerNode = model.ChannelCountPerNode;
+                if (ChannelCountPerNode == undefined) {
+                    ChannelCountPerNode = 3;
+                }
+                postr = "<tr id='row'" + i + " class='fppTableRow'>" +
+                    "<td class='center' valign='middle'>";
+
+                var attr = " ";
+                if (model.autoCreated) {
+                    postr += "";
+                    attr = " disabled";
+                } else {
+                    postr += "<div class='rowGrip'><i class='rowGripIcon fpp-icon-grip'></i></div>";
+                }
+
+                postr += "</td><td><input class='blk' type='text' size='31' maxlength='31' value='" + EscapeHtmlAttr(model.Name) + "'" + attr + "></td>";
+
+                switch (model.Type) {
+                    case "Channel":
+                        postr += "<td><span class='hidden type'>" + model.Type + "</span>" + model.Type + "</td>" +
+                            "<td><input class='start' type='text' size='6' maxlength='6' value='" + model.StartChannel + "'" + attr + "></td>" +
+                            "<td><input class='cnt' type='text' size='6' maxlength='6' value='" + model.ChannelCount + "'" + attr + "></td>" +
+                            "<td>" + GetChannelsPerNodeInput(ChannelCountPerNode, attr) + "</td>" +
+                            "<td style=\"white-space: nowrap;\">" + GetOrientationInput(model.Orientation + orientationDetails(model), attr) + "</td>";
+                        if (model.Orientation != "custom") {
+                            postr += "<td>" + GetStartingCornerInput(model.StartCorner, attr) + "</td>" +
+                                "<td><input class='strcnt' type='text' size='3' maxlength='3' value='" + model.StringCount + "'" + attr + "></td>" +
+                                "<td><input class='strands' type='text' size='2' maxlength='2' value='" + model.StrandsPerString + "'" + attr + "></td>";
+                        } else {
+                            postr += "<td><input class='corner' type='hidden' value='" + model.StartCorner + "'><input class='data' type='hidden' value='" + (model.data ?? "") + "'><input class='compressedData' type='hidden' value='" + (model.compressedData ?? "") + "'></td>" +
+                                "<td><input class='strcnt' type='hidden' value='" + model.StringCount + "'></td>" +
+                                "<td><input class='strands' type='hidden' value='" + model.StrandsPerString + "'></td>";
+                        }
+                        // This column is headed "xLights Generated" on the editable
+                        // table and "Submodels" on the auto created one.  The checkbox
+                        // is meaningless for an auto created model - it is never an
+                        // xLights import - but the submodel expander still applies, so
+                        // the cell is always emitted and only its contents differ.
+                        postr += "<td>";
+                        if (!model.autoCreated) {
+                            var xlchecked = "";
+                            if (model.xLights) {
+                                xlchecked = " checked";
+                            }
+                            postr += "<input class='xlights' type='checkbox'" + xlchecked + " disabled>";
+                            if (model.xLights) {
+                                postr += " <i class='fas fa-eye' style='cursor:pointer; color:#5bc0de;' title='Preview model layout' onclick='showModelPreview(" + JSON.stringify(model.Name) + ")'></i>";
+                            }
+                        }
+                        var subModels = getSubModels(model.Name);
+                        if (subModels && subModels.length > 0) {
+                            postr += " <i class='fas fa-sitemap' style='cursor:pointer; color:#9b59b6;' title='" + subModels.length + " submodel(s)' onclick='toggleSubModels(this," + JSON.stringify(model.Name) + ")'></i>"
+                                + " <span style='color:#9b59b6;font-size:0.85em;'>" + subModels.length + "</span>";
+                        }
+                        postr += "</td><td>"
+                        break;
+                    case "FB":
+                        var pixelSize = parseInt(model.PixelSize);
+                        if (!pixelSize || pixelSize < 1) {
+                            // Auto-created FB models (e.g. Virtual Matrix) don't
+                            // specify a PixelSize, which defaults to 1.
+                            pixelSize = 1;
+                        }
+                        var pWidth = parseInt(model.Width / pixelSize);
+                        var pHeight = parseInt(model.Height / pixelSize);
+                        var channels = pWidth * pHeight * 3;
+                        var select = CreateSelect(FBDevices, model.Device, '', '-- Port --', 'device', 'DeviceChanged(this);');
+
+                        if (model.autoCreated) {
+                            select = select.replace('<select ', '<select disabled ');
+                        }
+
+                        postr += "<td><span class='hidden type'>FB</span>FrameBuffer</td>" +
+                            "<td>" + select + "</td>" +
+                            "<td class='channels'>" + channels + "</td>" +
+                            "<td colspan='3'>Size: <input class='width' type='number' min='8' max='4096' step='8' value='" + model.Width + "'" + attr + " onChange='WidthOrHeightModified(this);'> <b>X</b>" +
+                            "<input class='height' type='number' min='8' max='2160' step='8' value='" + model.Height + "'" + attr + " onChange='WidthOrHeightModified(this);'>";
+
+                        if (model.Device == 'x11') {
+                            postr += "<span class='X11input'>&nbsp;@ <input class='xOffset X11input' type='number' min='8' max='4096' step='8' value='" + model.X + "'" + attr + ">"
+                                + ",<input class='yOffset X11input' type='number' min='8' max='2160' step='8' value='" + model.Y + "'" + attr + "></span>";
+                        }
+
+                        postr += "<td colspan='2'>Pixel Size: <input class='pixelSize' type='number' min='1' max='64' value='" + pixelSize + "'" + attr + " onChange='WidthOrHeightModified(this);'></td>";
+                        postr += "</td>" +
+                            "<td></td>" +
+                            "<td>";
+                        break;
+                    case "Sub":
+                        var select = CreateSelect(PixelOverlayModels, model.Parent, '', '-- Parent --', 'parent', '');
+                        if (model.autoCreated) {
+                            select = select.replace('<select ', '<select disabled ');
+                        }
+
+                        postr += "<td><span class='hidden type'>Sub</span>Sub-Model</td>" +
+                            "<td>" + select + "</td>" +
+                            "<td class='channels'>" + (model.Width * model.Height * 3) + "</td><td>3</td>" +
+                            "<td>xOffset: <input class='xOffset' type='number' min='0' max='4096' value='" + model.XOffset + "'" + attr + "></td>" +
+                            "<td>yOffset: <input class='yOffset' type='number' min='0' max='2160' value='" + model.YOffset + "'" + attr + "></td>" +
+                            "<td colspan='2'><input class='width' type='number' min='8' max='4096' value='" + model.Width + "'" + attr + " onChange='WidthOrHeightModified(this);'> <b>X</b>" +
+                            "<input class='height' type='number' min='8' max='2160' value='" + model.Height + "'" + attr + " onChange='WidthOrHeightModified(this);'></td>" +
+                            "<td></td>" +
+                            "<td>";
+                        break;
+                }
+
+                if (model.effectRunning) {
+                    postr += "<span style='color:#4caf50;'><i class='fas fa-circle' style='font-size:0.6em;vertical-align:middle;'></i> " + model.effectName + "</span>";
+                } else {
+                    postr += "<span style='color:#666;'>&mdash;</span>";
+                }
+                if (model.autoCreated) {
+                    $('#channelMemMapsAutoCreate tbody').append(postr + "</td></tr>");
+                } else {
+                    $('#channelMemMaps tbody').append(postr + "</td></tr>");
+                }
+            }
+        }
+
+        // Toggle the collapsible detail row listing a model's xLights submodels.
+        // The detail row (which can hold hundreds of submodels) is built lazily
+        // on first expand so the main table stays fast to render. Submodels are
+        // first-class overlay models: they can be targeted by name through the
+        // standard overlay commands (e.g. "Overlay Model Effect").
+        function toggleSubModels(iconEl, modelName) {
+            var rowId = "subrow_" + normalizeModelName(modelName);
+            var $existing = $('#' + rowId);
+            if ($existing.length) {
+                $existing.toggle();
+                return;
+            }
+            var subModels = getSubModels(modelName);
+            if (!subModels || subModels.length == 0) {
+                return;
+            }
+            // Refresh running-effect status so effects started after page load
+            // (e.g. from a cue) show up, then build the detail table.
+            $.get("api/overlays/models", function (data) {
+                updateOverlayEffectMap(data);
+            }).always(function () {
+                renderSubModelDetail(iconEl, modelName, rowId, subModels);
+            });
+        }
+
+        function renderSubModelDetail(iconEl, modelName, rowId, subModels) {
+            var html = "<tr id='" + rowId + "' class='submodelDetail'>"
+                + "<td colspan='12' style='background:#1c1c1c;padding:8px 16px;'>"
+                + "<b style='color:#9b59b6;'>Submodels of " + modelName + "</b>"
+                + "<table style='width:100%;margin-top:6px;' class='submodelList'>"
+                + "<thead><tr><th style='text-align:left;'>Name</th><th>Size</th><th>Overlay Model Name</th><th>Running Effect</th><th>Preview</th></tr></thead><tbody>";
+            for (var i = 0; i < subModels.length; i++) {
+                var sm = subModels[i];
+                var fx = overlayEffectByName[sm.Name];
+                var fxCell = fx
+                    ? "<span style='color:#4caf50;'><i class='fas fa-circle' style='font-size:0.6em;vertical-align:middle;'></i> " + fx + "</span>"
+                    : "<span style='color:#666;'>&mdash;</span>";
+                html += "<tr>"
+                    + "<td>" + sm.DisplayName + "</td>"
+                    + "<td style='text-align:center;'>" + sm.Width + " x " + sm.Height + "</td>"
+                    + "<td><code style='font-size:0.85em;'>" + sm.Name + "</code></td>"
+                    + "<td style='text-align:center;'>" + fxCell + "</td>"
+                    + "<td style='text-align:center;'><i class='fas fa-eye' style='cursor:pointer;color:#5bc0de;' title='Preview submodel' onclick='showSubModelPreview(" + JSON.stringify(modelName) + "," + JSON.stringify(sm.Name) + ")'></i></td>"
+                    + "</tr>";
+            }
+            html += "</tbody></table></td></tr>";
+            $(iconEl).closest('tr').after(html);
+        }
+
+        // Preview a submodel by highlighting its nodes over the parent's preview
+        // pixels.  Both the submodel's grid (parent node numbers) and the
+        // parent's per-pixel coords are fetched on demand from the overlay API
+        // so the page stays light (showModelPreview loads the parent pixels).
+        function showSubModelPreview(parentName, subModelName) {
+            $.get("api/overlays/model/" + encodeURIComponent(subModelName), function (sm) {
+                if (!sm || !sm.Grid) {
+                    alert('No grid data returned for submodel "' + subModelName + '".\n\n'
+                        + 'This usually means fppd has not been restarted since submodel '
+                        + 'support was added. Restart fppd and try again.');
+                    return;
+                }
+                var nodes = parseGridNodes(sm.Grid);
+                var highlight = {};
+                for (var i = 0; i < nodes.length; i++) {
+                    highlight[nodes[i]] = true; // 1-based parent node index
+                }
+                showModelPreview(parentName, highlight, subModelName);
+            }).fail(function () {
+                alert('Could not load submodel: ' + subModelName);
+            });
+        }
+
+        // Parse a serialized submodel grid string ("n,n;n,n;..." with ""=hole)
+        // into a flat list of 1-based parent node numbers.
+        function parseGridNodes(grid) {
+            var out = [];
+            if (!grid) {
+                return out;
+            }
+            var rows = String(grid).split(';');
+            for (var r = 0; r < rows.length; r++) {
+                var cells = rows[r].split(',');
+                for (var c = 0; c < cells.length; c++) {
+                    var v = parseInt(cells[c]);
+                    if (!isNaN(v) && v > 0) {
+                        out.push(v);
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Running overlay effects by model name, from /api/overlays/models.
+        // Includes lazily-materialized submodels/groups (an active effect
+        // materializes them), so the submodel table can show what's running.
+        var overlayEffectByName = {};
+        function updateOverlayEffectMap(data) {
+            overlayEffectByName = {};
+            if (Array.isArray(data)) {
+                data.forEach(function (m) {
+                    if (m && m.effectRunning && m.Name) {
+                        overlayEffectByName[m.Name] = m.effectName || 'Effect';
+                    }
+                });
+            }
+        }
+
+        function GetChannelMemMaps() {
+            $.get("api/overlays/models", function (data) {
+                updateOverlayEffectMap(data);
+                PopulateChannelMemMapTable(data);
+            }).fail(function () {
+                DialogError("Load Pixel Overlay Models", "Load Failed, is fppd running?");
+            });
+            $.get("api/overlays/settings", function (data) {
+                PopulatePixelOverlaySettings(data);
+            }).fail(function () {
+            });
+        }
+
+        //give a little more detail about custom models:
+        function orientationDetails(data) {
+            if (data.Orientation != "custom" || !data.hasOwnProperty("data")) return "";
+            //for now, just show grid size
+            const rows = data.data.split(";"), cols = rows[0].split(",");
+            return "&nbsp;" + cols.length + "&nbsp;x&nbsp;" + rows.length;
+        }
+
+        function SetChannelMemMaps() {
+            var postData = "";
+            var dataError = 0;
+            var data = {};
+            var models = [];
+
+            $('#channelMemMaps tbody tr').each(function () {
+                $this = $(this);
+
+                var model = {
+                    Name: $this.find("input.blk").val(),
+                    Type: $this.find("span.type").html(),
+                };
+
+                if ((model.Name != "") && (model.Type != "")) {
+                    switch (model.Type) {
+                        case "Channel":
+                            model.StartChannel = parseInt($this.find("input.start").val());
+                            model.ChannelCount = parseInt($this.find("input.cnt").val());
+                            model.Orientation = $this.find("select.orientation").val();
+                            model.StartCorner = $this.find("select.corner").val();
+                            model.StringCount = parseInt($this.find("input.strcnt").val());
+                            model.StrandsPerString = parseInt($this.find("input.strands").val());
+                            model.ChannelCountPerNode = parseInt($this.find(".cpn").val());
+                            model.xLights = $this.find("input.xlights").is(':checked');
+
+                            if ((model.StartChannel > 0) &&
+                                (model.ChannelCount > 0)) {
+                                if (model.Orientation == "custom") {
+                                    // A custom layout arrives from xLights as either "data"
+                                    // or (FPP 10+) "compressedData"; keep whichever it has.
+                                    var data = $this.find("input.data").val();
+                                    var compressedData = $this.find("input.compressedData").val();
+                                    if (compressedData) {
+                                        model.compressedData = compressedData;
+                                    } else {
+                                        model.data = data;
+                                    }
+                                    model.StartCorner = $this.find("input.corner").val();
+                                    models.push(model);
+                                } else if ((model.StringCount > 0) &&
+                                    (model.StrandsPerString > 0)) {
+                                    models.push(model);
+                                } else {
+                                    dataError = 1;
+                                    // FIXME, put in some more info here, highlight bad field, etc.
+                                    alert("MemMap '" + model.BlockName + "' starting at channel '" + model.StartChannel + "' containing '" + model.ChannelCount + "' channel(s) is not valid.");
+                                    return;
+                                }
+                            }
+                            break;
+                        case "FB":
+                            model.Width = parseInt($this.find("input.width").val());
+                            model.Height = parseInt($this.find("input.height").val());
+                            model.Device = $this.find("select.device").val();
+                            model.PixelSize = parseInt($this.find("input.pixelSize").val());
+
+                            if (model.Device == 'x11') {
+                                model.X = parseInt($this.find("input.xOffset").val());
+                                model.Y = parseInt($this.find("input.yOffset").val());
+                            }
+
+                            models.push(model);
+                            break;
+                        case "Sub":
+                            model.Width = parseInt($this.find("input.width").val());
+                            model.Height = parseInt($this.find("input.height").val());
+                            model.XOffset = parseInt($this.find("input.xOffset").val());
+                            model.YOffset = parseInt($this.find("input.yOffset").val());
+                            model.Parent = $this.find("select.parent").val();
+
+                            models.push(model);
+                            break;
+                    }
+                } else {
+                    dataError = 1;
+                    // FIXME, put in some more info here, highlight bad field, etc.
+                    alert("MemMap '" + model.BlockName + "' starting at channel '" + model.StartChannel + "' containing '" + model.ChannelCount + "' channel(s) is not valid.");
+                    return;
+                }
+            });
+
+            if (dataError != 0)
+                return;
+
+            data.models = models;
+            data.autoCreate = $("#AutoCreatePixelOverlays").is(':checked');
+            postData = JSON.stringify(data, null, 2);
+
+            $.post("api/models", postData).done(function (data) {
+                $.jGrowl("Pixel Overlay Models saved.", { themeState: 'success' });
+                SetRestartFlag(2);
+                common_ViewPortChange();
+            }).fail(function () {
+                DialogError("Save Pixel Overlay Models", "Save Failed, is fppd running?");
+            });
+        }
+
+        function AddNewChannelModel() {
+            var currentRows = $("#channelMemMaps > tbody > tr").length;
+            $('#channelMemMaps tbody').append(
+                "<tr id='row'" + currentRows + " class='fppTableRow'>" +
+                "<td class='center' valign='middle'><div class='rowGrip'><i class='rowGripIcon fpp-icon-grip'></i></div></td>" +
+                "<td><input class='blk' type='text' size='31' maxlength='31' value=''></td>" +
+                "<td><span class='hidden type'>Channel</span>Channel</td>" +
+                "<td><input class='start' type='text' size='6' maxlength='6' value='1'></td>" +
+                "<td><input class='cnt' type='text' size='6' maxlength='6' value='150'></td>" +
+                "<td>" + GetChannelsPerNodeInput(3, "") + "</td>" +
+                "<td>" + GetOrientationInput("", "") + "</td>" +
+                "<td>" + GetStartingCornerInput('') + "</td>" +
+                "<td><input class='strcnt' type='text' size='3' maxlength='3' value='1'></td>" +
+                "<td><input class='strands' type='text' size='2' maxlength='2' value='1'></td>" +
+                "<td><input class='xlights' type='checkbox' disabled></td><td>" +
+                "<td></td>" +
+                "</tr>");
+        }
+
+        function AddNewFBModel() {
+            var currentRows = $("#channelMemMaps > tbody > tr").length;
+            var device = Object.keys(FBDevices)[0];
+            $('#channelMemMaps tbody').append(
+                "<tr id='row'" + currentRows + " class='fppTableRow'>" +
+                "<td class='center' valign='middle'><div class='rowGrip'><i class='rowGripIcon fpp-icon-grip'></i></div></td>" +
+                "<td><input class='blk' type='text' size='31' maxlength='31' value='" + device + "'></td>" +
+                "<td><span class='hidden type'>FB</span>FrameBuffer</td>" +
+                "<td>" + CreateSelect(FBDevices, device, '', '-- Port --', 'device', 'DeviceChanged(this);') + "</td>" +
+                "<td class='channels'>" + (FBInfo[device].Width * FBInfo[device].Height * 3) + "</td>" +
+                "<td colspan='3'>Size: <input class='width' type='number' min='0' max='4096' step='8' value='" + FBInfo[device].Width + "' onChange='WidthOrHeightModified(this);'> <b>X</b>" +
+                "<input class='height' type='number' min='0' max='2160' step='8' value='" + FBInfo[device].Height + "' onChange='WidthOrHeightModified(this);'></td>" +
+                "<span class='X11input'>&nbsp;@ <input class='xOffset X11input' type='number' min='8' max='4096' step='8' value='0' style='display: none;'>" +
+                ",<input class='yOffset X11input' type='number' min='8' max='2160' step='8' value='0' style='display: none;'></span>" +
+                "</td>" +
+                "<td colspan='2'>Pixel Size: <input class='pixelSize' type='number' min='1' max='64' value='1' onChange='WidthOrHeightModified(this);'></td>" +
+                "<td></td>" +
+                "<td></td>" +
+                "</tr>");
+        }
+
+        function AddNewSubModel() {
+            var currentRows = $("#channelMemMaps > tbody > tr").length;
+            $('#channelMemMaps tbody').append(
+                "<tr id='row'" + currentRows + " class='fppTableRow'>" +
+                "<td class='center' valign='middle'><div class='rowGrip'><i class='rowGripIcon fpp-icon-grip'></i></div></td>" +
+                "<td><input class='blk' type='text' size='31' maxlength='31' value=''></td>" +
+                "<td><span class='hidden type'>Sub</span>Sub-Model</td>" +
+                "<td>" + CreateSelect(PixelOverlayModels, '', '', '-- Parent --', 'parent', '') + "</td>" +
+                "<td class='channels'>" + (64 * 32 * 3) + "</td><td>3</td>" +
+                "<td>xOffset: <input class='xOffset' type='number' min='0' max='4096' value='0'></td>" +
+                "<td>yOffset: <input class='yOffset' type='number' min='0' max='2160' value='0'></td>" +
+                "<td colspan='2'><input class='width' type='number' min='8' max='4096' value='64' onChange='WidthOrHeightModified(this);'> <b>X</b>" +
+                "<input class='height' type='number' min='8' max='2160' value='32' onChange='WidthOrHeightModified(this);'></td>" +
+                "<td></td>" +
+                "<td></td>" +
+                "</tr>");
+        }
+
+        function AddNewModel() {
+            DoModalDialog({
+                id: "AddPixelOverlayModel",
+                body: "Choose the type of model to add.",
+                title: "Add Pixel Overlay Model",
+                backdrop: true,
+                keyboard: true,
+                class: "modal-sm",
+                buttons: {
+                    Channel: function () {
+                        AddNewChannelModel();
+                        common_ViewPortChange();
+                        CloseModalDialog("AddPixelOverlayModel");
+                    },
+                    <? if ($showAddFBButton) { ?>
+                        FrameBuffer: function () {
+                            AddNewFBModel();
+                            common_ViewPortChange();
+                            CloseModalDialog("AddPixelOverlayModel");
+                        },
+                    <? } ?>
+                    SubModel: function () {
+                        AddNewSubModel();
+                        common_ViewPortChange();
+                        CloseModalDialog("AddPixelOverlayModel");
+                    }
+                }
+            });
+        }
+
+        var tableInfo = {
+            tableName: "channelMemMaps",
+            selected: -1,
+            enableButtons: ["btnDelete"],
+            disableButtons: [],
+            sortable: 1
+        };
+
+
+        function DeleteSelectedMemMap() {
+            if (tableInfo.selected >= 0) {
+                //$('#channelMemMaps tbody tr:nth-child(' + (tableInfo.selected+1) + ')').remove();
+                $('#channelMemMaps .selectedEntry').remove();
+                tableInfo.selected = -1;
+                SetButtonState("#btnDelete", "disable");
+                common_ViewPortChange();
+            }
+        }
+
+        function DeleteXlightsModels() {
+            $('#channelMemMaps tbody tr').each(function () {
+                $this = $(this);
+                if ($this.find("input.xlights").is(':checked')) {
+                    $this.remove();
+                }
+            });
+            common_ViewPortChange();
+        }
+
+        // highlightNodes (optional): map of 1-based parent node index -> true.
+        // When provided, those pixels (by the node number in each preview point) are
+        // drawn highlighted and the rest dimmed, so a submodel can be shown in
+        // the context of its parent.  subModelName (optional) adjusts the title.
+        function showModelPreview(modelName, highlightNodes, subModelName) {
+            // Pixel coordinates are loaded on demand (not inlined into the page).
+            fetchModelPreviewPixels(modelName, function (pixels) {
+                if (!pixels || pixels.length === 0) {
+                    alert('No preview data available for model: ' + modelName);
+                    return;
+                }
+                renderModelPreview(modelName, pixels, highlightNodes, subModelName);
+            });
+        }
+
+        function renderModelPreview(modelName, pixels, highlightNodes, subModelName) {
+            $('#modelPreviewModal').remove();
+
+            var hasHighlight = highlightNodes && typeof highlightNodes === 'object';
+
+            var minX = Infinity, maxX = -Infinity;
+            var minY = Infinity, maxY = -Infinity;
+            pixels.forEach(function (p) {
+                minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
+                minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
+            });
+
+            var rangeX = maxX - minX || 1;
+            var rangeY = maxY - minY || 1;
+
+            var canvasW = 560;
+            var canvasH = Math.round(canvasW * rangeY / rangeX);
+            if (canvasH > 420) {
+                canvasH = 420;
+                canvasW = Math.round(canvasH * rangeX / rangeY);
+            }
+            if (canvasH < 80) canvasH = 80;
+            if (canvasW < 80) canvasW = 80;
+
+            var $canvas = $('<canvas></canvas>').attr({ width: canvasW, height: canvasH }).css({ background: '#111', display: 'block', margin: '0 auto' });
+            var infoText = pixels.length + ' pixels  |  W: ' + rangeX + '  H: ' + rangeY;
+            if (hasHighlight) {
+                var hcount = 0;
+                for (var k in highlightNodes) { if (highlightNodes.hasOwnProperty(k)) hcount++; }
+                infoText += '  |  submodel nodes: ' + hcount;
+            }
+            var $info = $('<p>').css({ 'text-align': 'center', 'margin-bottom': '8px' }).text(infoText);
+            var $body = $('<div>').append($info).append($canvas);
+
+            DoModalDialog({
+                id: 'modelPreviewModal',
+                title: hasHighlight ? ('Submodel Preview: ' + (subModelName || '')) : ('Model Preview: ' + modelName),
+                body: $body,
+                class: 'modal-lg',
+                backdrop: true,
+                keyboard: true,
+                open: function () {
+                    var canvas = $canvas[0];
+                    var ctx = canvas.getContext('2d');
+                    var margin = 8;
+                    var scaleX = (canvasW - 2 * margin) / rangeX;
+                    var scaleY = (canvasH - 2 * margin) / rangeY;
+                    var dotSize = Math.max(1, Math.min(6, Math.floor(Math.min(scaleX, scaleY) * 0.8)));
+                    pixels.forEach(function (p, idx) {
+                        var cx = margin + (p[0] - minX) * scaleX;
+                        var cy = canvasH - margin - (p[1] - minY) * scaleY;
+                        if (hasHighlight) {
+                            // p[3] is the 1-based node number; older fppd builds
+                            // omit it and their list order is not node order.
+                            var node = p.length > 3 ? p[3] : idx + 1;
+                            ctx.fillStyle = highlightNodes[node] ? '#ff3b6b' : '#2a3a44';
+                        } else {
+                            ctx.fillStyle = '#00aaff';
+                        }
+                        ctx.fillRect(cx - dotSize / 2, cy - dotSize / 2, dotSize, dotSize);
+                    });
+                },
+                buttons: {
+                    Close: function () { CloseModalDialog('modelPreviewModal'); }
+                }
+            });
+        }
+
+        // ── Running effects summary ───────────────────────────────────────
+        // A single view of every overlay effect running across models,
+        // submodels and model groups (GET /api/overlays/running), so you don't
+        // have to expand each model to find what's active. Auto-refreshes while
+        // open and offers per-row / stop-all controls.
+        var _runningFxTimer = null;
+        var _mgNameSet = null;
+
+        function isModelGroupName(name) {
+            if (_mgNameSet === null) {
+                _mgNameSet = {};
+                (xlightsModelGroups || []).forEach(function (g) {
+                    if (g.Name) _mgNameSet[normalizeModelName(g.Name)] = 1;
+                });
+            }
+            return !!_mgNameSet[normalizeModelName(name)];
+        }
+
+        function runningEffectType(m) {
+            if (m.Type !== 'Sub') return 'Model';
+            return isModelGroupName(m.Name) ? 'Model Group' : 'Submodel';
+        }
+
+        function ShowRunningEffectsModal() {
+            $('#runningFxModal').remove();
+            var $body = $("<div id='runningFxBody'><div style='color:#888;'>Loading&hellip;</div></div>");
+            DoModalDialog({
+                id: 'runningFxModal',
+                title: 'Running Overlay Effects',
+                body: $body,
+                class: 'modal-lg',
+                backdrop: true,
+                keyboard: true,
+                open: function () {
+                    RefreshRunningEffects();
+                    _runningFxTimer = setInterval(RefreshRunningEffects, 2000);
+                },
+                buttons: {
+                    "Stop All": function () { StopAllRunningEffects(); },
+                    Close: function () {
+                        if (_runningFxTimer) { clearInterval(_runningFxTimer); _runningFxTimer = null; }
+                        CloseModalDialog('runningFxModal');
+                    }
+                }
+            });
+        }
+
+        function RefreshRunningEffects() {
+            // Self-cancel if the modal was dismissed via Esc / backdrop.
+            if ($('#runningFxBody').length === 0) {
+                if (_runningFxTimer) { clearInterval(_runningFxTimer); _runningFxTimer = null; }
+                return;
+            }
+            $.get('api/overlays/running', function (data) {
+                RenderRunningEffects(Array.isArray(data) ? data : []);
+            }).fail(function () {
+                $('#runningFxBody').html("<div style='color:#c0392b;'>Could not load running effects &mdash; is fppd running?</div>");
+            });
+        }
+
+        function RenderRunningEffects(list) {
+            // Dedupe by overlay model name (the endpoint can list a model once
+            // per active layer).
+            var seen = {}, rows = [];
+            list.forEach(function (m) {
+                if (!m || !m.Name || seen[m.Name]) return;
+                seen[m.Name] = 1;
+                rows.push(m);
+            });
+
+            if (rows.length === 0) {
+                $('#runningFxBody').html("<div style='color:#888;padding:8px 0;'>No overlay effects are currently running.</div>");
+                return;
+            }
+
+            rows.sort(function (a, b) {
+                return String(a.DisplayName || a.Name).localeCompare(String(b.DisplayName || b.Name));
+            });
+
+            var badge = { 'Model': '#1d3a5a', 'Submodel': '#3a2d1d', 'Model Group': '#2d1d3a' };
+            var html = "<div style='margin-bottom:8px;color:#888;'>" + rows.length + " effect(s) running</div>"
+                + "<table class='fppTable' style='width:100%;'><thead><tr>"
+                + "<th style='text-align:left;'>Model</th><th>Type</th>"
+                + "<th style='text-align:left;'>Effect</th><th></th></tr></thead><tbody>";
+            rows.forEach(function (m) {
+                var type = runningEffectType(m);
+                var fx = (m.effect && m.effect.name) ? m.effect.name : '';
+                html += "<tr>"
+                    + "<td style='text-align:left;'>" + (m.DisplayName || m.Name)
+                    + "<br><code style='font-size:0.8em;color:#888;'>" + m.Name + "</code></td>"
+                    + "<td style='text-align:center;'><span style='background:" + (badge[type] || '#333')
+                    + ";color:#fff;padding:2px 8px;border-radius:3px;font-size:0.8em;white-space:nowrap;'>" + type + "</span></td>"
+                    + "<td style='text-align:left;'><span style='color:#4caf50;'><i class='fas fa-circle' style='font-size:0.6em;vertical-align:middle;'></i> "
+                    + fx + "</span></td>"
+                    + "<td style='text-align:center;'><button class='buttons btn-outline-danger' style='padding:2px 10px;'"
+                    + " onclick='StopRunningEffect(" + JSON.stringify(m.Name) + ")'>Stop</button></td>"
+                    + "</tr>";
+            });
+            html += "</tbody></table>";
+            $('#runningFxBody').html(html);
+        }
+
+        function StopOverlayEffectByName(name) {
+            return $.ajax({
+                url: 'api/command', method: 'POST', contentType: 'application/json',
+                data: JSON.stringify({ command: 'Overlay Model Effect', args: [name, 'Enabled', 'Stop Effects'] })
+            });
+        }
+
+        function StopRunningEffect(name) {
+            StopOverlayEffectByName(name).always(function () { setTimeout(RefreshRunningEffects, 250); });
+        }
+
+        function StopAllRunningEffects() {
+            $.get('api/overlays/running', function (data) {
+                (Array.isArray(data) ? data : []).forEach(function (m) {
+                    if (m && m.Name) StopOverlayEffectByName(m.Name);
+                });
+                setTimeout(RefreshRunningEffects, 400);
+            });
+        }
+
+        function pageSpecific_PageLoad_DOM_Setup() {
+            SetupSelectableTableRow(tableInfo);
+            GetChannelMemMaps();
+            PopulateModelGroups();
+        }
+
+        function pageSpecific_PageLoad_PostDOMLoad_ActionsSetup() {
+            //Mouse click on table rows
+            $('#channelMemMaps').on('mousedown', 'tr', function (event, ui) {
+                HandleTableRowMouseClick(event, $(this));
+
+                //console.log(event.target.nodeName);
+
+                if ($('#channelMemMaps > tr.selectedEntry').length > 0) {
+                    EnableButtonClass('btnDelete');
+                } else {
+                    DisableButtonClass('btnDelete');
+                }
+            });
+        }
+
+    </script>
+
+    <title><? echo $pageTitle; ?></title>
 </head>
+
 <body>
-	<div id="bodyWrapper">
-		<?php include 'menu.inc'; ?>
-		<br/>
+    <div id="bodyWrapper">
+        <?php
+        $activeParentMenuItem = 'input-output';
+        include 'menu.inc'; ?>
+        <div class="mainContainer">
+            <h1 class="title">Pixel Overlay Models</h1>
+            <div class="pageContent">
 
-		<div id="time" class="settings">
-			<fieldset>
-				<legend>Pixel Overlay Models</legend>
-				<table>
-					<tr>
-						<td width='70px'><input type=button value='Save' onClick='SetChannelMemMaps();' class='buttons'></td>
-						<td width='70px'><input type=button value='Add' onClick='AddNewMemMap();' class='buttons'></td>
-						<td width='40px'>&nbsp;</td>
-						<td width='70px'><input type=button value='Delete' onClick='DeleteSelectedMemMap();' id='btnDelete' class='disableButtons'></td>
-					</tr>
-				</table>
-				<div class="fppTableWrapper">
-					<table id="channelMemMaps">
-						<thead>
-							<tr class="fppTableHeader">
-								<th title='Name of Model'>Model Name</td>
-								<th title='Start Channel'>Start Ch.</td>
-								<th title='Channel Count'>Ch. Count</td>
-								<th title='String Orientation'>Orientation</td>
-								<th title='Starting Corner'>Start Corner</td>
-								<th title='Number of Strings'>Strings</td>
-								<th title='Number of Strands Per String'>Strands</td>
-							</tr>
-						</thead>
-						<tbody>
-						</tbody>
-					</table>
-				</div>
-				<br>
-				<font size=-1>
-					The Real-Time Pixel Overlay system and Pixel Overlay Models
-					allow overlaying user-provided data onto outoing channel
-					data via a special interface.
-				</font>
-			</fieldset>
-		</div>
 
-		<?php	include 'common/footer.inc'; ?>
-	</div>
+                <div class="row tablePageHeader">
+                    <div class="col-md">
+                        <h2>Pixel Overlay Models</h2>
+                    </div>
+                    <div class="col-md-auto ms-lg-auto">
+                        <div class="form-actions">
 
-<script language="Javascript">
-	$('#channelMemMaps').tooltip({
-		content: function() {
-			return $(this).attr('title');
-		}
-	});
-</script>
+                            <input type=button value='Running Effects' onClick='ShowRunningEffectsModal();'
+                                id='btnRunningEffects' class='buttons btn-outline-info'>
+                            <input type=button value='Delete' onClick='DeleteSelectedMemMap();'
+                                data-btn-enabled-class="btn-outline-danger" id='btnDelete' class='disableButtons'>
+                            <input type=button value='Delete xLights Generated' onClick='DeleteXlightsModels();'
+                                id='btnDeleteXlights' class='buttons btn-outline-danger'>
+                            <button type=button value='Add' onClick='AddNewModel();'
+                                class='buttons btn-outline-success'><i class="fas fa-plus"></i> Add</button>
+                            <input type=button value='Save' onClick='SetChannelMemMaps();'
+                                class='buttons btn-success ml-1'>
+
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    Create Overlays Automatically From Outputs: <input id="AutoCreatePixelOverlays" type="checkbox"
+                        checked />
+                </div>
+                <hr>
+                <div class='fppTableWrapper fppTableWrapperAsTable'>
+                    <div class='fppTableContents fppFThScrollContainer' role="region" aria-labelledby="channelMemMaps"
+                        tabindex="0">
+                        <table id="channelMemMaps" class="fppSelectableRowTable fppStickyTheadTable">
+                            <thead>
+                                <tr>
+                                    <th class="tblChannelMemMapsHeadGrip"></th>
+                                    <th><span title='Name of Model'>Model Name</span></th>
+                                    <th><span title='Type'>Type</span></th>
+                                    <th><span title='Start Channel'>Start Ch.</span></th>
+                                    <th><span title='Channel Count'>Ch. Count</span></th>
+                                    <th><span title='Channels each node occupies. 1, 3 and 4 are the widths FPP&apos;s outputs produce.'>Ch./Node</span></th>
+                                    <th><span title='String Orientation'>Orientation</span></th>
+                                    <th><span title='Starting Corner'>Start Corner</span></th>
+                                    <th><span title='Number of Strings or Width of FB/X11/Sub-Model'>Strings</span></th>
+                                    <th><span
+                                            title='Number of Strands Per String or Height of FB/X11/Sub-Model'>Strands</span>
+                                    </th>
+                                    <th><span title='Model was Generated and Uploaded from xLights'>xLights
+                                            Generated</span></th>
+                                    <th><span title='Running Effect'>Running Effect</span></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="row tableHeader">
+                    <div class="col-md">
+                        <h2>Auto Created Pixel Overlay Models</h2>
+                    </div>
+                </div>
+                <div class='fppTableWrapper fppTableWrapperAsTable'>
+                    <div class='fppTableContents fppFThScrollContainer' role="region"
+                        aria-labelledby="channelMemMapsAutoCreate" tabindex="0">
+                        <table id="channelMemMapsAutoCreate" class="fppSelectableRowTable fppStickyTheadTable">
+                            <thead>
+                                <tr>
+                                    <th class="tblChannelMemMapsHeadGrip"></th>
+                                    <th><span title='Name of Model'>Model Name</span></th>
+                                    <th><span title='Type'>Type</span></th>
+                                    <th><span title='Start Channel'>Start Ch.</span></th>
+                                    <th><span title='Channel Count'>Ch. Count</span></th>
+                                    <th><span title='Channels each node occupies. 1, 3 and 4 are the widths FPP&apos;s outputs produce.'>Ch./Node</span></th>
+                                    <th><span title='String Orientation'>Orientation</span></th>
+                                    <th><span title='Starting Corner'>Start Corner</span></th>
+                                    <th><span title='Number of Strings or Width of FB/X11/Sub-Model'>Strings</span></th>
+                                    <th><span
+                                            title='Number of Strands Per String or Height of FB/X11/Sub-Model'>Strands</span>
+                                    </th>
+                                    <th><span title='xLights submodels defined for this model'>Submodels</span></th>
+                                    <th><span title='Running Effect'>Running Effect</span></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="modelGroupsSection" style="display:none;">
+                    <div class="row tableHeader">
+                        <div class="col-md">
+                            <h2>xLights Model Groups <span id="modelGroupsCount"
+                                    style="font-size:0.6em;color:#9b59b6;"></span></h2>
+                            <p style="font-size:0.85em;color:#aaa;margin:0;">Groups are first-class overlay models
+                                (addressable by name through the standard overlay commands, e.g. "Overlay Model
+                                Effect"). An effect runs across the group's combined world-position buffer.</p>
+                        </div>
+                    </div>
+                    <div class='fppTableWrapper fppTableWrapperAsTable'>
+                        <div class='fppTableContents fppFThScrollContainer' tabindex="0">
+                            <table id="modelGroupsTable" class="fppSelectableRowTable fppStickyTheadTable">
+                                <thead>
+                                    <tr>
+                                        <th style="text-align:left;">Group Name</th>
+                                        <th>Members</th>
+                                        <th>Pixels</th>
+                                        <th>Buffer</th>
+                                        <th>Overlay Model Name</th>
+                                        <th>Running Effect</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="polarBuffersSection" style="display:none;">
+                    <div class="row tableHeader">
+                        <div class="col-md">
+                            <h2>Polar Buffers <span id="polarBuffersCount"
+                                    style="font-size:0.6em;color:#9b59b6;"></span></h2>
+                            <p style="font-size:0.85em;color:#aaa;margin:0;">Models declaring
+                                <code>BufferStyle: "polar"</code> &mdash; their buffer axes are radius and angle
+                                rather than wiring order, so an ordinary Horizontal sweep radiates from the centre
+                                and a Vertical one rotates around it. They paint the same channels as the target
+                                they are a view of, so driving both at once is last-writer-wins.</p>
+                        </div>
+                    </div>
+                    <div class='fppTableWrapper fppTableWrapperAsTable'>
+                        <div class='fppTableContents fppFThScrollContainer' tabindex="0">
+                            <table id="polarBuffersTable" class="fppSelectableRowTable fppStickyTheadTable">
+                                <thead>
+                                    <tr>
+                                        <th style="text-align:left;">Name</th>
+                                        <th style="text-align:left;">View Of</th>
+                                        <th>Pixels</th>
+                                        <th><span title="rings x sectors">Buffer</span></th>
+                                        <th>Overlay Model Name</th>
+                                        <th>Running Effect</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <?php include 'common/footer.inc'; ?>
+    </div>
+
 
 </body>
+
 </html>

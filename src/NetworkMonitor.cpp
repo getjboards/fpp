@@ -1,0 +1,176 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#ifndef PLATFORM_OSX
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <bits/types/struct_iovec.h>
+#include <linux/if_addr.h>
+#endif
+#include <net/if.h>
+#include <sys/socket.h>
+#include <cstring>
+#include <map>
+#include <string>
+#include <unistd.h>
+
+#include "common.h"
+#include "log.h"
+#include "commands/Commands.h"
+
+#include "NetworkMonitor.h"
+#include "SysSocket.h"
+
+NetworkMonitor NetworkMonitor::INSTANCE;
+
+#ifndef PLATFORM_OSX
+// IFF_UP/IFF_RUNNING of each interface as of its last RTM_NEWLINK, by index.
+// RTM_NEWLINK is not only a state change: a Wi-Fi driver sends one for every
+// scan result and statistics update, several a second, and each used to flush
+// the resolver cache, so a name that doesn't resolve was looked up again
+// (seconds of stall against a dead DNS server) after every one of them instead
+// of once per negative TTL.  Only the netlink callback touches this, on one thread.
+static std::map<int, unsigned> s_linkState;
+
+// True when this link event moves the interface up or down (or is the first
+// seen for it): the only link events that can change which DNS servers are
+// reachable.
+static bool linkStateChanged(int index, unsigned flags, bool deleted) {
+    if (deleted) {
+        s_linkState.erase(index);
+        return true;
+    }
+    unsigned state = flags & (IFF_UP | IFF_RUNNING);
+    auto it = s_linkState.find(index);
+    if (it != s_linkState.end() && it->second == state) {
+        return false;
+    }
+    s_linkState[index] = state;
+    return true;
+}
+#endif
+
+void NetworkMonitor::Init(std::map<int, std::function<bool(int)>>& callbacks) {
+#ifndef PLATFORM_OSX
+    int nl_socket = OpenSocket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (nl_socket < 0) {
+        LogWarn(VB_GENERAL, "Could not create NETLINK socket.\n");
+        return;
+    }
+
+    struct sockaddr_nl addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.nl_family = AF_NETLINK;
+    addr.nl_pid = getpid();
+    addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR;
+
+    if (bind(nl_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LogWarn(VB_GENERAL, "Could not bind NETLINK socket.\n");
+        close(nl_socket);
+        return;
+    }
+    callbacks[nl_socket] = [nl_socket, this](int i) {
+        int status;
+        int ret = 0;
+        char buf[4096];
+        struct iovec iov = { buf, sizeof buf };
+        struct sockaddr_nl snl;
+        struct msghdr msg = { (void*)&snl, sizeof snl, &iov, 1, NULL, 0, 0 };
+        struct nlmsghdr* h;
+        char name[IF_NAMESIZE + 1];
+
+        status = recvmsg(nl_socket, &msg, MSG_DONTWAIT);
+        while (status > 0) {
+            bool OK = true;
+            for (h = (struct nlmsghdr*)buf; OK && NLMSG_OK(h, (unsigned int)status); h = NLMSG_NEXT(h, status)) {
+                //Finish reading
+                //LogInfo(VB_GENERAL, "Type: %d    Flags: %X\n", h->nlmsg_type, h->nlmsg_flags);
+                switch (h->nlmsg_type) {
+                case NLMSG_DONE:
+                    OK = false;
+                    break;
+                case NLMSG_ERROR:
+                    //error - not sure what to do, just bail
+                    OK = false;
+                    break;
+                case RTM_NEWLINK:
+                case RTM_DELLINK: {
+                    struct ifinfomsg* ifi = (ifinfomsg*)NLMSG_DATA(h);
+                    std::string strName;
+                    if (if_indextoname(ifi->ifi_index, name)) {
+                        strName = name;
+                    }
+                    // A link coming up brings reachable DNS servers with it,
+                    // so names that failed while it was down have to be
+                    // retried now rather than at the end of their negative
+                    // TTL.  Flushed ahead of the callbacks so none of them
+                    // resolves against a cache filled under the old network.
+                    if (linkStateChanged(ifi->ifi_index, ifi->ifi_flags, h->nlmsg_type == RTM_DELLINK)) {
+                        FlushHostResolveCache();
+                    }
+                    callCallbacks(h->nlmsg_type == RTM_NEWLINK ? NetEventType::NEW_LINK : NetEventType::DEL_LINK,
+                                  (ifi->ifi_flags & IFF_RUNNING) ? 1 : 0, strName);
+                } break;
+                case RTM_NEWADDR:
+                case RTM_DELADDR: {
+                    struct ifaddrmsg* ifi = (ifaddrmsg*)NLMSG_DATA(h);
+                    if (ifi->ifa_family == AF_INET) {
+                        std::string strName;
+                        if (if_indextoname(ifi->ifa_index, name)) {
+                            strName = name;
+                        }
+                        // a new or lost address can change the route to the
+                        // DNS servers (or, with DHCP, the servers themselves)
+                        FlushHostResolveCache();
+                        callCallbacks(h->nlmsg_type == RTM_NEWADDR ? NetEventType::NEW_ADDR : NetEventType::DEL_ADDR,
+                                      h->nlmsg_type == RTM_NEWADDR ? 1 : 0, strName);
+                    }
+                } break;
+                default:
+                    //printf("NETLINK: %d   Uknown\n", h->nlmsg_type);
+                    break;
+                }
+            }
+            status = recvmsg(nl_socket, &msg, MSG_DONTWAIT);
+        }
+        return false;
+    };
+#endif
+}
+void NetworkMonitor::callCallbacks(NetEventType nl, int up, const std::string& n) {
+    // The resolver cache is flushed by the netlink handler above, before this
+    // runs, and only for the events that can change name resolution.
+
+    // Held for the whole dispatch: this both keeps the map stable while we walk
+    // it and makes removeCallback() block until an in-flight callback returns,
+    // so a caller that removes its callback (e.g. UDPOutput::Close) can then
+    // safely tear down the state the callback captures.  Callbacks here never
+    // re-enter register/removeCallback, so the single lock cannot self-deadlock.
+    std::lock_guard<std::mutex> lk(callbackLock);
+    for (auto& cb : callbacks) {
+        cb.second(nl, up, n);
+    }
+}
+
+int NetworkMonitor::registerCallback(std::function<void(NetEventType, int, const std::string&)>& callback) {
+    std::lock_guard<std::mutex> lk(callbackLock);
+    int id = curId++;
+    callbacks[id] = callback;
+    return id;
+}
+
+void NetworkMonitor::removeCallback(int id) {
+    std::lock_guard<std::mutex> lk(callbackLock);
+    callbacks.erase(id);
+}

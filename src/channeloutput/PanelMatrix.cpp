@@ -1,249 +1,457 @@
 /*
- *   Panel Matrix handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include <stdlib.h>
-#include <sys/types.h>
+#include "fpp-pch.h"
 
-#include "common.h"
-#include "log.h"
+#include "../common.h"
+#include "../log.h"
+
+#include "../Sequence.h"
 #include "PanelMatrix.h"
 
-PanelMatrix::PanelMatrix(int panelWidth, int panelHeight, int invertedData)
-  : m_width(0),
-	m_height(0),
-	m_outputCount(0),
-	m_pixelCount(0),
-	m_panelCount(0),
-	m_panelWidth(panelWidth),
-	m_panelHeight(panelHeight),
-	m_invertedData(invertedData)
-{
+PanelMatrix::PanelMatrix(int panelWidth, int panelHeight, int invertedData) :
+    m_width(0),
+    m_height(0),
+    m_outputCount(0),
+    m_pixelCount(0),
+    m_panelCount(0),
+    m_panelWidth(panelWidth),
+    m_panelHeight(panelHeight),
+    m_invertedData(invertedData) {
 }
 
-PanelMatrix::~PanelMatrix()
-{
+PanelMatrix::~PanelMatrix() {
 }
 
-int PanelMatrix::ConfigurePanels(std::string layout)
-{
-	int result = 1;
+int PanelMatrix::ConfigurePanels(std::string layout) {
+    int result = 1;
 
-	LogDebug(VB_CHANNELOUT, "Parsing Config: '%s'\n", layout.c_str());
+    LogDebug(VB_CHANNELOUT, "Parsing Config: '%s'\n", layout.c_str());
 
-	std::vector<std::string> panels = split(layout, '|');
+    std::vector<std::string> panels = split(layout, '|');
 
-	for (int i = 0; i < panels.size(); i++)
-	{
-		result &= AddPanel(panels[i]);
-	}
+    for (int i = 0; i < panels.size(); i++) {
+        result &= AddPanel(panels[i]);
+    }
 
-	if (result)
-		CalculateMaps();
+    if (result)
+        CalculateMaps();
 
-	return result;
+    return result;
 }
 
-int PanelMatrix::AddPanel(std::string config)
-{
-	int  output  = 0;
-	int  chain   = 0;
-	int  xOffset = 0;
-	int  yOffset = 0;
-	char orientation = 'N';
+int PanelMatrix::AddPanel(std::string config) {
+    int output = 0;
+    int chain = 0;
+    int xOffset = 0;
+    int yOffset = 0;
+    char orientation = 'N';
 
-	std::vector<std::string> elems = split(config, ':');
+    std::vector<std::string> elems = split(config, ':');
 
-	if (elems.size() == 5)
-	{
-		output  = atoi(elems[0].c_str());
-		chain   = atoi(elems[1].c_str());
-		xOffset = atoi(elems[3].c_str());
-		yOffset = atoi(elems[4].c_str());
+    if (elems.size() == 5) {
+        output = atoi(elems[0].c_str());
+        chain = atoi(elems[1].c_str());
+        xOffset = atoi(elems[3].c_str());
+        yOffset = atoi(elems[4].c_str());
 
-		if (elems[2].size())
-			orientation = elems[2].c_str()[0];
-	}
-	else
-	{
-		LogErr(VB_CHANNELOUT, "Invalid Panel Config: '%s'\n", config.c_str());
-		return 0;
-	}
-	
-	return AddPanel(output, chain, orientation, xOffset, yOffset);
+        if (elems[2].size())
+            orientation = elems[2].c_str()[0];
+    } else {
+        LogErr(VB_CHANNELOUT, "Invalid Panel Config: '%s'\n", config.c_str());
+        return 0;
+    }
+
+    return AddPanel(output, chain, orientation, xOffset, yOffset);
 }
 
 int PanelMatrix::AddPanel(int output, int chain, char orientation,
-	 int xOffset, int yOffset, FPPColorOrder colorOrder)
-{
-	int pWidth  = m_panelWidth;
-	int pHeight = m_panelHeight;
+                          int xOffset, int yOffset, FPPColorOrder colorOrder) {
+    int pWidth = m_panelWidth;
+    int pHeight = m_panelHeight;
 
-	// Orientation, Left, Right, Normal, Upside down
-	if ((orientation == 'L') || (orientation == 'R'))
-	{
-		pWidth = m_panelHeight;
-		pHeight = m_panelWidth;
-	}
-	else if ((orientation != 'N') && (orientation != 'U'))
-	{
-		LogErr(VB_CHANNELOUT, "Invalid orientation '%c'\n",
-			orientation);
-		return 0;
-	}
+    // These come straight from the config.  The UI only produces valid ones,
+    // but out of range they index m_outputPanels and the drivers' per-output
+    // tables, and a negative offset puts pixels before the frame.
+    if (output < 0 || output >= MAX_MATRIX_OUTPUTS || chain < 0 || chain >= MAX_PANELS_PER_OUTPUT ||
+        xOffset < 0 || yOffset < 0) {
+        LogErr(VB_CHANNELOUT, "Invalid panel: output %d, chain %d, offset %d,%d\n", output, chain, xOffset, yOffset);
+        return 0;
+    }
 
-	if ((xOffset + pWidth) > m_width)
-	{
-		m_width = xOffset + pWidth;
-		m_pixelCount = m_width * m_height;
-	}
+    // Orientation, Left, Right, Normal, Upside down
+    if ((orientation == 'L') || (orientation == 'R')) {
+        pWidth = m_panelHeight;
+        pHeight = m_panelWidth;
+    } else if ((orientation != 'N') && (orientation != 'U')) {
+        LogErr(VB_CHANNELOUT, "Invalid orientation '%c'\n",
+               orientation);
+        return 0;
+    }
 
-	if ((yOffset + pHeight) > m_height)
-	{
-		m_height = yOffset + pHeight;
-		m_pixelCount = m_width * m_height;
-	}
+    // Nor may an offset grow the matrix past what the channel buffer holds:
+    // m_width * m_height * 3 is the outputs' channel count, and offsets in
+    // the millions overflowed it (and the pixel maps sized from it).
+    int64_t newWidth = std::max<int64_t>(m_width, (int64_t)xOffset + pWidth);
+    int64_t newHeight = std::max<int64_t>(m_height, (int64_t)yOffset + pHeight);
+    if (newWidth * newHeight * 3 > (int64_t)FPPD_MAX_CHANNELS) {
+        LogErr(VB_CHANNELOUT, "Invalid panel: offset %d,%d makes the matrix %lldx%lld, more than %d channels\n",
+               xOffset, yOffset, (long long)newWidth, (long long)newHeight, FPPD_MAX_CHANNELS);
+        return 0;
+    }
 
-	if (output > m_outputCount)
-		m_outputCount = output;
+    if ((xOffset + pWidth) > m_width) {
+        m_width = xOffset + pWidth;
+        m_pixelCount = m_width * m_height;
+    }
 
-	if ((m_panelCount < MAX_MATRIX_PANELS) &&
-		(m_outputPanels[output].size() < MAX_PANELS_PER_OUTPUT))
-	{
-		m_panels[m_panelCount].output      = output;
-		m_panels[m_panelCount].chain       = chain;
-		m_panels[m_panelCount].width       = pWidth;
-		m_panels[m_panelCount].height      = pHeight;
-		m_panels[m_panelCount].orientation = orientation;
-		m_panels[m_panelCount].xOffset     = xOffset;
-		m_panels[m_panelCount].yOffset     = yOffset;
-		m_panels[m_panelCount].colorOrder  = colorOrder;
+    if ((yOffset + pHeight) > m_height) {
+        m_height = yOffset + pHeight;
+        m_pixelCount = m_width * m_height;
+    }
 
-		m_panels[m_panelCount].pixelMap.resize(pWidth & pHeight);
+    if (output > m_outputCount)
+        m_outputCount = output;
 
-		m_outputPanels[output].push_back(m_panelCount);
+    if ((m_panelCount < MAX_MATRIX_PANELS) &&
+        (m_outputPanels[output].size() < MAX_PANELS_PER_OUTPUT)) {
+        m_panels[m_panelCount].output = output;
+        m_panels[m_panelCount].chain = chain;
+        m_panels[m_panelCount].width = pWidth;
+        m_panels[m_panelCount].height = pHeight;
+        m_panels[m_panelCount].orientation = orientation;
+        m_panels[m_panelCount].xOffset = xOffset;
+        m_panels[m_panelCount].yOffset = yOffset;
+        m_panels[m_panelCount].colorOrder = colorOrder;
 
-		LogDebug(VB_CHANNELOUT, "Added Panel %d of size %dx%d at %dx%d facing '%c'.  Color Order: %s (%d).  Matrix size now: %dx%d. Panel Count: %d, Output: %d, Chain: %d\n",
-			m_panelCount, pWidth, pHeight, xOffset, yOffset, orientation, ColorOrderToString(colorOrder).c_str(), (int)colorOrder, m_width, m_height, m_panelCount, output, chain);
-		m_panelCount++;
-	}
+        m_panels[m_panelCount].pixelMap.resize(pWidth * pHeight * 3);
 
-	CalculateMaps();
+        m_outputPanels[output].push_back(m_panelCount);
 
-	return 1;
+        LogDebug(VB_CHANNELOUT, "Added Panel %d of size %dx%d at %dx%d facing '%c'.  Color Order: %s (%d).  Matrix size now: %dx%d. Panel Count: %d, Output: %d, Chain: %d\n",
+                 m_panelCount, pWidth, pHeight, xOffset, yOffset, orientation, ColorOrderToString(colorOrder).c_str(), (int)colorOrder, m_width, m_height, m_panelCount, output, chain);
+        m_panelCount++;
+    }
+
+    CalculateMaps();
+
+    return 1;
 }
 
-int PanelMatrix::CalculateMaps(void)
-{
-	LogDebug(VB_CHANNELOUT, "PanelMatrix::CalculateMaps(), %d panels\n",
-		m_panelCount);
+int PanelMatrix::CalculateMaps(void) {
+    LogDebug(VB_CHANNELOUT, "PanelMatrix::CalculateMaps(), %d panels\n",
+             m_panelCount);
 
-	for (int panel = 0; panel < m_panelCount; panel++)
-	{
-		int mOffset = 0;
-		int pOffset = 0;
-		int xOffset = m_panels[panel].xOffset;
-		int yOffset = m_panels[panel].yOffset;
-		int pWidth  = m_panels[panel].width;
-		int pHeight = m_panels[panel].height;
+    for (int panel = 0; panel < m_panelCount; panel++) {
+        int mOffset = 0;
+        int pOffset = 0;
+        int xOffset = m_panels[panel].xOffset;
+        int yOffset = m_panels[panel].yOffset;
+        int pWidth = m_panels[panel].width;
+        int pHeight = m_panels[panel].height;
 
-		FPPColorOrder colorOrder = m_panels[panel].colorOrder;
+        FPPColorOrder colorOrder = m_panels[panel].colorOrder;
 
-		//LogDebug(VB_CHANNELOUT, "P: %d, O: %c, Pos: %dx%d, w: %d, h: %d\n", panel, m_panels[panel].orientation, xOffset, yOffset, pWidth, pHeight);
-		m_panels[panel].pixelMap.resize(pWidth * pHeight * 3);
+        // LogDebug(VB_CHANNELOUT, "P: %d, O: %c, Pos: %dx%d, w: %d, h: %d\n", panel, m_panels[panel].orientation, xOffset, yOffset, pWidth, pHeight);
+        m_panels[panel].pixelMap.resize(pWidth * pHeight * 3);
 
-		for (int y = 0; y < pHeight; y++)
-		{
-			for (int x = 0; x < pWidth; x++)
-			{
-				if (m_invertedData)
-					mOffset = (((m_height - (yOffset + y) - 1) * m_width) + (xOffset + x));
-				else
-					mOffset = (((yOffset + y) * m_width) + (xOffset + x));
+        for (int y = 0; y < pHeight; y++) {
+            for (int x = 0; x < pWidth; x++) {
+                if (m_invertedData)
+                    mOffset = (((m_height - (yOffset + y) - 1) * m_width) + (xOffset + x));
+                else
+                    mOffset = (((yOffset + y) * m_width) + (xOffset + x));
 
-				switch (m_panels[panel].orientation)
-				{
-					case 'N':	pOffset = (y * pWidth) + x;
-								break;
-					case 'U':	pOffset = (pWidth * pHeight) - ((y * pWidth) + x) - 1;
-								break;
-					case 'L':	pOffset = (x * pHeight) + (pHeight - y - 1);
-								break;
-					case 'R':	pOffset = ((pWidth - x - 1) * pHeight) + y;
-								break;
-				}
+                switch (m_panels[panel].orientation) {
+                case 'N':
+                    pOffset = (y * pWidth) + x;
+                    break;
+                case 'U':
+                    pOffset = (pWidth * pHeight) - ((y * pWidth) + x) - 1;
+                    break;
+                case 'L':
+                    pOffset = (x * pHeight) + (pHeight - y - 1);
+                    break;
+                case 'R':
+                    pOffset = ((pWidth - x - 1) * pHeight) + y;
+                    break;
+                }
 
+                mOffset *= 3;
+                pOffset *= 3;
 
-				mOffset *= 3;
-				pOffset *= 3;
+                if (colorOrder == FPPColorOrder::kColorOrderRGB) {
+                    m_panels[panel].pixelMap[pOffset] = mOffset;
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset + 2;
+                } else if (colorOrder == FPPColorOrder::kColorOrderRBG) {
+                    m_panels[panel].pixelMap[pOffset] = mOffset;
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset + 2;
+                } else if (colorOrder == FPPColorOrder::kColorOrderGRB) {
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset;
+                    m_panels[panel].pixelMap[pOffset] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset + 2;
+                } else if (colorOrder == FPPColorOrder::kColorOrderGBR) {
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset;
+                    m_panels[panel].pixelMap[pOffset] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset + 2;
+                } else if (colorOrder == FPPColorOrder::kColorOrderBRG) {
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset;
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset] = mOffset + 2;
+                } else if (colorOrder == FPPColorOrder::kColorOrderBGR) {
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset;
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset] = mOffset + 2;
+                } else // Assume RGB if somehow invalid
+                {
+                    m_panels[panel].pixelMap[pOffset] = mOffset;
+                    m_panels[panel].pixelMap[pOffset + 1] = mOffset + 1;
+                    m_panels[panel].pixelMap[pOffset + 2] = mOffset + 2;
+                }
+            }
+        }
+    }
 
-				if (colorOrder == kColorOrderRGB)
-				{
-					m_panels[panel].pixelMap[pOffset    ] = mOffset;
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset + 2;
-				}
-				else if (colorOrder == kColorOrderRBG)
-				{
-					m_panels[panel].pixelMap[pOffset    ] = mOffset;
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset + 2;
-				}
-				else if (colorOrder == kColorOrderGRB)
-				{
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset;
-					m_panels[panel].pixelMap[pOffset    ] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset + 2;
-				}
-				else if (colorOrder == kColorOrderGBR)
-				{
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset;
-					m_panels[panel].pixelMap[pOffset    ] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset + 2;
-				}
-				else if (colorOrder == kColorOrderBRG)
-				{
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset;
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset    ] = mOffset + 2;
-				}
-				else if (colorOrder == kColorOrderBGR)
-				{
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset;
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset    ] = mOffset + 2;
-				}
-				else // Assume RGB if somehow invalid
-				{
-					m_panels[panel].pixelMap[pOffset    ] = mOffset;
-					m_panels[panel].pixelMap[pOffset + 1] = mOffset + 1;
-					m_panels[panel].pixelMap[pOffset + 2] = mOffset + 2;
-				}
-			}
-		}
-	}
-
-	return 1;
+    return 1;
 }
 
+void LEDPanel::drawTestPattern(unsigned char* channelData, int cycleNum, float percentOfCycle, int testType) {
+    // Test types match the ids the pixel-string test dropdown uses so the UIs
+    // can present a consistent list: 1 = panel layout/ID pattern, 4-7 =
+    // red/green/blue/white fades. Anything else draws the layout pattern.
+    if (testType >= 4 && testType <= 7) {
+        drawFadePattern(channelData, percentOfCycle, testType);
+        return;
+    }
+    unsigned char clr[3];
+    switch (cycleNum % 3) {
+    case 0:
+        clr[0] = clr[2] = 0;
+        clr[1] = 255;
+        break;
+    case 1:
+        clr[2] = clr[1] = 0;
+        clr[0] = 255;
+        break;
+    default:
+        clr[0] = clr[1] = 0;
+        clr[2] = 255;
+        break;
+    }
+
+    int actualHeight = height;
+    int actualWidth = width;
+
+    if ((orientation == 'L') || (orientation == 'R')) {
+        actualHeight = width;
+        actualWidth = height;
+    }
+
+    for (int y = 0; y < (actualHeight / 2); y++) {
+        int yw1 = y * actualWidth * 3;
+        int yw2 = (y + (actualHeight / 2)) * actualWidth * 3;
+
+        for (int x = 0; x < actualWidth; ++x) {
+            int r = 0, g = 0, b = 0;
+            int r2 = 0, g2 = 0, b2 = 0;
+            // Left Column
+            if (x == 0) {
+                r = r2 = clr[0];
+                g = g2 = clr[1];
+                b = b2 = clr[2];
+            }
+            // Right Column
+            if (x == (actualWidth - 1)) {
+                r = r2 = clr[1];
+                g = g2 = clr[2];
+                b = b2 = clr[0];
+            }
+            // Top Row (for yw1)
+            if (y == 0) {
+                r = clr[2];
+                g = clr[0];
+                b = clr[1];
+            }
+            // Bottom Row (for yw2)
+            if (y == (actualHeight / 2 - 1)) {
+                r2 = clr[2];
+                g2 = clr[0];
+                b2 = clr[1];
+            }
+            // Diagonal Top-Left to Middle
+            if (x == (2 * y) || x == (2 * y + 1)) {
+                r = g = 255;
+            }
+            // Diagonal Bottom-Left to Middle (part1)
+            if (x == (2 * (actualHeight / 2 - 1 - y))) {
+                b2 = g2 = 255;
+            }
+            // Diagonal Bottom-Left to Middle (part2)
+            if (x == (2 * (actualHeight / 2 - 1 - y) + 1)) {
+                b2 = g2 = 255;
+            }
+            // Square in middle
+            if (x >= (actualWidth / 2 - 2) && x <= (actualWidth / 2 + 1)) {
+                if (y <= 1) {
+                    r2 = g2 = b2 = 255;
+                } else if (y >= (actualHeight / 2 - 2)) {
+                    r = g = b = 255;
+                }
+            }
+
+            setPixel(channelData, yw1 + x * 3, r, g, b);
+            setPixel(channelData, yw2 + x * 3, r2, g2, b2);
+        }
+    }
+    drawNumber(output + 1, width / 2 + 1, height > 16 ? 2 : 1, channelData);
+    drawNumber(chain + 1, width / 2 + 8, height > 16 ? 2 : 1, channelData);
+}
+
+// Write r,g,b to the pixel's own channels so the output applies the color order
+void LEDPanel::setPixel(unsigned char* channelData, int idx, int r, int g, int b) {
+    int base = std::min(pixelMap[idx], std::min(pixelMap[idx + 1], pixelMap[idx + 2]));
+    channelData[base] = r;
+    channelData[base + 1] = g;
+    channelData[base + 2] = b;
+}
+
+void LEDPanel::drawFadePattern(unsigned char* channelData, float percentOfCycle, int testType) {
+    // Same triangle fade the pixel-string testers use (PixelFadeStringTester).
+    uint8_t fade;
+    if (percentOfCycle < 0.50f) {
+        fade = percentOfCycle * 508.0f + 1;
+    } else {
+        fade = 255 - (percentOfCycle - 0.5f) * 508.0f;
+    }
+    // 4 = red, 5 = green, 6 = blue, 7 = white.
+    uint8_t r = (testType == 4 || testType == 7) ? fade : 0;
+    uint8_t g = (testType == 5 || testType == 7) ? fade : 0;
+    uint8_t b = (testType == 6 || testType == 7) ? fade : 0;
+
+    int actualHeight = height;
+    int actualWidth = width;
+    if ((orientation == 'L') || (orientation == 'R')) {
+        actualHeight = width;
+        actualWidth = height;
+    }
+    for (int y = 0; y < actualHeight; y++) {
+        int yw = y * actualWidth * 3;
+        for (int x = 0; x < actualWidth; ++x) {
+            setPixel(channelData, yw + x * 3, r, g, b);
+        }
+    }
+}
+
+void LEDPanel::drawNumber(int v, int x, int y, unsigned char* channelData) {
+    if (v >= 20) {
+        drawNumber(2, x, y, channelData);
+        x += 4;
+        v -= 20;
+    }
+    if (v >= 10) {
+        drawNumber(1, x, y, channelData);
+        x += 2;
+        v -= 10;
+    }
+
+    int yw1;
+    int actualWidth = width;
+
+    if ((orientation == 'L') || (orientation == 'R')) {
+        actualWidth = height;
+    }
+
+    if (v == 1) {
+        for (int yo = 0; yo < 5; yo++) {
+            int yw1 = (y + yo) * actualWidth * 3;
+            channelData[pixelMap[yw1 + x * 3]] = 255;
+            channelData[pixelMap[yw1 + x * 3 + 1]] = 255;
+            channelData[pixelMap[yw1 + x * 3 + 2]] = 255;
+        }
+        return;
+    }
+    if (v == 4) {
+        for (int yo = 0; yo < 5; yo++) {
+            int yw1 = (y + yo) * actualWidth * 3;
+            channelData[pixelMap[yw1 + (x + 2) * 3]] = 255;
+            channelData[pixelMap[yw1 + (x + 2) * 3 + 1]] = 255;
+            channelData[pixelMap[yw1 + (x + 2) * 3 + 2]] = 255;
+            if (yo < 3) {
+                channelData[pixelMap[yw1 + x * 3]] = 255;
+                channelData[pixelMap[yw1 + x * 3 + 1]] = 255;
+                channelData[pixelMap[yw1 + x * 3 + 2]] = 255;
+            }
+        }
+        yw1 = (y + 2) * actualWidth * 3;
+        for (int x2 = 0; x2 < 3; x2++) {
+            channelData[pixelMap[yw1 + (x + x2) * 3]] = 255;
+            channelData[pixelMap[yw1 + (x + x2) * 3 + 1]] = 255;
+            channelData[pixelMap[yw1 + (x + x2) * 3 + 2]] = 255;
+        }
+        return;
+    }
+    if (v == 7) {
+        for (int yo = 0; yo < 5; yo++) {
+            int yw1 = (y + yo) * actualWidth * 3;
+            channelData[pixelMap[yw1 + (x + 2) * 3]] = 255;
+            channelData[pixelMap[yw1 + (x + 2) * 3 + 1]] = 255;
+            channelData[pixelMap[yw1 + (x + 2) * 3 + 2]] = 255;
+        }
+        yw1 = y * actualWidth * 3;
+        for (int x2 = 0; x2 < 3; x2++) {
+            channelData[pixelMap[yw1 + (x + x2) * 3]] = 255;
+            channelData[pixelMap[yw1 + (x + x2) * 3 + 1]] = 255;
+            channelData[pixelMap[yw1 + (x + x2) * 3 + 2]] = 255;
+        }
+        return;
+    }
+    yw1 = y * actualWidth * 3;
+    for (int x2 = 0; x2 < 3; x2++) {
+        channelData[pixelMap[yw1 + (x + x2) * 3]] = 255;
+        channelData[pixelMap[yw1 + (x + x2) * 3 + 1]] = 255;
+        channelData[pixelMap[yw1 + (x + x2) * 3 + 2]] = 255;
+
+        if (x2 != 1 || v != 0) {
+            channelData[pixelMap[yw1 + (x + x2) * 3 + actualWidth * 6]] = 255;
+            channelData[pixelMap[yw1 + (x + x2) * 3 + 1 + actualWidth * 6]] = 255;
+            channelData[pixelMap[yw1 + (x + x2) * 3 + 2 + actualWidth * 6]] = 255;
+        }
+
+        channelData[pixelMap[yw1 + (x + x2) * 3 + actualWidth * 12]] = 255;
+        channelData[pixelMap[yw1 + (x + x2) * 3 + 1 + actualWidth * 12]] = 255;
+        channelData[pixelMap[yw1 + (x + x2) * 3 + 2 + actualWidth * 12]] = 255;
+    }
+    yw1 = (y + 1) * actualWidth * 3;
+    if (v == 5 || v == 6 || v == 9 || v == 8 || v == 0) {
+        channelData[pixelMap[yw1 + x * 3]] = 255;
+        channelData[pixelMap[yw1 + x * 3 + 1]] = 255;
+        channelData[pixelMap[yw1 + x * 3 + 2]] = 255;
+    }
+    if (v == 2 || v == 3 || v == 9 || v == 8 || v == 0) {
+        channelData[pixelMap[yw1 + (x + 2) * 3]] = 255;
+        channelData[pixelMap[yw1 + (x + 2) * 3 + 1]] = 255;
+        channelData[pixelMap[yw1 + (x + 2) * 3 + 2]] = 255;
+    }
+    yw1 = (y + 3) * actualWidth * 3;
+    if (v == 2 || v == 6 || v == 8 || v == 0) {
+        channelData[pixelMap[yw1 + x * 3]] = 255;
+        channelData[pixelMap[yw1 + x * 3 + 1]] = 255;
+        channelData[pixelMap[yw1 + x * 3 + 2]] = 255;
+    }
+    if (v == 3 || v == 5 || v == 6 || v == 8 | v == 9 || v == 0) {
+        channelData[pixelMap[yw1 + (x + 2) * 3]] = 255;
+        channelData[pixelMap[yw1 + (x + 2) * 3 + 1]] = 255;
+        channelData[pixelMap[yw1 + (x + 2) * 3 + 2]] = 255;
+    }
+}

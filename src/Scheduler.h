@@ -1,149 +1,206 @@
+#pragma once
 /*
- *   Scheduler class for the Falcon Player (FPP) 
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _SCHEDULER_H
-#define _SCHEDULER_H
-
+#include <atomic>
+#include <map>
+#include "fpp-json.h"
+#include <mutex>
+#include <set>
 #include <vector>
 
 #include <pthread.h>
+#include <time.h>
 
 #include "ScheduleEntry.h"
 
-#define SCHEDULE_INDEX_INVALID  -1
-#define MAX_SCHEDULE_ENTRIES  64 
-#define SECONDS_PER_MINUTE    60
-#define SECONDS_PER_HOUR      3600
-#define SECONDS_PER_DAY       86400
-#define SECONDS_PER_WEEK      604800
-#define DAYS_PER_WEEK         7
+#define SCHEDULE_INDEX_INVALID -1
 
-#define INX_SUN                         0
-#define INX_MON                         1
-#define INX_TUE                         2
-#define INX_WED                         3
-#define INX_THU                         4
-#define INX_FRI                         5
-#define INX_SAT                         6
-#define INX_EVERYDAY                7
-#define INX_WKDAYS                  8
-#define INX_WKEND                       9
-#define INX_M_W_F                       10
-#define INX_T_TH                        11
-#define INX_SUN_TO_THURS        12
-#define INX_FRI_SAT                 13
-#define INX_DAY_MASK                0x10000
-#define INX_DAY_MASK_SUNDAY         0x04000
-#define INX_DAY_MASK_MONDAY         0x02000
-#define INX_DAY_MASK_TUESDAY        0x01000
-#define INX_DAY_MASK_WEDNESDAY      0x00800
-#define INX_DAY_MASK_THURSDAY       0x00400
-#define INX_DAY_MASK_FRIDAY         0x00200
-#define INX_DAY_MASK_SATURDAY       0x00100
+// The INX_* day index and day mask defines now live in ScheduleEntry.h, which
+// is included above, since they describe a ScheduleEntry's dayIndex field.
+// They remain visible to anything including this header.
 
-typedef struct{
-	char enable;
-	char playList[128];
-	int  dayIndex;
-	int  startHour;
-	int  startMinute;
-	int  startSecond;
-	int  endHour;
-	int  endMinute;
-	int  endSecond;
-	char repeat;
-	int  weeklySecondCount;
-	int  weeklyStartSeconds[DAYS_PER_WEEK];
-	int  weeklyEndSeconds[DAYS_PER_WEEK];
-	int  startDate; // YYYYMMDD format as an integer
-	int  endDate;   // YYYYMMDD format as an integer
-} ScheduleEntryStruct;
-
-typedef struct {
-	int ScheduleEntryIndex;
-	int weeklySecondIndex;
-	int startWeeklySeconds;
-	int endWeeklySeconds;
-} SchedulePlaylistDetails;
-
-
-class Scheduler {
-  public:
-	Scheduler();
-	~Scheduler();
-
-	void ScheduleProc(void);
-	void CheckIfShouldBePlayingNow(int ignoreRepeat = 0);
-	void ReLoadCurrentScheduleInfo(void);
-	void ReLoadNextScheduleInfo(void);
-	void GetNextScheduleStartText(char * txt);
-	void GetNextPlaylistText(char * txt);
-
-	std::string GetPlaylistThatShouldBePlaying(int &repeat);
-
-  private:
-	int  GetNextScheduleEntry(int *weeklySecondIndex);
-	void LoadCurrentScheduleInfo(void);
-	void LoadNextScheduleInfo(void);
-	void GetSunInfo(int set, int &hour, int &minute, int &second);
-	void SetScheduleEntrysWeeklyStartAndEndSeconds(ScheduleEntryStruct * entry);
-	void PlayListLoadCheck(void);
-	void PlayListStopCheck(void);
-	void LoadScheduleFromFile(void);
-	void SchedulePrint(void);
-	int  GetWeeklySeconds(int day, int hour, int minute, int second);
-	int  GetWeeklySecondDifference(int weeklySeconds1, int weeklySeconds2);
-	int  GetDayFromWeeklySeconds(int weeklySeconds);
-	int  FindNextStartingScheduleIndex(void);
-	void GetScheduleEntryStartText(int index,int weeklySecondIndex, char * txt);
-	void GetDayTextFromDayIndex(int index,char * txt);
-
-
-	int           m_ScheduleEntryCount;
-	unsigned char m_CurrentScheduleHasbeenLoaded;
-	unsigned char m_NextScheduleHasbeenLoaded;
-	int           m_nowWeeklySeconds2;
-	int           m_lastLoadDate;
-
-	time_t        m_lastProcTime;
-	time_t        m_lastLoadTime;
-	time_t        m_lastCalculateTime;
-
-	pthread_t     m_threadID;
-	int           m_runThread;
-	int           m_threadIsRunning;
-
-	pthread_mutex_t             m_scheduleLock;
-	std::vector<ScheduleEntry>  m_schedule;
-
-	ScheduleEntryStruct     m_Schedule[MAX_SCHEDULE_ENTRIES];
-	SchedulePlaylistDetails m_currentSchedulePlaylist;
-	SchedulePlaylistDetails m_nextSchedulePlaylist;
+class ScheduledItem {
+public:
+    ScheduleEntry* const entry;
+    int const priority;
+    int const entryIndex;
+    bool ran;
+    time_t const startTime;
+    time_t endTime;
+    std::string command;
+    Json::Value args;
+    // A playlist entry's start (as opposed to an FPP command entry).  The
+    // command string can't tell them apart: a command entry can run the
+    // "Start Playlist" command, and was then taken for a playlist entry with
+    // no playlist -- marked ran, never run.
+    bool isPlaylist = false;
 };
 
-extern Scheduler *scheduler;
+class Scheduler {
+public:
+    Scheduler();
+    ~Scheduler();
 
-#endif /* _SCHEDULER_H */
+    void ScheduleProc(void);
+    void CheckIfShouldBePlayingNow(int ignoreRepeat = 0, int forceStopped = -1);
+    void ReloadScheduleFile(void);
+    void SetTimeDelta(int delta, int timeLimit);
+    bool StartNextScheduledItemNow();
 
+    // Scheduled FPP commands run on their own detached threads.  At shutdown,
+    // wait (up to timeoutMS) for any still running, before the media, outputs
+    // and command registry they use are torn down.
+    static void WaitForCommandThreads(int timeoutMS);
+
+    std::string GetNextPlaylistName();
+    std::string GetNextPlaylistStartStr();
+    bool IsEnabled() const { return !m_schedulerDisabled; }
+
+    std::string GetPlaylistThatShouldBePlaying(int& repeat);
+    Json::Value GetInfo(void);
+    Json::Value GetSchedule(void);
+
+    // One expanded occurrence of a schedule entry, used while building the
+    // calendar range response.  Kept lightweight so a range holding tens of
+    // thousands of occurrences can be collected and aggregated before any of
+    // the much more expensive JSON is built.
+    struct Occurrence {
+        int entryIndex;
+        int dayKey; // YYYYMMDD of the local day the occurrence starts on
+        time_t start;
+        time_t end;
+        bool overridden;
+    };
+
+    Json::Value GetScheduleRange(time_t rangeStart, time_t rangeEnd,
+                                 bool includeDisabled, bool daySummary);
+
+private:
+    Json::Value BuildScheduleRangeItem(const ScheduleEntry& entry,
+                                       const Occurrence& occurrence,
+                                       const std::string& timeFmt);
+
+    // A player start/stop the scheduler decided on while holding
+    // m_scheduleLock, carried by value so it can be run after the lock is
+    // released.  See the m_scheduleLock declaration below.
+    struct PlayerAction {
+        enum class Type {
+            StopUntilIdle,
+            StopNow,
+            StopGracefully,
+            StopGracefullyAfterLoop,
+            StartPlaylist
+        };
+
+        Type type;
+        int forceStop = 0;
+        std::string playlist;
+        int position = 0;
+        int repeat = 0;
+        int entryIndex = 0;
+        int priority = 0;
+        time_t startTime = 0;
+        time_t endTime = 0;
+        int stopType = 0;
+    };
+
+    // A countdown preset to trigger once the lock is released.  Presets run
+    // their commands synchronously, so they are subject to the same rule as
+    // PlayerAction.
+    struct CountdownPreset {
+        std::string name;
+        std::string playlist;
+    };
+
+    void RunPlayerActions(const std::vector<PlayerAction>& actions);
+    void RunCountdownPresets(const std::vector<CountdownPreset>& presets);
+
+    void AddScheduledItems(ScheduleEntry* entry, int index, std::time_t loadTime);
+    void DumpScheduledItem(const std::time_t itemTime, const ScheduledItem& item);
+    void DumpScheduledItems();
+    void CheckScheduledItems(bool restarted = false);
+    void ClearScheduledItems();
+    void SetItemRan(ScheduledItem& item, bool ran);
+
+    ScheduledItem* GetNextScheduledPlaylist();
+    void LoadScheduleFromFile(void);
+    void SchedulePrint(void);
+    std::string GetDayTextFromDayIndex(const int index);
+
+    void RegisterCommands();
+
+    void doCountdown(const std::time_t now, const std::time_t itemTime, const std::vector<ScheduledItem>& items,
+                     std::vector<CountdownPreset>& presets);
+    void doScheduledCommand(const std::time_t itemTime, const ScheduledItem& item);
+    bool doScheduledPlaylist(const std::time_t now, const std::time_t itemTime, ScheduledItem& item, bool restarted,
+                             std::vector<PlayerAction>& actions);
+
+    bool m_schedulerDisabled;
+    // Set lock-free from ScheduleProc, ReloadScheduleFile and SetTimeDelta on
+    // different threads; atomic so those unsynchronized writes/reads are defined.
+    std::atomic<bool> m_loadSchedule;
+    int m_lastLoadDate;
+    int m_timeDelta;
+    time_t m_timeDeltaThreshold;
+
+    time_t m_lastProcTime;
+
+    // The wall-clock second CheckScheduledItems last finished examining for
+    // scheduled FPP commands.  A command fires when its second falls in the
+    // (m_lastCommandCheckTime, now] window not yet examined, so a missed second
+    // (a slow midnight reload, an NTP step, a stalled main loop) still fires it
+    // on the next pass instead of dropping it silently.  A per-pass catch-up
+    // cap keeps a large forward clock step from replaying a batch of stale
+    // commands.  Playlists need no such window - they already tolerate a late
+    // start by checking their own end time.
+    time_t m_lastCommandCheckTime;
+
+    // Lock ordering: m_scheduleLock may be taken while holding no other lock,
+    // or from inside Playlist's m_playlistMutex (a playlist entry can run an
+    // FPP Command inline, and several of those call back into the scheduler).
+    // That makes m_playlistMutex -> m_scheduleLock the established order, so
+    // scheduler code must never start or stop the Player/Playlist while
+    // holding m_scheduleLock - doing so takes the two locks in the opposite
+    // order and deadlocks against a playlist thread.  Both mutexes are
+    // recursive, which does not help across threads.  Decide under the lock,
+    // copy out what the call needs, release, then call the Player (see
+    // CheckScheduledItems).  The read-only Player/Playlist getters do not take
+    // m_playlistMutex and are safe to call under this lock.
+    std::recursive_mutex m_scheduleLock;
+    std::vector<ScheduleEntry> m_Schedule;
+    std::map<std::time_t, std::vector<ScheduledItem>> m_scheduledItems;
+
+    // Scheduled starts decided under m_scheduleLock but not yet carried out
+    // (RunPlayerActions runs unlocked), keyed by start time and entry index.
+    // The player still reads idle while such a start loads, and a concurrent
+    // CheckIfShouldBePlayingNow() -- an API "Start Playlist At Item" runs one
+    // on its own thread -- used to reset the item's ran flag in that window
+    // and start it a second time.  Guarded by m_scheduleLock.
+    std::set<std::pair<std::time_t, int>> m_startsInFlight;
+    std::map<std::time_t, std::vector<ScheduledItem>> m_oldItems;
+    std::map<std::time_t, std::vector<ScheduledItem>> m_ranItems;
+
+    // The scheduled occurrence a higher-priority entry pre-empted: allowed to
+    // start again (despite not repeating) once the player goes idle, then
+    // consumed.  Keyed by occurrence -- entry index alone matched every later
+    // run of that entry forever, restarting it each time it ended.
+    int m_forcedNextPlaylist;
+    std::time_t m_forcedNextPlaylistStart = 0;
+
+    std::string m_lastBlockedPlaylist;
+    std::time_t m_lastBlockedTime;
+
+    bool m_schedulesExtendBeyondDistance;
+};
+
+extern Scheduler* scheduler;

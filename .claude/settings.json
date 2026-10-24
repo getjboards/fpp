@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/fpp/media/logs/**)",
+      "Bash(make -j4)"
+    ]
+  }
+}

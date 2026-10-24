@@ -1,0 +1,108 @@
+#
+# Docker is not a supported platform for using FPP.  It is intended to be used by developers/experts only.
+#
+# End-users should use FPP on supported platforms such as Pi or Beaglebone.
+#
+# Only a subset of FPP features work under docker, it is provided as-is and no support is provided
+#
+# Please do not log github issues related to docker.
+#
+FROM debian:trixie
+
+# if we get a bunch of these installed up front in one shot (assume a desktop so plenty of memory to do all at once)
+# then the FPP_Install step is faster.   In addition, docker will cache this result
+# so building docker containers will be faster
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -yq upgrade
+
+ARG PHPVER="8.4"
+
+#
+# This should exact match SD/FPP_Install.sh
+# 
+# Packages custom to docker are listed below
+#
+ARG PACKAGE_LIST="alsa-utils arping avahi-daemon avahi-utils locales nano net-tools \
+    apache2 apache2-bin apache2-data apache2-utils libavahi-client-dev \
+    bc bash-completion btrfs-progs exfatprogs lsof ethtool curl zip unzip bzip2 wireless-tools dos2unix \
+    fbi fbset file flite ca-certificates lshw gettext wget iproute2 \
+    build-essential ffmpeg gcc g++ gdb vim vim-common bison flex device-tree-compiler dh-autoreconf \
+    git hdparm i2c-tools jq less sysstat tcpdump time usbutils usb-modeswitch \
+    samba rsync sudo shellinabox dnsmasq hostapd vsftpd chrony sqlite3 at haveged samba samba-common-bin \
+    mp3info exim4 mailutils dhcp-helper parprouted bridge-utils libiio-utils \
+    php${PHPVER} php${PHPVER}-cli php${PHPVER}-fpm php${PHPVER}-common php${PHPVER}-curl php-pear \
+    php${PHPVER}-bcmath php${PHPVER}-sqlite3 php${PHPVER}-zip php${PHPVER}-xml \
+    libtag1-dev \
+    vorbis-tools libgraphicsmagick++-dev graphicsmagick-libmagick-dev-compat libdrogon-dev \
+    gettext x265 libtheora-dev libvorbis-dev libx265-dev iputils-ping mp3gain \
+    libmosquitto-dev mosquitto-clients mosquitto libzstd-dev xz-utils zstd gpiod libgpiod-dev libjsoncpp-dev libcurl4-openssl-dev libnl-3-dev libnl-genl-3-dev \
+    fonts-freefont-ttf flex bison pkg-config libasound2-dev libsdl2-dev libsdl3-dev mesa-common-dev qrencode libusb-1.0-0-dev \
+    flex bison pkg-config libasound2-dev python3-setuptools libssl-dev libtool bsdextrautils iw rsyslog tzdata ccache libsystemd-dev \
+    pipewire pipewire-bin pipewire-alsa pipewire-pulse pipewire-jack pipewire-audio-client-libraries wireplumber \
+    libpipewire-0.3-dev libspa-0.2-bluetooth pulseaudio-utils \
+    gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-alsa \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
+    gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-x \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-0 \
+    yt-dlp"
+
+ARG PACKAGE_LIST_DOCKER=ssh
+
+RUN echo "force-unsafe-io" > /etc/dpkg/dpkg.cfg.d/02apt-speedup
+RUN echo '\
+    Acquire::http {No-Cache=True;};\
+    Acquire::https {No-Cache=True;};\
+    Acquire::Retries "32";\
+    Acquire::https::Timeout "240";\
+    Acquire::http::Timeout "240";\
+    APT::Get::Assume-Yes "true";\
+    APT::Install-Recommends "false";\
+    APT::Install-Suggests "false";\
+    Debug::Acquire::https "true";\
+    ' > /etc/apt/apt.conf.d/99custom
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -yq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $PACKAGE_LIST
+
+#
+# These are unique to docker
+#
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -yq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" $PACKAGE_LIST_DOCKER
+
+RUN apt-get clean
+
+
+
+# Pass --build-arg EXTRA_INSTALL_FLAG=--skip-clone to build without
+# cloning the lastest from git and instead use the stuff in the local
+# directory
+ARG EXTRA_INSTALL_FLAG=
+
+# branch being build. Promote to ENV so it reaches `make` inside
+# FPP_Install.sh -- the makefile uses FPPBRANCH to decide whether to add
+# -g1 for release builds, and ARG alone is not in the RUN environment.
+ARG FPPBRANCH
+ENV FPPBRANCH=${FPPBRANCH}
+
+COPY ./ /opt/fpp/
+COPY SD/FPP_Install.sh /root/FPP_Install.sh
+RUN ( yes | bash /root/FPP_Install.sh $EXTRA_INSTALL_FLAG --branch ${FPPBRANCH:-master} --skip-apt-install )
+
+# nocc (distributed C++ compiler) is not a Debian package, so it can't live in
+# PACKAGE_LIST. FPP_Install configured FPP's apt repo + keyring above (under
+# --skip-apt-install it sets up the repo but leaves the install to us); pull it
+# here so it lands in its own cached layer.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -yq nocc \
+    || echo "WARNING: nocc install skipped (FPP apt repo unreachable)"
+
+RUN rm -rf /tmp/*
+RUN cp /opt/fpp/etc/asoundrc.plain /root/.asoundrc
+RUN echo "docker" > /etc/fpp/container
+
+# this will do additional updates and create the required directories
+# and set permissions
+RUN /opt/fpp/src/fppinit start
+
+VOLUME /home/fpp/media
+
+#      HTTP  DDP      e1.31    Multisync  FPPD/HTTP    Other
+EXPOSE 80    4048/udp 5568/udp 32320/udp    32322      9000/udp 9000/tcp
+ENTRYPOINT ["/opt/fpp/Docker/runDocker.sh"]

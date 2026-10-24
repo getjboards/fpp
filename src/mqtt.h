@@ -1,67 +1,97 @@
+#pragma once
 /*
- *   Mosquitto Client for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _MQTT_H
-#define _MQTT_H
+// PLUGIN ABI: native plugins compile against this header and are loaded with
+// dlopen(), so parts of it are baked into binaries FPP did not build.
+//   - MosquittoClient's data layout: plugins call the inline GetBaseTopic().
+//   - Its vtable (and EventHandler's, in Events.h): plugins call Publish()
+//     virtually through the global `mqtt`.
+// Any such change must bump FPP_PLUGIN_API_VERSION in Plugin.h. Without the
+// bump, a plugin built against the previous header still loads and silently
+// uses the old layout - FPP 10.2 shipped exactly that and crash-looped fppd.
+// See .claude/PLUGIN-ABI.md for which plugins use what.
 
-#include <pthread.h>
+#include <functional>
+#include "fpp-json-fwd.h"
+#include <map>
+#include <mutex>
 #include <string>
+#include <atomic>
+
+#include "Events.h"
+#include "Warnings.h"
 
 #include "mosquitto.h"
 
-class MosquittoClient {
-  public:
-  	MosquittoClient(const std::string &host, const int port, const std::string &topicPrefix);
-	~MosquittoClient();
+class MosquittoClient : public EventHandler {
+public:
+    MosquittoClient(const std::string& host, const int port, const std::string& topicPrefix);
+    ~MosquittoClient();
 
-	int  Init(const std::string &username, const std::string &password, const std::string &ca_file);
+    int Init(const std::string& username, const std::string& password, const std::string& ca_file);
 
-	int  PublishRaw(const std::string &topic, const std::string &msg);
-	int  Publish(const std::string &subTopic, const std::string &msg);
-	int  Publish(const std::string &subTopic, const int value);
+    virtual bool Publish(const std::string& topic, const std::string& data) override;
+    virtual bool Publish(const std::string& subTopic, const int valueconst) override;
+    virtual void RegisterCallback(const std::string& topic) override;
+    virtual void RemoveCallback(const std::string& topic) override;
 
-	void LogCallback(void *userdata, int level, const char *str);
-	void MessageCallback(void *obj, const struct mosquitto_message *message);
+    virtual void PrepareForShutdown() override;
 
-  private:
-	std::string m_host;
-	int         m_port;
-	int         m_keepalive;
+    int PublishRaw(const std::string& topic, const std::string& msg, const bool retain = false, const int qos = 1);
+    int Publish(const std::string& subTopic, const std::string& msg, const bool retain, const int qos = 1);
+    int Publish(const std::string& subTopic, const int valueconst, bool retain, const int qos = 1);
 
-	std::string m_topicPrefix;
-	std::string m_baseTopic;
+    void LogCallback(void* userdata, int level, const char* str);
+    void MessageCallback(void* obj, const struct mosquitto_message* message);
 
-	struct mosquitto *m_mosq;
-	pthread_mutex_t   m_mosqLock;
+    void HandleDisconnect();
+    void HandleConnect();
+    bool IsConnected();
 
-	// Topics we want to take action on
-	std::string m_topicPlaylist;
-	std::string m_topicPlaylistOld;
+    void SetReady();
 
+    void CacheSetMessage(std::string& topic, std::string& message);
+    bool CacheCheckMessage(std::string& topic, std::string& message);
+    bool GetCachedMessage(const std::string& topic, std::string& message);
+    bool GetCachedMessage(const std::string& topic, std::string& message, time_t& lastUpdated);
+    // Default shape is {topic: "value"} for backward compatibility with the
+    // public GET /api/fppd/mqtt/cache route. Pass includeMetadata=true for
+    // {topic: {value, lastUpdated}} (used internally by Variables::reportMqttVariables).
+    void dumpMessageCache(Json::Value& result, bool includeMetadata = false);
+
+    std::string GetBaseTopic() { return m_baseTopic; }
+
+private:
+    bool m_canProcessMessages;
+    std::atomic<bool> m_isConnected;
+    std::string m_host;
+    int m_port;
+    int m_keepalive;
+
+    std::string m_topicPrefix;
+    std::string m_baseTopic;
+
+    struct mosquitto* m_mosq;
+    std::mutex m_mosqLock;
+
+    std::list<std::string> callbackTopics;
+
+    struct CachedMqttMessage {
+        std::string value;
+        time_t lastUpdated = 0;
+    };
+    std::mutex messageCacheLock;
+    std::map<std::string, CachedMqttMessage> messageCache;
 };
 
-extern MosquittoClient *mqtt;
-
-#endif
+extern MosquittoClient* mqtt;

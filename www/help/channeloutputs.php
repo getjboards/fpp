@@ -1,34 +1,78 @@
-<h3>Channel Output Configuration</h3>
+<h3>Channel Outputs</h3>
+<p>Channel Outputs tell FPP where to send the light data it plays. Each output is a block of channels that is sent to a specific controller or piece of hardware. Add an output group, choose its type, set which FPP channels it covers, and save. The page has several tabs — <b>E1.31 / DDP</b> for network controllers, <b>Pixel Strings</b> for directly attached pixels, <b>PWM</b> for dimmers, <b>LED Panels</b> for HUB75 matrices, and <b>Add Output Group</b> to create a new group.</p>
 
-<p><b>E1.31</b> - The E1.31 output can drive up to 512 universes over the Pi v2 B's ethernet network interface at 50ms timing or 128 universes on the original A/B/B+.  BeagleBone output should be similar to the Pi v2 B.</p>
-<p><b>Falcon Pixelnet/DMX (FPD)</b> - The FPD output can send 32,768 channels out 12 ports configured for the DMX or Pixelnet protocols.  This is currently limited to the first 32768 channels in a sequence.</p>
-<p><b>DMX Open</b> - The DMX Open output can send DMX data out generic FTDI-based USB to RS485 dongles.  Other RS485 dongles may work if they support setting arbitrary bit rates.  Support should include the following dongles: Entec Open DMX, LOR, and D-Light along with generic FTDI-based USB to RS485 adapters.</p>
-<p><b>DMX Pro</b> - The DMX Pro output can send DMX data out Entec-Pro compatible dongles.  This should include the following dongles: Entec-Pro, Lynx USB dongle w/ DMX firmware, DIYC RPM, DMXking.com, and DIYblinky.com.  If the dongle works using xLights DMX Pro output, it should work in the Falcon Player. </p>
-<p><b>RGBMatrix</b> - The RGBMatrix output can drive up to four of the 'P10' style 32x16 RGB LED Panels.  These panels may be wired directly to the Pi's GPIO header or an adapter board may be used to handle the wiring.  The adapter board PCB info and BOM are listed in the Falcon wiki at <a href='http://falconchristmas.com/wiki/index.php/RGB-LED_Adapter'>RGB-LED_Adapter</a>.  Make sure the pinout of your LED panels matches the pinout of the LED port on the adapter board before using one of these with your panel or it will not function properly.</p>
-<center>
-<b>RGBMatrix Output Connections</b><br>
-<table border='1' cellpadding='4' cellspacing='1'>
-<tr><th>LED Panel</th><th>Raspberry Pi</th></tr>
-<tr><td>GND - Ground</td><td>Pin 3 - GND</td></tr>
-<tr><td>R1 - Red 1st bank</td><td>Pin 11 - GPIO 17</td></tr>
-<tr><td>G1 - Green 1st bank</td><td>Pin 12 - GPIO 18</td></tr>
-<tr><td>B1 - Blue 1st bank</td><td>Pin 15 - GPIO 22</td></tr>
-<tr><td>R2 - Red 2nd bank</td><td>Pin 16 - GPIO 23</td></tr>
-<tr><td>G2 - Green 2nd bank</td><td>Pin 18 - GPIO 24</td></tr>
-<tr><td>B2 - Blue 2nd bank</td><td>Pin 22 - GPIO 25</td></tr>
-<tr><td>A - Row address</td><td>Pin 26 - GPIO 7</td></tr>
-<tr><td>B - Row address</td><td>Pin 24 - GPIO 8</td></tr>
-<tr><td>C - Row address</td><td>Pin 21 - GPIO 9</td></tr>
-<tr><td>D - Row address</td><td>(Not Used for 32x16 panels</td></tr>
-<tr><td>OE - Neg. Output Enable</td><td>Pin 3 - GPIO 2</td></tr>
-<tr><td>CLK - Serial Clock</td><td>Pin 5 - GPIO 3</td></tr>
-<tr><td>STR - Strobe row data</td><td>Pin 7 - GPIO 4</td></tr>
-</table>
-</center>
-<p><b>Pixelnet Open</b> - The Pixelnet Open output can send Pixelnet data (one 4096-channel universe) out generic FTDI-based USB to RS485 dongles.</p>
-<p><b>Pixelnet Lynx</b> - The Pixelnet Lynx output can send Pixelnet data (one 4096-channel universe) out the Lynx USB dongle w/ Pixelnet firmware.</p>
-<p><b>Renard</b> - The Renard output can drive up to 4584 channels at the highest speeds using standard USB to serial dongles.</p>
-<p><b>SPI-WS2801</b> - The SPI-WS2801 output can drive one string of WS2801 pixels directly off the Raspberry Pi's SPI port.  The data, clock, and ground lines attach directly to the Pi while power for the pixels is injected from another source.</p>
+<h4>How the page works</h4>
+<ul>
+    <li><b>Tabs</b> — E1.31/DDP, Strings, PWM and LED Panels each show only outputs of that family. The active tab is highlighted; the content below matches the tab. The page opens on the tab that matches the detected cape — a pixel cape opens on its Pixel Strings tab, a panel-only cape (OctoPlus, PocketScroller) on its LED Panels tab. With no cape detected, it opens on E1.31/DDP.</li>
+    <li><b>Add Output Group</b> (plus icon, top right of tabs) — Creates a new output group. You then pick its type from the dropdown that appears.</li>
+    <li><b>Enable</b> (per-output checkbox) — When unchecked the output is kept in the config but not sent. Useful for testing.</li>
+    <li><b>Start Channel</b> and <b>Channel Count</b> — Which FPP channels this output drives. Start is the first channel number (1-based). Count is how many consecutive channels are sent. The end channel is calculated and shown to help you avoid overlaps.</li>
+    <li><b>Type-specific fields</b> — Universes, IP addresses, serial ports, panel sizes, color orders, etc. Each type shows only its own fields. Tooltips (help icon) explain each field.</li>
+    <li><b>Save</b> (green) — Writes <code>api/configfile/channeloutputs.json</code> (path from <code>settings['channelOutputsJSON']</code>) and shows a growl. Validation checks for overlapping channels and missing required fields before saving.</li>
+    <li><b>Clone / Delete</b> — Duplicate a selected output to quickly make a similar one, or remove it. You must still Save after.</li>
+    <li><b>Clone String</b> (Pixel Strings tab) — Copies the selected string's settings down (or up) onto the following ports, renumbering the description and stepping the start channel on for each copy. The button only appears once you click a string row to select it. It offers the number of ports left to fill as the default; enter a negative number to clone upwards. Ports belonging to an expansion set to <i>None</i> are hidden and are not counted or written to. Save afterwards as usual.</li>
+    <li><b>Save</b> (E1.31 / DDP tab) — Stays greyed out until the page has loaded the saved universes, so the empty table shown while it loads can't be saved over them. If they can't be loaded, an error is shown and Save stays off until you reload the page. With no universes saved yet, Save is available as soon as the page has loaded.</li>
+    <li><b>Save</b> (Pixel Strings tab) — Stays greyed out until the page has loaded the saved string configuration, so the empty table shown while it loads can't be saved over it. <b>Revert</b> greys it out again while it reloads. If the configuration can't be loaded, an error is shown and Save stays off; click Revert to try again. With no string configuration saved yet, the defaults shown are the starting point and Save is available as soon as the page has loaded.</li>
+    <li><b>F2</b> (Pixel Strings tab) — Sets the start channel of the string after the selected one so it follows straight on, then selects that string; press it repeatedly to chain the start channels down the ports. Click a string row to select it first. On this tab it replaces F2's usual jump to the Settings page.</li>
+</ul>
+
+<h4>Output types — what they do and when to use them</h4>
+<p>The descriptions and wiring tables below are the reference for directly attached hardware. For cape-based pixels, the cape itself determines the exact pinout — the tables show the underlying GPIO mapping FPP uses when no cape overrides it.</p>
+
+<p><b>E1.31</b> — The E1.31 output can drive up to 512 universes over the Pi v2 B's ethernet network interface at 50ms timing or 128 universes on the original A/B/B+. BeagleBone output should be similar to the Pi v2 B.</p>
+
+<p><b>DMX Open</b> — The DMX Open output can send DMX data out generic FTDI-based USB to RS485 dongles. Other RS485 dongles may work if they support setting arbitrary bit rates. Support should include the following dongles: Entec Open DMX, LOR, and D-Light along with generic FTDI-based USB to RS485 adapters.</p>
+
+<p><b>LOR Enhanced</b> — Drives Light-O-Rama pixel controllers (Pixie, PixCon16) on an enhanced LOR network through a USB to RS485 adapter, at 500k or 1 Mbps. Each <b>Unit</b> row is one LOR unit ID: <b>Pixels</b> is how many pixels it carries (up to 170), <b>LOR Start Pix</b> is the first pixel on the unit they go to, and <b>Start Ch</b> is where the unit's data starts within this output (1 is the output's Start Channel). A Pixie port set for 340 pixels takes two unit IDs, so add a row for each. The output's channel count follows the units — it runs to the last pixel of the unit that reaches furthest — so it is not edited directly. Only pixels that changed are sent each frame, with unchanged pixels refreshed in the background, so the pixel counts shown next to each speed — which assume every pixel changes every frame at 40fps — are a floor, not a limit.</p>
+
+<p><b>DMX Pro</b> — The DMX Pro output can send DMX data out Entec-Pro compatible dongles. This should include the following dongles: Entec-Pro, Lynx USB dongle w/ DMX firmware, DIYC RPM, DMXking.com, and DIYblinky.com. If the dongle works using xLights DMX Pro output, it should work in the Falcon Player.</p>
+
+<p><b>RGBMatrix</b> — The RGBMatrix output can drive up to 36 of the HUB75 style 32x16 RGB LED Panels. These panels may be wired directly to the Pi's GPIO header or an adapter board may be used to handle the wiring. The RGBMatrix output uses librgbmatrix from Henner Zeller's rpi-rgb-led-matrix git repository to drive HUB75 panels connected to a Raspberry Pi. If you wish to make your own board or manually connect a panel, the wiring pinout is available at <a href='https://github.com/hzeller/rpi-rgb-led-matrix/blob/master/wiring.md'>https://github.com/hzeller/rpi-rgb-led-matrix/blob/master/wiring.md</a>.</p>
+
+<p><b>PWM Register Profile</b> (LED Panels, BeagleBone capes) — Some HUB75 panels use a driver chip that does its own PWM (FM6373 / DP32019B, ICND1065L, SM16380SH). Those chips have to be sent a block of configuration registers before they will light, and the correct values depend on the panel's row driver IC and pixel pitch as well as its scan rate — not just on the chip. FPP carries one captured profile per chip, so a panel built around a different row driver can stay completely dark even though everything else is set correctly. If that happens, this field lets you supply the right register values instead.</p>
+
+<p>The field only appears once <b>LED Panel Type</b> is set to one of those three chips, and shows <i>Built-in default</i> until you import something. Click <b>Import…</b> for two ways to supply a profile:</p>
+<ul>
+    <li><b>Catalog file</b> — Load a <code>.profiles</code> capture catalog. The file is read in your browser and is not uploaded or stored on the player. The dropdown then lists the profiles it contains, with those captured at your panel's scan rate grouped first; each is labelled with the chip, row driver and pitch it was captured from. Pick one and click <b>Apply Selected</b>. Catalogs for these chips can hold several hundred entries, so working down the ones matching your scan rate is the practical approach.</li>
+    <li><b>Paste</b> — Paste a single profile, either a whole catalog line or just its <code>slot|R-words|G-words|B-words</code> payload, and click <b>Apply Pasted</b>. Use this when a supplier sends you one profile rather than a catalog.</li>
+</ul>
+<p>Applying a profile only stages it — <b>Save</b> writes it into the output config and restarts the output. The chosen values are stored in the configuration itself, so they survive a backup and restore without the catalog file. <b>Use Built-in</b> removes the imported profile and goes back to FPP's own table. A profile whose three colour lists are not all the same length is rejected, and fppd falls back to the built-in table (with a warning in the log) rather than half-applying it.</p>
+
+<p><b>PWM Register Upload</b> (LED Panels, BeagleBone capes) — Also alongside the register profile. Before a PWM chip will accept its configuration registers it has to see a specific pattern of LAT (latch) pulses, and a chip that does not recognise the pattern ignores the registers entirely — in which case changing the register profile has no effect at all, which is the symptom to watch for. FPP sends three LAT bursts followed by the register words, and these fields set the lengths, all counted in data clocks:</p>
+<ul>
+    <li><b>vsync</b> — The first burst. Default 3.</li>
+    <li><b>mid</b> — A second burst that only some chips in the family expect. Default 11; set it to <b>0</b> to skip it entirely.</li>
+    <li><b>pre</b> — The burst immediately before the register words. Default 14.</li>
+    <li><b>spacer</b> — The LAT-low gap after each burst and after each register word. Default 8; <b>0</b> emits no gap, which is what the reference implementation for these chips does.</li>
+</ul>
+<p>Leave them blank for FPP's defaults (3 / 11 / 14 / 8). Published captures show these varying per chip and per burst, so if a panel refuses its registers — profile changes making no difference is the clue — this is worth sweeping before trying more profiles.</p>
+
+<p><b>PWM OE Timing</b> (LED Panels, BeagleBone capes) — Appears alongside the register profile, for the same three chips. These panels are advanced one display row at a time by a pulse on the OE line, and a chip that does not see a pulse it likes simply never lights. The reference implementation for these chips measures both pulses in <b>DCLK periods</b> rather than in time, so the same units are used here and its published values can be entered directly.</p>
+<ul>
+    <li><b>OE pulse</b> — Width of the per-row pulse, in DCLK periods. The reference default is 4.</li>
+    <li><b>opener</b> — Width of the single longer pulse sent when the scan restarts, in DCLK periods. The reference default is 12.</li>
+    <li><b>row period</b> — How long each row is held, in microseconds.</li>
+</ul>
+<p>Leave a field blank to keep what FPP has always emitted for this family (a 600ns pulse, a 2&micro;s opener and a 20&micro;s row period), which is what existing panels are running. A DCLK period is about 194ns with 16 outputs and 109ns with 8, so the converted value depends on the cape as well as the number entered; the resulting pulse widths are logged at startup. If a panel stays dark with a correct register profile, widening the OE pulse is the usual next thing to try.</p>
+
+<p><b>Note:</b> vendor receiving-card files (NovaStar <code>.rcfgx</code>, ColorLight <code>.rcvbp</code>, Linsn <code>.RCG</code>) cannot be used here. Those files identify the driver chip and scan settings but do not contain the register values themselves — the receiving card holds its own table for each chip, the same way FPP does.</p>
+
+<p><b>Panel Addressing Type</b> (LED Panels) — How the panel selects which of its rows is lit. Most panels decode a row number from their A–E address lines, which is <b>Standard</b>. The others are for panels built differently:</p>
+<ul>
+    <li><b>Direct Row Select</b> — Each address line enables one row on its own, instead of the lines together forming a row number.</li>
+    <li><b>ABC-Addressed Panels</b> — The row drivers are shift registers: A is their clock and C their data, and B is not used. FPP clocks one bit per panel row every time the row changes, so panels that chain a separate row driver for each band of rows are covered too. Set <b>Panel Interleave</b> to match the panel as well — these panels often need a non-zero interleave.</li>
+    <li><b>AB-Addressed Panels</b> and <b>ABC Shift + DE Direct</b> — Other shift-register row drivers, clocked on A with data on B. Offered on PocketBeagle2 panel capes only.</li>
+</ul>
+<p>On the Raspberry Pi the list comes from the rpi-rgb-led-matrix library. A panel that needs ABC addressing but is left on Standard typically lights every pixel on several rows at once, in groups a few rows apart, and changing the interleave makes no difference to that.</p>
+
+<p><b>Pixelnet Open</b> — The Pixelnet Open output can send Pixelnet data (one 4096-channel universe) out generic FTDI-based USB to RS485 dongles.</p>
+
+<p><b>Pixelnet Lynx</b> — The Pixelnet Lynx output can send Pixelnet data (one 4096-channel universe) out the Lynx USB dongle w/ Pixelnet firmware.</p>
+
+<p><b>Renard</b> — The Renard output can drive up to 4584 channels at the highest speeds using standard USB to serial dongles.</p>
+
+<p><b>SPI-WS2801</b> — The SPI-WS2801 output can drive one string of WS2801 pixels directly off the Raspberry Pi's SPI port. The data, clock, and ground lines attach directly to the Pi while power for the pixels is injected from another source.</p>
+<p>
 <center>
 <b>SPI-WS2801 Output Connections</b><br>
 <table border='1' cellpadding='4' cellspacing='1'>
@@ -39,9 +83,12 @@
 <tr><td>Pixel Power</td><td>Not Connected to Pi</td></tr>
 </table>
 </center>
-<p><b>RPIWS281X</b> - The RPIWS281X output can drive two independent strings of WS281x pixels directly off the Raspberry Pi's GPIO ports.  The data and ground lines attach directly to the Pi while power for the pixels is injected from another source.  <b>NOTE: When you enable the RPIWS281X output, the onboard audio on the Pi will be disabled since both audio and RPIWS281X need to use the same PWM output.</b></p>
+</p>
+
+<p><b>PiHat</b> — The PiHat output can drive two independent strings of WS281x pixels directly off the Raspberry Pi's GPIO ports. The data and ground lines attach directly to the Pi while power for the pixels is injected from another source. These strings are driven by the <b>DPIPixels</b> output described below. <b>NOTE: This replaces the older RPIWS281X output, which required the onboard audio on the Pi to be disabled. Existing RPIWS281X configurations are migrated automatically and the onboard audio now continues to work.</b></p>
+<p>
 <center>
-<b>RPIWS281x Output Connections</b><br>
+<b>PiHat Output Connections</b><br>
 <table border='1' cellpadding='4' cellspacing='1'>
 <tr><th>WS281x Function</th><th>Raspberry Pi</th></tr>
 <tr><td>Data String #1</td><td>Pin 12 - GPIO18</td></tr>
@@ -50,7 +97,10 @@
 <tr><td>Pixel Power</td><td>Not Connected to Pi</td></tr>
 </table>
 </center>
-<p><b>spixels</b> - The spixels output can drive 16 independent strings of WS2801, APA102, LPD6803, or LPD8806 pixels directly off the Raspberry Pi's GPIO ports by emulating SPI outputs in software.  The data and ground lines attach directly to the Pi while power for the pixels is injected from another source.</b></p>
+</p>
+
+<p><b>spixels</b> — The spixels output can drive 16 independent strings of WS2801, APA102, LPD6803, or LPD8806 pixels directly off the Raspberry Pi's GPIO ports by emulating SPI outputs in software. The data and ground lines attach directly to the Pi while power for the pixels is injected from another source.</b></p>
+<p>
 <center>
 <b>spixels Output Connections</b><br>
 <table border='1' cellpadding='4' cellspacing='1'>
@@ -76,8 +126,12 @@
 <tr><td>Pixel Power</td><td>Not Connected to Pi</td></tr>
 </table>
 </center>
-<p><b>Triks-C</b> - The Triks-C output can drive up to four LEDTriks modules attached to Triks-C or Pix-C boards.  The start channel is specified along with the serial port the Triks-C is connected to and the panel layout.  Panels may be layed out in a horizontal row of 1-4 panels, a vertical column of 1-4 panels, or a 2x2 grid.  Panels must be numbered starting at the top left, going across then down.  In a 2x2 layout, the top row would be panels 1 and 2 and the bottom row would be panels 3 and 4 with panel 3 below panel 1 and panel 4 below panel 2.</p>
-<p><b>GPIO</b> - The GPIO outut can drive a single GPIO pin high or low based on a channel's value being zero (low) or non-zero (high).  This may be used to drive output relays or trigger other attached devices.</p>
+</p>
+
+<p><b>Generic UDP</b> — Sends each frame's channel data to an IP address and port as one UDP packet laid out by the <b>Data</b> tokens, separated by spaces: <code>{data}</code> is the channel data; <code>{S1}</code> the channel count as one byte; <code>{S2}</code> the channel count as two bytes, low byte first, and <code>{s2}</code> high byte first; <code>{P1}</code>, <code>{P2}</code> and <code>{p2}</code> the same for the pixel count (channels / 3); <code>0x41</code> or <code>#41</code> a byte given in hex.</p>
+
+<p><b>GPIO</b> — The GPIO output can drive a single GPIO pin high or low based on a channel's value being zero (low) or non-zero (high). This may be used to drive output relays or trigger other attached devices.</p>
+<p>
 <center>
 <b>GPIO Pins available on the Pi model B and B+</b><br>
 <table border='1' cellpadding='4' cellspacing='1'>
@@ -118,7 +172,10 @@
 <tr><td>Output 8</td><td>207</td></tr>
 </table>
 </center>
-<p><b>GPIO-595</b> - The GPIO-595 output can drive up to 16 daisy-chained 74HC595 Shift Register IC's using a set of 3 GPIO Output pins. See the table below for connection information. Pick one set of outputs 'GPIO 17-18-27' or 'GPIO 22-23-24', do not connect the 74HC595 to both sets of GPIO Pins.</p>
+</p>
+
+<p><b>GPIO-595</b> — The GPIO-595 output can drive up to 16 daisy-chained 74HC595 Shift Register IC's using a set of 3 GPIO Output pins. See the table below for connection information. Pick one set of outputs 'GPIO 17-18-27' or 'GPIO 22-23-24', do not connect the 74HC595 to both sets of GPIO Pins.</p>
+<p>
 <center>
 <b>GPIO-595 Output Connections</b><br>
 <table border='1' cellpadding='4' cellspacing='1'>
@@ -131,3 +188,60 @@
 <tr><td>Latch</td><td>12 - RCLK</td><td>BCM 27</td><td>P1 - Pin 13</td><td>BCM 24</td><td>P1 - Pin 18</td></tr>
 </table>
 </center>
+</p>
+
+<p><b>DPIPixels</b> — The DPIPixels Channel Output on the Raspberry Pi can drive up to 24 strings of LED pixels connected directly to the GPIO pins (a voltage shifter might also be needed since the GPIO pins are only 3.3V). The number of pixels is determined by the frame rate and protocol. For example, at 20 FPS over 1,600 WS281X pixels can be chained from each GPIO pin (each WS281X pixel takes 30 usec), allowing a Raspberry Pi to run close to 40K WS281x pixels at 20 FPS. <a id="more-dpi-info" href="#">Click here to show/hide more info</a>. <b>NOTE: The PiHat DPIPixels Channel Output is pin-compatible with the older RPIWS281X Channel Output but allows the onboard audio on the Pi to continue to function.</b></p>
+<p class="more-dpi-info">DPI redirects video output from the GPU onto selected GPIO pins. The RPi GPU serves as a high-speed 24-bit parallel port dongle, repeatedly refreshing the LED pixels from a GPU framebuffer and off-loading time-critical I/O from the RPi general processor cores.</p>
+<p class="more-dpi-info">GPIO pins that are used for DPI are not available for other functions such as SPI, PMW, UART serial output, or sensors, but each GPIO can be configured individually for DPI so conflicts can be avoided - the tradeoff is fewer DPI Channel Outputs available for LED pixels.</p>
+<p class="more-dpi-info">
+<center class="more-dpi-info" NOTE="table won't hide without this">
+<b>DPI Output Connections</b><br>
+<table border="1" cellpadding="4" cellspacing="1" style="margin: 0 40px;">
+<tr><th>RPi Pins</th><th>Function</th><th>Notes</th></tr>
+<tr><td>GPIO 0 - 3</td><td>Normal function</td><td>DPI uses these pins for video CLK, EN, HSYNC and VSYNC signals, which are not useful for Channel Outputs. These pins can be used for normal purposes.</td></tr>
+<tr><td style="white-space: nowrap;">GPIO 4 - 27</td><td style="white-space: nowrap;">Channel Outputs</td><td>GPIO 4 - 27 can optionally be used for pixel data or control signals. Otherwise, these pins are available for normal purposes.</td></tr>
+<tr><td>V+</td><td><em>Do not connect</em></td><td>The RPi power supply is not strong enough to run large numbers of LED pixels. A separate power supply must be used.</td></tr>
+<tr><td>Ground</td><td>Common</td><td>RPi ground must be connected to LED pixel ground to establish a common reference voltage.</td></tr>
+</table>
+</center>
+</p>
+<p class="more-dpi-info">DPI Channel Output in FPP currently only supports WS281X, but additional protocols might be added in future. DPI could also be used for servo or DC dimmer control, but AC (phase angle) dimming is currently not possible directly from the GPIO pins because the RPi GPU is not synced to AC line voltage (an external controller with AC zero-cross detection would be needed).</p>
+
+<h4>Tips for all outputs</h4>
+<ul>
+    <li>When using a cape or hat, let FPP auto-detect it — the <b>Channel Outputs</b> header shows which cape was found. Follow the cape vendor’s wiring for pixel ports; the tables above show the underlying SoC mapping when no cape overrides it.</li>
+    <li>USB serial adapters are numbered in the order they are found, so with more than one plugged in, <code>ttyUSB0</code> can be a different adapter after a reboot. For a serial output on a USB adapter pick the port's <code>serial/by-id</code> name, which belongs to that adapter, or for an adapter with no serial number its <code>serial/by-path</code> name, which follows the USB socket it is plugged into. Each entry shows the <code>tty</code> it is now.</li>
+    <li>Avoid channel overlaps unless you want two outputs to mirror each other. The Validation after Save warns about overlaps.</li>
+    <li>For network outputs (E1.31, DDP, ArtNet), put FPP and the controllers on the same subnet and verify with <b>Network Settings</b> that the IP and netmask are correct. Test with <b>Display Testing</b> to confirm lights respond.</li>
+    <li>Power injection is always separate from the Pi — never power large pixel strings from the Pi’s 5V pin.</li>
+</ul>
+
+<style>
+.back2top {
+        display: block;
+        margin-left: auto;
+        margin-right: 0;
+        z-index: 99;
+        background: red;
+        color: #fff;
+        border-radius: 30px;
+        padding: 15px;
+        font-weight: bold;
+        line-height: normal;
+        border: none;
+        opacity: 0.5;
+    }
+.more-dpi-info {
+        display: none;
+    }
+#helpText {
+    position: relative;
+}
+</style>
+<button type="button" class="back2top">Back to top</button>
+<script type="application/javascript">
+$(document).ready(function() {
+  $(".back2top").click(() => $("#dialog-help").animate({scrollTop: 0}, "slow"));
+  $("#more-dpi-info").click(() => $(".more-dpi-info").toggle({duration: 400}));
+});
+</script>

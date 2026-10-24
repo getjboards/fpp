@@ -1,0 +1,37 @@
+[Unit]
+Description=PipeWire Multimedia Service (FPP)
+After=sound.target
+Requires=sound.target
+# When the configured ALSA device appears late - e.g. a board with no real card
+# (snd-dummy is loaded by fppinit setupAudio well after PipeWire starts) or a
+# slow-probing USB sound card - PipeWire starts before its device exists and
+# exits immediately. With the default ~100ms RestartSec that becomes a tight
+# crash-loop that pins the single CPU core and starves the rest of boot
+# (observed ~12s of fppinit stall). Back off between restarts (RestartSec) and
+# never permanently give up (StartLimitIntervalSec=0) so it keeps retrying at a
+# low duty cycle until the device shows up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=audio
+Environment=PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp
+Environment=XDG_RUNTIME_DIR=/run/pipewire-fpp
+Environment=PIPEWIRE_STATE_DIR=/var/lib/pipewire-fpp
+Environment=PIPEWIRE_CONFIG_DIR=/etc/pipewire
+RuntimeDirectory=pipewire-fpp
+RuntimeDirectoryMode=0775
+StateDirectory=pipewire-fpp
+StateDirectoryMode=0775
+ExecStart=/usr/bin/pipewire
+Restart=on-failure
+RestartSec=3
+LimitRTPRIO=95
+LimitRTTIME=infinity
+LimitMEMLOCK=16777216
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target

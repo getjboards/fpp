@@ -1,14 +1,20 @@
 [Unit]
 Description=FPP OLED Status Display
 Documentation=https://falconchristmas.com/forum/
-After=fppcapedetect.service
-Before=fppinit.service network.target multi-user.target
-Wants=network-pre.target home-fpp-media.mount
+DefaultDependencies=no
+# Start the OLED/boot-logo display as early as possible so the user gets visual
+# feedback quickly. It only needs its binary (/opt/fpp on root) and the i2c
+# device node (created by the kernel early); it writes its scratch cape image to
+# /var/tmp (on the root fs), so it does NOT need tmp.mount. Depending on
+# tmp.mount/networking used to delay the logo by several seconds.
+Before=fpp_postnetwork.service systemd-networkd.service networking.service networking.target
+After=home-fpp-media.mount
+Wants=home-fpp-media.mount
 
 [Service]
-ExecStart=/opt/fpp/scripts/fppoled start
-ExecStop=/opt/fpp/scripts/fppoled stop
+ExecStartPre=-/opt/fpp/src/fppoled clear
+ExecStart=/opt/fpp/src/fppoled
 Type=simple
 
 [Install]
-WantedBy=default.target
+WantedBy=sysinit.target

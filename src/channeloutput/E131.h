@@ -1,58 +1,56 @@
+#pragma once
 /*
- *   E131 output handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _E131_H
-#define _E131_H
-
-#include <sys/uio.h>
 #include <netinet/in.h>
+#include "fpp-json-fwd.h"
+#include <sys/uio.h>
 #include <vector>
 
 #include "UDPOutput.h"
-#include "e131defs.h"
+#include "../e131defs.h"
 
 class E131OutputData : public UDPOutputData {
 public:
-    E131OutputData(const Json::Value &config);
+    explicit E131OutputData(const Json::Value& config);
     virtual ~E131OutputData();
-    
-    virtual bool IsPingable();
-    virtual void PrepareData(unsigned char *channelData);
-    virtual void CreateMessages(std::vector<struct mmsghdr> &ipMsgs);
-    virtual void DumpConfig();
-    virtual void GetRequiredChannelRange(int &min, int & max);
 
+    virtual bool IsPingable() override;
 
-    int           universe;
-    int           universeCount;
-    int           priority;
-    char          E131sequenceNumber;
+    virtual void PrepareData(unsigned char* channelData, UDPOutputMessages& msgs) override;
+    virtual void PostPrepareData(unsigned char* channelData, UDPOutputMessages& msgs) override;
 
-    sockaddr_in   e131Address;
-    std::vector<struct iovec>  e131Iovecs;
-    std::vector<unsigned char *> e131Headers;
+    virtual void DumpConfig() override;
+    virtual void GetRequiredChannelRange(int& min, int& max) override;
+
+    virtual const std::string& GetOutputTypeString() const override;
+    virtual void FrameSent() override;
+
+    int universe;
+    int universeCount;
+    int priority;
+    int syncUniverse;
+
+    std::vector<sockaddr_in> e131Addresses;
+    std::vector<struct iovec> e131Iovecs;
+    std::vector<unsigned char*> e131Headers;
+
+    unsigned char* e131SyncPacket;
+    // Per universe: the sequence number last sent, and whether the prepared
+    // packet (carrying the next one) is pending -- see FrameSent().
+    std::vector<unsigned char> e131SentSequence;
+    std::vector<bool> e131Pending;
+    unsigned char e131SyncSentSequence = 0;
+    bool e131SyncPending = false;
+    struct iovec e131SyncIovec;
+    sockaddr_in e131SyncAddress;
 };
-
-#endif

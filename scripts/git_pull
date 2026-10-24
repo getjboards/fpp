@@ -5,27 +5,149 @@ BINDIR=$(cd $(dirname $0) && pwd)
 . ${BINDIR}/common
 . ${BINDIR}/functions
 
-teeOutput
+# Ensure git's "dubious ownership" guard doesn't trip when running git as
+# root via sudo against /opt/fpp (owned by fpp:fpp). FPP_Install.sh sets
+# this system-wide already, but be defensive in case an old install is
+# missing it -- otherwise the very first git call below fails before we
+# get a chance to recover.
+# Kept ahead of startUpgradeLog so the branch lookup below cannot trip the same
+# guard; both lines are silenced anyway, so nothing is lost by not logging them.
+# --replace-all, not --add: --add appended another copy on every update
+# (hundreds of lines on a long-lived box), and replace-all also collapses the
+# copies already there into one.
+$SUDO git config --system --replace-all safe.directory /opt/fpp '^/opt/fpp$' 2>/dev/null || true
+$SUDO git config --system --replace-all safe.directory '*' '^\*$' 2>/dev/null || true
 
-if curl --silent --head https://github.com | grep "Content-Type: text/html; charset=utf-8" >/dev/null; then
-	GITBRANCH=$(cd ${FPPDIR} && git branch | grep "^\*" | sed -e "s/\*\s//")
+# Unified upgrade logging -> logs/fpp_system_upgrades.log. Labelling the run with the
+# branch is best-effort: a detached or unreadable checkout logs as "unknown"
+# rather than holding up the update.
+startUpgradeLog "fpp-update" "$(cd ${FPPDIR} 2>/dev/null && $SUDO git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 
-	echo "Upgrading git revision from branch ${GITBRANCH}"
-
-	remountRootReadWrite
-
-	if [ "x${FPPDIR}" = "x/opt/fpp" ]
-	then
-		cd ${FPPDIR} && $SUDO git pull && $SUDO git fetch --tags && $SUDO git submodule sync && $SUDO git submodule update --init
-	else
-		cd ${FPPDIR} && sudo -u ${FPPUSER} git pull && sudo -u ${FPPUSER} git fetch --tags && sudo -u ${FPPUSER} git submodule sync && sudo -u ${FPPUSER} git submodule update --init
-	fi
-
-    sudo ${SCRIPTDIR}/upgrade_config
-	compileBinaries
-
-	remountRootReadOnlyIfNeeded
-else
-	echo "Can not access github, unable to pull git updates"
+SOURCEIP=$(getSetting UpgradeSource)
+if [ "x${SOURCEIP}" == "x" ]; then
+    SOURCEIP=github.com
 fi
 
+HTTPURL="http://${SOURCEIP}/git"
+if [ "${SOURCEIP}" == "github.com" ]; then
+    HTTPURL="https://github.com/"
+fi
+
+if curl --silent --head "${HTTPURL}" | grep -i "Content-Type: text/html; charset" >/dev/null; then
+
+    if [ "${SOURCEIP}" == "github.com" ]; then
+        $SUDO git remote set-url origin "https://github.com/FalconChristmas/fpp.git"
+    else
+        $SUDO git remote set-url origin "http://${SOURCEIP}/git/"
+    fi
+    # rev-parse gives the plain branch name (and "HEAD" for a detached checkout)
+    # -- unlike "git branch | grep '^\*'" it never returns "(HEAD detached...)".
+    GITBRANCH=$(cd ${FPPDIR} && $SUDO git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    # PR branches track origin/pull/<n>/head which is not covered by the
+    # default +refs/heads/*:refs/remotes/origin/* fetch refspec. Refresh
+    # it explicitly (forced) so `git rebase @{u}` sees the force-pushed
+    # head rather than rebasing onto a stale frozen ref.
+    if [[ "${GITBRANCH}" =~ ^pr-([0-9]+)$ ]]; then
+        PR_NUM="${BASH_REMATCH[1]}"
+        # git_branch registers a fetch refspec for the PR so prune keeps the
+        # ref; a box that switched before that existed has none, so add it.
+        PR_REFSPEC="+refs/pull/${PR_NUM}/head:refs/remotes/origin/pull/${PR_NUM}/head"
+        if ! (cd ${FPPDIR} && git config --get-all remote.origin.fetch | grep -qxF "${PR_REFSPEC}"); then
+            if [ "x${FPPDIR}" = "x/opt/fpp" ]; then
+                (cd ${FPPDIR} && git config --add remote.origin.fetch "${PR_REFSPEC}")
+            else
+                (cd ${FPPDIR} && sudo -u ${FPPUSER} git config --add remote.origin.fetch "${PR_REFSPEC}")
+            fi
+        fi
+        if [ "x${FPPDIR}" = "x/opt/fpp" ]; then
+            runGitLocked "cd ${FPPDIR} && git fetch origin +pull/${PR_NUM}/head:refs/remotes/origin/pull/${PR_NUM}/head 2>&1 | head -20" || true
+        else
+            runGitLocked "cd ${FPPDIR} && sudo -u ${FPPUSER} git fetch origin +pull/${PR_NUM}/head:refs/remotes/origin/pull/${PR_NUM}/head 2>&1 | head -20" || true
+        fi
+    fi
+
+    logStage "Fetching updates from branch ${GITBRANCH}"
+
+    if [ "x${FPPDIR}" = "x/opt/fpp" ]
+    then
+        cd ${FPPDIR}
+		# Fetch, then rebase onto this branch's configured upstream (@{u})
+		# rather than a bare "git pull". @{u} follows whatever remote the
+		# branch tracks (origin, newfeatures, a custom mirror) and, unlike a
+		# rebasing pull, never consults FETCH_HEAD -- so it can't hit
+		# "Cannot rebase onto multiple branches." See scripts/functions.
+		runGitLocked "cd ${FPPDIR} && git fetch && git rebase @{u}"
+		if [ $? -ne 0 ]; then
+		  exit 1
+		fi
+		$SUDO git fetch --tags -f
+        if [[ $(git config --list | grep -c 'safe.directory=/opt/fpp') < 1 ]]; then
+            $SUDO git config --global --add safe.directory ${FPPDIR}
+        fi
+        
+        if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
+            if [ "${SOURCEIP}" == "github.com" ]; then
+                cd ${FPPDIR} && $SUDO git submodule sync && $SUDO git submodule update --init --remote
+            else
+                cd ${FPPDIR} && $SUDO git config submodule.external/spixels.url http://${SOURCEIP}/git/modules/external/spixels
+                cd ${FPPDIR} && $SUDO git config submodule.external/RF24.url http://${SOURCEIP}/git/modules/external/RF24
+                cd ${FPPDIR} && $SUDO git config submodule.external/rpi-rgb-led-matrix.url http://${SOURCEIP}/git/modules/external/rpi-rgb-led-matrix
+
+
+                cd ${FPPDIR}/external/rpi-rgb-led-matrix && $SUDO git remote set-url origin "http://${SOURCEIP}/git/modules/external/rpi-rgb-led-matrix" && $SUDO git fetch
+                cd ${FPPDIR}/external/spixels && $SUDO git remote set-url origin "http://${SOURCEIP}/git/modules/external/spixels" && $SUDO git fetch
+                cd ${FPPDIR}/external/RF24 && $SUDO git remote set-url origin "http://${SOURCEIP}/git/modules/external/RF24" && $SUDO git fetch
+                cd ${FPPDIR}/
+            fi
+            cd ${FPPDIR}/ && $SUDO git submodule update --init
+        fi
+    else
+        cd ${FPPDIR}
+		runGitLocked "cd ${FPPDIR} && sudo -u ${FPPUSER} git fetch && sudo -u ${FPPUSER} git rebase @{u}"
+		if [ $? -ne 0 ]; then
+		  exit 1
+		fi
+		sudo -u ${FPPUSER} git fetch --tags -f
+        if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
+            cd ${FPPDIR} && sudo -u ${FPPUSER} git submodule sync && sudo -u ${FPPUSER} git submodule update --init
+        fi
+    fi
+    $SUDO ${SCRIPTDIR}/upgrade_config
+    logStage "Building FPP (longest step, please wait)"
+    compileBinaries
+    PULL_BUILD_RC=$?
+else
+    echo "Can not access ${HTTPURL}, unable to pull git updates.  Check if you have Internet Access from this FPP by going to Help->System Health Check"
+    PULL_UNREACHABLE=1
+
+    if ! fppdBinaryValid; then
+        echo "${FPPBINDIR}/fppd is missing or damaged, need to build it"
+        logStage "Building FPP (longest step, please wait)"
+        compileBinaries
+        PULL_BUILD_RC=$?
+    fi
+fi
+
+# A failed build exits 3, distinct from the pull failures above (exit 1):
+# the tree has already moved to the new code (or, offline, was rebuilt in
+# place), so manualUpdate.php must still restart fppd and refresh the Apache
+# config / CSP before reporting the upgrade as failed, whereas a failed pull
+# left the old tree untouched.
+if [ "${PULL_BUILD_RC:-0}" != "0" ]; then
+    echo "ERROR: build failed (rc=${PULL_BUILD_RC}) -- binaries were NOT rebuilt."
+    exit 3
+fi
+
+# An unreachable update source is a failed update, not a successful no-op:
+# exiting 0 here had manualUpdate.php restart fppd and report "Upgrade
+# Complete" with nothing pulled. Exit 4 when the old tree was rebuilt in place
+# (fppd was missing), so the new binaries still get fppd restarted and the run
+# is reported as a completed rebuild, not an update; otherwise exit 1 like any
+# other failed pull.
+if [ -n "${PULL_UNREACHABLE}" ]; then
+    if [ -n "${PULL_BUILD_RC}" ]; then
+        exit 4
+    fi
+    exit 1
+fi

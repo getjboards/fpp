@@ -1,0 +1,282 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <semaphore>
+#include <set>
+#include <shared_mutex>
+#include <stdio.h>
+#include <thread>
+#include <utility>
+
+#include "fpp-json.h" // Json::Value -- the serialization side of FPPWarning lives here
+
+#include "Warnings.h"
+#include "common.h"
+#include "log.h"
+#include "settings.h"
+
+using namespace std::chrono;
+
+namespace
+{
+    std::list<FPPWarning> warnings;
+    std::shared_mutex warningsLock;
+    std::mutex listenerListLock;
+    std::set<WarningListener*> listenerList;
+    steady_clock::time_point wakeUpTime = steady_clock::time_point::max();
+    std::atomic_bool runNotifyThread{ false };
+    // Intentionally leaked: if this were a plain static, __cxa_finalize would
+    // run ~thread() on ANY exit() call (early startup failures call exit(1)
+    // long before the orderly _exit(0) at the end of main()), and destroying
+    // a still-joinable std::thread calls std::terminate. Leaking the object
+    // means the destructor never runs; StopNotifyThread still joins it on the
+    // orderly shutdown path.
+    std::thread& notifyThread = *new std::thread();
+    std::binary_semaphore sema{ 0 };
+}
+
+static void PruneWarnings();
+
+FPPWarning::FPPWarning(int i, const std::string& m, const std::string& p) :
+    m_id(i),
+    m_message(m),
+    m_plugin(p) {
+    timeout = steady_clock::time_point::max();
+}
+
+Json::Value FPPWarning::toJsonValue() const {
+    Json::Value v;
+    v["id"] = m_id;
+    v["message"] = m_message;
+    if (!m_plugin.empty()) {
+        v["plugin"] = m_plugin;
+    }
+    for (auto& kv : data) {
+        v["data"][kv.first] = kv.second;
+    }
+    return v;
+}
+
+void WarningHolder::AddWarningListener(WarningListener* l) {
+    LogDebug(VB_GENERAL, "About to add listener\n");
+    std::unique_lock<std::mutex> lock(listenerListLock);
+    listenerList.insert(l);
+    LogDebug(VB_GENERAL, "Adding Listener Done\n");
+}
+
+void WarningHolder::RemoveWarningListener(WarningListener* l) {
+    std::unique_lock<std::mutex> lock(listenerListLock);
+    if (listenerList.erase(l)) {
+        LogDebug(VB_GENERAL, "Removing Warning Listener Complete\n");
+    } else {
+        LogWarn(VB_GENERAL, "Requested to remove Listener, but it wasn't found\n");
+    }
+}
+
+void WarningHolder::StartNotifyThread() {
+    runNotifyThread = true;
+    notifyThread = std::thread(WarningHolder::WarningsThreadMain);
+}
+
+void WarningHolder::StopNotifyThread() {
+    runNotifyThread = false;
+    sema.release();
+    // Guard the join: StopNotifyThread() can run when the thread was never
+    // started (a crash signal arrives before StartNotifyThread) or has already
+    // been joined (normal shutdown joins it, then a later crash re-enters the
+    // signal handler). join() on a non-joinable thread throws std::system_error
+    // on both Linux and macOS -> terminate. joinable() makes it safe/idempotent.
+    // Nor from the notify thread itself (a crash inside a warnings listener
+    // reaches here on that thread): joining yourself throws, which would
+    // terminate from inside the crash handler.
+    if (notifyThread.joinable() && notifyThread.get_id() != std::this_thread::get_id()) {
+        notifyThread.join();
+    }
+}
+void WarningHolder::WriteWarningsFile() {
+    Json::Value result = Json::Value(Json::ValueType::arrayValue);
+    Json::Value resultFull = Json::Value(Json::ValueType::arrayValue);
+    {
+        // Only the copy is made under the lock.  The writes below are file
+        // I/O on the SD card, and every AddWarning/RemoveWarning -- some on
+        // the output and media timing paths -- waits for this lock.
+        std::shared_lock<std::shared_mutex> lock(warningsLock);
+        for (auto& warn : warnings) {
+            result.append(warn.message());
+            resultFull.append(warn.toJsonValue());
+        }
+    }
+    SaveJsonToFile(result, getFPPDDir("/www/warnings.json"));
+    SaveJsonToFile(resultFull, getFPPDDir("/www/warnings_full.json"));
+}
+void WarningHolder::WriteCrashedWarningsFile(int id, const std::string& message) {
+    FPPWarning warn(id, message, "");
+    Json::Value result = Json::Value(Json::ValueType::arrayValue);
+    Json::Value resultFull = Json::Value(Json::ValueType::arrayValue);
+    result.append(warn.message());
+    resultFull.append(warn.toJsonValue());
+    SaveJsonToFile(result, getFPPDDir("/www/warnings.json"));
+    SaveJsonToFile(resultFull, getFPPDDir("/www/warnings_full.json"));
+}
+void WarningHolder::ClearWarningsFile() {
+    remove(getFPPDDir("/www/warnings.json").c_str());
+    remove(getFPPDDir("/www/warnings_full.json").c_str());
+}
+
+void WarningHolder::WarningsThreadMain() {
+    SetThreadName("FPP-Warnings");
+    PruneWarnings();
+    WriteWarningsFile();
+    while (runNotifyThread) {
+        // Read under warningsLock, which every writer of wakeUpTime holds.
+        steady_clock::time_point wake;
+        {
+            std::shared_lock<std::shared_mutex> lock(warningsLock);
+            wake = wakeUpTime;
+        }
+        sema.try_acquire_until(wake);
+        if (!runNotifyThread) {
+            break;
+        }
+        PruneWarnings();
+        WriteWarningsFile();
+
+        auto copy = GetWarnings();
+
+        LogDebug(VB_GENERAL, "Warnings may have changed; notifying other threads of %zu Warnings\n", copy.size());
+
+        std::unique_lock lock(listenerListLock);
+        std::for_each(listenerList.begin(), listenerList.end(), [&](WarningListener* l) { l->handleWarnings(copy); });
+    }
+}
+
+void WarningHolder::AddWarning(const std::string& w) {
+    AddWarningTimeout(-1, UNKNOWN_WARNING_ID, w);
+}
+void WarningHolder::AddWarningTimeout(const std::string& w, int seconds) {
+    AddWarningTimeout(seconds, UNKNOWN_WARNING_ID, w);
+}
+void WarningHolder::RemoveWarning(const std::string& w) {
+    RemoveWarning(UNKNOWN_WARNING_ID, w);
+}
+void WarningHolder::AddWarning(int id, const std::string& w, const std::map<std::string, std::string>& data) {
+    AddWarningTimeout(-1, id, w, data);
+}
+void WarningHolder::AddWarning(int id, const std::string& w, const std::string& fixUrl, const std::string& fixText) {
+    std::map<std::string, std::string> data;
+    if (!fixUrl.empty()) {
+        data["fixUrl"] = fixUrl;
+    }
+    if (!fixText.empty()) {
+        data["fixText"] = fixText;
+    }
+    AddWarningTimeout(-1, id, w, data);
+}
+
+void WarningHolder::AddWarningTimeout(int sec, int id, const std::string& w, const std::map<std::string, std::string>& data, const std::string& plugin) {
+    LogDebug(VB_GENERAL, "Adding Warning: %s\n", w.c_str());
+    steady_clock::time_point timeoutTime = steady_clock::time_point::max();
+    if (sec != -1) {
+        timeoutTime = steady_clock::now() + seconds(sec);
+    }
+    std::unique_lock<std::shared_mutex> lock(warningsLock);
+    for (auto it = warnings.begin(); it != warnings.end(); ++it) {
+        if (it->id() == id && it->message() == w) {
+            // Timeout is allowed to move later, but not earlier
+            if (timeoutTime > it->timeout)
+                it->timeout = timeoutTime;
+            return;
+        }
+    }
+
+    auto& ref = warnings.emplace_back(id, w, plugin);
+    ref.data = data;
+
+    ref.timeout = timeoutTime;
+    if (timeoutTime < wakeUpTime) {
+        wakeUpTime = timeoutTime;
+    }
+    lock.unlock();
+
+    // Notify Listeners
+    sema.release();
+}
+void WarningHolder::RemoveWarning(int id, const std::string& w, const std::string& plugin) {
+    LogDebug(VB_GENERAL, "Removing Warning: %s\n", w.c_str());
+    std::unique_lock<std::shared_mutex> lock(warningsLock);
+    for (auto it = warnings.begin(); it != warnings.end(); ++it) {
+        if (it->id() == id && it->message() == w && it->plugin() == plugin) {
+            warnings.erase(it);
+            lock.unlock();
+            // Notify Listeners
+            sema.release();
+            return;
+        }
+    }
+}
+void WarningHolder::UpdateLogLevelWarnings() {
+    RemoveWarning(2, EXCESSIVE_LOG_LEVEL_WARNING);
+    RemoveWarning(3, DEBUG_LOG_LEVEL_WARNING);
+    int lowestLogLevel = FPPLogger::INSTANCE.MinimumLogLevel();
+    if (lowestLogLevel == LOG_EXCESSIVE)
+        AddWarning(2, EXCESSIVE_LOG_LEVEL_WARNING);
+    else if (lowestLogLevel == LOG_DEBUG)
+        AddWarning(3, DEBUG_LOG_LEVEL_WARNING);
+}
+
+// Comes down by its timeout: a loader that still finds the entry raises it again.
+static constexpr int INVALID_CONFIG_ENTRY_WARNING_ID = 73;
+
+void WarningHolder::InvalidConfigEntry(const std::string& file, const std::string& detail) {
+    LogErr(VB_GENERAL, "%s: skipping an entry that could not be read (%s)\n", file.c_str(), detail.c_str());
+    AddWarningTimeout(3600, INVALID_CONFIG_ENTRY_WARNING_ID, file + " has an entry that could not be read and was skipped: " + detail);
+}
+
+void WarningHolder::RemoveAllWarnings() {
+    std::unique_lock<std::shared_mutex> lock(warningsLock);
+    warnings.clear();
+    wakeUpTime = steady_clock::time_point::max();
+    lock.unlock();
+
+    // Notify Listeners
+    sema.release();
+}
+
+std::list<FPPWarning> WarningHolder::GetWarnings() {
+    std::shared_lock<std::shared_mutex> lock(warningsLock);
+    return warnings;
+}
+
+void PruneWarnings() {
+    // warnings are not stored in a heap or sorted, so we must walk over the warnings to find expired
+    std::unique_lock lock(warningsLock);
+    wakeUpTime = steady_clock::time_point::max();
+    if (!warnings.empty()) {
+        auto now = steady_clock::now();
+        for (auto it = warnings.begin(); it != warnings.end(); /* in loop */) {
+            if (it->timeout <= now) {
+                // warning has expired
+                it = warnings.erase(it);
+                continue;
+            } else if (it->timeout < wakeUpTime) {
+                // our next warning
+                wakeUpTime = it->timeout;
+            }
+            ++it;
+        }
+    }
+}

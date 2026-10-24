@@ -1,0 +1,71 @@
+Installing FPP on Armbian
+==========================
+
+This documents installing FPP on top of an existing Armbian system. For
+generic Debian / Ubuntu / NUC installs see SD/README.Debian. For images
+that FPP itself produces and ships, see SD/README.md and the per-platform
+build scripts (no Armbian image build is shipped today).
+
+Supported releases
+------------------
+
+- Armbian based on Debian 13 (Trixie)
+- Armbian based on Ubuntu 24.04
+
+Older Armbian (Bullseye / Bookworm / Ubuntu 22.04 base) is no longer
+supported. Download the most recent stable Armbian build for your board
+from https://www.armbian.com/. Prefer the "minimal" / "cli" image variant
+if available; desktop variants install fine but waste a lot of disk.
+
+Hardware caveats
+----------------
+
+FPP on Armbian gets you a basic player -- E1.31 / DDP / sound output should
+work on most boards. Caveats vary per board:
+
+- Hats / capes for pixels or LED panels are unlikely to work without
+  board-specific GPIO/SPI overlays. The FPP cape autodetect logic targets
+  Pi and BeagleBone hardware.
+- HDMI output may need /boot/armbianEnv.txt tweaks to enable a framebuffer.
+  Search the Armbian forums for your specific board.
+- Hardware-accelerated video decode usually doesn't work; software decode
+  via VLC works for SD content but high-def will likely stutter.
+- For Le Potato, VLC sometimes wants explicit DRI args:
+    --kms-device /dev/dri/card1 --kms-connector HDMI-A-1 --kms-drm-chroma XR24
+
+eMMC installs
+-------------
+
+If the board has eMMC and you want FPP installed there, use `armbian-config`
+to copy the running system to eMMC. Easier to do before installing FPP
+(less data to copy), but you can also install on SD first then mass-copy
+the SD-running install to eMMC across multiple devices.
+
+Thermal note
+------------
+
+The compile pegs all cores at 100% for a long time. Boards without a long time
+Boards without a heatsink/fan can hit thermal-shutdown mid-install. If that
+happens, you have to restart from a fresh image. To avoid it, lock the CPU
+lower before running the installer:
+
+    cpufreq-set -u 800000   # cap at 800 MHz
+
+Install
+-------
+
+```bash
+# Update the base system first.
+sudo apt-get update
+sudo apt-get -y upgrade
+sudo reboot   # if a kernel/glibc upgrade landed
+
+# Run the installer (default mode -- side-install, doesn't take over the
+# whole device). For a dedicated FPP-player config, add --img instead.
+wget -O ./FPP_Install.sh https://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
+chmod 700 ./FPP_Install.sh
+sudo ./FPP_Install.sh
+```
+
+See SD/README.Debian for the full flag list and a description of `--img`
+vs default mode.

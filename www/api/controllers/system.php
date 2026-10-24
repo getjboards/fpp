@@ -1,0 +1,2015 @@
+<?
+
+require_once "../common/settings.php";
+require_once '../commandsocket.php';
+
+/**
+ * Reboot the operating system
+ *
+ * Reboots the operating system.
+ *
+ * @route POST /api/system/reboot
+ * @route GET /api/system/reboot deprecated
+ * @response 200 Reboot initiated
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function RebootDevice()
+{
+    global $settings;
+    global $SUDO;
+
+    if (file_exists("/etc/fpp/container")) {
+        // apache is container's long-running process, send it a SIGTERM
+        $status = exec($SUDO . " killall -15 apache2");
+    } else {
+        $status = exec($SUDO . " bash -c '{ sleep 1; shutdown -r now; }  > /dev/null 2>&1 &'");
+    }
+
+    $output = array("status" => "OK");
+    return json($output);
+}
+
+/**
+ * Shutdown the operating system
+ *
+ * Executes a clean shutdown of the operating system.
+ *
+ * @route POST /api/system/shutdown
+ * @route GET /api/system/shutdown deprecated
+ * @response 200 Shutdown initiated
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function SystemShutdownOS()
+{
+    global $SUDO;
+
+    if (file_exists("/etc/fpp/container")) {
+        // apache is container's long-running process, send it a SIGTERM
+        $status = exec($SUDO . " killall -15 apache2");
+    } else {
+        $status = exec($SUDO . " bash -c '{ sleep 1; shutdown -h now; }  > /dev/null 2>&1 &'");
+    }
+
+    $output = array("status" => "OK");
+    return json($output);
+}
+
+/**
+ * Start fppd
+ *
+ * Starts the `fppd` process idempotently (if it isn't already running).
+ *
+ * @route POST /api/system/fppd/start
+ * @route GET /api/system/fppd/start deprecated
+ * @response 200 fppd started
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function StartFPPD()
+{
+    global $settingsFile, $SUDO, $fppDir, $settings;
+    $rc = "Already Running";
+    $status = exec("if ps cax | grep -q fppd; then echo \"true\"; else echo \"false\"; fi");
+    if ($status == 'false') {
+        if ($settings["Platform"] == "MacOS") {
+            exec("launchctl start falconchristmas.fppd");
+        } else {
+            exec($SUDO . " " . $fppDir . "/scripts/fppd_start");
+        }
+        $rc = "OK";
+    }
+    $output = array("status" => $rc);
+    return json($output);
+}
+
+/**
+ * Sends stop commands to `fppd` and kills the process if it does not exit cleanly.
+ * Used internally by `StopFPPD()` and `RestartFPPD()`; returns no output.
+ */
+function StopFPPDNoStatus()
+{
+    global $SUDO, $settings;
+
+    // Stop Playing
+    SendCommand('d');
+
+    // Shutdown
+    SendCommand('q'); // Ignore return and just kill if 'q' doesn't work...
+    // wait half a second for shutdown and outputs to close
+
+    if (file_exists("/etc/fpp/container")) {
+        usleep(500000);
+        // kill it if it's still running
+        exec($SUDO . " " . dirname(dirname(__FILE__)) . "/scripts/fppd_stop");
+    } else if ($settings["Platform"] == "MacOS") {
+        exec("launchctl stop falconchristmas.fppd");
+    } else {
+        // systemctl uses fppd_stop to stop fppd, but we need systemctl to know
+        exec($SUDO . " systemctl stop fppd");
+    }
+}
+
+/**
+ * Stop fppd
+ *
+ * Stops the `fppd` process if it is running.
+ *
+ * @route POST /api/system/fppd/stop
+ * @route GET /api/system/fppd/stop deprecated
+ * @response 200 fppd stopped
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function StopFPPD()
+{
+    StopFPPDNoStatus();
+    $output = array("status" => "OK");
+    return json($output);
+}
+
+/**
+ * Restart fppd process
+ *
+ * Restarts the `fppd` process. Pass `?quick=1` to reload some configuration without
+ * a full restart.
+ *
+ * @route POST /api/system/fppd/restart
+ * @route GET /api/system/fppd/restart deprecated
+ * @response 200 fppd restarted
+ * ```json
+ * {"status": "OK"}
+ * ```
+ */
+function RestartFPPD()
+{
+    global $_GET;
+    if ((isset($_GET['quick'])) && ($_GET['quick'] == 1)) {
+        $status = exec("if ps cax | grep -q fppd; then echo \"true\"; else echo \"false\"; fi");
+        if ($status == 'true') {
+            SendCommand('restart');
+
+            $output = array("status" => "OK");
+            return json($output);
+        }
+    }
+    StopFPPDNoStatus();
+    return StartFPPD();
+}
+
+/**
+ * Get release notes
+ *
+ * Returns release notes for the specified FPP version tag from the GitHub releases API.
+ *
+ * @route GET /api/system/releaseNotes/{version}
+ * @response 200 Release notes
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "draft": false,
+ *   "prerelease": false,
+ *   "body": "...",
+ *   "published_at": "2026-01-08T03:09:40Z"
+ * }
+ * ```
+ */
+function ViewReleaseNotes()
+{
+    $version = params('version');
+
+    ini_set('user_agent', 'Mozilla/4.0 (compatible; MSIE 6.0)');
+    $json = file_get_contents("https://api.github.com/repos/FalconChristmas/fpp/releases/tags/" . $version);
+
+    $data = json_decode($json, true);
+    if (isset($data['body'])) {
+        $keys = array("draft", "prerelease", "body", "published_at");
+        $rc = array("status" => "OK");
+        foreach ($keys as $key) {
+            $rc[$key] = $data[$key];
+        }
+        return json($rc);
+    } else {
+        return json(array("status" => "Release not found"));
+    }
+}
+
+/**
+ * Get fpp upgrade status
+ *
+ * Returns the current FPP update/upgrade status, including whether a newer version is available,
+ * the current commit, and any major version or end-of-life warnings.
+ *
+ * @route GET /api/system/updateStatus
+ * @response 200 FPP upgrade status
+ * ```json
+ * {
+ *   "status": "OK",
+ *   "branchUpgradeAvailable": false,
+ *   "branchUpgradeTarget": "",
+ *   "branchUpgradeVersion": "",
+ *   "isMajorVersionUpgrade": false,
+ *   "commitUpdateAvailable": false,
+ *   "remoteCommit": "ece480e86b7dd8f2d013248e8f99bb0e8baac197",
+ *   "currentBranch": "master",
+ *   "localCommit": "ece480e86",
+ *   "versionUnknown": false,
+ *   "isEndOfLife": false,
+ *   "latestMajorVersion": 9,
+ *   "checked": true
+ * }
+ * ```
+ */
+function GetUpdateStatus()
+{
+    // Test mode: simulate different upgrade scenarios
+    // Usage: api/system/updateStatus?test=branch (or commit, both, uptodate, major/eol, osonly)
+    // This allows testing the upgrade UI without being on an actual old version
+    if (isset($_GET['test'])) {
+        $test = $_GET['test'];
+        $localCommit = get_local_git_version();
+        $currentMajor = getFPPMajorVersion();
+
+        if ($test === 'branch') {
+            // Simulate: on v9.4, v9.5 available (minor version upgrade)
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => true,
+                "branchUpgradeTarget" => "v9.5",
+                "branchUpgradeVersion" => "9.5",
+                "isMajorVersionUpgrade" => false,
+                "commitUpdateAvailable" => false,
+                "remoteCommit" => "",
+                "currentBranch" => "v9.4",
+                "localCommit" => $localCommit,
+                "isEndOfLife" => false,
+                "latestMajorVersion" => $currentMajor
+            ));
+        } else if ($test === 'major' || $test === 'eol') {
+            // Simulate: major version upgrade available (e.g., v9.x → v10.0)
+            // This also triggers EOL since current major < latest major
+            $nextMajor = intval($currentMajor) + 1;
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => true,
+                "branchUpgradeTarget" => "v" . $nextMajor . ".0",
+                "branchUpgradeVersion" => $nextMajor . ".0",
+                "isMajorVersionUpgrade" => true,
+                "commitUpdateAvailable" => false,
+                "remoteCommit" => "",
+                "currentBranch" => "v" . $currentMajor . ".5",
+                "localCommit" => $localCommit,
+                "isEndOfLife" => true,
+                "latestMajorVersion" => $nextMajor
+            ));
+        } else if ($test === 'commit') {
+            // Simulate: on current branch, commits behind
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => false,
+                "branchUpgradeTarget" => "",
+                "branchUpgradeVersion" => "",
+                "isMajorVersionUpgrade" => false,
+                "commitUpdateAvailable" => true,
+                "remoteCommit" => "def456789",
+                "currentBranch" => getFPPBranch(),
+                "localCommit" => $localCommit,
+                "isEndOfLife" => false,
+                "latestMajorVersion" => $currentMajor
+            ));
+        } else if ($test === 'both') {
+            // Simulate: FPP branch upgrade AND OS upgrade both available
+            // (exercises the "Recommended: Upgrade OS First" recommendation banner)
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => true,
+                "branchUpgradeTarget" => "v9.5",
+                "branchUpgradeVersion" => "9.5",
+                "isMajorVersionUpgrade" => false,
+                "commitUpdateAvailable" => true,
+                "remoteCommit" => "def456789",
+                "currentBranch" => "v9.4",
+                "localCommit" => $localCommit,
+                "forceOsUpgradeAvailable" => true,
+                "isEndOfLife" => false,
+                "latestMajorVersion" => $currentMajor
+            ));
+        } else if ($test === 'uptodate') {
+            // Simulate: everything up to date
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => false,
+                "branchUpgradeTarget" => "",
+                "branchUpgradeVersion" => "",
+                "isMajorVersionUpgrade" => false,
+                "commitUpdateAvailable" => false,
+                "remoteCommit" => $localCommit,
+                "currentBranch" => getFPPBranch(),
+                "localCommit" => $localCommit,
+                "isEndOfLife" => false,
+                "latestMajorVersion" => $currentMajor
+            ));
+        } else if ($test === 'osonly') {
+            // Simulate: FPP up to date, but OS upgrade available
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => false,
+                "branchUpgradeTarget" => "",
+                "branchUpgradeVersion" => "",
+                "isMajorVersionUpgrade" => false,
+                "commitUpdateAvailable" => false,
+                "remoteCommit" => $localCommit,
+                "currentBranch" => getFPPBranch(),
+                "localCommit" => $localCommit,
+                "forceOsUpgradeAvailable" => true,
+                "isEndOfLife" => false,
+                "latestMajorVersion" => $currentMajor
+            ));
+        } else if ($test === 'notbuilt') {
+            // Simulate: no local version (cleaned/never-built tree).  Nothing can
+            // be compared, so the UI should offer a rebuild, not an upgrade.
+            return json(array(
+                "status" => "OK",
+                "branchUpgradeAvailable" => false,
+                "branchUpgradeTarget" => "",
+                "branchUpgradeVersion" => "",
+                "isMajorVersionUpgrade" => false,
+                "commitUpdateAvailable" => false,
+                "remoteCommit" => "",
+                "currentBranch" => "Unknown",
+                "localCommit" => $localCommit,
+                "versionUnknown" => true,
+                "isEndOfLife" => false,
+                "latestMajorVersion" => $currentMajor
+            ));
+        }
+    }
+
+    // Get the latest release from GitHub (cached). releases/latest only returns
+    // full, published releases, and the response already includes the asset
+    // list, so we record both the version and whether a downloadable OS image
+    // (.fppos) exists for this device without making a second request.
+    $latestRelease = file_cache('github_latest_release', function () {
+        global $settings;
+
+        $ch = curl_init('https://api.github.com/repos/FalconChristmas/fpp/releases/latest');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'FPP');
+        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+        $response = curl_exec($ch);
+        curl_close($ch);
+
+        $result = ['version' => '', 'hasDeviceAsset' => false];
+        if ($response) {
+            $releaseData = json_decode($response, true);
+            if (isset($releaseData['tag_name'])) {
+                $result['version'] = $releaseData['tag_name'];
+            }
+            if (isset($releaseData['assets']) && is_array($releaseData['assets'])) {
+                foreach ($releaseData['assets'] as $asset) {
+                    if (MatchesDeviceOSImage($asset['name'] ?? '', $settings)) {
+                        $result['hasDeviceAsset'] = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // If we couldn't determine a release version (network failure or bad
+        // response), return null so file_cache() keeps the last good result
+        // instead of caching an empty release for the cache window.  A real
+        // release with no device asset yet still has a version, so it is
+        // cached normally.
+        if ($result['version'] === '') {
+            return null;
+        }
+        return json_encode($result);
+    }, 300, 60);
+
+    $latestReleaseData = json_decode($latestRelease, true) ?: [];
+    $latestReleaseVersion = $latestReleaseData['version'] ?? '';
+    $latestReleaseHasDeviceAsset = !empty($latestReleaseData['hasDeviceAsset']);
+
+    // Get unified update status
+    $updateStatus = check_fppstats_updates($latestReleaseVersion, $latestReleaseHasDeviceAsset);
+
+    // Get current major version
+    $currentMajor = getFPPMajorVersion();
+
+    // Determine latest major version from the release tag
+    $latestMajorVersion = $currentMajor; // Default to current if we can't determine
+    if ($latestReleaseVersion && preg_match('/^v?(\d+)/', $latestReleaseVersion, $matches)) {
+        $latestMajorVersion = intval($matches[1]);
+    }
+
+    // Check if this is a major version upgrade (e.g., v9.x → v10.x)
+    $isMajorVersionUpgrade = false;
+    if ($updateStatus['branchUpgradeAvailable']) {
+        if (preg_match('/^v?(\d+)/', $updateStatus['branchUpgradeTarget'], $matches)) {
+            $targetMajor = intval($matches[1]);
+            $isMajorVersionUpgrade = ($targetMajor > intval($currentMajor));
+        }
+    }
+
+    // Check if current version is End of Life
+    // EOL = current major version is older than the latest major version.
+    // With no local version there is nothing to compare, so never claim EOL.
+    $isEndOfLife = !$updateStatus['versionUnknown'] && (intval($currentMajor) < $latestMajorVersion);
+
+    return json(array(
+        "status" => "OK",
+        "branchUpgradeAvailable" => $updateStatus['branchUpgradeAvailable'],
+        "branchUpgradeTarget" => $updateStatus['branchUpgradeTarget'],
+        "branchUpgradeVersion" => $updateStatus['branchUpgradeVersion'],
+        "isMajorVersionUpgrade" => $isMajorVersionUpgrade,
+        "commitUpdateAvailable" => $updateStatus['commitUpdateAvailable'],
+        "remoteCommit" => $updateStatus['remoteCommit'],
+        "currentBranch" => $updateStatus['currentBranch'],
+        "localCommit" => $updateStatus['localCommit'],
+        "versionUnknown" => $updateStatus['versionUnknown'],
+        "isEndOfLife" => $isEndOfLife,
+        "latestMajorVersion" => $latestMajorVersion,
+        // false when no update source answered: the "no update" fields are
+        // unknown rather than a verdict, and the client should retry.
+        "checked" => $updateStatus['checked']
+    ));
+}
+
+/**
+ * Operations that constitute an FPP software/OS update run in
+ * logs/fpp_system_upgrades.log. Nested operations (e.g. fpp-config-upgrade
+ * running inside an fpp-update) are deliberately excluded: only these outer
+ * operations drive the persistent update-progress UI.
+ */
+function UpdateActivityOuterOps()
+{
+    return array('fpp-update', 'fpp-upgrade', 'os-upgrade', 'fpp-branch-switch', 'fpp-version-checkout');
+}
+
+/**
+ * Human label for an update operation, for banner/modal titles.
+ */
+function UpdateActivityKindLabel($op)
+{
+    static $labels = array(
+        'fpp-update' => 'FPP Update',
+        'fpp-upgrade' => 'FPP Upgrade',
+        'os-upgrade' => 'FPP OS Upgrade',
+        'fpp-branch-switch' => 'FPP Branch Switch',
+        'fpp-version-checkout' => 'FPP Version Change',
+        'fpp-rebuild' => 'FPP Rebuild'
+    );
+    return isset($labels[$op]) ? $labels[$op] : 'FPP Update';
+}
+
+/**
+ * Resolve the shared upgrade log file. Mirrors OpLogDir() in
+ * www/common/oplog.inc.php ($logDirectory from config.php, same fallback).
+ */
+function UpdateActivityLogFile()
+{
+    global $logDirectory, $settings;
+    if (isset($logDirectory) && $logDirectory != '') {
+        return rtrim($logDirectory, '/') . '/fpp_system_upgrades.log';
+    }
+    if (isset($settings['logDirectory']) && $settings['logDirectory'] != '') {
+        return rtrim($settings['logDirectory'], '/') . '/fpp_system_upgrades.log';
+    }
+    if (isset($settings['mediaDirectory']) && $settings['mediaDirectory'] != '') {
+        return rtrim($settings['mediaDirectory'], '/') . '/logs/fpp_system_upgrades.log';
+    }
+    return '/home/fpp/media/logs/fpp_system_upgrades.log';
+}
+
+/**
+ * True when an update worker process is currently alive. Patterns cover the
+ * commit update (git_pull, manualUpdate.php), branch upgrade (upgrade_FPP,
+ * upgradefpp.php, git_branch, git_checkout_version), OS upgrade
+ * (upgradeOS.php, upgradeOS-part1.sh) and the rebuild they all share
+ * (fpp_build). `ps ax` works on both Linux and macOS.
+ */
+function UpdateActivityProcessAlive()
+{
+    $out = array();
+    @exec("ps ax 2>/dev/null | grep -E 'git_pull|upgrade_FPP|upgradeOS-part1|git_branch|git_checkout_version|fpp_build|manualUpdate\\.php|upgradefpp\\.php|upgradeOS\\.php' 2>/dev/null | grep -v grep 2>/dev/null", $out);
+    return count($out) > 0;
+}
+
+/**
+ * Resolve the shared update lock file without depending on
+ * www/common/updateLock.inc.php (which the API context does not load).
+ * Mirrors UpdateLockFile() there: <media>/tmp/fpp-update.lock.
+ */
+function UpdateActivityLockFile()
+{
+    global $settings, $mediaDirectory;
+    $base = '';
+    if (isset($settings['mediaDirectory']) && $settings['mediaDirectory'] != '') {
+        $base = $settings['mediaDirectory'];
+    } elseif (isset($mediaDirectory) && $mediaDirectory != '') {
+        $base = $mediaDirectory;
+    } else {
+        $base = '/home/fpp/media';
+    }
+    return rtrim($base, '/') . '/tmp/fpp-update.lock';
+}
+
+/**
+ * True when another request currently holds the update lock (an update or
+ * rebuild is running). Probed with a non-blocking SHARED lock: it succeeds
+ * immediately when no exclusive holder exists and fails when one does, and
+ * is released at once so this probe never blocks an update.
+ *
+ * This covers phases that append nothing to the log and are invisible to
+ * `ps`: the long OS image download (wget under php-fpm) and rebuildfpp.php
+ * (fpp_build writes no START marker). Fail-safe: any error reports
+ * not-held. Never creates the file (mode 'r').
+ */
+function UpdateActivityLockHeld()
+{
+    return UpdateActivityLockHolder() !== false;
+}
+
+/**
+ * The current update-lock holder: false when the lock is free, otherwise
+ * the record UpdateLockAcquireOrConflict() wrote into the lock file
+ * (op, target, pid, acquiredAt) -- an empty array when the holder has not
+ * written it yet or it is unreadable. The content is only trusted while the
+ * lock is held, so a leftover record from a finished request is never used.
+ */
+function UpdateActivityLockHolder()
+{
+    if (!function_exists('flock')) {
+        return false;
+    }
+    $file = UpdateActivityLockFile();
+    if (!is_file($file)) {
+        return false;
+    }
+    $fh = @fopen($file, 'r');
+    if (!$fh) {
+        return false;
+    }
+    if (@flock($fh, LOCK_SH | LOCK_NB)) {
+        @flock($fh, LOCK_UN);
+        @fclose($fh);
+        return false;
+    }
+    $raw = @stream_get_contents($fh, 4096);
+    @fclose($fh);
+    $holder = ($raw !== false && $raw !== '') ? json_decode($raw, true) : null;
+    return is_array($holder) ? $holder : array();
+}
+
+/**
+ * Number of log-tail lines requested by ?lines=N (default 200, clamped 1-500).
+ */
+function UpdateActivityRequestedLines()
+{
+    $n = 200;
+    if (isset($_GET['lines'])) {
+        $n = intval($_GET['lines']);
+        if ($n < 1) {
+            $n = 1;
+        }
+        if ($n > 500) {
+            $n = 500;
+        }
+    }
+    return $n;
+}
+
+/**
+ * Generic active payload for work the log cannot attribute to a run: a
+ * worker with no START marker in view, or a lock holder other than the
+ * log's last run (rebuildfpp.php, an OS image downloadOnly, a new request
+ * that has not logged its START yet). Labelled from the lock holder's op
+ * when known.
+ */
+function UpdateActivityWorkersActive($empty, $holder, $mtime, $logSize, $withLogTail)
+{
+    $op = (is_array($holder) && isset($holder['op']) && is_string($holder['op'])) ? $holder['op'] : '';
+    $active = $empty;
+    $active['inProgress'] = true;
+    $active['op'] = $op;
+    $active['kind'] = UpdateActivityKindLabel($op !== '' ? $op : 'fpp-update');
+    $active['runId'] = 'workers-active';
+    $active['logUpdatedAt'] = $mtime;
+    $active['logSize'] = $logSize;
+    if ($withLogTail) {
+        $file = UpdateActivityLogFile();
+        $active['logTail'] = (is_file($file) && is_readable($file))
+            ? UpdateActivityLastLines($file, UpdateActivityRequestedLines())
+            : '';
+    }
+    return $active;
+}
+
+/**
+ * True when any liveness signal says an update is running: a worker process
+ * is alive OR the update lock is held. The lock probe is cheap (no fork);
+ * the ps probe forks, so callers on the hot path should check the lock
+ * first and consult this only when needed.
+ */
+function UpdateActivityAnyAlive()
+{
+    if (UpdateActivityLockHeld()) {
+        return true;
+    }
+    return UpdateActivityProcessAlive();
+}
+
+/**
+ * Read the last lines of the upgrade log without loading multi-MB builds
+ * fully into memory (submodule chatter can run to several MB).
+ */
+function UpdateActivityReadTail($maxLines = 10000, $maxBytes = 524288)
+{
+    $file = UpdateActivityLogFile();
+    if (!is_file($file) || !is_readable($file)) {
+        return array('lines' => array(), 'mtime' => 0);
+    }
+    $mtime = @filemtime($file);
+    $size = @filesize($file);
+    if ($size === false || $size <= 0) {
+        return array('lines' => array(), 'mtime' => $mtime ? $mtime : 0);
+    }
+    // A noisy rebuild (submodule chatter) can put megabytes between the run's
+    // START marker and the current tail. The default 512KB window holds
+    // several thousand lines and keeps the every-few-seconds status poll
+    // cheap (hot page-cache reads of a few milliseconds); when no START is
+    // found below, GetUpdateActivityInternal() retries with a larger window
+    // (see UPDATE_ACTIVITY_EXTENDED_BYTES) rather than giving up.
+    $chunk = '';
+    $fh = @fopen($file, 'r');
+    if ($fh) {
+        $readSize = $size > $maxBytes ? $maxBytes : $size;
+        @fseek($fh, $size - $readSize);
+        $chunk = @stream_get_contents($fh);
+        @fclose($fh);
+    }
+    if ($chunk === '' || $chunk === false) {
+        return array('lines' => array(), 'mtime' => $mtime ? $mtime : 0);
+    }
+    $lines = preg_split("/\r?\n/", $chunk);
+    if (count($lines) > $maxLines) {
+        $lines = array_slice($lines, -$maxLines);
+    }
+    return array('lines' => $lines, 'mtime' => $mtime ? $mtime : 0);
+}
+
+/**
+ * Last N lines of a file as a string, without loading multi-MB logs fully
+ * into memory (a 300-line build tail is tens of KB; submodule chatter can
+ * make the whole file several MB, and the progress modal polls this every
+ * few seconds while open).
+ */
+function UpdateActivityLastLines($file, $n)
+{
+    if ($n < 1) {
+        $n = 1;
+    }
+    if ($n > 500) {
+        $n = 500;
+    }
+    $size = @filesize($file);
+    if ($size === false || $size <= 0) {
+        return '';
+    }
+    $fh = @fopen($file, 'r');
+    if (!$fh) {
+        return '';
+    }
+    // Read trailing bytes incrementally until N line breaks are covered.
+    $readSize = 65536;
+    $chunk = '';
+    while (true) {
+        if ($readSize > $size) {
+            $readSize = $size;
+        }
+        @fseek($fh, $size - $readSize);
+        $chunk = @stream_get_contents($fh);
+        if ($chunk === false) {
+            $chunk = '';
+            break;
+        }
+        if (substr_count($chunk, "\n") >= $n + 1 || $readSize >= $size || $readSize >= 1048576) {
+            break;
+        }
+        $readSize *= 2;
+    }
+    @fclose($fh);
+    if ($chunk === '') {
+        return '';
+    }
+    $lines = preg_split("/\r?\n/", $chunk);
+    // The seek can land mid-line: drop the first (partial) line, unless the
+    // whole file was read.
+    if ($readSize < $size && count($lines) > 0) {
+        array_shift($lines);
+    }
+    // A trailing newline leaves a final empty element; drop those so the
+    // tail ends with the last real line plus one newline.
+    while (count($lines) > 0 && end($lines) === '') {
+        array_pop($lines);
+    }
+    $lines = array_slice($lines, -$n);
+    if (empty($lines)) {
+        return '';
+    }
+    return implode("\n", $lines) . "\n";
+}
+
+/**
+ * Cache file for the idle update-activity payload, in <media>/tmp next to
+ * the update lock (not in logs/, where it would show up in the log list and
+ * in support zips).
+ * api/system/status runs every few seconds (plus MultiSync/remote pollers),
+ * and a full tail scan costs ~66ms on single-core boards even when idle.
+ * The cache is keyed strictly on log size+mtime: a hit serves the stored
+ * payload without the 512KB read or the ps fork. Only idle/stale payloads
+ * are cached (never an in-progress one, which must stay live), and only for
+ * the no-logTail path. Atomic write via temp+rename; corrupt cache = miss.
+ */
+function UpdateActivityCacheFile()
+{
+    return dirname(UpdateActivityLockFile()) . '/fpp-update-activity.cache';
+}
+
+function UpdateActivityReadCache($size, $mtime)
+{
+    $cache = UpdateActivityCacheFile();
+    if (!is_file($cache) || !is_readable($cache)) {
+        return null;
+    }
+    $raw = @file_get_contents($cache);
+    if ($raw === false || $raw === '') {
+        return null;
+    }
+    $data = json_decode($raw, true);
+    if (!is_array($data) || !isset($data['size'], $data['mtime'], $data['activity'])) {
+        return null;
+    }
+    if (intval($data['size']) !== intval($size) || intval($data['mtime']) !== intval($mtime)) {
+        return null;
+    }
+    if (!is_array($data['activity'])) {
+        return null;
+    }
+    // Only idle/stale payloads are cached; an in-progress entry must be
+    // re-derived so completion is never served stale.
+    if (!empty($data['activity']['inProgress'])) {
+        return null;
+    }
+    return $data['activity'];
+}
+
+function UpdateActivityWriteCache($size, $mtime, $activity)
+{
+    if (!empty($activity['inProgress'])) {
+        return;
+    }
+    $cache = UpdateActivityCacheFile();
+    $tmp = $cache . '.' . getmypid() . '.tmp';
+    $raw = json_encode(array('size' => intval($size), 'mtime' => intval($mtime), 'activity' => $activity));
+    if ($raw === false) {
+        return;
+    }
+    if (@file_put_contents($tmp, $raw, LOCK_EX) === false) {
+        return;
+    }
+    @rename($tmp, $cache);
+}
+
+/**
+ * Derive update-in-progress state from the durable log plus process liveness.
+ *
+ * Source of truth is logs/fpp_system_upgrades.log: the last outer START
+ * marker (emitted by startUpgradeLog() / upgradeOS-part1.sh, format
+ * "[<op> <target>] ===== <op> START: ... =====") opens a run, and the run
+ * closes on its matching "===== <op> FINISH: ... (rc=N) =====" trailer or a
+ * terminal stage ("Upgrade Complete", "Upgrade Failed", "Rebooting") logged
+ * after it. A run that is open in the log is reported in progress when a
+ * worker process is alive or the log was written recently (covers the brief
+ * restart window where ps misses); an open run with neither is reported as
+ * stale so the UI can still offer the log without claiming activity.
+ *
+ * @param bool $withLogTail Include the last N lines of the run's log.
+ * @return array Activity payload (also embedded in api/system/status).
+ */
+function GetUpdateActivityInternal($withLogTail = false)
+{
+    // Whether the built fppd is present and runnable (fppdBinaryValid(), #3120).
+    // Same condition menu.inc's "FPPD is missing or damaged. Rebuild required"
+    // banner renders from, so the UI can retire that banner without a refresh
+    // once a rebuild recreates the binary — or (re)show it when the build
+    // failed. A few stats and 4-byte reads.
+    $fppdBinaryExists = fppdBinaryValid();
+
+    // Version vector for stale-echo ordering (see js/fpp-update.js): every
+    // payload carries the log's mtime+size, and the client drops anything
+    // older than the last applied payload. Equal vectors always apply so
+    // state transitions without log writes (active->stale) still land.
+    $logFileForStat = UpdateActivityLogFile();
+    $logStatSize = @filesize($logFileForStat);
+    if ($logStatSize === false) {
+        $logStatSize = 0;
+    }
+    // 0 for a missing log, so that state is cached like any other: a player
+    // never updated from the UI has no log at all, and every status poll
+    // forked ps for it.  Every update starter writes the log or takes the
+    // lock before anything else, so neither a new run nor markerless work
+    // is hidden behind a cached idle payload.
+    $logStatMtime = @filemtime($logFileForStat);
+    if ($logStatMtime === false) {
+        $logStatMtime = 0;
+    }
+
+    $empty = array(
+        'inProgress' => false,
+        'op' => '',
+        'target' => '',
+        'kind' => '',
+        'runId' => '',
+        'stage' => '',
+        'logUpdatedAt' => 0,
+        'logSize' => 0,
+        'stale' => false,
+        'failed' => false,
+        'fppdBinaryExists' => $fppdBinaryExists
+    );
+
+    // Cheap idle fast-path (no 512KB read, no ps fork): when the log is
+    // unchanged since the last idle computation AND no update holds the
+    // lock, serve the cached payload. The lock probe is a single
+    // open+flock; a held lock bypasses the cache so a starting update (or
+    // a markerless rebuild) is never served stale. Skipped for the modal's
+    // logTail path, which needs a fresh tail.
+    if (!$withLogTail && !UpdateActivityLockHeld()) {
+        $cached = UpdateActivityReadCache($logStatSize, $logStatMtime);
+        if ($cached !== null) {
+            $cached['fppdBinaryExists'] = $fppdBinaryExists;
+            return $cached;
+        }
+    }
+
+    $tail = UpdateActivityReadTail();
+    $lines = $tail['lines'];
+    if (empty($lines)) {
+        // No markers (missing/empty/rotated log): do NOT return before the
+        // worker-liveness fallback below. A browser opened in this window
+        // must still see a running update.
+        $holder = UpdateActivityLockHolder();
+        if ($holder !== false || UpdateActivityProcessAlive()) {
+            return UpdateActivityWorkersActive($empty, $holder, $tail['mtime'], $logStatSize, $withLogTail);
+        }
+        if (!$withLogTail) {
+            UpdateActivityWriteCache($logStatSize, $logStatMtime, $empty);
+        }
+        return $empty;
+    }
+
+    $outerOps = UpdateActivityOuterOps();
+    $opsAlt = implode('|', $outerOps);
+    $startRe = '/\[(' . $opsAlt . ')\s+([^\]]*)\]\s*=====\s*\1\s+START:/';
+
+    // Last outer START opens the run under inspection.
+    $startIdx = -1;
+    $startOp = '';
+    $startTarget = '';
+    $startLine = '';
+    foreach ($lines as $i => $line) {
+        if (preg_match($startRe, $line, $m)) {
+            $startIdx = $i;
+            $startOp = $m[1];
+            $startTarget = trim($m[2]);
+            $startLine = $line;
+        }
+    }
+    if ($startIdx < 0) {
+        // The default 512KB window can miss the START when a noisy rebuild
+        // (submodule chatter, several MB) sits between it and the tail. Before
+        // falling back, retry once with a larger bounded window (4MB / 30000
+        // lines, still a hot page-cache read) when a run is plausible (a worker
+        // is alive or the log was written recently). This keeps runIds stable
+        // and preserves completion reporting for multi-MB logs.
+        $aliveProbe = UpdateActivityAnyAlive();
+        $recentProbe = ($tail['mtime'] > 0) && ((time() - $tail['mtime']) < 900);
+        if ($aliveProbe || $recentProbe) {
+            $ext = UpdateActivityReadTail(30000, 4194304);
+            if (!empty($ext['lines'])) {
+                foreach ($ext['lines'] as $i => $line) {
+                    if (preg_match($startRe, $line, $m)) {
+                        $startIdx = $i;
+                        $startOp = $m[1];
+                        $startTarget = trim($m[2]);
+                        $startLine = $line;
+                    }
+                }
+                if ($startIdx >= 0) {
+                    $lines = $ext['lines'];
+                    $tail = $ext;
+                }
+            }
+        }
+    }
+    if ($startIdx < 0) {
+        // No run markers (fresh/rotated log, or a worker between spawn and
+        // its first log line): a live worker alone still means an update is
+        // running. The fixed runId keeps a dismiss stable across polls in
+        // this rare state.
+        $holder = UpdateActivityLockHolder();
+        if ($holder !== false || UpdateActivityProcessAlive()) {
+            return UpdateActivityWorkersActive($empty, $holder, $tail['mtime'], $logStatSize, $withLogTail);
+        }
+        if (!$withLogTail) {
+            UpdateActivityWriteCache($logStatSize, $logStatMtime, $empty);
+        }
+        return $empty;
+    }
+
+    $after = array_slice($lines, $startIdx + 1);
+    $finished = false;
+    $finishFailed = false;
+    $finishRc = null;
+    // Stable runId across continuations: the OS upgrade opens its run in PHP
+    // and upgradeOS-part1.sh emits a second outer START for the same image
+    // afterwards. Without this the runId flips mid-upgrade (the START lines
+    // differ in their timestamp prefix) and a dismiss during the download
+    // stops matching. Walk back over the unbroken chain of same-op +
+    // same-target STARTs (no FINISH/terminal between) and identify the run
+    // by the earliest one. Sequential runs stay distinct: a FINISH or
+    // terminal between two STARTs breaks the chain.
+    $runIdLine = $startLine;
+    for ($j = $startIdx - 1; $j >= 0; $j--) {
+        if (preg_match($startRe, $lines[$j], $mm)) {
+            if ($mm[1] === $startOp && trim($mm[2]) === $startTarget) {
+                $runIdLine = $lines[$j];
+                continue;
+            }
+            break;
+        }
+        if (preg_match('/=====\s*' . preg_quote($startOp, '/') . '\s+FINISH:/', $lines[$j])) {
+            break;
+        }
+        if (preg_match('/^.*?=====\s*(Upgrade Complete|Upgrade Failed|Rebooting|Rebuild Complete|Upgrade complete[^=]*)\s*=====\s*$/i', $lines[$j])) {
+            break;
+        }
+    }
+    // Scan the WHOLE remainder: a FINISH trailer never shadows a later
+    // failure marker and vice versa. The build-failure path can be
+    // `fpp-update FINISH (rc=0)` followed by the PHP-side `Upgrade Failed`
+    // verdict (a nonzero make status used to be swallowed on the way to
+    // git_pull's exit code); stopping at the first terminator reported that
+    // sequence as success. A recorded failure is sticky: a later success
+    // marker never clears it.
+    foreach ($after as $line) {
+        // Matching FINISH trailer for this run. The exit code matters: branch
+        // switches and version checkouts can fail with only this marker
+        // (no "Upgrade Failed" stage), so a nonzero rc is a failure outcome.
+        // No break: a later "Upgrade Failed" terminal still overrides an
+        // rc=0 FINISH (see above).  git_pull's rc=4 is not a failure: the
+        // update source was unreachable but the missing fppd was rebuilt,
+        // which is what a Rebuild is for (manualUpdate.php logs "Rebuild
+        // Complete"); a failed build exits 3.
+        if (preg_match('/=====\s*' . preg_quote($startOp, '/') . '\s+FINISH:/', $line)) {
+            $finished = true;
+            if (preg_match('/\(rc=(\d+)\)/', $line, $rcm) && intval($rcm[1]) !== 0
+                && !($startOp === 'fpp-update' && intval($rcm[1]) === 4)) {
+                $finishFailed = true;
+                $finishRc = intval($rcm[1]);
+            }
+            continue;
+        }
+        // Terminal stage logged after the script's tee is gone (PHP side of
+        // manualUpdate.php / upgradeOS.php / upgradefpp.php).
+        if (preg_match('/^.*?=====\s*(Upgrade Complete|Upgrade Failed|Rebooting|Rebuild Complete|Upgrade complete[^=]*)\s*=====\s*$/i', $line, $tm)) {
+            $finished = true;
+            if (stripos($tm[1], 'fail') !== false) {
+                $finishFailed = true;
+                $finishRc = null;
+            }
+            continue;
+        }
+    }
+
+    $base = array(
+        'inProgress' => false,
+        'op' => $startOp,
+        'target' => $startTarget,
+        'kind' => UpdateActivityKindLabel($startOp),
+        'runId' => md5($runIdLine),
+        'stage' => '',
+        'logUpdatedAt' => $tail['mtime'],
+        'logSize' => $logStatSize,
+        'stale' => false,
+        'failed' => false,
+        'fppdBinaryExists' => $fppdBinaryExists
+    );
+
+    // Latest stage marker since the run started (drives the modal title).
+    // START/FINISH framing lines are skipped so the title names the work,
+    // not the framing. Scanned newest-first stopping at the first hit: the
+    // window above can hold thousands of build lines, and only the latest
+    // marker matters.
+    $stageRe = '/^.*?=====\s*(.+?)\s*=====\s*$/';
+    foreach (array_reverse($after) as $line) {
+        if (preg_match($stageRe, $line, $m)) {
+            $marker = trim($m[1]);
+            if (!preg_match('/^(?:' . $opsAlt . ')\s+(START|FINISH):/', $marker)
+                && !preg_match('/^(?:' . $opsAlt . ')\s+(START|FINISH)$/', $marker)) {
+                $base['stage'] = $marker;
+                break;
+            }
+        }
+    }
+
+    // Failure outcome: a nonzero FINISH rc (branch/version paths fail with
+    // only this marker) or an "Upgrade Failed" terminal stage. Exposed as a
+    // dedicated flag (new clients) plus a fail-bearing stage when none was
+    // logged (old clients that infer from /fail/ still classify correctly).
+    $base['failed'] = $finishFailed;
+    if ($finished && $finishFailed && $base['stage'] === '') {
+        $base['stage'] = ($finishRc !== null) ? ('Failed (rc=' . $finishRc . ')') : 'Upgrade Failed';
+    }
+
+    if ($withLogTail) {
+        $file = UpdateActivityLogFile();
+        if (is_file($file) && is_readable($file)) {
+            $last = UpdateActivityLastLines($file, UpdateActivityRequestedLines());
+            // Show the whole run when its START is inside the fetched tail,
+            // otherwise the last N lines. Trim at the run's FIRST start
+            // ($runIdLine, which may precede $startLine for continuations
+            // such as part1's take-over) so the download phase is included.
+            $runStart = -1;
+            if ($last !== '' && $runIdLine !== '') {
+                $runLines = explode("\n", $last);
+                foreach ($runLines as $i => $line) {
+                    if (strpos($line, $runIdLine) !== false) {
+                        $runStart = $i;
+                    }
+                }
+                if ($runStart >= 0) {
+                    $last = implode("\n", array_slice($runLines, $runStart));
+                    if ($last !== '' && substr($last, -1) !== "\n") {
+                        $last .= "\n";
+                    }
+                }
+            }
+            $base['logTail'] = $last;
+        } else {
+            $base['logTail'] = '';
+        }
+    }
+
+    if ($finished) {
+        // A held update lock means a request is still running: never report
+        // a settled outcome while it is held.
+        $holder = UpdateActivityLockHolder();
+        if ($holder !== false) {
+            // The run's own request finalizing after its script's FINISH
+            // (manualUpdate.php restarts fppd and regenerates the Apache
+            // config for several seconds): it is still THIS run, so keep its
+            // runId, stage and tail. Swapping to a placeholder here made the
+            // client lose track of the run and drop its completion. The
+            // holder is this run when it is the same op and took the lock
+            // before the log's last write; a holder that arrived after it is
+            // new work that has not logged a START yet.
+            $acquiredAt = isset($holder['acquiredAt']) ? intval($holder['acquiredAt']) : 0;
+            if (isset($holder['op']) && $holder['op'] === $startOp
+                && $acquiredAt > 0 && $acquiredAt <= $tail['mtime']) {
+                $base['inProgress'] = true;
+                return $base;
+            }
+            // Different (or markerless) work, e.g. rebuildfpp.php: surface
+            // it as the generic active state instead of hiding it behind
+            // the previous finished run.
+            return UpdateActivityWorkersActive($empty, $holder, $tail['mtime'], $logStatSize, $withLogTail);
+        }
+        if (!$withLogTail) {
+            UpdateActivityWriteCache($logStatSize, $logStatMtime, $base);
+        }
+        return $base;
+    }
+
+    // Run is open in the log: live when a worker is alive, the update lock
+    // is held (long OS download under php-fpm, rebuild), or the log is
+    // fresh; stale (crashed/killed, power loss) otherwise.
+    $alive = UpdateActivityAnyAlive();
+    $recent = ($tail['mtime'] > 0) && ((time() - $tail['mtime']) < 900);
+    if ($alive || $recent) {
+        $base['inProgress'] = true;
+        return $base;
+    }
+    $base['stale'] = true;
+    if (!$withLogTail) {
+        UpdateActivityWriteCache($logStatSize, $logStatMtime, $base);
+    }
+    return $base;
+}
+
+/**
+ * Update activity for the persistent progress UI
+ *
+ * Reports whether an FPP software or OS update is currently running, derived
+ * from logs/fpp_system_upgrades.log markers plus worker process liveness, so
+ * any browser (including one opened mid-update or after a refresh) can show
+ * the live progress. Pass `?logTail=1&lines=200` to include the run's log.
+ *
+ * @route GET /api/system/updateActivity
+ * @response 200 Update activity
+ * ```json
+ * {"status": "OK", "inProgress": true, "op": "fpp-update", "kind": "FPP Update", "runId": "abc", "stage": "Building FPP (longest step, please wait)", "fppdBinaryExists": true}
+ * ```
+ */
+function GetUpdateActivity()
+{
+    $withLog = (isset($_GET['logTail']) && $_GET['logTail']);
+    $activity = GetUpdateActivityInternal($withLog);
+    // Test mode: pretend an update is running so the banner/modal/warning can
+    // be exercised without flashing a device. Mirrors ?test= in GetUpdateStatus.
+    if (isset($_GET['test']) && $_GET['test'] === 'inprogress') {
+        $activity['inProgress'] = true;
+        if ($activity['op'] === '') {
+            $activity['op'] = 'fpp-update';
+            $activity['kind'] = UpdateActivityKindLabel('fpp-update');
+            $activity['target'] = 'master';
+            $activity['runId'] = 'test-run';
+            $activity['stage'] = 'Fetching updates';
+        }
+    }
+    $activity['status'] = 'OK';
+    return json($activity);
+}
+
+/**
+ * Set volume
+ *
+ * Sets the system volume. The new level should be passed as a JSON body.
+ *
+ * @route POST /api/system/volume
+ * @body {"volume": 34}
+ * @response 200 Volume set
+ * ```json
+ * {"status": "OK", "volume": 34}
+ * ```
+ */
+function SystemSetAudio()
+{
+    $rc = "OK";
+    $json = strval(file_get_contents('php://input'));
+    $input = json_decode($json, true);
+    $vol = 75;
+    if (isset($input['volume'])) {
+        $vol = intval($input['volume']);
+    }
+
+    if ($vol < 0) {
+        $vol = 0;
+    }
+    if ($vol > 100) {
+        $vol = 100;
+    }
+
+    // Optional "target" addresses one node in the PipeWire graph instead of the
+    // global master.  Omitted (the shape every existing caller sends) keeps the
+    // original master-only behaviour untouched.
+    if (isset($input['target'])) {
+        // "adjust" is a delta against the target's own current level, for
+        // Volume Adjust; "volume" is absolute.
+        if (isset($input['adjust'])) {
+            $current = SystemGetTargetVolume($input['target']);
+            if ($current < 0) {
+                http_response_code(400);
+                return json(array("status" => "ERROR", "message" => "Could not read current volume for target"));
+            }
+            $vol = max(0, min(100, $current + intval($input['adjust'])));
+        }
+        return SystemSetTargetedAudio($input['target'], $vol);
+    }
+
+    setVolume($vol);
+    return json(array("status" => $rc, "volume" => $vol));
+}
+
+/**
+ * Split a volume target into its "type" plus id parts.
+ *
+ * Accepts the flat "type:id[:id2]" key listed by
+ * GET /api/pipewire/audio/targets, or the object form
+ * { "type": "sink", "id": "fpp_group_kitchen" }.
+ */
+function SystemParseVolumeTarget($target)
+{
+    if (is_array($target)) {
+        $parts = array(isset($target['type']) ? $target['type'] : '');
+        if (isset($target['id'])) {
+            $parts[] = strval($target['id']);
+        }
+        if (isset($target['id2'])) {
+            $parts[] = strval($target['id2']);
+        }
+        return $parts;
+    }
+    return explode(':', strval($target));
+}
+
+/**
+ * Current volume (0-100) for a target, or -1 if it cannot be determined.
+ *
+ * Read from the saved PipeWire config rather than the live graph: every setter
+ * now persists on write, so the config is authoritative and readable even when
+ * the node is not currently running (an idle stream slot, a card that is not
+ * playing).
+ */
+function SystemGetTargetVolume($target)
+{
+    global $settings;
+
+    $parts = SystemParseVolumeTarget($target);
+    $type = $parts[0];
+    $mediaDir = $settings['mediaDirectory'];
+
+    if ($type === 'slot' && count($parts) >= 2) {
+        $slot = intval($parts[1]);
+        // Every slot, slot 1 included, has a fader of its own; the master is a
+        // separate control applied downstream.
+        $file = "$mediaDir/config/pipewire-stream-slots.json";
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            if (isset($data['slots'][strval($slot)])) {
+                return intval($data['slots'][strval($slot)]);
+            }
+        }
+        return 100;
+    }
+
+    if ($type === 'sink' && count($parts) >= 2) {
+        $file = "$mediaDir/config/pipewire-audio-groups.json";
+        if (!file_exists($file)) {
+            return -1;
+        }
+        $data = json_decode(file_get_contents($file), true);
+        if (!is_array($data) || !isset($data['groups'])) {
+            return -1;
+        }
+        foreach ($data['groups'] as $group) {
+            $groupName = isset($group['name']) ? $group['name'] : 'Group';
+            $groupNode = 'fpp_group_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($groupName));
+            if ($groupNode === $parts[1]) {
+                return isset($group['volume']) ? intval($group['volume']) : 100;
+            }
+            if (!isset($group['members'])) {
+                continue;
+            }
+            $groupId = isset($group['id']) ? intval($group['id']) : 0;
+            foreach ($group['members'] as $member) {
+                $cardId = isset($member['cardId']) ? $member['cardId'] : '';
+                $fxNode = 'fpp_fx_g' . $groupId . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($cardId));
+                $nodeTarget = isset($member['nodeTarget']) ? $member['nodeTarget'] : '';
+                if ($fxNode === $parts[1] || ($nodeTarget !== '' && $nodeTarget === $parts[1])) {
+                    return isset($member['volume']) ? intval($member['volume']) : 100;
+                }
+            }
+        }
+        return -1;
+    }
+
+    if (($type === 'input' || $type === 'route') && count($parts) >= 3) {
+        $file = "$mediaDir/config/pipewire-input-groups.json";
+        if (!file_exists($file)) {
+            return -1;
+        }
+        $data = json_decode(file_get_contents($file), true);
+        if (!is_array($data) || !isset($data['inputGroups'])) {
+            return -1;
+        }
+        foreach ($data['inputGroups'] as $ig) {
+            if (intval($ig['id']) !== intval($parts[1])) {
+                continue;
+            }
+            if ($type === 'input') {
+                $idx = intval($parts[2]);
+                if (isset($ig['members'][$idx])) {
+                    return isset($ig['members'][$idx]['volume']) ? intval($ig['members'][$idx]['volume']) : 100;
+                }
+                return -1;
+            }
+            $pathKey = strval(intval($parts[2]));
+            if (isset($ig['routing'][$pathKey]['volume'])) {
+                return intval($ig['routing'][$pathKey]['volume']);
+            }
+            return 100;
+        }
+        return -1;
+    }
+
+    return -1;
+}
+
+/**
+ * Apply a volume to a single PipeWire node.
+ *
+ * $target is either the flat "type:id[:id2]" key listed by
+ * GET /api/pipewire/audio/targets, or the equivalent object form
+ * { "type": "sink", "id": "fpp_group_kitchen" }.  Resolution and the actual
+ * pactl/pw-cli work stay in pipewire.php -- this only routes to the right
+ * setter there.
+ */
+function SystemSetTargetedAudio($target, $vol)
+{
+    $parts = SystemParseVolumeTarget($target);
+    $type = $parts[0];
+
+    switch ($type) {
+        case 'sink':
+            if (count($parts) < 2) {
+                break;
+            }
+            return SetPipeWireGroupVolume(array("sink" => $parts[1], "volume" => $vol));
+        case 'slot':
+            if (count($parts) < 2) {
+                break;
+            }
+            return SetStreamSlotVolume(array("slot" => intval($parts[1]), "volume" => $vol));
+        case 'input':
+            if (count($parts) < 3) {
+                break;
+            }
+            return SetInputGroupMemberVolume(array(
+                "groupId" => intval($parts[1]),
+                "memberIndex" => intval($parts[2]),
+                "volume" => $vol
+            ));
+        case 'route':
+            if (count($parts) < 3) {
+                break;
+            }
+            return SetRoutingPathVolume(array(
+                "inputGroupId" => intval($parts[1]),
+                "outputGroupId" => intval($parts[2]),
+                "volume" => $vol
+            ));
+    }
+
+    http_response_code(400);
+    return json(array(
+        "status" => "ERROR",
+        "message" => "Unrecognized volume target; see GET /api/pipewire/audio/targets"
+    ));
+}
+
+/**
+ * Get volume
+ *
+ * Returns the current volume if `fppd` is running, or the `Volume` setting value if not.
+ *
+ * @route GET /api/system/volume
+ * @response 200 Current volume
+ * ```json
+ * {"status": "OK", "method": "FPPD", "volume": 70}
+ * ```
+ */
+function SystemGetAudio()
+{
+    global $settings;
+
+    // Optional ?target= reports one PipeWire node's level instead of the
+    // master.  Absent (what every existing caller sends) is unchanged.
+    if (isset($_GET['target']) && $_GET['target'] !== '') {
+        $vol = SystemGetTargetVolume($_GET['target']);
+        if ($vol < 0) {
+            http_response_code(404);
+            return json(array(
+                "status" => "ERROR",
+                "message" => "Unknown volume target; see GET /api/pipewire/audio/targets"
+            ));
+        }
+        return json(array("status" => "OK", "method" => "Target",
+            "target" => $_GET['target'], "volume" => $vol));
+    }
+
+    $curl = curl_init('http://localhost:32322/fppd/status');
+    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 200);
+    $request_content = curl_exec($curl);
+    curl_close($curl);
+
+    $method = "FPPD";
+    $vol = 75;
+    if ($request_content === false) {
+        $method = "Default";
+        if (isset($settings['volume'])) {
+            $vol = $settings['volume'];
+            $method = "Settings";
+        }
+    } else {
+        $data = json_decode($request_content, true);
+        $vol = $data['volume'];
+    }
+
+    return json(array("status" => "OK", "method" => $method, "volume" => $vol));
+}
+
+/**
+ * Get system status
+ *
+ * Returns `fppd`, network, current playlist, schedule, utilization, host, version, and MQTT status.
+ * Pass an optional array of IP addresses (e.g. `&ip[]=192.168.0.1&ip[]=192.168.0.2`) to query
+ * remote instances instead.
+ *
+ * @route GET /api/system/status
+ * @response 200 System status
+ * ```json
+ * {
+ *   "fppd": "running",
+ *   "status": 1,
+ *   "status_name": "playing",
+ *   "mode": 2,
+ *   "mode_name": "player",
+ *   "current_playlist": {
+ *     "count": "4",
+ *     "playlist": "Test1",
+ *     "type": "pause",
+ *     "index": "2",
+ *     "generated": false
+ *   },
+ *   "volume": 70,
+ *   "wifi": [],
+ *   "interfaces": []
+ * }
+ * ```
+ */
+function SystemGetStatus()
+{
+    global $_GET;
+
+    /*
+     * NOTE: There are some weird things here to provide backwards compatibility
+     *  - wifi data is returned in both "wifi"  and "interfaces" s
+     *  - IP addresses are listed in both "interfaces" and "advanceView"."IP"
+     */
+
+    //close the session before we start, this removes the session lock and lets other scripts run
+    session_write_close();
+
+    //Default json to be returned
+    $default_return_json = array(
+        'fppd' => 'unknown',
+        'status' => 'stopped',
+        'wifi' => [],
+        'interfaces' => [],
+        'status_name' => 'unknown',
+        'current_playlist' =>
+            [
+                'playlist' => '',
+                'type' => '',
+                'index' => '0',
+                'count' => '0',
+            ],
+        'current_sequence' => '',
+        'current_song' => '',
+        'seconds_played' => '0',
+        'seconds_remaining' => '0',
+        'time_elapsed' => '00:00',
+        'time_remaining' => '00:00'
+    );
+
+    $default_return_json['uuid'] = stats_getUUID();
+
+    //if the ip= argument supplied
+    if (isset($_GET['ip'])) {
+        $ipAddresses = $_GET['ip'];
+        $type = "FPP";
+        if (isset($_GET['type'])) {
+            $type = $_GET['type'];
+        }
+        $isArray = true;
+        if (!is_array($ipAddresses)) {
+            $ipAddresses = array();
+            $ipAddresses[] = $_GET['ip'];
+            $isArray = false;
+        }
+
+        $result = array();
+
+        $curlmulti = curl_multi_init();
+        $curls = array();
+        foreach ($ipAddresses as $ip) {
+            //validate IP address is a valid IPv4 or IPv6 address - possibly overkill but have seen IPv6 addresses polled
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                //IPv6 literals must be bracketed to be usable in a URL
+                $urlHost = fppUrlHost($ip);
+                if ($type == "Genius") {
+                    $curl = curl_init("http://" . $urlHost . "/api/state");
+                } else if ($type == "WLED") {
+                    $curl = curl_init("http://" . $urlHost . "/json/info");
+                } else if ($type == "Baldrick") {
+                    $curl = curl_init("http://" . $urlHost . "/system_state");
+                } else if ($type == "FV3") {
+                    $curl = curl_init("http://" . $urlHost . "/status.xml");
+                } else if ($type == "FV4") {
+                    $curl = curl_init("http://" . $urlHost . "/api");
+                    $data = '{"T":"Q","M":"ST","B":0,"E":0,"I":0,"P":{}}';
+                    curl_setopt($curl, CURLOPT_POSTFIELDS, $data);
+                    curl_setopt($curl, CURLOPT_HTTPHEADER, array('Content-Type:application/json'));
+                } else {
+                    // Everything else, ESPixelStick 4.x included, answers FPP's
+                    // own status URL.  (There used to be an "ESPixelStick" branch
+                    // here that curled http://<ip>/ws with WebSocket upgrade
+                    // headers; curl cannot complete a WS handshake, let alone
+                    // frame a request, so it only ever returned "unreachable".
+                    // ESPixelStick 3.x really is WebSocket-only and is polled
+                    // from the browser through /proxy/<ip>/ws instead.)
+                    $curl = curl_init("http://" . $urlHost . "/api/system/status");
+                }
+                curl_setopt($curl, CURLOPT_FAILONERROR, true);
+                curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+                curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 500);
+                curl_setopt($curl, CURLOPT_TIMEOUT_MS, 3000);
+                $curls[$ip] = $curl;
+                curl_multi_add_handle($curlmulti, $curl);
+            }
+        }
+        $running = null;
+        do {
+            curl_multi_exec($curlmulti, $running);
+        } while ($running > 0);
+
+        foreach ($curls as $ip => $curl) {
+            $request_content = curl_multi_getcontent($curl);
+            curl_multi_remove_handle($curlmulti, $curl);
+            $responseCode = 200;
+            if ($request_content === false || $request_content == null || $request_content == "") {
+                $responseCode = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+                $result[$ip] = array_merge(array(), $default_return_json);
+                if ($responseCode == 401) {
+                    $result[$ip]['reason'] = "Cannot Access - Web GUI Password Set";
+                    $result[$ip]["status_name"] = "password";
+                } else if ($responseCode == 404 && $type == "FPP") {
+                    // old device, possibly ESPixelStick, maybe FPP4
+                    $curl = curl_init("http://" . fppUrlHost($ip) . "/fppjson.php?command=getFPPstatus&advancedView=true");
+                    curl_setopt($curl, CURLOPT_FAILONERROR, true);
+                    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+                    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 500);
+                    curl_setopt($curl, CURLOPT_TIMEOUT_MS, 3000);
+                    $request_content = curl_exec($curl);
+                    $responseCode = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+                } else if ($responseCode == 0) {
+                    $result[$ip]["status_name"] = "unreachable";
+                }
+            }
+            if ($responseCode == 200) {
+                if (strpos($request_content, 'Not Running') !== false) {
+                    $result[$ip]["status_name"] = "not running";
+                } else {
+                    if ($type == "FV3") {
+                        $content = simplexml_load_string($request_content);
+                    } else {
+                        $content = json_decode($request_content, true);
+                    }
+                    if (!isset($content["status_name"])) {
+                        $content["status_name"] = "Running";
+                    }
+                    $result[$ip] = $content;
+                }
+            }
+        }
+        curl_multi_close($curlmulti);
+        if (!$isArray && count($ipAddresses) > 0 && $ipAddresses[0] != "") {
+            $result = $result[$ipAddresses[0]];
+        }
+        return json($result);
+    } else if (isset($_GET['systemonly'])) {
+        // Just the host-side augmentation (advancedView cpu/mem, wifi, interfaces,
+        // reboot/restart flags, plugin indicators, crash-report warning) with no
+        // fppd base.  Used by pages that get the fppd half over the /fppdws
+        // WebSocket: they poll this slowly (default 30s) purely for the slow
+        // augmentation, so returning the fppd base too would just clobber the
+        // fresh WebSocket status with a stale copy.  Skipping the /fppd/status
+        // curl also means these warnings are the PHP-sourced ones only (crash
+        // report, and — since fppd is up whenever the WebSocket is — nothing
+        // else), so the client can union them with fppd's live warnings without
+        // a cleared warning lingering.
+        return json(finalizeStatusJson(array()));
+    } else {
+        // If IP[] was not provided, then status of the local machine is desired.
+        //go through the new API to get the status
+        // use curl so we can set a low connect timeout so if fppd isn't running we detect that quickly
+        $curl = curl_init('http://localhost:32322/fppd/status');
+        curl_setopt($curl, CURLOPT_FAILONERROR, true);
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 200);
+        curl_setopt($curl, CURLOPT_TIMEOUT_MS, 3000);
+        $request_content = curl_exec($curl);
+        curl_close($curl);
+
+        if ($request_content === false) {
+            $status = exec("if ps cax | grep -q git_pull; then echo \"updating\"; else echo \"false\"; fi");
+
+            $default_return_json['fppd'] = "Not Running";
+            $default_return_json['status_name'] = $status == 'updating' ? $status : 'stopped';
+
+            return json(finalizeStatusJson($default_return_json));
+        }
+        $data = json_decode($request_content, true);
+        return json(finalizeStatusJson($data));
+    }
+}
+
+/**
+ * Get system info
+ *
+ * Returns basic information about the system.
+ *
+ * @route GET /api/system/info
+ * @response 200 System information
+ * ```json
+ * {
+ *   "HostName": "FPPPi",
+ *   "HostDescription": "",
+ *   "Platform": "Raspberry Pi",
+ *   "Variant": "Pi 4",
+ *   "Mode": "player",
+ *   "Version": "6.0",
+ *   "Branch": "master",
+ *   "OSVersion": "v2022-02",
+ *   "OSRelease": "Raspbian GNU/Linux 11 (bullseye)",
+ *   "channelRanges": "1545-84479",
+ *   "majorVersion": 6,
+ *   "minorVersion": 1000,
+ *   "typeId": 13,
+ *   "uuid": "M1-10000000AAAAAAA",
+ *   "Utilization": {"CPU": 0.12, "Memory": 1.96, "Uptime": "11 days"},
+ *   "Kernel": "5.10.92-v7l+",
+ *   "LocalGitVersion": "b998f65",
+ *   "RemoteGitVersion": "ed62c12",
+ *   "UpgradeSource": "github.com",
+ *   "IPs": ["192.168.3.84"]
+ * }
+ * ```
+ */
+function SystemGetInfo()
+{
+    $result = GetSystemInfoJsonInternal(isset($_GET['simple']));
+    return json($result);
+}
+
+function GetFPPDRestartBlocked()
+{
+    // Only a dead fppd can be held back by the restart limit, and one that
+    // accepts a connection on its API port is not dead.  Every status poll
+    // lands here, and the systemctl calls below are ~230ms of forks on a
+    // BeagleBone -- most of the cost of api/system/status -- so settle the
+    // overwhelmingly common case without them.
+    $sock = @fsockopen('127.0.0.1', 32322, $errno, $errstr, 0.2);
+    if ($sock !== false) {
+        fclose($sock);
+        return array("blocked" => false);
+    }
+    // Check if systemd is available
+    if (!is_executable("/usr/bin/systemctl") && !is_executable("/bin/systemctl")) {
+        return array("blocked" => false);
+    }
+    // Quick check: is fppd in failed state?
+    $activeState = trim(shell_exec("systemctl show fppd --property=ActiveState --value 2>/dev/null"));
+    if ($activeState !== "failed") {
+        return array("blocked" => false);
+    }
+    // Check if the failure is due to restart limit (Start request repeated too quickly)
+    $statusOutput = shell_exec("systemctl status fppd 2>&1 | head -n 30");
+    if (strpos($statusOutput, "Start request repeated too quickly") === false) {
+        // Also check journal for the message in case status doesn't show it
+        $statusOutput2 = shell_exec("journalctl -u fppd --no-pager -n 20 2>&1 | grep -q 'Start request repeated too quickly' && echo found || echo notfound");
+        if (trim($statusOutput2) !== "found") {
+            return array("blocked" => false);
+        }
+    }
+    // Get interval and timestamps
+    $intervalStr = trim(shell_exec("systemctl show fppd --property=StartLimitIntervalSec --value 2>/dev/null"));
+    // StartLimitIntervalSec may be in microseconds (e.g. 200000000 for 200s) or seconds (200)
+    $intervalSec = 200; // default from fppd.service
+    if ($intervalStr !== "" && is_numeric($intervalStr)) {
+        $intervalVal = intval($intervalStr);
+        if ($intervalVal > 10000) {
+            $intervalSec = intval($intervalVal / 1000000);
+        } else if ($intervalVal > 0) {
+            $intervalSec = $intervalVal;
+        }
+    }
+    // Also try manager property if unit doesn't have it
+    if ($intervalSec === 200) {
+        $managerInterval = trim(shell_exec("systemctl show --property=StartLimitIntervalSec --value 2>/dev/null"));
+        if ($managerInterval !== "" && is_numeric($managerInterval)) {
+            $mVal = intval($managerInterval);
+            if ($mVal > 10000) $mVal = intval($mVal / 1000000);
+            if ($mVal > 0) $intervalSec = $mVal;
+        }
+    }
+    $inactiveTimestamp = trim(shell_exec("systemctl show fppd --property=InactiveEnterTimestamp --value 2>/dev/null"));
+    $remainingSec = $intervalSec;
+    if ($inactiveTimestamp !== "" && $inactiveTimestamp !== "n/a") {
+        $inactiveTime = strtotime($inactiveTimestamp);
+        if ($inactiveTime !== false) {
+            $elapsed = time() - $inactiveTime;
+            $remainingSec = max(0, $intervalSec - $elapsed);
+        }
+    } else {
+        // Fallback: try monotonic timestamp
+        $inactiveMonotonic = trim(shell_exec("systemctl show fppd --property=InactiveEnterTimestampMonotonic --value 2>/dev/null"));
+        if ($inactiveMonotonic !== "" && $inactiveMonotonic !== "0") {
+            // Monotonic is microseconds since boot; compare to current monotonic
+            $nowMonotonic = trim(shell_exec("cat /proc/uptime 2>/dev/null | awk '{print int(\$1*1000000)}'"));
+            if (is_numeric($inactiveMonotonic) && is_numeric($nowMonotonic)) {
+                $elapsedSec = intval((intval($nowMonotonic) - intval($inactiveMonotonic)) / 1000000);
+                $remainingSec = max(0, $intervalSec - $elapsedSec);
+            }
+        }
+    }
+    return array(
+        "blocked" => $remainingSec > 0,
+        "remainingSec" => intval($remainingSec),
+        "intervalSec" => intval($intervalSec),
+        "burst" => 5
+    );
+}
+
+/**
+ * Get FPPD restart blocked status
+ *
+ * Returns whether FPPD is currently blocked from restarting due to systemd's
+ * StartLimitBurst (too many restarts in a short time) and how long to wait.
+ *
+ * @route GET /api/system/fppd/restartStatus
+ * @response 200 Restart blocked status
+ * ```json
+ * {"blocked": true, "remainingSec": 87, "intervalSec": 200, "burst": 5}
+ * ```
+ */
+function GetFPPDRestartStatus()
+{
+    return json(GetFPPDRestartBlocked());
+}
+
+/**
+ * Adds network interfaces, reboot/restart flags, boot delay status, advanced system info,
+ * plugin header indicators, and crash warnings to the `fppd` status array.
+ *
+ * @param array $obj The base status array returned from fppd or the default stub.
+ * @return array The enriched status array.
+ */
+function finalizeStatusJson($obj)
+{
+    global $settings;
+
+    if (!isset($_GET['nonetwork'])) {
+        $obj['wifi'] = network_wifi_strength_obj();
+        $obj['interfaces'] = network_list_interfaces_obj();
+    }
+
+    if (isset($settings['rebootFlag'])) {
+        $obj['rebootFlag'] = intval($settings['rebootFlag']);
+    } else {
+        $obj['rebootFlag'] = 0;
+    }
+
+    if (isset($settings['restartFlag'])) {
+        $obj['restartFlag'] = intval($settings['restartFlag']);
+    } else {
+        $obj['restartFlag'] = 0;
+    }
+
+    // Check if boot delay is in progress
+    $bootDelayFile = $settings['mediaDirectory'] . '/tmp/boot_delay';
+    if (file_exists($bootDelayFile)) {
+        $obj['bootDelayActive'] = 1;
+        $delayInfo = trim(file_get_contents($bootDelayFile));
+        $parts = explode(',', $delayInfo);
+        if (count($parts) == 2) {
+            $obj['bootDelayStart'] = intval($parts[0]);
+            $obj['bootDelayDuration'] = $parts[1]; // Could be number or "auto"
+        }
+    } else {
+        $obj['bootDelayActive'] = 0;
+    }
+
+    //Get the advanced info directly as an array
+    $request_expert_content = GetSystemInfoJsonInternal(isset($_GET['simple']), !isset($_GET['nonetwork']));
+    //check we have valid data
+    if ($request_expert_content === false) {
+        $request_expert_content = array();
+    }
+    //Add data into the final response, since we have the status as an array already then just add the expert view
+    //Add a new key for the expert data to the original data array
+    $obj['advancedView'] = $request_expert_content;
+    // Add plugin header indicators
+    if (!isset($_GET['noplugins'])) {
+        $obj['pluginHeaderIndicators'] = json_decode(GetPluginHeaderIndicators(), true);
+    }
+
+    if (is_dir($settings['mediaDirectory'] . "/crashes")) {
+        // -manual.zip reports were asked for (POST /api/crashes/report), not crashes
+        $num = count(preg_grep('/-manual\.zip$/', glob($settings['mediaDirectory'] . "/crashes/*.zip") ?: array(), PREG_GREP_INVERT));
+        if ($num > 0) {
+            $plural = 's';
+            $verb = 'are';
+            if ($num == 1) {
+                $plural = '';
+                $verb = 'is';
+            }
+
+            // <= 0 rather than == 0: reports written while sending was enabled
+            // stay on disk after the user switches to "keep locally" (0) or
+            // "disabled" (-1), and telling them those will be uploaded is wrong
+            // in both cases.
+            if (intval($settings['ShareCrashData']) <= 0) {
+                $crWarning = "There $verb $num crash report$plural available. Send or delete them in the File Manager.";
+            } else {
+                // fppd uploads once, at the crash, and keeps the file either way
+                $crWarning = "There $verb $num crash report$plural available. " .
+                    "This system sends crash reports automatically when they are written, so they may already have been sent; you may delete them in the File Manager.";
+            }
+            $obj["warnings"][] = $crWarning;
+            $wi["message"] = $crWarning;
+            $wi["id"] = 0;
+            $wi["data"] = array("fixUrl" => "filemanager.php#tab-crashes", "fixText" => "File Manager");
+            $obj["warningInfo"][] = $wi;
+        }
+    }
+
+    // Check if FPPD restart limit has been hit (Start request repeated too quickly)
+    $obj['fppdRestartBlocked'] = GetFPPDRestartBlocked();
+
+    // Update activity (FPP software / OS update in progress) for the
+    // persistent progress banner/modal. Log tail is excluded here to keep the
+    // every-few-seconds status poll light; the modal fetches it from
+    // GET /api/system/updateActivity?logTail=1.
+    $obj['updateActivity'] = GetUpdateActivityInternal(false);
+
+    return $obj;
+}
+
+/**
+ * Get all system packages
+ *
+ * Returns a list of all installed and available OS package names via `apt list --all-versions`.
+ *
+ * @route GET /api/system/packages
+ * @response 200 List of OS package names
+ * ```json
+ * ["apache2", "ffmpeg", "php"]
+ * ```
+ */
+function ReadPackageNamesFrom($cmd)
+{
+    $packages = [];
+    $handle = popen($cmd, 'r');
+    if ($handle === false) {
+        return $packages;
+    }
+    while (($line = fgets($handle)) !== false) {
+        $line = rtrim($line, "\r\n");
+        if ($line !== '') {
+            $packages[] = $line;
+        }
+    }
+    pclose($handle);
+
+    return $packages;
+}
+
+/**
+ * Every package name apt knows about, sorted and deduplicated.
+ *
+ * The obvious implementation -- parsing `apt list` -- is what this replaces,
+ * and it was slow enough to be the whole cost of the Packages page: `apt list`
+ * builds and formats a record per package (version, archive, architecture,
+ * install state) and then this threw all of that away and kept the name. On a
+ * PocketBeagle2 that was 5.5s warm and far worse on the first load of the day,
+ * when the 56MB index has to come off eMMC. `--all-versions` made it worse
+ * again for nothing: it repeats a package once per available version, so the
+ * list arrived with tens of thousands of duplicates in it (34,750 of 104,875
+ * entries on one box here) that the page then had to hold and search.
+ *
+ * Reading the index files directly is the same data from the same source --
+ * these are the files apt itself parses -- for the one field that is wanted.
+ * The dpkg status file is included alongside them so a package that is
+ * installed but no longer in any configured repository still appears, which is
+ * what `apt list` does too. Measured against it on a PocketBeagle2: 0.52s
+ * versus 5.5s, and the two produce identical name sets.
+ *
+ * Falls back to asking apt if that yields implausibly little -- an apt
+ * configured to keep its indexes compressed (Acquire::GzipIndexes) would leave
+ * no *_Packages for the glob to match.
+ */
+function CollectOSPackageNames()
+{
+    $packages = ReadPackageNamesFrom(
+        'grep -h "^Package: " /var/lib/apt/lists/*_Packages /var/lib/dpkg/status 2>/dev/null'
+        . ' | sed "s/^Package: //" | LC_ALL=C sort -u'
+    );
+
+    if (count($packages) > 100) {
+        return $packages;
+    }
+
+    error_log("GetOSPackages: no usable apt index files, falling back to apt list");
+
+    return ReadPackageNamesFrom(
+        'apt list 2>/dev/null | sed -n "s|^\([^ /]*\)/.*|\1|p" | LC_ALL=C sort -u'
+    );
+}
+
+function GetOSPackages()
+{
+    return json(CollectOSPackageNames());
+}
+
+/**
+ * Get system package information
+ *
+ * Returns description, dependencies, and installation status for the specified OS package.
+ *
+ * @route GET /api/system/packages/info/{packageName}
+ * @response 200 Package information
+ * ```json
+ * {
+ *   "Description": "The FFmpeg multimedia framework",
+ *   "Depends": "libavcodec58, libavformat58",
+ *   "Installed": "Yes"
+ * }
+ * ```
+ */
+function GetOSPackageInfo()
+{
+    $packageName = params('packageName');
+
+    // Fetch package information using apt-cache show
+    $output = shell_exec("apt-cache show " . escapeshellarg($packageName) . " 2>&1");
+    if (!$output || strpos($output, 'E:') === 0) {
+        // Return error if apt-cache output is empty or contains an error
+        error_log("Package '$packageName' not found or invalid: $output");
+        return json_encode(['error' => "Package '$packageName' not found or no information available."]);
+    }
+
+    // Check installation status using dpkg-query
+    $installStatus = shell_exec("/usr/bin/dpkg-query -W -f='\${Status}\n' " . escapeshellarg($packageName) . " 2>&1");
+    $trimmedStatus = trim($installStatus);
+    $isInstalled = ($trimmedStatus === 'install ok installed') ? 'Yes' : 'No';
+
+    // Parse apt-cache output
+    $lines = explode("\n", $output);
+    $description = '';
+    $depends = '';
+
+    foreach ($lines as $line) {
+        if (strpos($line, 'Description:') === 0) {
+            $description = trim(substr($line, strlen('Description:')));
+        } elseif (strpos($line, 'Depends:') === 0) {
+            $depends = trim(substr($line, strlen('Depends:')));
+        }
+    }
+
+    return json_encode([
+        'Description' => $description,
+        'Depends' => $depends,
+        'Installed' => $isInstalled
+    ]);
+}
+
+/**
+ * Skip boot delay
+ *
+ * Skips the current boot delay by creating a skip flag file, allowing FPP startup to proceed immediately.
+ *
+ * @route POST /api/system/fppd/skipBootDelay
+ * @response 200 Boot delay skip requested
+ * ```json
+ * {"status": "OK", "message": "Boot delay skip requested"}
+ * ```
+ */
+function SkipBootDelay()
+{
+    global $settings;
+
+    $bootDelayFile = $settings['mediaDirectory'] . '/tmp/boot_delay';
+    $skipFile = $settings['mediaDirectory'] . '/tmp/boot_delay_skip';
+
+    if (!file_exists($bootDelayFile)) {
+        return json_encode(['status' => 'error', 'message' => 'No boot delay in progress']);
+    }
+
+    // Create skip flag file that FPPINIT will check for
+    file_put_contents($skipFile, '1');
+
+    return json_encode(['status' => 'OK', 'message' => 'Boot delay skip requested']);
+}

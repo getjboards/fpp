@@ -1,38 +1,727 @@
+# Prevent Apache from sending in the `Server` response header its
+# exact version number, the description of the generic OS-type or
+# information about its compiled-in modules.
+#
+# https://httpd.apache.org/docs/current/mod/core.html#servertokens
+ServerTokens Prod
+
 <VirtualHost *:80>
 	ServerAdmin webmaster@localhost
 
-	DocumentRoot FPPDIR/www
+	# mqtt-<topic> Variables use '/' inside the name (an MQTT topic path),
+	# reaching this server pre-encoded as %2F from encodeURIComponent().
+	# Without this, Apache 404s any GET/POST api/variables/mqtt-<topic>
+	# whose topic contains a slash instead of passing it through to fppd.
+	# Must be "On" (decode), not "NoDecode" - NoDecode keeps the %2F as
+	# literal text, which then gets re-percent-encoded (%2F -> %252F) when
+	# proxied to the backend; Drogon's single decode pass on that leaves a
+	# literal "%2F" string in the path instead of a real '/', so the
+	# variable name never matches anything and the response is silently
+	# empty (200 OK, zero-length body) instead of erroring visibly.
+	AllowEncodedSlashes On
+
+	# Cross-site request gate.
+	#
+	# There is no login by default, so without this any web page a user
+	# opens could make this player do things:
+	# change settings, install plugins, run scripts, reboot it.  Browsers say
+	# where a request comes from, so requests another site starts are refused
+	# here, in front of every page, the API and the routes proxied to fppd.
+	# Browsers send Sec-Fetch-Site only to HTTPS (and localhost) origins, so on
+	# a plain-HTTP player it is Origin, sent with every cross-origin
+	# POST/PUT/DELETE, that does the work in rule 1; rule 2 can only act on
+	# Sec-Fetch-Site and so applies only when the UI is reached over HTTPS.
+	# Over plain HTTP those GETs stay open until FPP 11 (docs/DEPRECATED.md);
+	# www/common.php marks them deprecated meanwhile.  Clients that are not browsers
+	# (xLights, other players, scripts, curl) send neither header and are not
+	# affected, and a page served by this player is "same-origin" -- also
+	# when another player's UI reaches it through /proxy/, which forwards
+	# the header unchanged.  The WLED-compatible endpoints (/json, /win, /ws)
+	# are left open: WLED apps drive them from anywhere, and all they can do
+	# is switch overlay models.
+	#
+	# Server context, so it runs before the <Directory> rewrites and before
+	# ProxyPass; REDIRECT_STATUS keeps it to the original request, whose path
+	# Apache has already decoded and normalised.
+	RewriteEngine On
+
+	# 1. Anything but GET/HEAD/OPTIONS that another site's page sent.
+	#    An Origin that names the host a reverse proxy was asked for
+	#    (X-Forwarded-Host) is this UI too: an older player's /proxy/ passes
+	#    the browser's Origin -- that player -- on unchanged, and without
+	#    this every POST control of this player's UI seen through it was
+	#    refused.  A page on another site cannot add that
+	#    header: a custom header needs a CORS preflight, and nothing here
+	#    allows it (Access-Control-Allow-Headers is Content-Type only).
+	RewriteCond %{ENV:REDIRECT_STATUS} ^$
+	RewriteCond %{REQUEST_URI} !^/(json|win|ws)(/|$)
+	RewriteCond %{REQUEST_METHOD} !^(GET|HEAD|OPTIONS)$
+	RewriteCond expr "%{HTTP:Sec-Fetch-Site} -in {'cross-site', 'same-site'} || (%{HTTP:Sec-Fetch-Site} == '' && %{HTTP:Origin} != '' && %{HTTP:Origin} != 'http://' . %{HTTP_HOST} && %{HTTP:Origin} != 'https://' . %{HTTP_HOST} && %{HTTP:Origin} != 'http://' . %{HTTP:X-Forwarded-Host} && %{HTTP:Origin} != 'https://' . %{HTTP:X-Forwarded-Host})"
+	RewriteRule ^ - [F]
+
+	# 2. GETs that act rather than read, when another site's page sent them
+	#    (a link, an <img>, a fetch).  Reading stays open cross-origin.
+	#    Only effective over HTTPS (see above): over plain HTTP these routes
+	#    stay reachable until they stop answering GET in FPP 11.  Keep this
+	#    list, and the copy in www/common.php that marks them deprecated, in
+	#    step with any GET route that changes state.
+	RewriteCond %{ENV:REDIRECT_STATUS} ^$
+	RewriteCond %{HTTP:Sec-Fetch-Site} ^(cross-site|same-site)$ [NC]
+	RewriteCond %{REQUEST_URI} ^(/proxy/[^/]+)?/api/(index\.php|api\.php|command/|events/[^/]+/trigger|file/move/|git/reset|network/interface/add/|playlists/(stop|pause|resume|stopgracefully|stopgracefullyafterloop)$|playlist/[^/]+/start|playlist/repeat/|plugin/[^/]+/upgrade|sequence/current/(stop|togglePause)|sequence/[^/]+/start/|scripts/[^/]+/run|system/(reboot|shutdown)$|system/fppd/(start|stop|restart)$) [NC,OR]
+	RewriteCond %{REQUEST_URI} ^/(changebranch|copystorage|disableKiosk|flash-storage|formatstorage|gitCheckoutVersion|growsd|installKiosk|manualUpdate|newpartitionsd|packagesHelper|rebootRemoteFPP|rebuildfpp|resetConfig|restartRemoteFPPD|run_mp3gain|runEventScript|shutdownRemoteFPP|upgradeCapeFirmware|upgradefpp|upgradeOS)\.php$ [NC]
+	RewriteRule ^ - [F]
+
+	# A plugin's own assets: /js/plugin/<plugin>/<file>, and the same under
+	# /css/plugin/ and /images/plugin/, are handed to plugin.php, which serves
+	# the file from the plugin's directory.  There are no such directories
+	# under www/, and must not need to be: a <Directory> section only applies
+	# to a directory that exists, so rules kept in one never ran for a path
+	# that is only a URL, and every plugin script and stylesheet 404d.
+	#
+	# Split on the FIRST slash after the plugin name: the plugin name is one
+	# path component and everything after it is the file, which may sit in a
+	# subdirectory (images/foo.png).  A greedy split handed plugin.php a
+	# plugin of "myplugin/images", and its name allow-list rejects the slash.
+	# PT, so the rewritten /plugin.php is mapped (and password-protected) like
+	# any other page.
+	RewriteRule ^/(js|css|images)/plugin/([^/]+)/(.+)$ /plugin.php?plugin=$2&file=$3&nopage=1 [NC,QSA,B,PT,L,E=FPP_PLUGIN_ASSET:1]
+	Header always set Access-Control-Allow-Origin "*" env=FPP_PLUGIN_ASSET
+	Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT" env=FPP_PLUGIN_ASSET
+
+	DocumentRoot /opt/fpp/www
 
 	<Directory />
 		Options FollowSymLinks
-		AllowOverride All
+		AllowOverride None
 	</Directory>
 
-	<Directory FPPDIR/www/>
+	<Directory /opt/fpp/www/>
 		Options Indexes FollowSymLinks
-		AllowOverride All
-		Require all granted
+		AllowOverride None
+     # Local, but not by way of /proxy/: proxied back to this player's own
+     # address, a request arrives from the server's address, which "Require
+     # local" counts as local -- and so skipped the UI password.
+     <RequireAll>
+       Require local
+       Require expr "%{HTTP:X-FPP-Proxied} == ''"
+     </RequireAll>
+
+    # Equivalent to 'Satisfy Any'
+    # Apache 2.4 uses logical OR when multiple Require directives are present
+
+    # Set environment variable based on Host header
+    SetEnvIf Host "^" LOCAL_PROTECT=0
+
+    # Control password protected UI
+    IncludeOptional /home/fpp/media/config/ui-password-config.conf
+
+    # WLED iOS app embeds a WKWebView that loads http://<device>/ with a
+    # custom User-Agent of "wled-native/<n>". Redirect that to our
+    # WLED-styled overlay UI so users see a familiar interface instead of
+    # the full FPP admin page. Also accept ?wled=1 as a manual override.
+    RewriteEngine On
+    RewriteCond %{HTTP_USER_AGENT} wled-native [NC,OR]
+    RewriteCond %{QUERY_STRING} (^|&)wled=1(&|$)
+    RewriteCond %{REQUEST_URI} ^/(index\.php)?$
+    RewriteRule ^.*$ /wled/ [R=302,L]
 	</Directory>
 
-	SetEnv GIT_PROJECT_ROOT FPPDIR/.git
-	SetEnv GIT_HTTP_EXPORT_ALL 1
-	ScriptAlias /git/ /usr/lib/git-core/git-http-backend/
+  # WLED-compatibility JSON shims. Apache normally 301-redirects /json/info
+  # to /json/info/ to add the trailing slash; WLED clients call the slash-less
+  # form, so we disable that and dispatch via index.php directly.
+  # WLED-compat WebSocket. The WLED iOS app speaks WebSocket at /ws on
+  # port 80 and exchanges JSON state frames. fppd's WLEDAPIResponder
+  # handles those on 127.0.0.1:32327; we proxy with mod_proxy_wstunnel
+  # (already loaded by FPP for the existing /proxy/* WS upgrade).
+  ProxyPass        /ws  ws://127.0.0.1:32327/ws  upgrade=websocket
+  ProxyPassReverse /ws  ws://127.0.0.1:32327/ws
 
-	<Directory "/usr/lib/git-core">
+  # WLED-compat shim endpoints. WLED clients hit /json/info (no trailing
+  # slash); AliasMatch dispatches them straight to the right index.php so
+  # there's no 301 round-trip and no Apache "directory listing forbidden"
+  # response on the bare /json or /win paths.
+  AliasMatch "^/json/(info|state|eff|pal|palx|nodes|live)/?$" "/opt/fpp/www/json/$1/index.php"
+  AliasMatch "^/json/?$" "/opt/fpp/www/json/index.php"
+  AliasMatch "^/win/?$" "/opt/fpp/www/win/index.php"
+
+  # No Require directive here — inherits from /opt/fpp/www/ (which OR's
+  # `Require local` with the password-config include). Same pattern as
+  # /opt/fpp/www/api so LAN clients can reach the WLED-compat endpoints.
+  <Directory "/opt/fpp/www/json">
+    Options FollowSymLinks
+    AllowOverride None
+    Header always set Access-Control-Allow-Origin "*"
+    Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT"
+    Header always set Access-Control-Allow-Headers "Content-Type"
+  </Directory>
+
+  <Directory "/opt/fpp/www/win">
+    Options FollowSymLinks
+    AllowOverride None
+    Header always set Access-Control-Allow-Origin "*"
+  </Directory>
+
+  <Directory "/opt/fpp/www/api">
+    Options FollowSymLinks
+    AllowOverride None
+
+    # Enable mod_rewrite
+    RewriteEngine On
+    RewriteBase /api/
+
+    # Only rewrite if not a file or directory
+    RewriteCond %{SCRIPT_FILENAME} !-f
+    RewriteCond %{SCRIPT_FILENAME} !-d
+
+    # Proxy rules
+    RewriteRule ^fppd/(.*)$ http://localhost:32322/fppd/$1 [P]
+    RewriteRule ^overlays/(.*)$ http://localhost:32322/overlays/$1 [P]
+    RewriteRule ^models(.*)$ http://localhost:32322/models$1 [P]
+    RewriteRule ^commands(.*)$ http://localhost:32322/commands$1 [P]
+    RewriteRule ^command(.*)$ http://localhost:32322/command$1 [P]
+    RewriteRule ^player(.*)$ http://localhost:32322/player$1 [P]
+    RewriteRule ^gpio(.*)$ http://localhost:32322/gpio$1 [P]
+    RewriteRule ^variables(.*)$ http://localhost:32322/variables$1 [P]
+    RewriteRule ^aes67(.*)$ http://localhost:32322/aes67$1 [P]
+    RewriteRule ^opusrtp(.*)$ http://localhost:32322/opusrtp$1 [P]
+    # Block fppd's internal-only routes (see src/httpAPI.cpp's
+    # /internal/pluginApiRoutes) from the generic plugin-apis passthrough
+    # below -- must come first, since that rule proxies any fppd path
+    # unconditionally and would otherwise forward these too.  NC because
+    # fppd matches its routes without regard to case.
+    RewriteRule ^plugin-apis/internal(/.*)?$ - [F,L,NC]
+    RewriteRule ^plugin-apis/(.*)$ http://localhost:32322/$1 [P]
+
+    # SSE endpoints - use dedicated proxy rules with immediate flushing
+    # Do NOT use RewriteRule [P] for SSE - it causes buffering issues
+    # These are handled by ProxyPass below
+    RewriteRule ^http-virtual-display/(.*)$ - [L]
+    RewriteRule ^http-virtual-display-3d/(.*)$ - [L]
+
+    # Static and redirect rules
+    RewriteRule ^$ /api/index.php?uri=/ [L]
+    RewriteRule ^index.php - [L,NC]
+    RewriteRule ^api.php - [L,NC]
+    RewriteRule ^api.html - [L,NC]
+    RewriteRule ^help ../api/ [R=301,L,NC]
+    RewriteRule ^help/.* ../api/ [R=301,L,NC]
+    RewriteRule ^endpoints.json - [L,NC]
+
+    # Catch-all rewrite to index.php
+    RewriteRule ^(.*)$ /api/index.php?uri=/$1 [NC,L,QSA,B]
+
+    # CORS headers, only when "Let other websites read the API" is on
+    # (AllowCrossOriginAPI; the file is kept in step with it).  Without them
+    # a web page the user merely visits can still send a GET, but cannot read
+    # the answer: the cape serial, the settings, the file lists.  FPP's own
+    # pages never need them, since every call to another player goes through
+    # /proxy/ or our PHP; apps that are not browsers ignore them.
+    Header always set Access-Control-Allow-Origin "*" "expr=-f '/home/fpp/media/config/api-cross-origin'"
+    Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT" "expr=-f '/home/fpp/media/config/api-cross-origin'"
+    Header always set Access-Control-Allow-Headers "Content-Type" "expr=-f '/home/fpp/media/config/api-cross-origin'"
+</Directory>
+
+# SSE (Server-Sent Events) ProxyPass with flushpackets for immediate streaming
+# These MUST be outside Directory block and use ProxyPass instead of RewriteRule [P]
+ProxyPass /api/http-virtual-display-3d/ http://localhost:32329/ flushpackets=on
+ProxyPassReverse /api/http-virtual-display-3d/ http://localhost:32329/
+
+ProxyPass /api/http-virtual-display/ http://localhost:32328/ flushpackets=on
+ProxyPassReverse /api/http-virtual-display/ http://localhost:32328/
+
+# WebSocket status push from fppd (/fppdws).  Same same-origin reverse-proxy
+# trick the SSE routes above use, so the browser never talks to :32322
+# directly (no CORS, works under HTTPS).  A WebSocket upgrade cannot go through
+# RewriteRule [P]; it needs ProxyPass with the ws:// scheme.  mod_proxy_http
+# (Apache >= 2.4.47, which all supported FPP OS images have) tunnels the upgrade
+# natively; mod_proxy_wstunnel is enabled as well for defense on older configs.
+ProxyPass /fppdws ws://localhost:32322/fppdws
+ProxyPassReverse /fppdws ws://localhost:32322/fppdws
+
+# The media directory's virtualdisplay_assets is linked into the web root and
+# is writable through the file API (/api/file/virtualdisplay_assets/...), so a
+# PHP file put there would run as the web server: assets only, no scripts.
+# Nor in the browser: an uploaded .html or .svg opened from here would run its
+# script with this player's origin and full use of its API.  The sandbox only
+# applies to a document opened from here; the 3D view's fetches and image
+# loads of these files are unaffected.
+<Directory ~ "^(/opt/fpp/www|/home/fpp/media)/virtualdisplay_assets">
+    <FilesMatch "\.(ph(ar|p[0-9]?|t|tml)|phps)$">
+        Require all denied
+    </FilesMatch>
+    # Inside <If>, which is merged after every <Files>/<FilesMatch> section:
+    # set directly here, the server-wide mod_headers rules further down, which
+    # unset Content-Security-Policy for .rss, .atom, .rdf, .txt, .json and
+    # others, ran after it and took the sandbox off those -- and browsers
+    # render the XML ones, script and all.
+    <If "true">
+        Header always set Content-Security-Policy "sandbox"
+    </If>
+</Directory>
+
+<Directory "/opt/fpp/www/localonly">
+    Options FollowSymLinks
+    AllowOverride None
+
+    # Restrict access to local requests only (not ones /proxy/ sent back
+    # to this player's own address; see /opt/fpp/www/ above)
+    <RequireAll>
+      Require local
+      Require expr "%{HTTP:X-FPP-Proxied} == ''"
+    </RequireAll>
+</Directory>
+
+
+
+
+# General Proxy Settings
+#
+# /proxy/<ip>/... is a byte-for-byte passthrough to the controller's own web
+# server, with exactly one exception (the <If> below).
+#
+# This block used to carry an unconditional "SetOutputFilter INFLATE;DEFLATE"
+# plus a set of ProxyHTML* directives. The ProxyHTML* ones never did anything -
+# they only configure mod_proxy_html's filter, and that filter is never inserted
+# because nothing here (or in Debian's proxy_html.conf) sets "ProxyHTMLEnable
+# On". The INFLATE;DEFLATE chain exists to hand mod_proxy_html decompressed HTML
+# to rewrite links in, so with that filter absent it was gunzipping and
+# re-gzipping every proxied byte - js, css, fonts, images - to feed a consumer
+# that was not in the chain.
+#
+# Re-compressing is not free of side effects. Apache cannot know the compressed
+# length up front, so it drops the controller's Content-Length and switches the
+# response to Transfer-Encoding: chunked. Genius 2.x serves its assets with a
+# plain Content-Length plus Content-Encoding: gzip, so the chunking the browser
+# complained about in FalconChristmas/fpp#2836 was ours, added on the way out -
+# and when such a response ended early the browser got "HTTP 200 +
+# net::ERR_INCOMPLETE_CHUNKED_ENCODING" with a truncated body rather than the
+# plain length mismatch it actually was.
+#
+# The one thing the filter did earn its keep for: controllers such as
+# ESPixelStick store their web assets pre-gzipped and have no CPU headroom to
+# expand them, so they answer with Content-Encoding: gzip even when the client
+# never asked. A client that cannot handle gzip (curl and wget send no
+# Accept-Encoding by default) would otherwise get a body it cannot read. So keep
+# INFLATE - but only for those clients. Browsers all send Accept-Encoding: gzip
+# and therefore now get the controller's bytes through untouched.
+#
+# Note this is an *output* filter either way, so it has never had any bearing on
+# what we ask the controller FOR: mod_proxy forwards the client's Accept-Encoding
+# upstream verbatim whether or not this filter is configured.
+#
+# If HTML link rewriting is ever actually wanted here, it needs
+# "ProxyHTMLEnable On" AND the INFLATE;DEFLATE chain back, scoped to text/html
+# only (AddOutputFilterByType) so assets stay untouched.
+<Directory "/opt/fpp/www/proxy">
+    Options Indexes FollowSymLinks
+    AllowOverride None
+    Require all granted
+
+    # The cross-site gate at the top has already judged this request.  Passed
+    # on, its Origin (this player) would not match the next player's Host, so
+    # that player's gate would refuse this player's own UI.
+    RequestHeader unset Origin
+    # Marks what /proxy forwards.  Proxied back to this player's own
+    # address, a request arrives from the server's own address, which
+    # "Require local" counts as local; the local exemptions below and in the
+    # UI password config refuse a request carrying this, so /proxy/<own IP>/
+    # cannot skip the password.  A client cannot use it to gain anything:
+    # it only ever takes the local exemption away.  Not set for a client that
+    # is itself on loopback (a kiosk browser at http://localhost): it was
+    # local already, and its UI lists this player by its LAN address, so its
+    # own proxied requests would otherwise ask it for a password it never
+    # gave.  A mark an earlier hop set is passed on all the same.
+    RequestHeader set X-FPP-Proxied 1 "expr=! -R '127.0.0.0/8' && ! -R '::1/128'"
+
+    # Expand gzip only for clients that cannot decode it themselves; everything
+    # else is passed through exactly as the controller sent it.
+    <If "%{HTTP:Accept-Encoding} !~ /gzip/">
+        SetOutputFilter INFLATE
+    </If>
+
+    RewriteEngine On
+
+  # WebSocket upgrade handling.  Never to this device itself: /proxy is not
+  # behind the UI password, and a request proxied to 127.x/0.x arrives from the
+  # local address, which "Require local" lets through.
+   RewriteCond %{HTTP:Upgrade} websocket [NC]
+   RewriteCond %{HTTP:Connection} Upgrade [NC]
+   RewriteCond %{REQUEST_URI} !^/proxy/(127|0)\.
+   RewriteRule ^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(.*)$ ws://$1/$2 [P,L]
+
+  # Add trailing slash to /proxy/<IP> if missing
+   RewriteCond %{REQUEST_URI} ^/proxy/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$
+   RewriteRule ^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$ /proxy/$1/ [R=301,L]
+
+  # Include proxy rewrite rules for devices configured via UI
+  # These need occur before the generic "api" rules below
+   IncludeOptional /home/fpp/media/config/proxy-config.conf
+
+  # Include proxy rewrite rules for devices configured via FPP's dhcp server
+  # These need occur before the generic "api" rules below
+   IncludeOptional /home/fpp/media/config/dhcp-proxy-config.conf
+
+  # Proxy to API endpoint on private subnet devices
+   RewriteRule ^(192\.168\.\d{1,3}\.\d{1,3})/api/?(.*)$ http://$1/api/$2 [P,L]
+   RewriteRule ^(10\.\d{1,3}\.\d{1,3}\.\d{1,3})/api/?(.*)$ http://$1/api/$2 [P,L]
+   RewriteRule ^(172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3})/api/?(.*)$ http://$1/api/$3 [P,L]
+
+</Directory>
+
+
+
+
+
+	# Match Apache upload size to 4G used in php.ini
+	LimitRequestBody 4398046511104
+
+	SetEnv GIT_PROJECT_ROOT /opt/fpp/.git
+	SetEnv GIT_HTTP_EXPORT_ALL 1
+	ScriptAlias /git/ /opt/fpp/scripts/git-http-backend-wrapper/
+
+	<Directory "/opt/fpp/scripts/">
 		Options +ExecCgi -MultiViews +SymLinksIfOwnerMatch
 		AllowOverride none
 		Require all granted
 	</Directory>
 
-	ErrorLog FPPHOME/media/logs/apache2-error.log
+	ErrorLog /home/fpp/media/logs/apache2-error.log
 #	ErrorLog ${APACHE_LOG_DIR}/error.log
 
 	# Possible values include: debug, info, notice, warn, error, crit,
 	# alert, emerg.
 	LogLevel warn
 
-#	CustomLog FPPHOME/media/logs/apache2-access.log combined
+#	CustomLog /home/fpp/media/logs/apache2-access.log combined
 #	CustomLog ${APACHE_LOG_DIR}/access.log combined
 	Include conf-available/serve-cgi-bin.conf
+
+	# Set the timeout for Proxy FCGI PHP FPM connections to 20 minutes to avoid Apache expiring connections for long running scripts
+	# Default value is value of Timeout (which is defaulted to 300 seconds or 5 minutes)
+	ProxyTimeout 1200
 </VirtualHost>
 
+<IfModule !mod_php7.c>
+<IfModule proxy_fcgi_module>
+# Need to make sure flushing from php-fpm will send the packets
+# back to the client immediately instead of waiting for the 16K
+# buffers to completely fill.
+#
+# enablereuse stays OFF.  With it on, each httpd thread keeps its own
+# persistent connection to php-fpm, and a connection is only served by the
+# child that accepted it.  MaxRequestWorkers is far larger than
+# pm.max_children (75 vs 25 on a Pi), so once 25 different httpd threads have
+# each opened a connection, every child is pinned to one of them for good and
+# no child ever returns to the accept queue.  Requests arriving on any further
+# thread then hang until ProxyTimeout -- 20 minutes below -- which is exactly
+# long enough for the whole UI to stop loading until php-fpm is restarted.
+# One connection per request costs a unix-socket connect and cannot wedge.
+    <Proxy fcgi://localhost enablereuse=off flushpackets=on>
+    </Proxy>
+</IfModule>
+</IfModule>
+
+
+# MIME types SETTINGS
+# Serve resources with the proper media types (f.k.a. MIME types).
+# https://www.iana.org/assignments/media-types/media-types.xhtml
+
+<IfModule mod_mime.c>
+
+  # Data interchange
+
+    # 2.2.x+
+
+    AddType text/xml                                    xml
+
+    # 2.2.x - 2.4.x
+
+    AddType application/json                            json
+    AddType application/rss+xml                         rss
+
+    # 2.4.x+
+
+    AddType application/json                            map
+
+  # JavaScript
+
+    # 2.2.x+
+
+    # See: https://html.spec.whatwg.org/multipage/scripting.html#scriptingLanguages.
+    AddType text/javascript                             js mjs
+
+
+  # Manifest files
+
+    # 2.2.x+
+
+    AddType application/manifest+json                   webmanifest
+    AddType text/cache-manifest                         appcache
+
+
+  # Media files
+
+    # 2.2.x - 2.4.x
+
+    AddType audio/mp4                                   f4a f4b m4a
+    AddType audio/ogg                                   oga ogg spx
+    AddType video/mp4                                   mp4 mp4v mpg4
+    AddType video/ogg                                   ogv
+    AddType video/webm                                  webm
+    AddType video/x-flv                                 flv
+	AddType image/png									png
+
+
+    # 2.2.x+
+
+    AddType image/svg+xml                               svgz svg
+    AddType image/x-icon                                cur ico
+
+    # 2.4.x+
+
+    AddType image/webp                                  webp
+    AddType image/png                                   png
+
+
+  # Web fonts
+
+    # 2.2.x - 2.4.x
+
+    AddType application/vnd.ms-fontobject               eot
+
+    # 2.2.x+
+
+    AddType font/woff                                   woff
+    AddType font/woff2                                  woff2
+    AddType font/ttf                                    ttf
+    AddType font/collection                             ttc
+    AddType font/otf                                    otf
+
+
+  # Other
+
+    # 2.2.x+
+
+    AddType text/vtt                                    vtt
+
+</IfModule>
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# Serve all resources labeled as `text/html` or `text/plain`
+# with the media type `charset` parameter set to `utf-8`.
+#
+# https://httpd.apache.org/docs/current/mod/core.html#adddefaultcharset
+
+AddDefaultCharset utf-8
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+# Serve the following file types with the media type `charset`
+# parameter set to `utf-8`.
+#
+# https://httpd.apache.org/docs/current/mod/mod_mime.html#addcharset
+
+<IfModule mod_mime.c>
+    AddCharset utf-8 .appcache \
+                     .atom \
+                     .css \
+                     .js \
+                     .json \
+                     .manifest \
+                     .map \
+                     .mjs \
+                     .rdf \
+                     .rss \
+					           .svg \
+                     .vtt \
+                     .webmanifest \
+                     .xml
+</IfModule>
+
+  # Pull in the Apache2 ContentPolicy
+  IncludeOptional /opt/fpp/etc/apache2.csp
+
+<IfModule mod_headers.c>
+  # Set other security settings
+
+  Header always set X-Content-Type-Options "nosniff"
+	header always set X-XSS-Protection "1; mode=block"
+
+	Header unset Expires
+    Header unset Host
+    Header unset P3P
+    Header unset Pragma
+    Header unset Public-Key-Pins
+    Header unset Public-Key-Pins-Report-Only
+    Header unset Via
+    Header unset X-AspNet-Version
+    Header unset X-AspNetMvc-version
+    Header unset X-Frame-Options
+    Header unset X-Powered-By
+    Header unset X-Runtime
+    Header unset X-Version
+
+# remove unneeded headers
+	<FilesMatch "\.(appcache|atom|bbaw|png|js|bmp|crx|css|cur|eot|f4[abpv]|flv|geojson|gif|htc|ic[os]|jpe?g|m?js|json(ld)?|m4[av]|manifest|map|markdown|md|mp4|oex|og[agv]|opus|otf|pdf|png|rdf|rss|safariextz|svgz?|swf|topojson|tt[cf]|txt|vcard|vcf|vtt|webapp|web[mp]|webmanifest|woff2?|xloc|xpi)$">
+        Header always unset X-UA-Compatible
+        Header always unset X-XSS-Protection
+    </FilesMatch>
+
+    <FilesMatch "\.(appcache|atom|bbaw|png|js|bmp|crx|css|cur|eot|f4[abpv]|flv|geojson|gif|htc|ic[os]|jpe?g|json(ld)?|m4[av]|manifest|map|markdown|md|mp4|oex|og[agv]|opus|otf|png|rdf|rss|safariextz|swf|topojson|tt[cf]|txt|vcard|vcf|vtt|webapp|web[mp]|webmanifest|woff2?|xloc|xpi)$">
+        Header always unset Content-Security-Policy
+        Header always unset X-Content-Security-Policy
+        Header always unset X-WebKit-CSP
+    </FilesMatch>
+
+</IfModule>
+
+# CACHE CONTROL SETTINGS
+<IfModule mod_expires.c>
+
+  # Automatically add the `Cache-Control` header (as well as the
+  # equivalent `Expires` header).
+
+    ExpiresActive on
+
+  # By default, inform user agents to cache all resources for 1 year.
+
+    ExpiresDefault                                   "access plus 1 year"
+
+
+  # Overwrite the previous for file types whose content usually changes
+  # very often, and thus, should not be cached for such a long period,
+  # or at all.
+
+    # AppCache manifest files
+
+        ExpiresByType text/cache-manifest            "access plus 0 seconds"
+
+
+    # /favicon.ico (cannot be renamed!)
+
+        # [!] If you have access to the main Apache configuration
+        #     file, you can match the root favicon exactly using the
+        #     `<Location>` directive. The same cannot be done inside
+        #     of a `.htaccess` file where only the `<Files>` directive
+        #     can be used, reason why the best that can be done is match
+        #     all files named `favicon.ico` (but that should work fine
+        #     if filename/path-based revving is used)
+        #
+        # See also: https://httpd.apache.org/docs/current/sections.html#file-and-web.
+
+        <Files "favicon.ico">
+            ExpiresByType image/x-icon               "access plus 1 hour"
+        </Files>
+
+
+    # Data interchange
+
+        ExpiresByType application/atom+xml           "access plus 1 hour"
+        ExpiresByType application/rdf+xml            "access plus 1 hour"
+        ExpiresByType application/rss+xml            "access plus 1 hour"
+
+        ExpiresByType application/binary             "access plus 0 seconds"
+        ExpiresByType application/json               "access plus 0 seconds"
+        ExpiresByType application/ld+json            "access plus 0 seconds"
+        ExpiresByType application/schema+json        "access plus 0 seconds"
+        ExpiresByType application/vnd.geo+json       "access plus 0 seconds"
+        ExpiresByType text/xml                       "access plus 0 seconds"
+
+
+    # HTML
+
+        ExpiresByType text/html                      "access plus 0 seconds"
+        ExpiresByType text/plain                     "access plus 0 seconds"
+
+	# Images
+
+		ExpiresByType image/png                      "access plus 1 year"
+		ExpiresByType image/svg+xml				     "access plus 1 year"
+
+
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+    # Where needed add `immutable` value to the `Cache-Control` header
+
+    <IfModule mod_headers.c>
+
+        # Because `mod_headers` cannot match based on the content-type,
+        # the following workaround needs to be done.
+
+        # 1) Add the `immutable` value to the `Cache-Control` header
+        #    to all resources.
+
+        Header merge Cache-Control immutable
+
+        # 2) Remove the value for all resources that shouldn't be have it.
+        #
+        # js/css are in this list deliberately. They inherit ExpiresDefault
+        # (1 year) above, and FPP's pages append ?ref=<filemtime> so an
+        # upgraded asset is fetched under a new URL. `immutable` would be
+        # correct only if EVERY asset carried that buster -- and any tag that
+        # is missing one becomes unrecoverable, because `immutable` tells the
+        # browser not to revalidate even on a normal reload. The user is then
+        # left running a stale library against fresh FPP script with no way
+        # out short of a hard reload (Ctrl+F5), which is exactly the failure
+        # this caused in the file manager: bootstrap-table.min.js had no
+        # buster, so an upgrade left the cached copy in place and every tab
+        # rendered empty. Dropping `immutable` here costs one conditional GET
+        # per asset per session (a 304, no body) and makes that class of
+        # mistake self-healing on the next reload.
+
+        # php belongs in this list for a stronger reason than the rest: every
+        # FPP page is a .php, they carry "access plus 0 seconds" (max-age=0)
+        # from ExpiresByType above, and it is the page HTML that carries the
+        # ?ref=<filemtime> busters for css/js. `immutable` on a max-age=0
+        # document is self-contradictory, and browsers that honour it skip
+        # revalidation on a normal reload -- so the browser keeps serving the
+        # cached page, which still names the OLD ?ref for every asset, and
+        # those old URLs are cached for a year. The result is that a CSS or JS
+        # change is invisible no matter how many times the user reloads, even
+        # though the server is serving the new file correctly. Ctrl+F5 is the
+        # only way out, which is exactly the trap the note above set out to
+        # avoid.
+        #
+        # The separator goes with it. And when PHP set its own Cache-Control
+        # (the file-backed /api routes send no-cache), the merge above added
+        # `immutable` as a second Cache-Control header rather than to PHP's,
+        # and taking the word out of it left an empty one: the two went out
+        # as "Cache-Control: no-cache, ". An emptied header is dropped.
+        <FilesMatch "\.(appcache|css|cur|geojson|m?js|json(ld)?|php|x?html?|topojson|xml)$">
+            Header edit Cache-Control "\s*,?\s*\bimmutable\b" ""
+            Header unset Cache-Control "expr=-z resp('Cache-Control')"
+        </FilesMatch>
+
+        # 3) And remove it from anything that says max-age=0, whatever it is
+        #    named. FilesMatch can only see an extension, so every extension-
+        #    less route -- which is all of /api/ -- fell through the list above
+        #    and was served as `max-age=0, immutable`. That pairing is the same
+        #    self-contradiction described for .php, and it is worse on an API:
+        #    a client told never to revalidate cannot pick up new state at all,
+        #    and cannot even send a conditional request to find out. Matching on
+        #    the value rather than the name covers both cases for good.
+        Header edit Cache-Control "max-age=0,\s*immutable" "max-age=0"
+
+    </IfModule>
+
+    # Compress JSON.
+    #
+    # Debian's stock mods-available/deflate.conf lists text/*, the javascript
+    # types, application/xml and application/wasm -- but not application/json,
+    # which did not exist when that list was written and has never been added.
+    # So every API response that sets its content type correctly went out
+    # uncompressed, while the handlers that return a bare string (and so fall
+    # back to text/html) were compressed by accident. That is exactly backwards:
+    # /api/cape/eeprom/vendors is 30KB of JSON that gzips to 3KB, and none of
+    # the file listings, config files or channel output configs were compressed
+    # at all.
+    #
+    # fppd's own routes are unaffected either way -- drogon compresses its
+    # responses itself before Apache ever sees them.
+    <IfModule mod_filter.c>
+        AddOutputFilterByType DEFLATE application/json application/json+ld
+        AddOutputFilterByType DEFLATE application/manifest+json text/csv
+    </IfModule>
+
+</IfModule>

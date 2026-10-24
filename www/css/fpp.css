@@ -1,942 +1,5182 @@
-#footer
-{
-	font-size: 14px;
-	text-align: center;
-	#background: rgb(240, 240, 240);
-	width: 1200px;
-	margin-left: auto;
-	margin-right: auto;
+/* ========================= */
+/* = Base & Reset Styles = */
+/* ========================= */
+
+html {
+	forced-color-adjust: none;
 }
 
-.buttons
-{
-	background-color: #eeeeee;
-	background-image: -webkit-gradient(linear, left top, left bottom, color-stop(0%, #eeeeee), color-stop(100%, #cccccc));
-	background-image: -webkit-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: -moz-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: -ms-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: -o-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: linear-gradient(top, #eeeeee, #cccccc);
-	border: 1px solid #ccc;
-	border-bottom: 1px solid #bbb;
-	-webkit-border-radius: 3px;
-	-moz-border-radius: 3px;
-	border-radius: 3px;
-	color: #333;
-	font: bold 11px "Lucida Grande", "Lucida Sans Unicode", "Lucida Sans", Geneva, Verdana, sans-serif;
-	line-height: 1;
-	padding: 1px 0;
-	text-align: center;
-	text-shadow: 0 1px 0 #eee;
-	width: 90px;
-	height: 20px;
+/* The dark "page" background behind the content cards. Historically this was
+   faked by a 10000px-spread box-shadow on every .pageContent, which breaks
+   when two cards stack (the lower card's shadow paints over the upper one).
+   Setting a real background here lets individual cards stand on their own. */
+body {
+	background-color: #20222e;
 }
 
-.buttons:hover
-{
-	background-color: #dddddd;
-	background-image: -webkit-gradient(linear, left top, left bottom, color-stop(0%, #dddddd), color-stop(100%, #bbbbbb));
-	background-image: -webkit-linear-gradient(top, #dddddd, #bbbbbb);
-	background-image: -moz-linear-gradient(top, #dddddd, #bbbbbb);
-	background-image: -ms-linear-gradient(top, #dddddd, #bbbbbb);
-	background-image: -o-linear-gradient(top, #dddddd, #bbbbbb);
-	background-image: linear-gradient(top, #dddddd, #bbbbbb);
-	border: 1px solid #bbb;
-	border-bottom: 1px solid #999;
-	cursor: pointer;
-	text-shadow: 0 1px 0 #ddd;
+/* Pages loaded inside a settings-modal iframe (?modal=1) render their content
+   directly on <body> with no .pageContent card, so the dark page background
+   above would sit behind light-theme text and buttons. Use the theme surface
+   color instead; the [data-bs-theme="dark"] body rule in fpp-dark.css loads
+   later and keeps the darker shade in dark mode. */
+body.modal-mode {
+	background-color: var(--bs-body-bg);
 }
 
-.buttons:active
-{
-	border: 1px solid #aaa;
-	border-bottom: 1px solid #888;
-	-webkit-box-shadow: inset 0 0 5px 2px #aaaaaa, 0 1px 0 0 #eeeeee;
-	-moz-box-shadow: inset 0 0 5px 2px #aaaaaa, 0 1px 0 0 #eeeeee;
-	box-shadow: inset 0 0 5px 2px #aaaaaa, 0 1px 0 0 #eeeeee;
+/* Fix dark border on datalist inputs (SSID fields) */
+
+[data-bs-theme='light'] input[list] {
+	background: white !important;
+	border: 1px solid var(--fpp-border) !important;
+	border-radius: 3px !important;
+	-webkit-appearance: none !important;
+	-moz-appearance: none !important;
+	appearance: none !important;
 }
 
-.disableButtons
-{
-    cursor: not-allowed;
-    pointer-events: none;
-	background-color: #eeeeee;
-	background-image: -webkit-gradient(linear, left top, left bottom, color-stop(0%, #eeeeee), color-stop(100%, #cccccc));
-	background-image: -webkit-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: -moz-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: -ms-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: -o-linear-gradient(top, #eeeeee, #cccccc);
-	background-image: linear-gradient(top, #eeeeee, #cccccc);
-	border: 1px solid #ccc;
-	border-bottom: 1px solid #bbb;
-	-webkit-border-radius: 3px;
-	-moz-border-radius: 3px;
-	border-radius: 3px;
-	color: #AAA;
-	font: bold 11px "Lucida Grande", "Lucida Sans Unicode", "Lucida Sans", Geneva, Verdana, sans-serif;
-	line-height: 1;
-	padding: 1px 0;
-	text-align: center;
-	text-shadow: 0 1px 0 #eee;
-	width: 90px;
-	height: 20px;
+input[list]:focus {
+	border-color: #007cba !important;
+	outline: none !important;
+	box-shadow: 0 0 3px rgba(0, 124, 186, 0.3) !important;
 }
 
-.disableButtons:active
-{
-	border: 1px solid #aaa;
-	border-bottom: 1px solid #888;
-	-webkit-box-shadow: inset 0 0 5px 2px #aaaaaa, 0 1px 0 0 #eeeeee;
-	-moz-box-shadow: inset 0 0 5px 2px #aaaaaa, 0 1px 0 0 #eeeeee;
-	box-shadow: inset 0 0 5px 2px #aaaaaa, 0 1px 0 0 #eeeeee;
+/* Remove datalist dropdown arrow styling inconsistencies */
+
+input[list]::-webkit-calendar-picker-indicator {
+	opacity: 0.6;
 }
 
-#playerControls input
-{
-	margin: 0 10px 0 0;
-	width: 100px;
-}
-
-#bodyWrapper
-{
-	width: 1200px;
-	margin-left: auto;
-	margin-right: auto;
-	background: rgb(240, 240,240);
-}
-
-#daemoncontrol, #playerstats
-{
-	background: rgb(240, 240, 240);
-	margin:10px;
-	padding:10px;
-}
-
-.controlHeader{
-	width: 15%;
-}
-.controlValue{
-	width: 40%;
-}
-.controlButton{
-	text-align: right;
-	width: 45%;
-}
-
-#nextPlaylist
-{
-	margin-top:10px;
-	padding:5px;
-	background:#DDD;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
-
-}
-
-#rebootShutdown
-{
-	margin-left: auto;
-	margin-right: auto;
-	text-align: center;
-	width: 100%;
-}
-
-.center
-{
-	text-align: center;
-}
-
-.ui-front
-{
-	z-index: 1001;
-}
-.ui-dialog
-{
- 	z-index: 10000;
-}	
-
-
-.settings
-{
-	width: 1100px;
-	margin-left: auto;
-	margin-right: auto;
-}
-
-#divNetwork
-{
-	margin-left: auto;
-	margin-right: auto;
-	text-align: center;
-}
-
-.clear
-{
-	clear:both;	
-}
-
-.settings fieldset
-{
-	margin-left: auto;
-	margin-right: auto;
-	border: solid 2px rgb(0,0,0);
-}
-
-#playerControls, #eventControls {
-	text-align:center;
-}
-
-.eventTblID{
-	width: 5%;
-}
-.eventTblName{
-	width: 30%;
-}
-.eventTblEffect{
-	width: 20%;
-}
-.eventTblStartCh{
-	width: 5%;
-}
-.eventTblScript{
-	width: 20%;
-}
-.eventTblScriptArgs{
-	width: 20%;
-}
-
-.aboutLeft{
-	float: left;
-	width: 47%;
-}
-.aboutCenter{
-	float: left;
-	width: 6%;
-}
-.aboutRight{
-	float: left;
-	width: 47%;
-}
-
-html
-{
-	background: url(../images/grill-bg.jpg) no-repeat center fixed;
-	-webkit-background-size: cover;
-	-moz-background-size: cover;
-	-o-background-size: cover;
-	background-size: cover;
-}
-
-#divEthernet, #divEffectLibrary{
-	min-height: 200px;
-	width: 383px;
-	float: left;
-}
-
-#divSeqData, #divMusicData, #divVideoData, #divEffectsData, #divScriptsData, #divLogsData, #divUploadsData {
-	overflow: auto;
-	min-height: 120px;
-	max-height: 120px;
-	width: 100%;
-}
-
-#divWireless, #divRunningEffects{
-	overflow: auto;
-	display: table;
-	min-height: 200px;
-	max-height: 300px;
-	width: 383px;
-	float: right;
-}
-
-#restartFlag {
+input[list]::-webkit-list-button {
 	display: none;
-	background-color: #AA0000;
-	color: #FFFFFF;
-	padding-top: 5px;
-	font-size: 20px;
-	font-weight: bold;
-	text-align: center;
-	min-height: 30px;
-	width: 100%;
 }
 
-#rebootFlag {
-	display: none;
-	background-color: #AA0000;
-	color: #FFFFFF;
-	padding-top: 5px;
-	font-size: 20px;
-	font-weight: bold;
-	text-align: center;
-	min-height: 30px;
-	width: 100%;
+/* Specific styling for SSID input fields to match other inputs */
+
+[data-bs-theme='light'] #eth_ssid,
+[data-bs-theme='light'] #backupeth_ssid {
+	background: white !important;
+	border: 1px solid var(--fpp-border) !important;
+	border-radius: 3px !important;
+	padding: 4px 6px !important;
+	font-family: inherit !important;
+	font-size: inherit !important;
 }
 
-#upgradeFlag {
-	background-color: #00AA00;
-	color: #FFFFFF;
-	padding-top: 5px;
-	font-size: 20px;
-	font-weight: bold;
-	text-align: center;
-	min-height: 30px;
-	width: 100%;
+#eth_ssid:focus,
+#backupeth_ssid:focus {
+	border-color: #007cba !important;
+	outline: none !important;
+	box-shadow: 0 0 3px rgba(0, 124, 186, 0.3) !important;
 }
 
-legend
-{
-	font-weight: bold;
-	padding: 0.1em 0.4em;
-	text-align: left;
-	-moz-border-radius: 5px;
+body .ui-widget {
+	font-family: Helvetica, Arial, sans-serif;
+}
+
+body .ui-tooltip {
+	color: #171720;
+	font-size: 0.88rem;
+	line-height: 1.3;
+	padding: 0.6em 0.8em;
+	box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.1);
 	border-radius: 5px;
-	-webkit-border-radius: 5px;
-	margin-left: auto;
-	margin-right: auto;
-	border: solid 2px rgb(0,0,0);
 }
 
-fieldset
-{
-	-moz-border-radius:5px;
-    border-radius: 5px;
-    -webkit-border-radius: 5px;
-}
-.header{padding: 10px; }
-.headerLeft , .headerRight
-{
-	width:200px;
-	text-align:center;
-	float:left;
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+	line-height: inherit;
 }
 
-.headerCenter
-{
-	width:770px;
-	text-align:center;
-	float:left;
+body .ui-widget input,
+body .ui-widget select,
+body .ui-widget textarea,
+body .ui-widget button {
+	font-family: Helvetica, Arial, sans-serif;
 }
 
-.siteName{font-size: 200%; padding-top: 13px; }
-
-
-.colPlaylistNumberDrag {
-	background-image: url(../images/vertdrag.png);
-	background-repeat:no-repeat;
-	background-size:7px 14px;
-	background-position:0 2px;
-	padding-left:20px;
-}
-.colPlaylistNumber {
-	text-align:right;
-	padding-right:0px;
-//	width: 5%;
-}
-.colPlaylistType {
-	text-align:left;
-	padding-left:5px;
-//	width: 10%;
-}
-.colPlaylistData1 {
-	text-align:left;
-	padding-left:5px;
-//	width: 40%;
-}
-.colPlaylistData2 {
-	text-align:left;
-	padding-left:5px;
-//	width: 40%;
+body .pageContent .ui-widget.ui-widget-content {
+	border: none;
+	background: none;
 }
 
-.volumeButton {
-	float: left;
-}
-
-#slider{
-	border-width: 1px;
-	border-style: solid;
-	border-color: #333 #333 #777 #333;
-	border-radius: 25px;
-	margin-left: 12px;
-	margin-right: 12px;
-	width: 100px;
-	position: relative;
-	height: 13px;
-	background-color: #8e8d8d;
-	background: url('../images/bg-track.png') repeat top left;
-    box-shadow: inset 0 1px 5px 0px rgba(0, 0, 0, .5), 
-    				  0 1px 0 0px rgba(250, 250, 250, .5);
-    left: 0px;
-	top: 6px;
-	float:left;
-}
-
-#speaker {
-	content: "";
-	display: inline-block;
-	width: 25px;
-	height: 25px;
-	background: url('../images/volume.png') no-repeat 0 -50px;
-	position: relative;
-}
-.ui-slider-handle {
-	position: absolute;
-	z-index: 2;
-	width: 25px;
-	height: 25px;
-	cursor: pointer;
-	background: url('images/handle.png') no-repeat 50% 50%;
-	font-weight: bold;
-	color: #1C94C4;
-	outline: none;
-	top: -7px;
-	margin-left: -12px;
-}
-.ui-slider-range {
-	background: #ffffff; /* Old browsers */
-	background: -moz-linear-gradient(top,  #ffffff 0%, #eaeaea 100%); /* FF3.6+ */
-	background: -webkit-gradient(linear, left top, left bottom, color-stop(0%,#ffffff), color-stop(100%,#eaeaea)); /* Chrome,Safari4+ */
-	background: -webkit-linear-gradient(top,  #ffffff 0%,#eaeaea 100%); /* Chrome10+,Safari5.1+ */
-	background: -o-linear-gradient(top,  #ffffff 0%,#eaeaea 100%); /* Opera 11.10+ */
-	background: -ms-linear-gradient(top,  #ffffff 0%,#eaeaea 100%); /* IE10+ */
-	background: linear-gradient(top,  #ffffff 0%,#eaeaea 100%); /* W3C */
-	filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#ffffff', endColorstr='#eaeaea',GradientType=0 ); /* IE6-9 */
-	position: absolute;
+body .ui-widget-header {
+	background: none;
 	border: 0;
-	top: 0;
-	height: 100%;
-	border-radius: 25px;
+	border-bottom: none;
+	border-radius: 0;
 }
 
-#statusPlaylistContents{
-	height:220px;
-	min-height:220px;
-	max-height:220px;
-	overflow:auto
-}
-
-#statusPlaylistContents table {
-	border-collapse:collapse;
-} 
-
-#eventListContents, #effectListContents{
-	height:120px;
-	min-height:120px;
-	max-height:120px;
-	overflow:auto
-}
-
-#statusPlaylist, #eventList, #effectList, #effectLibrary, #runningEffects{
-	border:thin solid;	
-	margin-top: 5px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
-	min-height: 65px;
-}
-
-#playerStatus{
-}
-
-.playerStatusHeader{
-	width: 40%;
-}
-.playerStatusLeft{
-	width: 50%;
-	float: left;
-}
-.playerStatusRight{
-	width: 50%;
-	float: left;
-}
-
-#tblStatusPlaylist {
-	 width:100%;
-}
-
-#tblStatusPlaylist tbody tr th{
-	background: #aaaaaa;
-}
-
-#tblStatusPlaylistEntries{
-	 width:100%;
-	 border-collapse:collapse;
-}
-
-#tblCreatePlaylist {
-	 width:100%;
-	 border-collapse:collapse;
-}
-
-#tblCreatePlaylist tbody tr th{
-	background: #aaaaaa;
-}
-
-#fppSystems thead {
-	background:#CCC;
-}
-
-.playlistHeader, .eventListHeader, .effectListHeader{
-	background:#DDD;
-	text-align:center;
-}
-
-.textRight{
-	text-align:right;
-	padding-right:5px;
-	}
-	
-.textLeft{
-	text-align:left;
-	padding-left:5px;
-	}	
-	
-.textCenter{
-	text-align:center;
-	}	
-
-.playlistSelectedEntry, .eventSelectedEntry, .effectSelectedEntry{
-	background:#CCC;
-}
-
-.unselectable {
-   -moz-user-select: -moz-none;
-   -khtml-user-select: none;
-   -webkit-user-select: none;
-  -ms-user-select: none;
-   user-select: none;
-}
-
-
-.PlaylistPlayingIcon{
-	background-image: url(../images/playlistplay.png);
-	background-size:10px 10px;
-	background-repeat:no-repeat;
-	background-position: 4px 4px;
-}
-
-.PlaylistRowPlaying{
-	background:#D1E0FF;
-}	
-
-#MusicOptions{
-	display:none;
-}
-
-
-#playlistEntryProperties ul li{
-	float:left;
-	list-style:none;
-	padding-right:8px;
-}
-
-#playlistEntryProperties ul li select option{
-	font-size:12px;
-}
-
-
-#btnAddPlaylistEntry{
-	margin-top:18px;
-}
-
-#tblCreatePlaylist{
-	 width:100%;
-	 border-collapse:collapse;
-}
-
-#createPlaylistItems{
-  margin:10px;
-  padding:10px;
-	border:thin solid;	
-	font-size:12px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
-}
-
-#bytesTransferred{
-  margin:10px;
-  padding:10px;
-	border:thin solid;	
-	font-size:12px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
-	min-height:200px;
-	text-align:center;
-	display:none;
-}
-
-#bridgeStatistics1{
-	margin-left:25px;
-	float:left;
-}
-
-#bridgeStatistics2{
-	margin-left:125px;
-	float:left;
-}
-
-#rowCreatePlaylistHeader{
-		background:#DDD;
-		text-align:left;
-		padding-left:5px;
-		text-decoration:underline;
-		border-collapse:collapse;
-}
-
-#rowReceivedBytesHeader{
-		background:#DDD;
-		text-align:left;
-		padding-left:5px;
-		text-decoration:underline;
-		border-collapse:collapse;
-}
-
-.selectedEntry {
-	background: #CCC;
-}
-
-.tblCreatePlaylistEntries_tbody {
-	height: auto;
-	min-height: 20px;
-}
-
-.pl_title {
-	font-size: larger;
-}
-
-.title {
-	font-size: larger;
-	text-align: center;
+body .ui-tabs .ui-tabs-nav li {
 	font-weight: bold;
 }
 
-.helpLink {
+input#backup\.Path {
+	width: 70%;
+}
+
+input#MultiSyncExtraRemotes {
+	width: 90%;
+}
+
+input#MultiSyncHTTPSubnets {
+	width: 90%;
+}
+
+body .headerCenter a {
+	color: rgba(255, 255, 255, 0.75);
 	text-decoration: none;
-	color: blue;
+}
+
+body .headerCenter a:hover {
+	color: rgba(255, 255, 255, 1);
+	text-decoration: none;
+}
+
+body fieldset {
+	border: 0;
+	padding: 0;
+	margin: 0;
+	border-bottom: 1px solid var(--fpp-border);
+	padding-bottom: 2em;
+	margin-bottom: 1em;
+	margin-top: 1.5em;
+}
+
+body legend {
+	border: 0;
+	padding: 0;
+	font-size: 1.6em;
+	font-weight: bold;
+	margin-bottom: 0.5em;
+	display: block;
+	margin-bottom: 0.5em;
+}
+
+input[type='range'] {
+	-webkit-appearance: none;
+	appearance: none;
+	/* Hides the slider so that custom slider can be made */
+	width: 100%;
+	/* Specific width is required for Firefox. */
+	background: transparent;
+	/* Otherwise white in Chrome */
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+	width: 100%;
+	height: 8px;
+	background: #d9d9d9;
+	border-radius: 4px;
+}
+
+input[type='range']::-moz-range-track {
+	width: 100%;
+	height: 8px;
+	background: #d9d9d9;
+	border-radius: 4px;
+}
+
+input[type='range']::-ms-track {
+	width: 100%;
+	height: 8px;
+	background: #d9d9d9;
+	border-radius: 4px;
+}
+
+input[type='range']::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.1);
+	border-radius: 1.5em;
+	border: 1px solid var(--fpp-border);
+	background-color: #fff;
+	border-radius: 50%;
+	width: 35px;
+	height: 35px;
+	margin-top: -12.5px;
+}
+
+input[type='range']::-moz-range-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.1);
+	border-radius: 1.5em;
+	border: 1px solid var(--fpp-border);
+	background-color: #fff;
+	border-radius: 50%;
+	width: 35px;
+	height: 35px;
+	margin-top: -12.5px;
+}
+
+input[type='range']::-ms-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.1);
+	border-radius: 1.5em;
+	border: 1px solid var(--fpp-border);
+	background-color: #fff;
+	border-radius: 50%;
+	width: 35px;
+	height: 35px;
+	margin-top: -12.5px;
+}
+
+hr {
+	border: 0px;
+	border-style: solid;
+	border-top: 1px solid var(--fpp-border);
+}
+
+body .sm-clean a .sub-arrow {
+	right: 5px;
+}
+
+/* Remove borders around the browsers default color swatch,*/
+
+input[type='color'] {
+	-webkit-appearance: none;
+	appearance: none;
+	border: none;
+	width: 5em;
+	height: 2em;
+	/*padding-left: 0 !important;*/
+}
+
+/*Chrome, Safari Opera */
+
+input[type='color']::-webkit-color-swatch-wrapper {
+	padding: 0;
+}
+
+input[type='color']::-webkit-color-swatch {
+	border: none;
+}
+
+/*Firefox */
+
+input[type='color']::-moz-color-swatch {
+	border: none;
+}
+
+/* ============================= */
+/* = Layout & Page Structure = */
+/* ============================= */
+
+.fppOuterContainer {
+	max-width: 1800px;
+	margin: auto;
+	padding-left: 0;
+	padding-right: 0;
+	margin-top: -22px;
+}
+
+.fppMenuContainer {
+	padding-bottom: 0;
+}
+
+.tab-content > .spinner-border {
+	display: block;
+	margin: auto;
 }
 
 .helpLinkDiv {
-	float: right;
+	text-align: right;
+	padding: 0.5em;
 }
 
-.nonULLink {
+.helpLinkDiv a {
+	color: #8a8a8a;
 	text-decoration: none;
-	color: blue;
+	font-size: 0.8em;
 }
 
-#playlistEntryProperties ul{
-	padding: 0;
-	margin: 10px;
+.container {
+	margin: auto;
+	/* margin-left: 5%;
+	margin-right: 5%; */
 }
 
-#credits{
-	text-align: center;
+.row {
+	display: flex;
 }
 
-.logo{
-	height: 60px;
+.title {
+	font-size: 2.3em;
+	margin-bottom: 0.65em;
+	font-weight: bold;
+	color: #fff;
 }
 
-.channelOutputTable {
-	width: 100%;
+.settings .row {
+	margin-bottom: 1.1em;
 }
 
-#fileManager, #channelOutputManager, #channelTester, .fppTabs {
-	min-width: 1068px;
-	width: 1160px;
-	margin-left: auto;
-	margin-right: auto;
+.fppMenuContainer {
+	margin-top: -15px;
 }
-.fileDetails {
-	font-size: 13px;
+
+.pageContent {
+	background: #fff;
+	border-radius: 8px;
+	color: #000;
+	padding: 2.5em 3em;
+	box-shadow: 5px 0px 0px 10000px #20222e, -1000px 100px 0px 0px #20222e,
+		1000px 100px 0px 0px #20222e;
 }
-.fileName {
-	width: 70%;
+
+.pageContent {
+	border-radius: 8px;
+	padding: 2.5em 3em;
 }
-.fileTime {
-	width: 10%;
+
+.pageContent-tabs {
+	padding-bottom: 0.85em;
+	border-bottom: 1px solid var(--fpp-border);
+	margin-bottom: 1em;
 }
-.fileExtraInfo{
-	width: 7%;
+
+.pageContent-tabs > .nav-item {
+	margin-top: 0;
 }
-#logText {
+
+[data-bs-theme='light'] body.has-touch .pageContent-tabs {
 	overflow: auto;
-}
-#logViewer {
-	border: 2px solid #000000;
+	display: block;
+	margin-right: -20px;
+
+	background: linear-gradient(
+			to left,
+			rgba(255, 255, 255, 1),
+			rgba(255, 255, 255, 1),
+			rgba(255, 255, 255, 0) 1.5em
+		),
+		radial-gradient(
+				farthest-side at 100% 50%,
+				rgba(34, 34, 34, 0.5),
+				rgba(255, 255, 255, 0)
+			)
+			100%;
+	background-color: rgba(255, 255, 255, 1);
+	background-repeat: no-repeat;
+	background-attachment: local, scroll;
+	background-size: 100% 100%, 0.75em 100%;
+	min-height: 36px;
+	/*height: 100%;*/
 }
 
-.fppTableWrapper {
-	border:thin solid;
-	font-size:12px;
-	margin-top: 5px;
-	-moz-border-radius: 5px;
-	border-radius: 5px;
-	-webkit-border-radius: 5px;
-	min-height: 65px;
-
-	-moz-user-select: -moz-none;
-	-khtml-user-select: none;
-	-webkit-user-select: none;
-	-ms-user-select: none;
-	user-select: none;
+body.has-touch .pageContent-tabs > .nav-item:not(.hidden) {
+	display: inline-block;
+	margin-left: 1.5px;
+	margin-right: 1.5px;
 }
 
-.fppTableHeader {
-	background:#DDD;
-	text-align:center;
-	font-weight: bold;
+.pageContent .volumeControls .buttons {
+	border-color: var(--fpp-border);
+	border-radius: 29px;
+	width: 62px;
+	height: 46px;
 }
 
-.fppTableSelectedEntry {
-	background:#CCC;
+.pageContent .disableButtons {
+	background-color: rgba(0, 0, 0, 0.1);
+	border-color: rgba(0, 0, 0, 0.1);
+	color: rgba(0, 0, 0, 0.3);
 }
 
-#restoreSuccessFlag{
-    display: block;
-    background-color: forestgreen;
-    color: #FFFFFF;
-    padding-top: 5px;
-    padding-bottom: 5px;
-    font-size: 18px;
-    font-weight: bold;
-    text-align: center;
-    width: 100%;
+.settings .playlistSelectRow {
+	align-items: center;
+	margin-bottom: 1.5em;
 }
 
-.bad
-{
-	font-weight: bold;
-	color: red;
-}
-.good
-{
-	font-weight: bold;
-	color: green;
+#controlsSection.container-fluid,
+#controlsSection.container-fluid .row {
+	padding-top: 0.1em;
+	padding-left: 0;
+	padding-right: 0;
+	padding-bottom: 0.2em;
+	margin: 0;
 }
 
-pre
-{
-	border: 1px solid #000;
-	margin: 30px;
-	padding: 5px;
-	background: #ddd;
+.fppScriptEntry > .row {
+	margin-bottom: 0;
 }
 
-.button
-{
-	border: 1px solid #a0a0a0;
-	padding: 2px;
-	margin: 2px;
-	background: #ccc;
-	-webkit-border-radius: 3px;
-	-moz-border-radius: 3px;
-	border-radius: 3px;
+.playlistSelectHeader > .row {
+	flex: 1;
 }
 
-.button:hover
-{
-	cursor:pointer;
+.row.tablePageHeader {
+	margin-bottom: 0;
+	padding-top: 0.5em;
 }
 
-.pluginTitle
-{
-	font-weight: bold;
-	font-size: 1.1em;
-	font-family: Arial, Helvetica, sans-serif;
+.row.tableTabPageHeader {
+	margin-bottom: 0;
+	padding-top: 0.5em;
 }
 
-.pluginTable
-{
-	width: 800px;
+/* Spinner shown on a settings row while that setting's save is in flight.
+   SetSetting() in js/fpp.js adds .settingSaving before the request goes out and
+   removes it when the reply lands.  The API applies the setting before it
+   replies - restarting a service, rewriting the hostname, hashing a password -
+   so this is regularly a multi-second wait.
+
+   No fade and no transition-delay: the point is to tell the user *immediately*
+   that their change was picked up.  A delayed fade-in never made it onto the
+   screen anyway, because the save used to be a synchronous XHR that blocked the
+   main thread for the whole request. */
+@keyframes fppSettingSaveSpin {
+	to {
+		transform: rotate(360deg);
+	}
 }
 
-.pluginTable td
-{
-	text-align: left;
-	vertical-align: top;
-}
-
-td.pluginsHeader {
-	text-align: center;
-	font-weight: bold;
-	font-size: 22px;
-	background-color: #000000;
-	color: #FFFFFF;
-}
-
-td.bgBlue {
-	background-color: #000088;
-}
-
-td.bgGreen {
-	background-color: #008800;
-}
-
-td.bgRed {
-	background-color: #880000;
-}
-
-td.bgDarkOrange {
-	background-color: #BA4A00;
-}
-
-.pendingSpan {
-	color: #00AA00;
-}
-
-.updateTable td {
-	text-align: center;
+.row.settingSaving > :last-child::after {
+	content: '';
+	display: inline-block;
+	color: var(--bs-danger);
+	width: 22px;
+	height: 22px;
 	vertical-align: middle;
-	font-weight: bold;
-	font-size: 10px;
+	margin-left: 0.5em;
+	border: 0.25em solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: fppSettingSaveSpin 0.75s linear infinite;
 }
 
-#overlay{
-    position:fixed;
-    top:0;
-    left:0;
-    background:rgba(0,0,0,0.6);
-    z-index:4000;
-    width:100%;
-    height:100%;
+@media (prefers-reduced-motion: reduce) {
+	.row.settingSaving > :last-child::after {
+		animation-duration: 1.5s;
+	}
+}
+
+[data-bs-theme='light'] .pageContent .multiSelect {
+	background: #fff;
+	padding-right: 0.65rem;
+}
+
+.rowUniverseDetails .presetRow {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px; /* adds spacing between elements */
+	margin-bottom: 2px;
+}
+
+.rowUniverseDetails .command-select,
+.rowUniverseDetails .remove-row {
+	flex: 1 1 auto;
+	min-width: 120px;
+}
+
+/* ========================= */
+/* = jQuery UI Overrides = */
+/* ========================= */
+
+.ui-tabs .ui-tabs-nav .ui-tabs-anchor {
+	padding: 0.75em 1.5em;
+}
+
+.ui-state-default,
+.ui-widget-content .ui-state-default,
+.ui-widget-header .ui-state-default,
+.ui-button,
+html .ui-button.ui-state-disabled:hover,
+html .ui-button.ui-state-disabled:active {
+	background: none;
+	border: none;
+}
+
+/* Light-theme active tab: white fill so the selected tab merges with the
+   content panel. Scoped to tabs on purpose: left generic, this also matches
+   every other jQuery UI widget using .ui-state-active (datepicker selected
+   day, autocomplete/menu hovered item) and blanks them with white text on
+   white in light mode. */
+[data-bs-theme='light'] .ui-tabs .ui-tabs-nav .ui-state-active,
+[data-bs-theme='light'] a.ui-button:active,
+[data-bs-theme='light'] .ui-button:active,
+[data-bs-theme='light'] .ui-button.ui-state-active:hover {
+	background: #fff;
+}
+
+/* Datepicker today must stay distinguishable in light mode. The
+   .ui-state-default reset above removes jQuery UI's yellow today fill (the
+   today link carries .ui-state-default and .ui-state-highlight), leaving only
+   olive text on white. Restore the fill with box-shadow for the edge so the
+   cell keeps the same size as its neighbours. */
+[data-bs-theme='light'] .ui-datepicker .ui-state-highlight {
+	background: #fffa90;
+	box-shadow: inset 0 0 0 1px #dad55e;
+	color: #777620;
+}
+
+/* Datepicker selected day must stay visible in light mode. The selected day
+   link carries .ui-state-default and .ui-state-active, so two rules above
+   conspire to blank it: the .ui-state-default reset removes jQuery UI's blue
+   active fill, and the light .ui-state-active override (now scoped to tabs)
+   set it to white while leaving the white active text from jquery-ui.css.
+   This rule is still needed after scoping the tab rule because the
+   background:none reset alone would leave the selection unfilled. Placed after
+   the today rule so a selected today shows the selection. Fill uses
+   --fpp-primary-hover (#0056b3, white text ~7:1) to meet WCAG AA, and
+   box-shadow instead of border so the selected cell keeps the same size as
+   its neighbours. */
+[data-bs-theme='light'] .ui-datepicker .ui-state-active {
+	background: var(--fpp-primary-hover);
+	box-shadow: inset 0 0 0 1px var(--fpp-primary-hover);
+	color: var(--bs-white);
+}
+
+.fppMinMaxSliderRange.ui-widget.ui-widget-content {
+	border: 1px;
+	border-style: solid;
+	border-color: #c5c5c5;
+}
+
+[data-bs-theme='light'] .fppMinMaxSliderRange .ui-slider-handle {
+	background-color: lightgrey;
+	border-color: #c5c5c5;
+}
+
+.fppMinMaxSliderRange .ui-slider-handle {
+	border: 1px;
+	border-style: solid;
+	border-radius: 0.5rem;
+	width: 0.75em;
+	height: 1.25em;
+}
+
+.fppMinMaxSliderRange .ui-slider-range {
+	background-color: #adb5bd;
+}
+
+.playlistRow.ui-sortable-helper {
+	background-color: #dfdfdf;
+	border-radius: 5px;
+}
+
+.ui-sortable .playlistRow {
+	cursor: grab;
+}
+
+.ui-sortable .playlistRow .ui-sortable-helper {
+	cursor: grabbing;
+}
+
+/* Compatibility / Accessibility fixes - last review Jan 2025  */
+
+/* JQuery UI Overrides */
+
+.ui-helper-zfix {
+	-ms-filter: 'alpha(opacity=0)';
+	filter: 'alpha(opacity=0)';
+}
+
+/* ============ */
+/* = Header = */
+/* ============ */
+
+.header {
+	border-bottom: 1px solid #2d3043;
+	display: flex;
+	color: #fff;
+	background-color: #171720;
+}
+
+.headerCenter {
+	padding-left: 0px;
+}
+
+.statusHostname {
+	/*display: inline;*/
 	display: none;
 }
 
-
-
-#fppMenu ul {
-	padding: 0px;
-	z-index:9999; }
-
-#fppMenu {
-	border-radius: 0px;
-	-moz-border-radius:0;
-	-webkit-border-radius:0;
-	padding: 0px; }
-
-#fppMenu li a span.sub-arrow {
-	border-color: white transparent transparent transparent; }
-
-#fppMenu > li {
-	width: 25%; }
-#fppMenu li {
-	text-align: center;
-	background: #414141; }
-
-#fppMenu > li {
-	border-right: 1px solid #888; }
-
-#fppMenu > li:last-child {
-	border: none; }
-
-#fppMenu li a {
-	font: bold 12px Verdana;
-	padding-top: 8px;
-	padding-bottom: 8px;
-	color: white; }
-
-#fppMenu li ul li a {
-	padding: 6px; }
-
-#fppMenu li a:hover {
-	cursor: pointer;
-	background-color: #111; }
-
-#fppMenu li ul {
-	border-radius: 0px;
-	-moz-border-radius:0;
-	-webkit-border-radius:0;
-	border: none; }
-
-#fppMenu li ul:before, #fppMenu li ul:after {
-	border: none; }
-
-#fppMenu li ul li {
-	border-bottom: 1px solid #888; }
-
-#fppMenu li ul li:last-child {
-	border: none; }
-
-#fppMenu li ul li a {
-	font-weight: normal; }
-
-#hostnameColumn{
-	max-width: 50px;
+.header > div {
+	padding: 1em;
 }
 
-.hostDescriptionSM{
+.headerLeft {
+	flex: 1;
+	display: flex;
+}
+
+.headerLeft a {
+	text-decoration: none;
+}
+
+.headerLeftCol {
+	display: flex;
+	align-items: center;
+}
+
+.headerLeft .logo {
+	max-height: 26px;
+}
+
+.fppBrand {
+	padding-left: 0.5em;
+	padding-right: 1.2em;
+}
+
+.fppBrand a {
+	color: #989898;
+}
+
+.fpp-logo {
+	width: 56px;
+	margin-left: 0.7em;
+}
+
+.fppBrand a:hover {
+	color: #fff;
+}
+
+.fppBrand .versionHead {
+	font-size: 0.8em;
+	display: inline-block;
+	padding-left: 1em;
+}
+
+.headerRight {
+	display: flex;
+	align-items: center;
+}
+
+.capeVendor {
+	position: relative;
+	margin-left: 1em;
+}
+
+.capeVendorLogo {
+	border-radius: 7px;
+	overflow: hidden;
+}
+
+.capeVendor:after {
+	content: '';
+	display: block;
+	position: absolute;
+}
+
+.headerRight .capeVendor .logo {
+	max-height: 32px;
+}
+
+.headerRight .logo {
+	max-height: 32px;
+}
+
+.header .headerRight {
+	padding-left: 0;
+}
+
+.header .headerCenter {
+	display: flex;
+	align-items: center;
+	font-size: 0.8em;
+	padding-right: 0;
+}
+
+.headerHost {
+	display: flex;
+	align-items: center;
+}
+
+#header_host a {
+	color: #fff;
+}
+
+.headerHostName {
+	display: flex;
+	align-items: center;
+	font-size: 1.9em;
+	height: 40px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	padding-right: 0.25em;
+}
+
+.headerHostLink {
+	font-weight: bold;
+	padding-right: 1em;
+}
+
+.headerBox span {
+	display: inline-block;
+	height: 28px;
+
+	background-position: center top;
+	vertical-align: middle;
+	margin-left: 0.1em;
+	padding-right: 0.9em;
+	text-align: center;
+	position: relative;
+}
+
+.headerBox span:after {
+	content: '';
+	border-right: 1px solid #2d3043;
+	width: 0;
+	height: 100%;
+	position: absolute;
+	top: 0;
+	right: 0;
+	transform: skewX(-13deg);
+}
+
+.headerBox small {
+	font-size: 1.05em;
+	display: block;
+	text-align: center;
+}
+
+.headerCenter > div {
+	margin-left: 0.5em;
+	margin-right: 0.5em;
+}
+
+/* ======================= */
+/* = Navigation & Menu = */
+/* ======================= */
+
+#fppMenu {
+	background: none;
+	float: right;
+}
+
+#fppMenu a,
+#fppMenu a:hover,
+#fppMenu a:focus,
+#fppMenu a:active {
+	font-family: Helvetica, Arial, sans-serif;
+	font-weight: bold;
+	cursor: pointer;
+	color: #b8b8b8;
+}
+
+#fppMenu a:hover,
+#fppMenu a:focus,
+#fppMenu a:active {
+	color: #fff;
+}
+
+.nav-open #fppMenu a,
+.nav-open #fppMenu a:hover,
+.nav-open #fppMenu a:focus,
+.nav-open #fppMenu a:active {
+	font-family: Helvetica, Arial, sans-serif;
+	font-weight: bold;
+	cursor: pointer;
+}
+
+[data-bs-theme='light'] .nav-open #fppMenu a:hover,
+[data-bs-theme='light'] .nav-open #fppMenu a:focus,
+[data-bs-theme='light'] .nav-open #fppMenu a:active {
+	color: #363636;
+}
+
+[data-bs-theme='light'] #fppMenuList .dropdown-item {
+	color: #363636;
+}
+
+#fppMenuList li ul a:hover,
+#fppMenu li ul a:focus,
+#fppMenu li ul a:active {
+	background-color: var(--bs-danger);
+	color: #fff;
+}
+
+#fppMenuList > li {
+	border-bottom: 3px solid transparent;
+	margin-left: 1em;
+}
+
+#fppMenuList > li > a {
+	font-size: 1.1em;
+}
+
+#fppMenuList > li.active {
+	border-bottom-color: var(--bs-danger);
+}
+
+#fppMenuList > li.active > a {
+	color: #fff;
+}
+
+#fppMenuList .external-link {
+	float: right;
+	color: rgb(160, 160, 160);
 	font-size: 0.7em;
 }
 
-.playlistInfoText{
-	font-size: 0.8em;
+[data-bs-theme='light'] .nav-open #fppMenuList > li.active > a {
+	color: #363636;
 }
 
+#rebootShutdown > button,
+#rebootShutdown > .dropdown,
+#rebootShutdown > .dropup {
+	display: inline-block;
+}
 
-.multiSyncadvancedView{
-	float: right;
+.dropdown-menu {
+	padding-left: 0.3125rem;
+	padding-right: 0.3125rem;
+}
+
+.dropdown-menu button.dropdown-item {
+	width: 100%;
+	margin: 0;
+}
+
+#fppModeDropdownButton {
+	font-weight: normal;
+	font-size: 0.9rem;
+}
+
+#fppModeDropdownButton::after {
+	border-top: 0.3em solid;
+	border-right: 0.3em solid transparent;
+	border-bottom: 0;
+	border-left: 0.3em solid transparent;
+}
+
+#fppModeDropdownButtonModeText {
 	font-weight: bold;
+	font-size: 0.95rem;
+	text-transform: capitalize;
 }
 
-.advancedViewHeaderSpacer{
-	min-width: 20px;
+#fppMenu .dropdown:after {
+	-webkit-transform: rotate(0deg);
+	-moz-transform: rotate(0deg);
+	-o-transform: rotate(0deg);
+	-ms-transform: rotate(0deg);
+	transform: rotate(0deg);
+	-webkit-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	-moz-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	-o-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	-ms-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
 }
 
-.advancedViewHeader {
-	color: #fff;
-	background-color: #414141;
+#fppMenu .dropdown.show > .dropdown-toggle:after,
+#fppMenu .dropdown > .dropdown-toggle.show:after {
+	-webkit-transform: rotate(180deg);
+	-moz-transform: rotate(180deg);
+	-o-transform: rotate(180deg);
+	-ms-transform: rotate(180deg);
+	transform: rotate(180deg);
+	-webkit-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	-moz-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	-o-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	-ms-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
 }
 
-.advancedViewRow{
-	font-size: 0.8em;
-	color: #fff;
-	background-color: #414141;
+#fppMenu .dropdown-menu {
+	display: none;
+	padding: 0.3125rem 0;
+	border: 0;
+	opacity: 0;
+	transform: scale(0);
+	transform-origin: 0 0;
+	will-change: transform, opacity;
+	transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+		opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+	box-shadow: 0 2px 5px 0 rgba(0, 0, 0, 0.26);
+	top: 40px;
+}
+
+#fppMenu .dropdown-menu.show {
+	animation-name: dropdown-animation;
+	animation-duration: 0.3s;
+	animation-fill-mode: forwards;
+	animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+#fppMenu .open > .dropdown-menu,
+#fppMenu .dropdown-menu.show {
+	display: block;
+	opacity: 1;
+	transform: scale(1);
+}
+
+#fppMenu .dropdown-menu.hiding {
+	display: block;
+	opacity: 0;
+	transform: scale(0);
+}
+
+#fppMenu .dropdown-menu[x-placement='bottom-start'] {
+	transform-origin: 0 0;
+}
+
+#fppMenu .dropdown-menu[x-placement='bottom-end'] {
+	transform-origin: 100% 0;
+}
+
+#fppMenu .dropdown-menu[x-placement='top-start'] {
+	transform-origin: 0 100%;
+}
+
+#fppMenu .dropdown-menu[x-placement='top-end'] {
+	transform-origin: 100% 100%;
+}
+
+[data-bs-theme='light'] #fppMenu .dropdown-menu .disabled > a {
+	color: #777;
+}
+
+[data-bs-theme='light'] #fppMenu .dropdown-menu .disabled > a:focus,
+[data-bs-theme='light'] #fppMenu .dropdown-menu .disabled > a:hover {
+	color: #777;
+}
+
+#fppMenu .dropdown-menu .disabled > a:focus,
+#fppMenu .dropdown-menu .disabled > a:hover {
+	text-decoration: none;
+	background-color: transparent;
+	background-image: none;
+}
+
+#fppMenu .dropdown-menu.dropdown-with-icons .dropdown-item {
+	padding: 0.75rem 1.25rem 0.75rem 0.75rem;
+}
+
+#fppMenu .dropdown-item svg,
+.dropdown-item .fas {
+	width: 20px;
+	display: inline-block;
 	text-align: center;
-	min-width: 90px;
+	padding-right: 4px;
 }
 
-.updateAvailable {
-	color: #FF0000;
+/* "Help for This Page" at the top of the Help menu. Tinted with the theme's
+   primary-subtle tokens so it reads in light and dark mode. This cannot be
+   the bg-primary-subtle / text-primary-emphasis utilities: those are
+   !important and would defeat the menu's :hover/:focus highlight below, so
+   the tint is scoped to the resting state and the hover rule stays in charge. */
+#fppMenu .dropdown-item.help-for-page:not(:hover):not(:focus):not(:active) {
+	background-color: var(--bs-primary-bg-subtle);
+	color: var(--bs-primary-text-emphasis);
+}
+
+#fppMenu .dropdown-menu.dropdown-with-icons .dropdown-item .material-icons {
+	vertical-align: middle;
+	font-size: 24px;
+	position: relative;
+	margin-top: -4px;
+	top: 1px;
+	margin-right: 12px;
+	opacity: 0.5;
+}
+
+#fppMenu .dropdown-menu .dropdown-item,
+#fppMenu .dropdown-menu li > a {
+	position: relative;
+	width: auto;
+	display: flex;
+	flex-flow: nowrap;
+	align-items: center;
+	text-decoration: none;
+	font-size: 0.9rem;
+	border-radius: 5px;
+	margin: 0 0.3125rem;
+	-webkit-transition: all 150ms linear;
+	-moz-transition: all 150ms linear;
+	-o-transition: all 150ms linear;
+	-ms-transition: all 150ms linear;
+	transition: all 150ms linear;
+	min-width: 7rem;
+	padding: 0.625rem 1.25rem;
+	overflow: hidden;
+	line-height: 1.428571;
+	text-overflow: ellipsis;
+	word-wrap: break-word;
+}
+
+[data-bs-theme='light'] #fppMenu .dropdown-menu .dropdown-item,
+[data-bs-theme='light'] #fppMenu .dropdown-menu li > a {
+	color: #333;
+}
+
+.dropdown-menu .dropdown-item {
+	border-radius: 5px;
+}
+
+.dropdown-menu .dropdown-item:hover,
+.dropdown-menu .dropdown-item:focus,
+.dropdown-menu .dropdown-item:active,
+.dropdown-menu a:active,
+.dropdown-menu a.active,
+.dropdown-menu a:hover,
+.dropdown-menu a:focus,
+.dropdown-menu a:active {
+	box-shadow: 0 4px 5px 0px rgba(0, 0, 0, 0.14),
+		0 7px 10px -5px rgba(156, 39, 176, 0.4);
+	background-color: var(--bs-danger);
+	color: #fff !important;
+}
+
+.nav-link {
+	text-decoration: none;
+	padding: 0.6rem 1em;
+}
+
+.nav-pills li {
+	margin-top: 0.2em;
+	text-align: center;
+}
+
+#scrollTopButton {
+	display: none;
+	position: fixed;
+	top: 72px;
+	right: 5px;
+	z-index: 9999;
+	background-color: red;
+	color: white;
+}
+
+#scrollTopButton:hover {
+	background-color: #555;
+}
+
+.scrollTopButtonHidden {
+	display: none;
+}
+
+.scrollTopButtonShowing {
+	display: block !important;
+}
+
+/* Body scrolling is locked while a modal is open, so the Top button is useless
+   there and would sit on top of the modal's close button. */
+body.modal-open #scrollTopButton {
+	display: none !important;
+}
+
+.navbar-toggler {
+	padding: 0.25rem 0.75rem;
+	font-size: 1.25rem;
+	line-height: 1;
+	background-color: transparent;
+	border: 0px solid transparent;
+	border-radius: 0.25rem;
+}
+
+.navbar-toggler:hover,
+.navbar-toggler:focus {
+	text-decoration: none;
+}
+
+.navbar-toggler:not(:disabled):not(.disabled) {
+	cursor: pointer;
+}
+
+.navbar-toggler-icon {
+	display: inline-block;
+	width: 1.5em;
+	height: 1.5em;
+	vertical-align: middle;
+	content: '';
+	background: no-repeat center center;
+	background-size: 100% 100%;
+}
+
+.navbar-dark .navbar-toggler-icon {
+	background-image: url("data:image/svg+xml;charset=utf8,%3Csvg viewBox='0 0 30 30' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath stroke='rgba(255, 255, 255, 1)' stroke-width='2' stroke-linecap='round' stroke-miterlimit='10' d='M4 7h22M4 15h22M4 23h22'/%3E%3C/svg%3E");
+}
+
+.nav-open .navbar-dark .navbar-toggler-icon {
+	background-image: none;
+}
+
+.nav-open .navbar-dark .navbar-toggler-icon:before {
+	content: '✖';
+	left: -5px;
+	position: relative;
+	top: 0;
+	color: #ffffff;
+	font-size: 30px;
+	z-index: 1040;
+}
+
+.navbar-toggler:focus {
+	box-shadow: none;
+}
+
+#navbarUpdateAvail,
+#navbarUpdateInProgress,
+#navbarPluginUpdateAvail {
+	display: none;
+}
+
+#navbarUpdateAvail a,
+#navbarUpdateInProgress a,
+#navbarPluginUpdateAvail a {
+	/* A token, not an rgb() literal (rule 3); see its definition. */
+	color: var(--fpp-header-attention);
+	font-size: 1.5em;
+}
+
+#divLEDPanelMatrices a.nav-link.active {
+	color: blue;
+}
+
+/* =============================== */
+/* = Loading States & Spinners = */
+/* =============================== */
+
+/* Use as <div class="ajax-loading-60px"></div> */
+
+.ajax-loading-60px {
+	border: 16px solid #f3f3f3;
+	border-radius: 50%;
+	border-top: 16px solid #3498db;
+	width: 60px;
+	height: 60px;
+	-webkit-animation: ajax-spin 2s linear infinite;
+	/* Safari */
+	animation: ajax-spin 2s linear infinite;
+}
+
+/* ================= */
+/* = Status Page = */
+/* ================= */
+
+#schedulerInfo .schedulerStartTime,
+#schedulerInfo .schedulerEndTime {
+	display: none;
+}
+
+.schedulePreviewTable {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
+.schedulePreviewTable > tbody > tr > td {
+	background-color: transparent;
+	padding-top: 0.2em;
+	padding-bottom: 0.2em;
+	border-bottom: 0px;
+}
+
+.statusPageLoading {
+	display: none;
+	align-items: center;
+	justify-content: center;
+	min-height: 300px;
+}
+
+/* Gated on .show-loading-skeleton, not on .is-loading alone: fpp.js only adds
+   that class if the page is still loading after a short delay, so a fast
+   refresh settles without ever painting these placeholders. */
+body.is-loading.show-loading-skeleton .statusPageLoading {
+	display: block;
+	animation: fppSkeletonFadeIn 0.2s ease-in both;
+}
+
+@keyframes fppSkeletonFadeIn {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+body.is-loading.show-loading-skeleton #schedulerInfo .labelHeading,
+body.is-loading.show-loading-skeleton #schedulerInfo .labelValue {
+	position: relative;
+	color: rgba(0, 0, 0, 0);
+}
+
+body.is-loading.show-loading-skeleton #schedulerInfo .labelAction {
+	opacity: 0;
+}
+
+body.is-loading.show-loading-skeleton #schedulerInfo .labelHeading:before,
+body.is-loading.show-loading-skeleton #schedulerInfo .labelValue:before {
+	display: block;
+	content: '';
+	top: 0;
+	left: 0;
+
+	position: absolute;
+	animation-duration: 6s;
+	animation-fill-mode: forwards;
+	animation-iteration-count: infinite;
+	animation-name: placeholderSkeleton;
+	animation-timing-function: linear;
+	background: #20222e;
+	border-radius: 5px;
+	background: linear-gradient(
+		90deg,
+		#2c3048 0%,
+		#20222e 39%,
+		#20222e 57%,
+		#2c3048 100%
+	);
+}
+
+body.is-loading.show-loading-skeleton #schedulerInfo .labelHeading:before {
+	right: 0;
+	height: 14px;
+}
+
+body.is-loading.show-loading-skeleton #schedulerInfo .labelValue:before {
+	height: 14px;
+	width: 60px;
+}
+
+.statusPageControlsRow.statusPageControlsRow {
+	margin-bottom: 0;
+}
+
+#playerModeInfo,
+#remoteModeInfo,
+#bridgeModeInfo {
+	display: none;
+}
+
+#programControl {
+	color: #fff;
+}
+
+/* The status page stacks multiple .pageContent cards (playerModeInfo,
+   bridgeModeInfo, etc.). The default 10000px box-shadow makes each card try to
+   paint the whole page background, so a lower card's shadow covers the card
+   above it and that card loses its bounding box (most visible in dark mode).
+   Since body now provides the page background, render these as real cards. */
+#programControl .pageContent {
+	box-shadow: none;
+	border: 1px solid var(--fpp-border);
+}
+
+.statusDivTopRow {
+	color: #fff;
+	display: flex;
+	margin-bottom: 2em;
+	margin-left: 0;
+}
+
+.statusDivTopCol {
+	position: relative;
+	margin-left: 1.4em;
+	padding-left: 1.4em;
+}
+
+.statusDivTopCol:before {
+	content: '';
+	display: block;
+	border-left: 1px solid #2d3043;
+	height: 100%;
+	position: absolute;
+	top: 0;
+	left: 0;
+	transform: skewX(-13deg);
+}
+
+.statusDivTopCol:first-child {
+	margin-left: 0;
+	padding-left: 0;
+}
+
+.statusDivTopCol:first-child:before {
+	content: none;
+}
+
+.schedulerStatusCol {
+	display: flex;
+}
+
+.schedulerStatusCol .labelAction {
+	padding-left: 2em;
+}
+
+#txtPlayerStatus {
+	padding-left: 0.5em;
+}
+
+.settingLabelHeading {
+	font-weight: normal;
+}
+
+.playlistRepeatCol .settingLabelHeading {
+	display: inline-block;
+	padding-right: 1em;
+}
+
+#playerModeInfo .statusBoxRight,
+#settingsManager .statusBoxRight {
+	float: right;
+}
+
+#schedulerInfo {
+	display: flex;
+}
+
+#volumeControl .labelHeading {
+	margin-bottom: 0;
+}
+
+.volumeControlsContainer .labelHeading {
+	margin-bottom: 0%;
+}
+
+#playerTime .labelValue,
+#playerTime .labelHeading,
+.tblPlaylistHeaderDetails .labelValue,
+.tblPlaylistHeaderDetails .labelHeading {
+	padding: 15px;
+}
+
+#playerTime .labelHeading,
+.tblPlaylistHeaderDetails .labelHeading {
+	padding-bottom: 0.05em;
+	padding-top: 0;
+	margin-bottom: 0.5em;
+}
+
+#playerTime .labelValue,
+.tblPlaylistHeaderDetails .labelValue {
+	background-color: var(--bs-border-color);
+	padding-top: 0.5em;
+	padding-bottom: 0.5em;
+	font-size: 1em;
+}
+
+#playerTime > div:first-child .labelValue,
+.tblPlaylistHeaderDetails > div:first-child .labelValue {
+	border-bottom-left-radius: 28px;
+	border-top-left-radius: 28px;
+}
+
+#playerTime > div:last-child .labelValue,
+.tblPlaylistHeaderDetails > div:last-child .labelValue,
+.tblPlaylistHeaderDetails > div.lastVisibleDetail .labelValue {
+	border-top-right-radius: 28px;
+	border-bottom-right-radius: 28px;
+}
+
+/* #schedulerInfo .statusTable>div{
+	margin-left: 4em;
+}
+#schedulerInfo .statusTable>div:first-child{
+	margin-left: 0;
+}*/
+
+#schedulerInfo .container {
+	padding-left: 0em;
+	padding-right: 0em;
+}
+
+/* ===================== */
+/* = Player Controls = */
+/* ===================== */
+
+.volumeControlsContainer {
+	display: flex;
+	margin-bottom: 0.4em;
+}
+
+.volumeControls {
+	display: flex;
+	align-items: center;
+}
+
+.volumeControls input {
+	margin-left: 0.5em;
+	margin-right: 0.5em;
+}
+
+#playerTime {
+	display: flex;
+}
+
+#playerTime {
+	margin-top: 0;
+}
+
+#playerTime p {
+	margin-bottom: 0;
+	font-size: 0.75rem;
+}
+
+#progressBar {
+	padding-left: 5%;
+	padding-right: 5%;
+}
+
+#playerTime > div:first-child > div {
+	padding-left: 0px;
+}
+
+#playerTime > div:last-child > div {
+	padding-right: 10px;
+}
+
+[data-bs-theme='light'] .controlsSectionToPin.Zebra_Pin,
+[data-bs-theme='light'] #controlsSection.Zebra_Pin {
+	background-color: #fff;
+	box-shadow: 0px 5px 4px -5px rgba(0, 0, 0, 0.2), 5px 0px 0px 0px #fff;
+}
+
+/* #controlsSection is the element Zebra_Pin actually pins (see fpp-dark.css);
+   keep its pinned padding consistent with the legacy .controlsSectionToPin. */
+.controlsSectionToPin.Zebra_Pin,
+#controlsSection.Zebra_Pin {
+	padding-top: 0.5em;
+	margin-left: 0%;
+}
+
+#playerControls {
+	padding: 0;
+}
+
+[data-bs-theme='light'] #playerControls.Zebra_Pin {
+	background-color: #fff;
+	box-shadow: 0px 5px 4px -5px rgba(0, 0, 0, 0.2), 5px 0px 0px 0px #fff;
+}
+
+#playerControls.Zebra_Pin {
+	padding-top: 0.5em;
+}
+
+[data-bs-theme='light'] #playerTime.Zebra_Pin {
+	background-color: #fff;
+	box-shadow: 0px 5px 4px -5px rgba(0, 0, 0, 0.2), 5px 0px 0px 0px #fff;
+}
+
+#playerTime.Zebra_Pin {
+	padding-top: 0.5em;
+}
+
+/* ============== */
+/* = Playlist = */
+/* ============== */
+
+#playlistOuterScroll {
+	max-height: 75vh;
+	overflow-y: scroll;
+}
+
+#playlistSelect {
 	font-weight: bold;
 }
 
-@media screen and (max-width: 950px) {
-	html {
-		background: #f0f0f0;
-	}
-	#bodyWrapper
-	{
-		width: 100%;
-	}
-	.settings
-	{
-		width: 100%;
-	}
-	#footer
-	{
-		width: 100%;
-	}
-	.headerLeft, .headerRight, .headerCenter
-	{
-		width: 100%;
-		margin-left: auto;
-		margin-right: auto;
-		text-align: center;
+.playlistRepeatCol {
+	display: flex;
+	align-items: center;
+}
+
+.playlistSelectCol {
+	flex: 1;
+}
+
+.playlistRepeatCol {
+	padding-left: 2em;
+}
+
+.playlistEntriesBody {
+	background-color: #ececec;
+	border-radius: 8px;
+	padding: 1.1em;
+
+	width: 100%;
+}
+
+.tblPlaylistDetailsHeader h2 {
+	padding-right: 1.5em;
+	font-size: 1.4em;
+	margin-top: 1.2em;
+}
+
+.tblPlaylistDetailsHeader > div {
+	display: flex;
+	margin-top: 1.2em;
+}
+
+.tblPlaylistDetailsHeader th {
+	padding: 0.2em 0 1em 0;
+}
+
+.tblPlaylistContainer {
+	display: none;
+}
+
+.tblPlaylistContainer.tblPlaylistActive {
+	display: block;
+}
+
+.PlaylistRowPlaying {
+	color: #fff;
+	background-color: var(--bs-success);
+}
+
+.PlaylistRowPlaying td:first-child:before {
+	content: '\f04b';
+	font-family: 'Font Awesome 5 Free';
+	font-weight: 900;
+	font-size: 0.8em;
+	display: inline-block;
+	vertical-align: middle;
+	padding-right: 1em;
+}
+
+.tblPlaylistWrap {
+	padding: 0.75em;
+	background-color: #f5f5f5;
+	border-radius: 10px;
+	margin-top: 0.75em;
+}
+
+[data-bs-theme='light'] .playlistSelectedEntry:not(.unselectable),
+[data-bs-theme='light']
+	.playlistSelectedEntry.PlaylistRowPlaying:not(.unselectable),
+[data-bs-theme='light'] .fileDetails.selectedEntry:not(.unselectable) {
+	color: #000;
+	background-color: #c5d6f9;
+}
+
+.PlaylistRowPlaying td,
+.playlistSelectedEntry td,
+.playlistSelectedEntry.PlaylistRowPlaying td,
+.fileDetails.selectedEntry td {
+	border-top-color: transparent;
+}
+
+#playlistDetails table {
+	border: 0;
+	border-spacing: 0;
+}
+
+.playlistRow {
+	transition: background-color 0.15s ease-out;
+}
+
+.playlistRow td {
+	padding: 0.1em 1em;
+	transition: background-color 0.15s ease-out;
+	border-top: 1px solid var(--fpp-border);
+}
+
+.playlistRow:first-child td {
+	border-top: none;
+}
+
+.playlistRow td:first-child {
+	padding: 0.4em 1em;
+	border-radius: 5px 0 0 5px;
+}
+
+.playlistRow td:last-child {
+	padding: 0.75em 1em;
+	border-radius: 0 5px 5px 0;
+}
+
+.tblPlaylistHeaderDetails {
+	display: flex;
+}
+
+.tblPlaylistHeaderDetails > div:first-child > div {
+	padding-left: 30px;
+}
+
+.tblPlaylistHeaderDetails > div:last-child > div,
+.tblPlaylistHeaderDetails > div.lastVisibleDetail > div {
+	padding-right: 30px;
+}
+
+#verbosePlaylistItemDetailsRow i {
+	display: none;
+}
+
+.verbosePlaylistItemSetting th {
+	font-weight: normal;
+}
+
+.verbosePlaylistItemSetting {
+	margin-top: 1.5em;
+	margin-bottom: 1.5em;
+}
+
+#verbosePlaylistItemDetailsRow {
+	margin-bottom: 0;
+}
+
+.psi {
+	width: 100%;
+	padding: 0px;
+	display: flex;
+	align-items: center;
+}
+
+.psiHeader {
+	text-align: left;
+	font-weight: bold;
+	padding: 0px;
+	padding-right: 5px;
+	vertical-align: top;
+	white-space: nowrap;
+	width: 10%;
+	min-width: 100px;
+}
+
+.psiDuration {
+	padding: 0px;
+	vertical-align: top;
+	width: 10%;
+	min-width: 100px;
+}
+
+.psiDurationSeconds {
+	display: none;
+}
+
+.psiDataSimple {
+	flex: 1;
+	padding: 0px;
+	vertical-align: top;
+	width: 80%;
+}
+
+.psiDataSimple .psiNote {
+	font-style: italic;
+	color: #666;
+	margin-left: 4px;
+}
+
+.psiData {
+	flex: 1;
+	padding: 0px;
+	vertical-align: top;
+	width: 80%;
+	display: none;
+}
+
+.psiDetailsWrapper {
+	width: 100%;
+	float: left;
+}
+
+.psiDetails {
+	width: 100%;
+	overflow: hidden;
+	display: flex;
+	flex-wrap: wrap;
+}
+
+.psiDetailsArg {
+	width: 100%;
+	display: flex;
+	flex-wrap: wrap;
+}
+
+.psiDetailsHeader {
+	text-align: left;
+	font-weight: bold;
+	padding: 0px;
+	padding-right: 5px;
+	vertical-align: top;
+	white-space: nowrap;
+}
+
+.psiDetailsData {
+	flex: 1;
+	padding: 0px;
+	vertical-align: top;
+}
+
+.psiDetailsLF {
+	flex-basis: 100%;
+	height: 0px;
+}
+
+.colPlaylistNumber {
+	width: 75px;
+}
+
+#playlistEditor .tblPlaylistWrap {
+	padding: 0;
+}
+
+#playlistEditor .tblPlaylistLeadInContainer .tblPlaylistDetailsHeader > div {
+	margin-top: 0;
+}
+
+.playlistEditContainer #playlistEntryProperties td {
+	padding-top: 0.2em;
+	padding-bottom: 0.2em;
+}
+
+.playlistEditContainer #playlistEntryProperties td:first-child {
+	padding-right: 1em;
+}
+
+.playlistEditForm {
+	flex: 5;
+	padding-right: 5%;
+}
+
+#playlistEntryProperties {
+	flex: 7;
+}
+
+.playlistSelectHeader,
+.playlistEditorHeader {
+	display: flex;
+	border-bottom: 1px solid #ced4da;
+	padding-bottom: 0.5em;
+	margin-bottom: 1em;
+	align-items: top;
+}
+
+.playlistEditorHeaderTitleWrapper {
+	display: flex;
+}
+
+.playlistEditorHeaderTitleEditButton {
+	margin-left: 1em;
+}
+
+.playlistEditorHeaderTitleEditButtonWrapper {
+	transform: translateY(5px);
+}
+
+.playlistEditorHeaderTitle {
+	margin-bottom: 0;
+	margin-left: 1em;
+}
+
+.playlistEditorHeaderActions {
+	margin-left: auto;
+	display: flex;
+	margin-top: 0;
+}
+
+[data-bs-theme='light'] .playlistEditorBackButton {
+	background-color: #fff;
+	border: 1px solid var(--fpp-border);
+	color: #707070;
+}
+
+.playlistEditorBackButton {
+	appearance: none;
+	font-size: 1.2em;
+	padding: 0.3em 1em;
+	border-radius: 1.5rem;
+	transition: 0.5s all cubic-bezier(0.075, 0.82, 0.165, 1);
+}
+
+.playlistEditorBackButton .fa-chevron-left {
+	padding-right: 0.5em;
+}
+
+.playlistEditorBackButton:hover {
+	border-color: var(--bs-danger);
+	color: var(--bs-danger);
+}
+
+/* Destructive actions (e.g. Delete) look like any other button until
+   hovered, so the warning shows without the button standing out on the page.
+   Applied via data-btn-enabled-class so disabled buttons never pick it up;
+   hover-capable devices only, so a tap doesn't leave the button stuck red. */
+@media (hover: hover) {
+	.buttons.btn-hover-danger:hover {
+		color: var(--bs-white);
+		background-color: var(--bs-danger);
+		border-color: var(--bs-danger);
 	}
 }
 
-@media screen and (max-width: 700px) {
-	#fppMenu > li {
-		width: 100%; }
-	#fppMenu > li a {
-		border-bottom: 1px solid #888; }
-	#fppMenu li a {
-		color: white !important; }
-	#fppMenu li ul li {
-		background: #555; }
+.playlistEditorBackButton .fa-grip-horizontal {
+	color: var(--bs-danger);
+}
+
+.playlistEditEntriesActions {
+	float: right;
+}
+
+.hasPlaylistDetailsLoaded .playlistSelectContainer {
+	display: none;
+}
+
+.playlistEditorContainer {
+	display: none;
+}
+
+.playlistRowEditActionCell {
+	width: 150px;
+	text-align: right;
+}
+
+.playlistRowCheckCell {
+	width: 32px;
+	padding: 0.4em 0.4em !important;
+	text-align: center;
+	display: none;
+}
+
+.playlistSelectMode .playlistRowCheckCell {
+	display: table-cell;
+}
+
+.playlistSelectMode .playlistRowCheckCell + .center {
+	display: none;
+}
+
+.playlistSelectMode .playlistRowEditActionCell {
+	display: none;
+}
+
+.playlistEntryCheckbox {
+	cursor: pointer;
+	width: 16px;
+	height: 16px;
+}
+
+.playlistSelectMode .playlistSelectedEntry {
+	background-color: transparent !important;
+}
+
+.playlistSelectMode .playlistSelectModeBtn {
+	background-color: var(--bs-success);
+	color: #fff;
+}
+
+.playlistSelectActionsDropdown .buttons {
+	background-color: var(--bs-success);
+	color: #fff;
+	font-size: 0.85em;
+}
+
+.playlistSelectActionsDropdown .buttons:hover {
+	filter: brightness(1.1);
+}
+
+.hasPlaylistDetailsLoaded .playlistEditorContainer {
+	display: block;
+}
+
+.playlistCard {
+	padding: 1.4em;
+	position: relative;
+}
+
+.savePlaylistBtnHasChange {
+	display: none;
+}
+
+.playlist-warning::after {
+	content: '\26a0';
+	background-color: rgb(251, 255, 7);
+	color: #000;
+	display: inline-block;
+	text-align: center;
+	vertical-align: middle;
+	width: 32px;
+	height: 32px;
+	border-radius: 17px;
+	font-family: 'Font Awesome 5 Free';
+	font-weight: 900;
+	font-size: 1.2em;
+	padding-top: 0em;
+	margin-left: 0.8em;
+}
+
+.playlistRowWarning {
+	background-color: var(--bs-warning-bg-subtle) !important;
+}
+.playlistEntryWarningIcon,
+.cmdTmplWarning {
+	color: var(--bs-warning);
+	font-family: 'Font Awesome 5 Free';
+	font-weight: 900;
+	font-size: 1.1em;
+	margin-left: 0.4em;
+	vertical-align: middle;
+}
+
+.playlistCard {
+	margin-top: 0.5em;
+	cursor: pointer;
+}
+
+.playlistSelectBody {
+	margin-top: -0.5em;
+}
+
+.playlistCard h3 {
+	margin-bottom: 0;
+	cursor: pointer;
+}
+
+.playlistCard:hover {
+	color: var(--bs-danger);
+	transition: 0.3s all cubic-bezier(0.075, 0.82, 0.165, 1);
+	transform: translateY(-4px);
+}
+
+.playlistCard h3:before {
+	content: '\f0cb';
+	background-color: var(--bs-danger);
+	color: #fff;
+	display: inline-block;
+	text-align: center;
+	vertical-align: middle;
+	width: 32px;
+	height: 32px;
+	border-radius: 17px;
+	font-family: 'Font Awesome 5 Free';
+	font-weight: 900;
+	font-size: 0.75em;
+	padding-top: 0.4em;
+	margin-right: 0.8em;
+}
+
+.tblScheduleHeadPlaylist,
+#tblSchedule select.cmdTmplCommand {
+	width: 300px;
+}
+
+/* =============== */
+/* = Scheduler = */
+/* =============== */
+
+.schOptionsCommand .cmdTmplArgsTable {
+	margin-top: 0.5em;
+}
+
+.schOptionsCommand .cmdTmplArgsTable tr th,
+.schOptionsCommand .cmdTmplArgsTable tr td {
+	padding: 0em;
+	margin: 0;
+	text-transform: none;
+	font-weight: bold;
+	font-size: 1em;
+}
+
+.schOptionsCommand .cmdTmplArgsTable tr td {
+	font-weight: normal;
+	padding-left: 0.5em;
+}
+
+#tblSchedule {
+	margin-top: 0;
+}
+
+#tblSchedule input[type='text'],
+#tblSchedule select {
+	width: 100%;
+}
+
+#tblSchedule tr td table.dayMaskTable {
+	margin-top: 0.5em;
+}
+
+#tblSchedule tr td table.dayMaskTable th {
+	padding-bottom: 0;
+	text-align: center;
+}
+
+#tblSchedule tr td table.dayMaskTable td {
+	padding-left: 0;
+	padding-right: 0.2em;
+	padding-top: 0em;
+	padding-bottom: 0;
+}
+
+/* ======================================================== */
+/* = Form Elements (Range Sliders, Color Pickers, etc.) = */
+/* ======================================================== */
+
+.fppMinMaxSliderRange {
+	width: 100%;
+	background-color: white !important;
+	z-index: 1 !important;
+	border: 1px !important;
+	border-style: solid !important;
+	border-color: #c5c5c5ca !important;
+}
+
+/* =========================== */
+/* = Tables & Data Display = */
+/* =========================== */
+
+/* Single-knob thead styling — all FPP data-table headers share one background.
+   Adjust --fpp-thead-bg in fpp-system-design.css / fpp-dark.css to re-theme everyone.
+   Structural rules (border-radius, padding, font-weight) stay on per-table selectors below. */
+.tblheader,
+#tblEffectLibrary thead th,
+#fppSystemsTable thead th,
+#fppSystemsTable thead td,
+.table-download-existing-backups thead,
+.table-restore-existing-backups thead,
+#wifiNetworksTable thead,
+#divRunningEffects table thead th,
+#divOverlayEffects table thead th,
+.fppStickyTheadTable thead th,
+.fppStickyTheadTable thead td,
+.fppStickyModalTheadTable thead th,
+.fppStickyModalTheadTable thead td,
+.floatThead-table thead th,
+.floatThead-table thead td,
+table.fppStickyTheadTable thead.Zebra_Pin th,
+table.fppStickyTheadTable thead.Zebra_Pin td {
+	background-color: var(--fpp-thead-bg) !important;
+	color: var(--fpp-thead-color) !important;
+}
+
+/* floatThead clone container — gets a copy of the thead positioned fixed,
+   needs an opaque background or rows scroll through visibly. */
+.floatThead-container,
+.floatThead-wrapper,
+.floatThead-container > table,
+.floatThead-container > table > thead,
+.floatThead-container > table > thead > tr {
+	background-color: var(--fpp-thead-bg) !important;
+}
+
+/* jQuery UI sets the datepicker z-index inline to (input z-index + 1), which
+   is ~1 for a table-cell input, so the popup slid under the floatThead clone
+   (zIndex 990 in fpp.js). Keep it above the sticky header but below modals. */
+.ui-datepicker {
+	z-index: 1000 !important;
+}
+
+.tblheader {
+	text-align: center;
+}
+
+/* Shared "selected row" highlight — used by scheduler, co-pixelStrings, co-universes,
+   commandPresets, pixeloverlaymodels, channelinputs, outputprocessors, and more.
+   Previously defined inside scheduler.php's <style> block; now global. */
+.selectedEntry {
+	background: var(--fpp-selected-row-bg);
+}
+
+.fppTableWrapper thead th {
+	font-weight: bold;
+}
+
+/* Make the size attribute mean something on numeric table inputs.
+   size= is ignored by browsers for type=number, so a column holding a 0-9
+   null count renders as wide as one holding a channel number and the table
+   overflows for no reason.  The markup already states the intent, so key off
+   it rather than inventing per-column classes: no Bootstrap width utility
+   covers this, and it is a layout constraint rather than a cosmetic tweak.
+   ch units so it tracks the font, plus room for the spinner. */
+.fppTableWrapper input[type='number'][size='2'] {
+	width: 5.5ch;
+}
+
+.fppTableWrapper input[type='number'][size='3'] {
+	width: 6.5ch;
+}
+
+.fppTableWrapper input[type='number'][size='4'] {
+	width: 7.5ch;
+}
+
+.fppTableWrapper input[type='number'][size='5'] {
+	width: 8.5ch;
+}
+
+.fppTableWrapper input[type='number'][size='6'] {
+	width: 9.5ch;
+}
+
+.fppTableWrapper input[type='number'][size='7'] {
+	width: 10.5ch;
+}
+
+.fppTableWrapper input[type='number'][size='8'] {
+	width: 11.5ch;
+}
+
+/* Generic clearfix-child utility (legacy). Kept global so pages don't need
+   to redefine it. Used by about.php and potentially elsewhere. */
+.clear {
+	clear: both;
+}
+
+.fppTableRowTemplate {
+	display: none;
+}
+
+.tablePageHeader .form-actions {
+	margin-top: 0;
+	margin-bottom: 0;
+	padding-bottom: 0.7em;
+}
+
+[data-bs-theme='light'] .tablePageHeader.Zebra_Pin {
+	background-color: #fff;
+	box-shadow: 0px 5px 4px -5px rgba(0, 0, 0, 0.2), 5px 0px 0px 0px #fff;
+}
+
+.tablePageHeader.Zebra_Pin {
+	padding-top: 0.5em;
+}
+
+.tablePageHeader.Zebra_Pin .form-actions {
+	margin-bottom: 0;
+}
+
+.tableTabPageHeader .form-actions {
+	margin-top: 0;
+	margin-bottom: 0;
+	padding-bottom: 0.7em;
+}
+
+[data-bs-theme='light'] .tableTabPageHeader.Zebra_Pin {
+	background-color: #fff;
+	box-shadow: 0px 5px 4px -5px rgba(0, 0, 0, 0.2), 5px 0px 0px 0px #fff;
+}
+
+.tableTabPageHeader.Zebra_Pin {
+	padding-top: 0.5em;
+}
+
+.tableTabPageHeader.Zebra_Pin .form-actions {
+	margin-bottom: 0;
+}
+
+.tableOptionsForm {
+	padding: 0.65em;
+}
+
+.tableOptionsForm .form-inline input,
+.tableOptionsForm .form-inline select {
+	margin-left: 0.6em;
+}
+
+.tableOptionsFormHeadingCol {
+	display: flex;
+	align-items: center;
+}
+
+.tableOptionsFormHeadingCol h3 {
+	margin-bottom: 0;
+	margin-left: 0.4em;
+}
+
+.enableCheckboxWrapper {
+	padding: 0.65em 1em;
+}
+
+.fppTableWrapper.backdrop {
+	padding: 0.75em;
+}
+
+/* WiFi Configuration Subsection Specific Styling */
+
+.network-subsection + .settingsGroupTable h2 {
+	font-size: 16px !important;
+	color: #666 !important;
+	margin: 10px 0 15px 0 !important;
+	padding: 8px 0 8px 0 !important;
+	border-bottom: 1px solid var(--fpp-border) !important;
+	font-weight: 600 !important;
+	background: none !important;
+}
+
+/* Style headings within settings group tables to be more subdued */
+
+.settingsGroupTable h2,
+.settingsTable h2 {
+	font-size: 16px !important;
+	color: #666 !important;
+	margin: 10px 0 15px 0 !important;
+	padding: 8px 0 8px 0 !important;
+	border-bottom: 1px solid var(--fpp-border) !important;
+	font-weight: 600 !important;
+	background: none !important;
+}
+
+/* ================== */
+/* = File Manager = */
+/* ================== */
+
+.fileDetails.selectedEntry td:first-child {
+	border-radius: 5px 0 0 5px;
+}
+
+.fileDetails.selectedEntry td:last-child {
+	border-radius: 0 5px 5px 0;
+}
+
+.fileDetails td {
+	padding: 0.4em 0.4em;
+	cursor: pointer;
+	border-top: 1px solid var(--fpp-border);
+}
+
+.fileDetails:first-child td,
+.fileDetails.selectedEntry td {
+	border-top: 1px solid transparent;
+}
+
+#tblSequences {
+	width: 100%;
+}
+
+#tblMusic {
+	width: 100%;
+}
+
+#fileUploadTabsContent {
+	margin-top: -0.5em;
+}
+
+#fileUploadTabsContent .tab-pane {
+	margin-bottom: 1em;
+	/* jQuery UI's .ui-tabs-panel padding would inset the file list from the
+	   pill strip and the upload drop zone, which both run edge to edge. */
+	padding-left: 0;
+	padding-right: 0;
+}
+
+.fileManagerDivData {
+	position: relative;
+	background-color: #ececec;
+	border-radius: 8px;
+	padding: 0.65em;
+	max-height: 300px;
+	overflow: auto;
+}
+
+.fileManagerDivData > table {
+	width: 100%;
+}
+
+/* When Bootstrap Table manages its own scrolling, disable the outer container scroll */
+
+.fileManagerDivData.bt-managed {
+	max-height: none;
+	overflow: visible;
+}
+
+/* Make Bootstrap Table sort icons visible against grey background */
+
+.fileManagerDivData
+	.bootstrap-table
+	.fixed-table-container
+	.table
+	thead
+	th
+	.both {
+	background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512" fill="%23aaa"><path d="m103.05877,41.4c9.37707,-12.5 24.60541,-12.5 33.98248,0l96.02113,128c6.90152,9.2 8.92696,22.9 5.17614,34.9s-12.45274,19.8 -22.20489,19.8l-192.04225,-0.1c-9.67713,0 -18.45406,-7.8 -22.20489,-19.8s-1.65036,-25.7 5.17614,-34.9l96.02113,-128l0.07501,0.1zm0,429.3l-96.02113,-128c-6.90152,-9.2 -8.92696,-22.9 -5.17614,-34.9s12.45274,-19.8 22.20489,-19.8l192.04225,0c9.67713,0 18.45406,7.8 22.20489,19.8s1.65036,25.7 -5.17614,34.9l-96.02113,128c-9.37707,12.5 -24.60541,12.5 -33.98248,0l-0.07501,0z"/></svg>');
+}
+
+.fileManagerDivData
+	.bootstrap-table
+	.fixed-table-container
+	.table
+	thead
+	th
+	.asc {
+	background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512" fill="%23333"><path d="m136.9496,41.4c-9.3763,-12.5 -24.60342,-12.5 -33.97972,0l-96.01334,128c-6.90096,9.2 -8.92624,22.9 -5.17572,34.9s12.45173,19.8 22.20309,19.8l192.02668,0c9.67634,0 18.45256,-7.8 22.20309,-19.8s1.65023,-25.7 -5.17572,-34.9l-96.01334,-128l-0.07501,0z"/></svg>');
+}
+
+.fileManagerDivData
+	.bootstrap-table
+	.fixed-table-container
+	.table
+	thead
+	th
+	.desc {
+	background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512" fill="%23333"><path d="m136.94959,471.6c-9.3763,12.5 -24.60342,12.5 -33.97972,0l-96.01334,-128c-6.90096,-9.2 -8.92624,-22.9 -5.17572,-34.9s12.45173,-19.8 22.20308,-19.8l192.02667,0c9.67634,0 18.45256,7.8 22.20308,19.8s1.65023,25.7 -5.17572,34.9l-96.01334,128l-0.07501,0z"/></svg>');
+}
+
+.fileManagerDivData > tr:first-child td:first-child {
+	border-top-left-radius: 8px;
+}
+
+.fileManagerDivData > tr:first-child td:last-child {
+	border-top-right-radius: 8px;
+}
+
+.fileManagerDivData > tr:last-child td:first-child {
+	border-bottom-left-radius: 8px;
+}
+
+.fileManagerDivData > tr:last-child td:last-child {
+	border-bottom-right-radius: 8px;
+}
+
+.fileManagerDivData .fileDetails td {
+	padding-top: 0.4em;
+	padding-bottom: 0.4em;
+}
+
+.fileManagerDivData .fileDetails td:first-child {
+	padding-left: 1em;
+}
+
+.fileText textarea {
+	height: calc(100vh - 192px);
+	margin-bottom: 0;
+}
+
+.fileText pre {
+	margin-bottom: 0;
+	/* The scrollable modal body is the vertical scroller; a fixed height here
+	   would make the pre a second, nested one. Long log lines still scroll
+	   horizontally. */
+	overflow-y: visible;
+}
+
+#storageText {
+	height: calc(100vh - 350px);
+}
+
+/* ====================== */
+/* = Backup & Restore = */
+/* ====================== */
+
+#backuparea,
+#restorearea {
+	width: 100%;
+}
+
+select#backup\.Direction {
+	width: 70%;
+}
+
+#tab-jsonBackup td,
+#tab-fileCopy td {
+	padding-top: 0.8em;
+	padding-bottom: 0.8em;
+}
+
+/* Effect library sort table header (structural only — bg lives in the unified thead rule) */
+#tblEffectLibrary thead th:first-child {
+	border-top-left-radius: 8px;
+}
+#tblEffectLibrary thead th:last-child {
+	border-top-right-radius: 8px;
+}
+
+/* Sort-icon spans: use CSS mask so the icon color comes from background-color,
+   which can be a CSS variable that auto-adapts to dark mode.
+   Overrides bootstrap-table's static-colored background-image SVGs. */
+#tblEffectLibrary thead th .both,
+#tblEffectLibrary thead th .asc,
+#tblEffectLibrary thead th .desc {
+	background-image: none;
+	mask-repeat: no-repeat;
+	mask-position: center right 2px;
+	mask-size: 16px 16px;
+	-webkit-mask-repeat: no-repeat;
+	-webkit-mask-position: center right 2px;
+	-webkit-mask-size: 16px 16px;
+}
+#tblEffectLibrary thead th .both {
+	background-color: var(--fpp-text-muted);
+	mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path d="m103.05877,41.4c9.37707,-12.5 24.60541,-12.5 33.98248,0l96.02113,128c6.90152,9.2 8.92696,22.9 5.17614,34.9s-12.45274,19.8 -22.20489,19.8l-192.04225,-0.1c-9.67713,0 -18.45406,-7.8 -22.20489,-19.8s-1.65036,-25.7 5.17614,-34.9l96.02113,-128l0.07501,0.1zm0,429.3l-96.02113,-128c-6.90152,-9.2 -8.92696,-22.9 -5.17614,-34.9s12.45274,-19.8 22.20489,-19.8l192.04225,0c9.67713,0 18.45406,7.8 22.20489,19.8s1.65036,25.7 -5.17614,34.9l-96.02113,128c-9.37707,12.5 -24.60541,12.5 -33.98248,0l-0.07501,0z"/></svg>');
+	-webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path d="m103.05877,41.4c9.37707,-12.5 24.60541,-12.5 33.98248,0l96.02113,128c6.90152,9.2 8.92696,22.9 5.17614,34.9s-12.45274,19.8 -22.20489,19.8l-192.04225,-0.1c-9.67713,0 -18.45406,-7.8 -22.20489,-19.8s-1.65036,-25.7 5.17614,-34.9l96.02113,-128l0.07501,0.1zm0,429.3l-96.02113,-128c-6.90152,-9.2 -8.92696,-22.9 -5.17614,-34.9s12.45274,-19.8 22.20489,-19.8l192.04225,0c9.67713,0 18.45406,7.8 22.20489,19.8s1.65036,25.7 -5.17614,34.9l-96.02113,128c-9.37707,12.5 -24.60541,12.5 -33.98248,0l-0.07501,0z"/></svg>');
+}
+#tblEffectLibrary thead th .asc {
+	background-color: var(--bs-body-color);
+	mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path d="m136.9496,41.4c-9.3763,-12.5 -24.60342,-12.5 -33.97972,0l-96.01334,128c-6.90096,9.2 -8.92624,22.9 -5.17572,34.9s12.45173,19.8 22.20309,19.8l192.02668,0c9.67634,0 18.45256,-7.8 22.20309,-19.8s1.65023,-25.7 -5.17572,-34.9l-96.01334,-128l-0.07501,0z"/></svg>');
+	-webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path d="m136.9496,41.4c-9.3763,-12.5 -24.60342,-12.5 -33.97972,0l-96.01334,128c-6.90096,9.2 -8.92624,22.9 -5.17572,34.9s12.45173,19.8 22.20309,19.8l192.02668,0c9.67634,0 18.45256,-7.8 22.20309,-19.8s1.65023,-25.7 -5.17572,-34.9l-96.01334,-128l-0.07501,0z"/></svg>');
+}
+#tblEffectLibrary thead th .desc {
+	background-color: var(--bs-body-color);
+	mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path d="m136.94959,471.6c-9.3763,12.5 -24.60342,12.5 -33.97972,0l-96.01334,-128c-6.90096,-9.2 -8.92624,-22.9 -5.17572,-34.9s12.45173,-19.8 22.20308,-19.8l192.02667,0c9.67634,0 18.45256,7.8 22.20308,19.8s1.65023,25.7 -5.17572,34.9l-96.01334,128l-0.07501,0z"/></svg>');
+	-webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><path d="m136.94959,471.6c-9.3763,12.5 -24.60342,12.5 -33.97972,0l-96.01334,-128c-6.90096,-9.2 -8.92624,-22.9 -5.17572,-34.9s12.45173,-19.8 22.20308,-19.8l192.02667,0c9.67634,0 18.45256,7.8 22.20308,19.8s1.65023,25.7 -5.17572,34.9l-96.01334,128l-0.07501,0z"/></svg>');
+}
+
+/* Multisync systems table header */
+#fppSystemsTable thead th {
+	padding-top: 0.4em;
+}
+#fppSystemsTable thead th .th-inner {
+	padding-top: 0.2em;
+}
+#fppSystemsTable thead th:first-child {
+	border-top-left-radius: 8px;
+}
+#fppSystemsTable thead th:last-child {
+	border-top-right-radius: 8px;
+}
+#fppSystemsTable thead td {
+	padding-bottom: 1.1em;
+}
+#fppSystemsTable thead td:first-child {
+	border-bottom-left-radius: 8px;
+}
+#fppSystemsTable thead td:last-child {
+	border-bottom-right-radius: 8px;
+}
+#fppSystemsTable th .th-inner:has(#selectAllCheckbox) {
+	overflow: visible;
+	text-overflow: clip;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+#fppSystemsTable td.centerCenter {
+	text-align: center;
+	vertical-align: middle;
+}
+#fppSystemsTable .multisyncRowCheckbox {
+	margin: 0;
+	vertical-align: middle;
+}
+
+.table-download-existing-backups-container,
+.table-restore-existing-backups-container {
+	overflow-y: scroll;
+	max-height: 220px;
+}
+
+.table-download-existing-backups,
+.table-restore-existing-backups {
+	width: 100%;
+}
+
+#table-download-existing-backups-content > tr,
+#table-restore-existing-backups-content > tr {
+	border-bottom: #0a0a0a solid 1px;
+}
+
+#table-download-existing-backups-content > tr > td,
+#table-restore-existing-backups-content > tr > td {
+	padding-top: 0;
+	padding-bottom: 0;
+}
+
+.table-download-existing-backups-legend {
+	padding-top: 8px;
+}
+
+#backup-file-date {
+	font-size: 0.9em;
+}
+
+#backup-file-configuration-change {
+	font-size: 0.9em;
+}
+
+#backup-file-configuration-actions {
+	font-size: 0.9em;
+}
+
+.fpp-backup-action-loading:before {
+	content: '';
+	display: inline-block;
+	color: var(--bs-danger);
+	width: 16px;
+	height: 16px;
+	opacity: 1;
+	vertical-align: middle;
+	/*margin-left: 0.5em;*/
+	border: 0.25em solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	-webkit-animation: spinner-border 0.75s linear infinite;
+	animation: spinner-border 0.75s linear infinite;
+	transition: 0.3s opacity ease-out;
+	transition-delay: 0.5s;
+}
+
+.host_rsyncd_warning {
+	font-size: 0.8em;
+	padding-left: 10px;
+}
+
+.host_rsyncd_warning b {
+	color: var(--bs-danger) !important;
+}
+
+#CopyFlagsTable input {
+	margin: 0.4em;
+}
+
+/* ================================ */
+/* = MultiSync & Remote Systems = */
+/* ================================ */
+
+#uifppsystems #multiAction {
+	width: 235px;
+}
+
+.multiSyncCopyFilesSettingsTable .printSettingLabelCol {
+	flex: 0 0 0;
+}
+
+table#fppSystemsTable td {
+	padding-bottom: 0px;
+	padding-top: 0px;
+}
+
+table#fppSystemsTable > thead > tr:last-child > td {
+	padding-bottom: 0.5em;
+}
+
+#fppSystems > tr > td {
+	border-top: 1px solid var(--bs-border-color);
+}
+
+#fppSystems > tr:first-child > td {
+	border-top: none;
+}
+
+#fppSystems > tr > td:first-child {
+	padding-left: 1em;
+}
+
+/* #fppSystems > tr > td:last-child {
+	padding-right: 1em;
+} */
+
+#multisyncViewOptions .settingsTable {
+	flex-wrap: wrap;
+}
+
+#multisyncViewOptions .settingsTable .tr {
+	width: 25%;
+	margin-bottom: 1.5em;
+}
+
+.multisyncBulkActions {
+	display: flex;
+	flex: 1;
+	justify-content: flex-end;
+
+	padding: 0;
+}
+
+.multisyncBulkActions b {
+	display: block;
+	padding-top: 0.5em;
+}
+
+.wifi-icon {
+	height: 20px;
+	display: inline-block;
+	width: 28px;
+	vertical-align: middle;
+}
+
+.systemRow .wifi-icon {
+	margin-left: 0.5em;
+}
+
+#fppSystemsTable,
+#syncStatsTable {
+	width: 100%;
+}
+
+#fppSystemsTable .multisyncRowCheckbox {
+	margin: auto;
+	display: block;
+}
+
+.txtIP {
+	width: 150px;
+}
+
+.txtDesc {
+	width: 150px;
+}
+
+/* =============================== */
+/* = Effects & Display Testing = */
+/* =============================== */
+
+.displayTestingFillOptionBoxHeader {
+	display: flex;
+}
+
+.color-box {
+	width: 46px;
+	height: 33px;
+	border-radius: 8px;
+	box-shadow: 3px 3px 8px rgb(0 0 0 / 10%);
+	border: 1px solid var(--fpp-border);
+	cursor: pointer;
+	display: block;
+}
+
+[id^='tableColorPair'].color-box {
+	display: inline-block;
+	vertical-align: middle;
+}
+
+.displayTestingFillOptionBoxHeader .color-box {
+	margin-left: 1em;
+	margin-top: 0.35em;
+}
+
+.icon-effect-type {
+	margin-right: 1em;
+}
+
+.tblRunningEffectsPlaceholder {
+	text-align: center;
+}
+
+#tblRunningEffects {
+	display: none;
+}
+
+.divRunningEffectsRunning #tblRunningEffects {
+	display: block;
+}
+
+.divRunningEffectsRunning .tblRunningEffectsPlaceholder {
+	display: none;
+}
+
+.divRunningEffectsDisabled .tblRunningEffectsPlaceholder {
+	padding-bottom: 0.8em;
+	padding-top: 0.2em;
+}
+
+.divRunningEffectsDisabled .tblRunningEffectsPlaceholder:before {
+	content: '\f0d0';
+	font-family: 'Font Awesome 5 Free';
+	font-weight: 900;
+	display: block;
+	font-size: 3em;
+	color: #d1d1d1;
+}
+
+.tblOverlayEffectsPlaceholder {
+	text-align: center;
+}
+
+#tblOverlayEffects {
+	display: none;
+}
+
+.divOverlayEffectsRunning #tblOverlayEffects {
+	display: block;
+}
+
+.divOverlayEffectsRunning .tblOverlayEffectsPlaceholder {
+	display: none;
+}
+
+.divOverlayEffectsDisabled .tblOverlayEffectsPlaceholder {
+	padding-bottom: 0.8em;
+	padding-top: 0.2em;
+}
+
+.divOverlayEffectsDisabled .tblOverlayEffectsPlaceholder:before {
+	content: '\f06b';
+	/* example icon (exclamation) */
+	font-family: 'Font Awesome 5 Free';
+	font-weight: 900;
+	display: block;
+	font-size: 3em;
+	color: #d1d1d1;
+}
+
+#divRunningEffects table thead th,
+#divOverlayEffects table thead th {
+	font: inherit;
+}
+
+/* ============= */
+/* = Plugins = */
+/* ============= */
+
+#pluginInput {
+	background-image: url(/images/redesign/search-24px.svg);
+	background-repeat: no-repeat;
+	background-position: right 15px center;
+	padding-right: 36px;
+}
+
+#pluginInput.has-text {
+	background-image: none;
+}
+
+/* The find-box row sits inside .settings, whose `.settings .row` rule adds a
+   1.1em bottom margin to every descendant row. As a flex child of the find
+   column that margin inflated the column height and pushed the input off-centre
+   (it top-pinned above the tab labels). Zero it so the input centres level with
+   the Available/Installed/Updates tabs. Specificity ties `.settings .row`; this
+   rule is later in the file so it wins. */
+.fppPluginInput.row {
+	margin-bottom: 0;
+}
+
+.pluginClearBtn {
+	position: absolute;
+	right: 12px;
+	top: 50%;
+	transform: translateY(-50%);
+	cursor: pointer;
+	color: #aaa;
+	display: none;
+	z-index: 5;
+	font-size: 18px;
+	line-height: 1;
+}
+
+.pluginClearBtn:hover {
+	color: #333;
+}
+
+.fppPluginSection {
+	display: none;
+}
+
+.fppPluginEntry {
+	display: none;
+	margin-bottom: 0.8em;
+}
+
+.fppPluginEntryBackdrop {
+	position: relative;
+	padding-left: 2.5em;
+}
+
+.fppPluginEntryBackdrop:before {
+	display: block;
+	content: '';
+	position: absolute;
+	background-color: gray;
+	border-radius: 4px;
+	width: 5px;
+	top: 0.75em;
+	bottom: 0.75em;
+	left: 0.5em;
+}
+
+.fppPluginEntry .fppPluginEntryFooter {
+	border-top: 1px solid #dbdfe4;
+	margin-right: 1px;
+	padding-top: 1em;
+	font-size: 0.9em;
+	margin-bottom: 0;
+}
+
+.pluginFilterVisible,
+.pluginFilterSectionVisible {
+	display: block;
+}
+
+.fppPluginEntryFooter a {
+	text-decoration: none;
+	color: #717171;
+}
+
+.fppPluginEntryActions .buttons {
+	width: 200px;
+	margin-bottom: 0.5em;
+}
+
+.fppPluginEntryInstallStatus {
+	font-size: 1.1em;
+}
+
+.fppPluginEntryUpdateStatus {
+	text-align: center;
+	margin-bottom: 0.5em;
+}
+
+#installedPlugins .fppPluginEntryBackdrop:before {
+	background-color: var(--bs-success);
+}
+
+#pluginTable .fppPluginEntryBackdrop:before {
+	background-color: #6b95ec;
+}
+
+#untestedPlugins .fppPluginEntryBackdrop:before {
+	background-color: #f2bc5f;
+}
+
+#incompatiblePlugins .fppPluginEntryBackdrop:before {
+	background-color: var(--bs-danger);
+}
+
+.fppPluginEntryCompatibilityStatus {
+	margin-bottom: 1.5em;
+	font-size: 0.9em;
+	padding-left: 0.8em;
+	margin-top: 0.5em;
+}
+
+.pluginsHeader {
+	margin-top: 2em;
+	margin-bottom: 1em;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+}
+
+.pluginsHeader h2 {
+	margin: 0;
+}
+
+/* Plugin Header Indicators */
+
+.pluginIndicator {
+	display: inline-block;
+	margin-left: 5px;
+	transition: color 0.3s ease, transform 0.2s ease;
+}
+
+.pluginIndicator:hover {
+	transform: scale(1.1);
+	opacity: 0.8;
+}
+
+/* ===================== */
+/* = Channel Outputs = */
+/* ===================== */
+
+.piPixelOutputTableWrapper {
+	padding-bottom: 0.85em;
+	border-bottom: 1px solid var(--fpp-border);
+	margin-bottom: 1em;
+}
+
+.piPixelOutputTableWrapper:last-child {
+	padding-bottom: 0;
+	border-bottom: none;
+	margin-bottom: 0;
+}
+
+#outputOffWarning {
+	margin-top: 0;
+}
+
+.circularVirtualStringButton {
+	display: block;
+}
+
+/* ================ */
+/* = LED Panels = */
+/* ================ */
+
+.panelMatrix-tab-content .backdrop {
+	margin: 0;
+	border-radius: 10px;
+}
+
+.panelMatrix-tab-content .divLEDPanelHeader {
+	padding: 0px;
+}
+
+.panelMatrix-tab-content .divLEDPanelWarnings {
+	margin: 0.2pc;
+}
+
+[data-bs-theme='light'] .panelMatrix-tab-content .divLEDPanelsData {
+	background-color: whitesmoke;
+}
+
+.panelMatrix-tab-content .divLEDPanelsData {
+	border-radius: 10px;
+	padding: 10px;
+	margin-top: 5px;
+}
+
+[data-bs-theme='light'] .panelMatrix-tab-content .divLEDPanelsLayoutData,
+[data-bs-theme='light'] .panelMatrix-tab-content .divPanelSettingsSection {
+	background-color: whitesmoke;
+}
+
+.panelMatrix-tab-content .divLEDPanelsLayoutData,
+.panelMatrix-tab-content .divPanelSettingsSection {
+	border-radius: 10px;
+	padding: 10px;
+	margin-top: 5px;
+}
+
+.LEDPanelTable table {
+	/* Black border */
+	border: 1px solid grey;
+	/* Rounded corners */
+	border-radius: 5px;
+
+	margin: 0.3pc;
+}
+
+.LEDPanelTable table {
+	border-spacing: 5px;
+	/* Ensure spacing works */
+	border-collapse: separate;
+	background-color: lightgray;
+}
+
+/* =========================== */
+/* = Network Configuration = */
+/* =========================== */
+
+/* Network Configuration Styles */
+
+.network-subsection {
+	margin-top: 20px;
+	margin-bottom: 15px;
+	color: #4a90e2;
+	border-bottom: 2px solid #e1e1e1;
+	padding-bottom: 8px;
+	font-weight: 600;
+	display: flex;
+	align-items: center;
+}
+
+.network-subsection i {
+	margin-right: 8px;
+	width: 18px;
+	text-align: center;
+}
+
+[data-bs-theme='light'] .global-network-section {
+	background-color: #f8f9fa;
+	border: 1px solid #e9ecef;
+}
+
+.global-network-section {
+	border-radius: 8px;
+	padding: 20px;
+	margin-bottom: 20px;
+}
+
+.global-network-section h2 {
+	margin-top: 0;
+	color: #2c3e50;
+	border-bottom: 2px solid #3498db;
+	padding-bottom: 10px;
+}
+
+/* Interface Configuration Styles */
+
+[data-bs-theme='light'] .interface-config-section {
+	background-color: #f8f9fa;
+	border: 1px solid #e9ecef;
+}
+
+.interface-config-section {
+	border-radius: 8px;
+	padding: 20px;
+	margin-bottom: 20px;
+}
+
+.interface-config-section h2 {
+	margin-top: 0;
+	color: #2c3e50;
+	border-bottom: 2px solid #e67e22;
+	padding-bottom: 10px;
+}
+
+.interface-subsection {
+	margin-top: 20px;
+	margin-bottom: 15px;
+	color: #e67e22;
+	border-bottom: 2px solid #e1e1e1;
+	padding-bottom: 8px;
+	font-weight: 600;
+	display: flex;
+	align-items: center;
+}
+
+.interface-subsection i {
+	margin-right: 8px;
+	width: 18px;
+	text-align: center;
+}
+
+/* Interface Selection Styles */
+
+[data-bs-theme='light'] .interface-selection {
+	background: #ffffff !important;
+	border: 1px solid var(--fpp-border) !important;
+}
+
+.interface-selection {
+	border-radius: 6px !important;
+	padding: 15px !important;
+	margin-bottom: 20px !important;
+}
+
+[data-bs-theme='light'] .interface-selection h3 {
+	color: #444 !important;
+	border-bottom: 1px solid var(--fpp-border) !important;
+}
+
+.interface-selection h3 {
+	margin-top: 0 !important;
+	font-size: 18px !important;
+	padding-bottom: 8px !important;
+	display: flex;
+	align-items: center;
+}
+
+.interface-selection h3 i {
+	margin-right: 8px;
+	width: 18px;
+	text-align: center;
+}
+
+/* Network Utilities Section Styles */
+
+[data-bs-theme='light'] .network-utilities-section {
+	background-color: #f8f9fa;
+	border: 1px solid #e9ecef;
+}
+
+.network-utilities-section {
+	border-radius: 8px;
+	padding: 20px;
+	margin-bottom: 20px;
+}
+
+.network-utilities-section h2 {
+	margin-top: 0;
+	color: #2c3e50;
+	border-bottom: 2px solid #27ae60;
+	padding-bottom: 10px;
+}
+
+/* Tethering Section Styles */
+
+[data-bs-theme='light'] .tethering-section {
+	background-color: #f8f9fa;
+	border: 1px solid #e9ecef;
+}
+
+.tethering-section {
+	border-radius: 8px;
+	padding: 20px;
+	margin-bottom: 20px;
+}
+
+.tethering-section h2 {
+	margin-top: 0;
+	color: #2c3e50;
+	border-bottom: 2px solid #9b59b6;
+	padding-bottom: 10px;
+}
+
+/* WiFi Networks Table Styling */
+
+#wifiNetworksTable {
+	max-height: 200px;
+	overflow-y: auto;
+	border: 1px solid var(--fpp-border);
+	border-radius: 4px;
+	margin-bottom: 10px;
+}
+
+#wifiNetworksTable table {
+	margin: 0;
+}
+
+#wifiNetworksTable {
+	position: relative;
+	z-index: auto;
+}
+
+#wifiNetworksTable thead {
+	position: relative;
+	z-index: auto;
+}
+
+#wifiNetworksTable th {
+	padding: 8px;
+	font-size: 12px;
+	font-weight: 600;
+	border-bottom: 1px solid #dee2e6;
+}
+
+#wifiNetworksTable td {
+	padding: 8px;
+	font-size: 13px;
+	border-bottom: 1px solid #f1f3f4;
+}
+
+.wifi-network-row {
+	cursor: pointer;
+	transition: background-color 0.15s ease;
+}
+
+[data-bs-theme='light'] .wifi-network-row:hover {
+	background-color: #f8f9fa !important;
+}
+
+.wifi-network-row:active {
+	background-color: var(--bs-secondary-bg);
+}
+
+[data-bs-theme='light'] .wifi-network-row.table-primary {
+	background-color: #d1ecf1 !important;
+}
+
+[data-bs-theme='light'] .wifi-network-row.table-primary:hover {
+	background-color: #bee5eb !important;
+}
+
+/* Utilities Subsection Styles - matching green theme */
+
+.utilities-subsection {
+	margin-top: 20px;
+	margin-bottom: 15px;
+	color: #27ae60;
+	border-bottom: 2px solid #e1e1e1;
+	padding-bottom: 8px;
+	font-weight: 600;
+	display: flex;
+	align-items: center;
+}
+
+.utilities-subsection i {
+	margin-right: 8px;
+	width: 18px;
+	text-align: center;
+}
+
+/* ===================== */
+/* = Command Presets = */
+/* ===================== */
+
+/* Command Preset Invalid Command Styling — fully driven by Bootstrap subtle tokens
+   so light/dark adapt automatically. No fpp-dark.css override needed. */
+.commandPresetInvalidCommand {
+	background-color: var(--bs-warning-bg-subtle) !important;
+	border-left: 3px solid var(--bs-warning) !important;
+}
+
+.commandPresetInvalidCommand .cmdTmplCommand {
+	background-color: var(--bs-danger-bg-subtle) !important;
+	color: var(--bs-danger-text-emphasis) !important;
+}
+
+.commandPresetInvalidWarning {
+	background-color: var(--bs-warning-bg-subtle);
+	border: 1px solid var(--bs-warning);
+	color: var(--bs-warning-text-emphasis);
+	border-radius: 4px;
+	padding: 10px;
+	margin-bottom: 15px;
+}
+
+.commandPresetInvalidWarning strong {
+	color: var(--bs-danger);
+}
+
+/* ====================== */
+/* = Modals & Dialogs = */
+/* ====================== */
+
+#bankSlider {
+	width: 800px;
+	border: 2px solid #d3d3d3 !important;
+}
+
+/* #tblSchedule .schDay{
+	width: 138px;
+}
+.schPlaylist{
+	width: 150px;
+}
+.schStopType{
+	width: 138px;
+} */
+
+.modal.no-close button.close {
+	display: none;
+}
+
+.modal-dialog {
+	display: flex;
+	justify-content: center;
+}
+
+.modal-dialog-scrollable .modal-dialog {
+	/* Must subtract the dialog's own margins: 70px clears the fixed top nav
+	   (.modal-dialog in fpp-bootstrap-5-3.scss), the bottom one is Bootstrap's.
+	   A plain height:100% overflows the modal root by exactly those margins,
+	   which paints a second, vestigial scrollbar alongside the real one. */
+	height: calc(100% - 70px - var(--bs-modal-margin));
+}
+
+.modal-header .close {
+	padding: 1rem 1rem;
+	margin: -1rem -1rem -1rem auto;
+}
+
+/* ============ */
+/* = Footer = */
+/* ============ */
+
+#footer {
+	background-color: #20222e;
+	box-shadow: 2000px 100px 0px 0px #20222e, -2000px 100px 0px 0px #20222e,
+		0px 100px 0px 0px #20222e;
+	position: relative;
+	text-align: center;
+	padding: 2em;
+}
+
+.footerLink {
+	border-top: 1px solid #2d3043;
+	padding: 2em;
+	margin-top: 2em;
+	padding-bottom: 0;
+	color: #fff;
+}
+
+.footerLink a {
+	color: #fff;
+	font-size: 0.9em;
+	text-decoration: none;
+}
+
+/* ========================================= */
+/* = Troubleshooting & API Documentation = */
+/* ========================================= */
+
+#troubleshooting-hot-links ul {
+	-moz-column-count: 2;
+	-moz-column-gap: 20px;
+	-webkit-column-count: 4;
+	-webkit-column-gap: 20px;
+	column-count: 2;
+	column-gap: 20px;
+}
+
+#api-list-hot-links ul {
+	-moz-column-count: 1;
+	-moz-column-gap: 20px;
+	-webkit-column-count: 4;
+	-webkit-column-gap: 20px;
+	column-count: 1;
+	column-gap: 20px;
+	padding-left: 20px;
+}
+
+a.troubleshoot-anchor {
+	/*display: block;*/
+	position: relative;
+	top: -20px;
+	visibility: hidden;
+}
+
+a.api-anchor {
+	position: relative;
+	top: -20px;
+	visibility: hidden;
+}
+
+.deprecatedEndpoint .endpointDescription,
+.deprecatedEndpoint .exampleDataTD,
+.deprecatedEndpoint .endpointMethod {
+	text-decoration: line-through;
+}
+
+.endpointMethod {
+	text-align: center;
+}
+
+pre.inputData,
+pre.outputData,
+pre.testData,
+.exampleDataTD pre {
+	background-color: var(--fpp-bg-page);
+	color: var(--bs-body-color);
+	border: 1px solid var(--fpp-border);
+	border-radius: 0.25rem;
+	padding: 0.5rem;
+	white-space: pre-wrap;
+}
+
+.jsKey {
+	color: var(--bs-body-color);
+	font-weight: 600;
+}
+
+.jsString {
+	color: var(--fpp-success-dark);
+}
+
+.jsNumber {
+	color: var(--fpp-primary);
+}
+
+.jsBoolean {
+	color: var(--fpp-warning-dark);
+}
+
+.jsNull {
+	color: var(--fpp-danger-dark);
+}
+
+/* =================================== */
+/* = Alerts, Flags & Notifications = */
+/* =================================== */
+
+#restartFlag,
+#rebootFlag,
+#unsupportedBrowser,
+#warningsRow,
+#bannerRow,
+#bannerHostnameRow {
+	display: none;
+	clear: both;
+}
+
+#bannerRow a,
+#bannerHostnameRow a {
+	color: white;
+}
+
+.divIPAddress {
+	display: none;
+}
+
+.hiddenSensor {
+	display: none !important;
+}
+
+/* =========================================== */
+/* = Utility Classes & Bootstrap Overrides = */
+/* =========================================== */
+
+.hiddenExternalLink {
+	display: none;
+}
+
+.pin-parent {
+	position: relative;
+}
+
+.no-bullets {
+	list-style-type: none;
+	padding-left: 0.5rem;
+}
+
+.warning-link a:link {
+	text-decoration: none;
+	color: white;
+}
+
+.warning-link a:visited {
+	text-decoration: none;
+	color: white;
+}
+
+.warning-link a:hover {
+	text-decoration: none;
+	color: yellow;
+}
+
+.inlineBlock {
+	display: inline-block;
+}
+
+.alert > span.inlineBlock {
+	margin-right: 0.8em;
+}
+
+.buttonActions {
+	top: 1em;
+	right: 1em;
+	position: absolute;
+	display: flex;
+}
+
+.buttonActionsParent .buttonActions button {
+	opacity: 0;
+	transition: 0.2s all cubic-bezier(0.01, 0.79, 0.32, 0.99);
+	transform: scale(0.5);
+	margin-left: 0.3em;
+}
+
+.buttonActionsParent:hover .buttonActions button {
+	cursor: pointer;
+	opacity: 1;
+	transform: scale(1);
+}
+
+.warning-text {
+	color: red;
+}
+
+.inputError {
+	border: 2px solid red !important;
+	background-color: red;
+}
+
+.inputWarning {
+	border: 2px solid #cc8400 !important;
+	background-color: #f0a500;
+	color: #000 !important;
+}
+
+.hideme {
+	display: none;
+}
+
+.singleDigitInput {
+	width: 85px;
+}
+
+.badge-light {
+	color: #212529;
+}
+
+.form-group {
+	margin-bottom: 1rem;
+}
+
+.form-text {
+	display: block;
+}
+
+.ms-auto {
+	margin-left: auto !important;
+}
+
+.me-auto {
+	margin-right: auto !important;
+}
+
+.text-muted {
+	color: var(--fpp-text-muted) !important;
+}
+
+.text-success {
+	color: var(--bs-success) !important;
+}
+
+.form-inline {
+	display: flex;
+	flex-flow: row wrap;
+	align-items: center;
+}
+
+.bg-success {
+	background-color: var(--bs-success) !important;
+}
+
+.tooltipSpan {
+	display: block;
+	text-align: left;
+}
+
+/* Default Bootstrap .tooltip-inner is capped at 200px, too narrow for
+   anything past a short sentence (e.g. Set Variable's "Set To" bulleted
+   list). A wider cap doesn't affect short tooltip content elsewhere - it's
+   just an upper bound, so raising it app-wide is safe rather than scoping to
+   one class. No Bootstrap utility covers max-width on a library-generated
+   tooltip node. Capped at 90vw too so it can't overflow a narrow phone
+   viewport. */
+.tooltip-inner {
+	max-width: min(320px, 90vw);
+}
+
+/* Signal strength styling */
+
+.text-success {
+	color: var(--bs-success) !important;
+}
+
+.text-warning {
+	color: var(--bs-warning) !important;
+}
+
+.text-danger {
+	color: var(--bs-danger) !important;
+}
+
+/* Security badge styling */
+
+/* .badge {
+	display: inline-block;
+	padding: 0.25em 0.4em;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1;
+	text-align: center;
+	white-space: nowrap;
+	vertical-align: baseline;
+	border-radius: 0.25rem;
+} */
+
+/*
+[data-bs-theme="light"] .badge-secondary {
+	color: #fff;
+	background-color: var(--bs-secondary);
+} */
+
+/* ========================= */
+/* = Keyframe Animations = */
+/* ========================= */
+
+/* Safari */
+
+@-webkit-keyframes ajax-spin {
+	0% {
+		-webkit-transform: rotate(0deg);
+	}
+
+	100% {
+		-webkit-transform: rotate(360deg);
+	}
+}
+
+@keyframes ajax-spin {
+	0% {
+		transform: rotate(0deg);
+	}
+
+	100% {
+		transform: rotate(360deg);
+	}
+}
+
+@keyframes dropdown-animation {
+	from {
+		opacity: 0;
+		transform: scale(0);
+	}
+
+	to {
+		opacity: 1;
+		transform: scale(1);
+	}
+}
+
+@keyframes pulse {
+	0%,
+	100% {
+		transform: scale(1);
+		opacity: 1;
+	}
+	50% {
+		transform: scale(1.15);
+		opacity: 0.85;
+	}
+}
+
+/* =================== */
+/* = Miscellaneous = */
+/* =================== */
+
+.volume {
+	display: block;
+	font-size: 1.1em;
+	font-weight: bold;
+}
+
+#settingsManager .tr {
+	align-items: center;
+	display: flex;
+}
+
+#settingsManager .th {
+	font-weight: bold;
+}
+
+.icon-help {
+	width: 28px;
+	height: 28px;
+	padding-left: 6px;
+	filter: saturate(100%) brightness(0%) invert(50%);
+}
+
+.arg_note {
+	width: 100%;
+}
+
+/* The playlist entry editor (playlists.php "New Entry" / "Edit Entry") lays its
+   args out in a 2-column table that is sized by its content, so a single very
+   long media or sequence filename in a <select> stretches the value column
+   until every label - and its help icon - is squeezed into 2-3 wrapped lines.
+   Capping the controls keeps the label column readable. Functional layout
+   constraint, not a cosmetic tweak: no Bootstrap utility caps at a px/rem
+   width. */
+#playlistEntryProperties select,
+#playlistEntryProperties input[type='text'] {
+	max-width: 32rem;
+}
+
+.fppSystemsUiSettings {
+	padding: 1.2em;
+}
+
+/* ================================ */
+/* = Responsive / Media Queries = */
+/* ================================ */
+
+@media (min-width: 991px) {
+	.header {
+		position: fixed;
+		z-index: 1;
+		left: 0;
+		right: 0;
+		top: 0;
+		background-color: #171720;
+	}
+
+	#bodyWrapper {
+		margin-top: 64px;
+	}
+}
+
+@media (max-width: 990px) {
+	.helpLinkDiv {
+		display: none;
+	}
+}
+
+@media (max-width: 820px) {
+	.fppBrand .versionHead {
+		display: none;
+	}
+}
+
+@media (min-width: 768px) {
+	#fppMenu .dropdown-menu .dropdown-item,
+	#fppMenu .dropdown-menu li > a {
+		padding-right: 1.5rem;
+		padding-left: 1.5rem;
+	}
+}
+
+@media all and (min-width: 991px) {
+	#navbarNavDropdown {
+		margin-top: 0.25em;
+	}
+}
+
+@media all and (max-width: 990px) {
+	.header {
+		padding-right: 56px;
+	}
+
+	#scrollTopButton {
+		top: 5px;
+	}
+
+	[class*='navbar-expand-'] > .container,
+	[class*='navbar-expand-'] > .container-fluid {
+		padding-left: 15px;
+		padding-right: 15px;
+	}
+
+	#fppMenu
+		.dropdown-menu.show
+		.dropdown-item.open
+		+ #fppMenu
+		.dropdown-menu.show {
+		right: 101% !important;
+	}
+
+	#fppMenu
+		.dropdown-menu.show
+		.dropdown-item.open
+		+ #fppMenu
+		.dropdown-menu.show
+		.dropdown-item.open
+		+ #fppMenu
+		.dropdown-menu,
+	#fppMenu
+		.dropdown-menu.show
+		.dropdown-item.open
+		+ #fppMenu
+		.dropdown-menu.show
+		.dropdown-item.open
+		+ #fppMenu
+		.dropdown-menu.show {
+		left: -165px !important;
+	}
+
+	.navbar .navbar-collapse .navbar-nav > li.button-container {
+		padding: 15px;
+	}
+
+	#fppMenu .navbar-collapse {
+		position: fixed;
+		display: block;
+		top: 0px;
+		height: 100vh;
+		width: 330px;
+		right: 0;
+		margin-right: 0 !important;
+		z-index: 1032;
+		visibility: visible;
+		background-color: rgb(153, 153, 153);
+		overflow-y: visible;
+		border-top: none;
+		text-align: left;
+		padding-right: 0;
+		padding-left: 0;
+		max-height: none !important;
+		-webkit-transform: translate3d(330px, 0, 0);
+		-moz-transform: translate3d(330px, 0, 0);
+		-o-transform: translate3d(330px, 0, 0);
+		-ms-transform: translate3d(330px, 0, 0);
+		transform: translate3d(330px, 0, 0);
+		-webkit-transition: all 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		-moz-transition: all 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		-o-transition: all 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		-ms-transition: all 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		transition: all 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+	}
+
+	[data-bs-theme='light'] #fppMenu .navbar-collapse::after {
+		background-color: #ffffff;
+	}
+
+	#fppMenu .navbar-collapse::after {
+		top: 0;
+		left: 0;
+		height: 100%;
+		width: 100%;
+		position: absolute;
+		display: block;
+		content: '';
+		z-index: 1;
+	}
+
+	#fppMenu .navbar-collapse .dropdown-toggle:after {
+		position: absolute;
+		right: 16px;
+		margin-top: 8px;
+	}
+
+	#fppMenu .navbar-collapse .navbar-nav {
+		position: relative;
+		z-index: 3;
+	}
+
+	[data-bs-theme='light']
+		#fppMenu
+		.navbar-collapse
+		.navbar-nav
+		.nav-item
+		.nav-link {
+		color: #000000;
+	}
+
+	#fppMenu .navbar-collapse .navbar-nav .nav-item .nav-link {
+		margin: 5px 15px;
+	}
+
+	#fppMenu .navbar-collapse .navbar-nav .nav-item.button-container .nav-link {
+		margin: 15px;
+	}
+
+	#fppMenu .navbar-collapse .navbar-nav .nav-item:after {
+		width: calc(100% - 30px);
+		content: '';
+		display: block;
+		height: 1px;
+		margin-left: 15px;
+		background-color: #e5e5e5;
+	}
+
+	#fppMenu .navbar-collapse .navbar-nav .nav-item:last-child:after {
+		display: none;
+	}
+
+	.nav-open #fppMenu .navbar-collapse {
+		-webkit-transform: translate3d(0px, 0, 0);
+		-moz-transform: translate3d(0px, 0, 0);
+		-o-transform: translate3d(0px, 0, 0);
+		-ms-transform: translate3d(0px, 0, 0);
+		transform: translate3d(0px, 0, 0);
+		box-shadow: -5px 0 10px rgba(0, 0, 0, 0.5);
+	}
+
+	.nav-open #fppMenu .navbar-translate {
+		-webkit-transform: translate3d(-330px, 0, 0);
+		-moz-transform: translate3d(-330px, 0, 0);
+		-o-transform: translate3d(-330px, 0, 0);
+		-ms-transform: translate3d(-330px, 0, 0);
+		transform: translate3d(-330px, 0, 0);
+	}
+
+	#fppMenu.navbar .navbar-translate {
+		position: fixed;
+		display: flex;
+		-ms-flex-pack: justify !important;
+		justify-content: space-between !important;
+		-ms-flex-align: center;
+		align-items: center;
+		-webkit-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		-moz-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		-o-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		-ms-transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		transition: transform 0.5s cubic-bezier(0.685, 0.0473, 0.346, 1);
+		top: 10px;
+		right: 0px;
+	}
+
+	#fppMenu.navbar .dropdown .dropdown-menu.show {
+		display: block;
+	}
+
+	#fppMenu.navbar .dropdown .dropdown-menu {
+		display: none;
+	}
+
+	#fppMenu.navbar .dropdown-menu .dropdown-item {
+		margin-left: 1.5rem;
+		margin-right: 1.5rem;
+	}
+
+	#fppMenu.navbar .dropdown.show .dropdown-menu,
+	#fppMenu.navbar .dropdown .dropdown-menu {
+		background-color: transparent;
+		border: 0;
+		padding-bottom: 15px;
+		transition: none;
+		-webkit-box-shadow: none;
+		box-shadow: none;
+		transform: none !important;
+		width: auto;
+		margin-bottom: 15px;
+		padding-top: 0;
+		height: 65vh;
+		animation: none;
+		opacity: 1;
+		overflow-y: auto;
+	}
+
+	@keyframes fadeIn {
+		0% {
+			opacity: 0;
+		}
+
+		100% {
+			opacity: 0.2;
+		}
+	}
+
+	@-moz-keyframes fadeIn {
+		0% {
+			opacity: 0;
+		}
+
+		100% {
+			opacity: 0.2;
+		}
+	}
+
+	@-webkit-keyframes fadeIn {
+		0% {
+			opacity: 0;
+		}
+
+		100% {
+			opacity: 0.2;
+		}
+	}
+
+	@-o-keyframes fadeIn {
+		0% {
+			opacity: 0;
+		}
+
+		100% {
+			opacity: 0.2;
+		}
+	}
+
+	@-ms-keyframes fadeIn {
+		0% {
+			opacity: 0;
+		}
+
+		100% {
+			opacity: 0.2;
+		}
+	}
+
+	[data-bs-theme='light'] #bodyClick {
+		background-color: #ffffff;
+	}
+
+	#bodyClick {
+		height: 100%;
+		width: 100%;
+		position: fixed;
+		opacity: 0.2;
+		top: 0;
+		left: auto;
+		right: 0;
+		content: '';
+		z-index: 1029;
+		overflow-x: hidden;
+		-webkit-animation: fadeIn ease 1s;
+		animation: fadeIn ease 1s;
+	}
+}
+
+@media (min-width: 991px) {
+	.divIPAddress {
+		display: inline-block;
+	}
+
+	.tablePageHeader .btn-success,
+	.tablePageHeader .btn-outline-success {
+		min-width: 100px;
+	}
+
+	.tablePageHeader .dropdown-toggle {
+		min-width: 34px;
+	}
+
+	.tableTabPageHeader .btn-success,
+	.tableTabPageHeader .btn-outline-success {
+		min-width: 100px;
+	}
+
+	.tableTabPageHeader .dropdown-toggle {
+		min-width: 34px;
+	}
+
+	.smallonly {
+		display: none;
+	}
+}
+
+@media (min-width: 768px) {
+	#verbosePlaylistItemDetailsRow .col-md-5 {
+		flex: 0 0 auto;
+		width: auto;
+		max-width: 100%;
+		padding-right: 0;
+		align-items: center;
+		display: flex;
+	}
+}
+
+@media (max-width: 1840px) {
+	.fppOuterContainer {
+		max-width: 95%;
+		margin: auto;
+	}
+
+	.pageContent {
+		padding: 1.5em 1.5em;
+	}
+
+	.tblScheduleHeadStopType {
+		width: 132px;
+	}
+
+	.tblScheduleHeadRepeat {
+		width: 120px;
+	}
+}
+
+@media (min-width: 769px) and (max-width: 1360px) {
+	.statusDivTopRow {
+		flex-flow: wrap;
+	}
+
+	.statusDivTopCol {
+		margin-top: 1.5em;
+	}
+
+	.statusDivTopCol:nth-child(4) {
+		margin-left: 0;
+		padding-left: 0;
+	}
+
+	.statusDivTopCol:nth-child(4):before {
+		content: none;
+	}
+}
+
+@media (max-width: 1440px) {
+	.fppOuterContainer {
+		max-width: 97%;
+	}
+
+	.vsDescription {
+		max-width: 175px;
+	}
+}
+
+@media (min-width: 1361px) {
+	.Zebra_Pin #playerControls .buttons,
+	.Zebra_Pin #playerControls .disableButtons {
+		margin-bottom: 0.65em;
+	}
+}
+
+@media (max-width: 1360px) {
+	#playerControls .buttons,
+	#playerControls .disableButtons,
+	#footer .buttons {
+		display: inline-block;
+		margin-bottom: 0.65em;
+	}
+
+	.tblScheduleHeadStartTime,
+	.tblScheduleHeadEndTime {
+		min-width: 63px;
+	}
+
+	.tblScheduleHeadStartDate,
+	.tblScheduleHeadEndDate {
+		min-width: 88px;
+	}
+
+	.tblScheduleHeadRepeat {
+		width: 108px;
+	}
+
+	.tblScheduleHeadSchType {
+		width: 82px;
+	}
+
+	.tblScheduleHeadDays {
+		width: 96px;
+	}
+
+	#tblSchedule tr td table.dayMaskTable td {
+		padding-right: 0;
+	}
+}
+
+@media (min-width: 991px) and (max-width: 1360px) {
+	#tblSchedule input[type='text'],
+	#tblSchedule select {
+		padding-left: 0.45rem;
+		font-size: 13.333px;
+	}
+}
+
+@media (max-width: 1200px) {
+	.pageContent-tabs .nav-link {
+		padding: 0.4rem 0.8em;
+	}
+}
+
+@media (min-width: 481px) and (max-width: 768px) {
+	.statusDivTopRow {
+		margin-top: 0.1em;
+		margin-bottom: 0.5em;
+		max-width: 100%;
+		flex-flow: wrap;
+	}
+
+	.statusDivTopCol {
+		border-bottom: 1px solid #2d3043;
+		margin-bottom: 1em;
+		padding-bottom: 1em;
+		padding-left: 0;
+		margin-top: 0.2em;
+	}
+
+	.statusDivTopCol:last-child {
+		border-bottom: none;
+	}
+
+	.statusDivTopCol:before {
+		content: none;
+	}
+}
+
+@media (max-width: 768px) {
+	.headerHostName {
+		max-width: 200px;
+	}
+
+	.headerRight {
+		display: none;
+	}
+
+	.fppOuterContainer {
+		max-width: 95%;
+	}
+}
+
+@media (max-width: 560px) {
+	.headerHostName {
+		max-width: 180px;
+	}
+
+	.fpp-logo,
+	.headerRight {
+		display: none;
+	}
+
+	.fppOuterContainer {
+		max-width: 95%;
+	}
+}
+
+@media (max-width: 480px) {
+	.headerHostName {
+		max-width: 200px;
+		padding-left: 3px;
+		padding-right: 3px;
+		font-size: 1.5em;
+	}
+
+	.header.swiped .headerLeft .logo {
+		display: none;
+	}
+
+	.header.swiped .headerHostName {
+		display: flex;
+	}
+
+	.header.swiped .headerLeft .logo {
+		display: none;
+	}
+
+	#header_IPs {
+		display: flex;
+	}
+
+	.fppOuterContainer {
+		max-width: 93%;
+	}
+
+	.container {
+		padding-left: 0.5rem;
+		padding-right: 0.5rem;
+	}
+
+	.pageContent {
+		margin-left: -0.1rem;
+		margin-right: -0.1rem;
+		padding: 1.4em 1.6em;
+	}
+
+	#txtPlayerStatus {
+		padding-left: 0;
+	}
+
+	.playlistSelectRow {
+		flex-direction: column;
+	}
+
+	.playlistRepeatCol {
+		display: flex;
+		width: 100%;
+
+		padding-left: 0;
+		justify-content: flex-end;
+		border-bottom: 1px solid var(--fpp-border);
+		border-top: 1px solid var(--fpp-border);
+		padding-bottom: 0.6em;
+		padding-top: 0.6em;
+		margin-top: 1.2em;
+	}
+
+	.playlistRepeatCol .settingLabelHeading {
+		flex: 1;
+	}
+
+	#playerControls {
+		margin-bottom: 0.2em;
+	}
+
+	.controlsSectionToPin.Zebra_Pin .controlsSection {
+		padding-left: 0.1em;
+	}
+
+	#controlsSection.Zebra_Pin #playerControls .buttons,
+	#controlsSection.Zebra_Pin #playerControls .disableButtons {
+		display: inline-block;
+		width: auto;
+		font-size: 1.2em;
+		margin-bottom: 0.2em;
+	}
+
+	#controlsSection.Zebra_Pin .buttons .playerControlButton-text,
+	#controlsSection.Zebra_Pin .disableButtons .playerControlButton-text {
+		display: none;
+	}
+
+	#btnPrev,
+	#btnNext {
+		width: calc(50% - 0.35em);
+	}
+
+	#btnPlay,
+	#btnStopNow,
+	#btnStopGracefully,
+	#btnStopGracefullyAfterLoop {
+		width: 100%;
+	}
+
+	.tblPlaylistDetailsHeader > div {
+		display: block;
+	}
+
+	.tblPlaylistHeaderDetails > div,
+	#playerTime > div {
+		flex: 1;
+	}
+
+	#playerModeInfo .statusBoxRight,
+	#settingsManager .statusBoxRight {
+		float: none;
+		width: 100%;
+	}
+
+	#playerTime > div:last-child > div,
+	.tblPlaylistHeaderDetails > div:last-child > div,
+	.tblPlaylistHeaderDetails > div.lastVisibleDetail > div {
+		padding-right: 10px;
+	}
+
+	.psi {
+		display: block;
+	}
+
+	.playlistRow td:first-child {
+		padding-right: 0;
+	}
+
+	.playlistRow td:last-child {
+		padding-left: 0.5em;
+	}
+
+	.playlistEntriesBody,
+	.tblPlaylistWrap {
+		padding: 0;
+	}
+
+	#schedulerInfo {
+		display: block;
+	}
+
+	.statusDivTop {
+		overflow-x: auto;
+	}
+
+	.statusDivTopRow {
+		width: 2000px;
+		flex-wrap: nowrap;
+		margin-bottom: 1.2em;
+	}
+
+	.statusDivTopWrap {
+		position: relative;
+	}
+
+	.statusDivTopWrap:after {
+		content: '';
+		position: absolute;
+		right: 0;
+		width: 45px;
+		bottom: 0;
+		top: 0;
+		pointer-events: none;
+		background: linear-gradient(
+			90deg,
+			rgba(23, 23, 32, 0) 0%,
+			rgba(23, 23, 32, 1) 100%
+		);
+	}
+
+	.statusTable.row > div {
+		width: auto;
+	}
+
+	.header > .headerLeft {
+		padding-left: 0.5em;
+		padding-right: 0.1em;
+	}
+
+	.fppBrand {
+		padding-left: 0;
+		padding-right: 0;
+	}
+
+	#header_Time {
+		width: 100px;
+	}
+
+	.form-actions.form-actions-primary {
+		flex-wrap: wrap;
+		flex-flow: wrap;
+	}
+
+	.tablePageHeader .form-actions,
+	.tablePageHeader .form-actions .buttons {
+		margin-bottom: 0em;
+	}
+
+	.tablePageHeader .form-actions .buttons {
+		margin-bottom: 0.4em;
+	}
+
+	.tableTabPageHeader .form-actions,
+	.tableTabPageHeader .form-actions .buttons {
+		margin-bottom: 0em;
+	}
+
+	.tableTabPageHeader .form-actions .buttons {
+		margin-bottom: 0.4em;
+	}
+}
+
+@media (max-width: 450px) {
+	.headerHostName {
+		max-width: 120px;
+	}
+
+	.headerLeft {
+		display: none;
+	}
+
+	.headerCenter > div {
+		margin-left: 0em;
+	}
+
+	.header > div {
+		padding-left: 0em;
+	}
+}
+
+@media (min-width: 481px) and (max-width: 1440px) {
+	.statusDivTopRow {
+		width: 100%;
+	}
+}
+
+@media (min-width: 769px) and (max-width: 1360px) {
+	body.schedulderStatusPlaying .statusDivTopCol {
+		width: calc(33.3333% - 1.4em);
+	}
+
+	.statusDivTopRow {
+		margin-top: -1em;
+	}
+
+	.statusDivTopCol {
+		margin-top: 1em;
+	}
+}
+
+@media (max-width: 990px) {
+	.largeonly {
+		display: none;
+	}
+
+	.title {
+		font-size: 2.15em;
+		margin-bottom: 0.5em;
+		padding-top: 0.25em;
+	}
+
+	.fppMenuContainer {
+		margin-top: 0;
+	}
+
+	#tblSchedule input[type='text'],
+	#tblSchedule select,
+	#tblSchedule input[type='date'] {
+		width: 100%;
+		min-width: 160px;
+	}
+
+	.fppScriptEntryCol {
+		padding-bottom: 1em;
+		border-top: 1px solid #e6e6e6;
+		padding-top: 1em;
+	}
+
+	.fppScriptEntryCol:first-child {
+		margin-bottom: 1;
+		padding-bottom: 0.5em;
+		padding-top: 0em;
+		border-top: none;
+	}
+
+	.statusDiv #playerStatusBottom {
+		clear: both;
+		padding-top: 1px;
+	}
+
+	#playerModeInfo .statusBoxRight {
+		float: none;
+	}
+
+	#playerTime > div {
+		flex: 1;
+	}
+}
+
+@media (min-width: 481px) and (max-width: 768px) {
+	.statusDivTopCol {
+		width: calc(50% - 1.4em);
+	}
+
+	.statusDivTopCol:nth-child(odd) {
+		margin-left: 0;
+	}
+}
+
+@media (min-width: 768px) {
+	#troubleshooting-hot-links ul {
+		-moz-column-count: 3;
+		column-count: 3;
+	}
+
+	#api-list-hot-links ul {
+		-moz-column-count: 2;
+		column-count: 2;
+	}
+}
+
+@media (min-width: 991px) {
+	#troubleshooting-hot-links ul {
+		-moz-column-count: 4;
+		column-count: 4;
+	}
+
+	#api-list-hot-links ul {
+		-moz-column-count: 3;
+		column-count: 3;
+	}
+}
+
+@media (min-width: 1360px) {
+	#api-list-hot-links ul {
+		-moz-column-count: 4;
+		column-count: 4;
+	}
+}
+
+@media (min-width: 991px) {
+	a.troubleshoot-anchor {
+		top: -50px;
+	}
+}
+
+@media (min-width: 991px) {
+	a.api-anchor {
+		top: -80px;
+	}
+}
+
+@media (min-width: 800px) {
+	.modal-dialog {
+		max-width: 700px;
+		margin: 1.75rem auto;
+		margin-top: 70px;
+	}
+
+	.modal-dialog-scrollable {
+		max-height: calc(100% - 3.5rem);
+	}
+
+	.modal-dialog-scrollable .modal-content {
+		max-height: calc(100vh - 8rem);
+	}
+
+	.modal-dialog-centered {
+		min-height: calc(100% - 3.5rem);
+	}
+
+	.modal-dialog-centered::before {
+		height: calc(100vh - 3.5rem);
+		height: -webkit-min-content;
+		height: -moz-min-content;
+		height: min-content;
+	}
+
+	.modal-sm .modal-content {
+		max-width: 400px;
+	}
+
+	.modal-m .modal-content {
+		max-width: 500px;
+	}
+
+	.modal-lg .modal-content {
+		max-width: 700px;
+	}
+}
+
+@media (min-width: 900px) {
+	.modal-dialog {
+		/*max-width: 850px;*/
+		max-width: calc(100% - 3.5rem);
+		margin: 1.75rem auto;
+		margin-top: 70px;
+	}
+
+	.modal-dialog-scrollable {
+		max-height: calc(100% - 3.5rem);
+	}
+
+	.modal-dialog-scrollable .modal-content {
+		max-height: calc(100vh - 8rem);
+	}
+
+	.modal-dialog-centered {
+		min-height: calc(100% - 3.5rem);
+	}
+
+	.modal-dialog-centered::before {
+		height: calc(100vh - 3.5rem);
+		height: -webkit-min-content;
+		height: -moz-min-content;
+		height: min-content;
+	}
+
+	.modal-sm .modal-content {
+		max-width: 500px;
+	}
+
+	.modal-m .modal-content {
+		max-width: 600px;
+	}
+
+	.modal-lg .modal-content {
+		max-width: 800px;
+	}
+}
+
+@media (min-width: 1440px) {
+	.col-xxxl-2 {
+		flex: 0 0 16.66667%;
+		max-width: 16.66667%;
+	}
+}
+
+@media (min-width: 576px) {
+	.form-inline .form-group {
+		display: flex;
+		flex: 0 0 auto;
+		flex-flow: row wrap;
+		align-items: center;
+		margin-bottom: 0;
+	}
+}
+
+/* ================== */
+/* = Print Styles = */
+/* ================== */
+
+/* force light mode for print */
+
+@media print {
+	body,
+	#footer {
+		background-color: #fff;
+		color: #fff;
+		box-shadow: none;
+	}
+
+	.statusDivTopRow,
+	.title {
+		color: #000;
+	}
+
+	.pageContent {
+		box-shadow: none;
+		border: 1px solid var(--fpp-border);
+	}
+
+	.btn-outline-light,
+	#fppMenu a,
+	#fppMenu a:hover,
+	#fppMenu a:focus,
+	#fppMenu a:active,
+	#fppMenuList > li.active > a {
+		border-color: #000;
+		color: #000;
+	}
+}
+
+/* Current Monitor demo (currentmonitor_bootstrap.php): fault-state port SVG.
+   Replaces 16 identical inline style="--color_fill: red;" attributes. */
+.svg-fault-fill {
+	--color_fill: red;
+}
+
+/* Scrollable checkbox multi-select used by the command editor (multisync Hosts
+   field and multistring args, issue #2733): scroll boundary so a large list
+   doesn't push the dialog off-screen. Border, rounding, padding, spacing and
+   layout use Bootstrap utilities. */
+.checkboxSelectList {
+	max-height: 180px;
+}
+
+/* Plugin icon / initials avatar */
+.pluginIconWrap {
+	width: 3.5rem;
+	height: 3.5rem;
+	flex-shrink: 0;
+	border-radius: 0.75rem;
+	overflow: hidden;
+	background: var(--fpp-bg-card, #e9ecef);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+.pluginIcon {
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+	display: block;
+}
+.pluginIconFallback {
+	width: 100%;
+	height: 100%;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-weight: 600;
+	font-size: 1rem;
+	color: var(--fpp-text-muted, #6c757d);
+	background: var(--fpp-bg-card, #f8f9fa);
+	border: 2px solid #000;
+	border-radius: inherit;
+	box-sizing: border-box;
+	user-select: none;
+}
+[data-bs-theme="dark"] .pluginIconFallback {
+	border-color: #fff;
+}
+/* Small variant for popular strip cards */
+.pluginIconWrapSm {
+	width: 2rem;
+	height: 2rem;
+	border-radius: 0.4rem;
+}
+.pluginIconFallbackSm {
+	font-size: 0.65rem;
+}
+
+/* Manual URL badge */
+.pluginManualBadge {
+	font-size: 0.7rem;
+	background: var(--fpp-danger-light, #fde8e8);
+	color: var(--fpp-danger-dark, #d92d2d);
+	padding: 0.1rem 0.45rem;
+	border-radius: 0.25rem;
+	white-space: nowrap;
+}
+/* Ensure the icon + title row doesn't overflow on narrow cards */
+.min-w-0 {
+	min-width: 0;
+}
+
+/* Plugin marketplace cards */
+.pluginCardInner {
+	cursor: pointer;
+}
+.pluginCardDesc {
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+/* releaseNotesStyle: script -- plain-text release notes, wrapped rather than
+   scrolling horizontally like a code block would. */
+pre.release-notes-body {
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+/* Popular Plugins: single horizontally-scrollable row (functional scroll
+   boundary + fixed item width so flex children don't collapse; no Bootstrap
+   utility covers a fixed rem width). Scroll is contained here so the page
+   body never scrolls sideways on phones. */
+.pluginPopularScroll {
+	scroll-snap-type: x proximity;
+	--fpp-pop-fade-start: 0;
+	--fpp-pop-fade-end: 0;
+}
+/* The Plugins page's top tabs and category pills scroll sideways on a phone
+   too, and get the same fade (UpdateScrollRowFade() in plugins.php). */
+.pluginScrollRow {
+	--fpp-pop-fade-start: 0;
+	--fpp-pop-fade-end: 0;
+}
+/* Edge fade marking that more cards exist off-screen. Overlay scrollbars are
+   invisible until you scroll (macOS/iOS/Android), so the scrollbar is not an
+   affordance -- this is. Masked rather than overlaid with a gradient because a
+   mask fades the cards themselves and so needs no knowledge of the pane's
+   background color, which differs between light and dark. The black/transparent
+   stops below are alpha-channel values, not visual colors: a mask has no color,
+   so no --fpp-* token applies here. The widths are driven from JS via
+   .is-scrollable-start/.is-scrollable-end, which also gate the mask entirely so
+   a non-overflowing strip gets no compositing layer and no soft edge. */
+.pluginPopularScroll.is-scrollable-start,
+.pluginPopularScroll.is-scrollable-end,
+.pluginScrollRow.is-scrollable-start,
+.pluginScrollRow.is-scrollable-end {
+	-webkit-mask-image: linear-gradient(to right,
+			transparent 0,
+			black var(--fpp-pop-fade-start),
+			black calc(100% - var(--fpp-pop-fade-end)),
+			transparent 100%);
+	mask-image: linear-gradient(to right,
+			transparent 0,
+			black var(--fpp-pop-fade-start),
+			black calc(100% - var(--fpp-pop-fade-end)),
+			transparent 100%);
+}
+.pluginPopularScroll.is-scrollable-start,
+.pluginScrollRow.is-scrollable-start {
+	--fpp-pop-fade-start: 2rem;
+}
+.pluginPopularScroll.is-scrollable-end,
+.pluginScrollRow.is-scrollable-end {
+	--fpp-pop-fade-end: 2rem;
+}
+.pluginPopularScroll > .pluginPopularCard {
+	flex: 0 0 auto;
+	width: 14rem;
+	scroll-snap-align: start;
+}
+/* Popular card title: allow two lines before truncating so more of long
+   plugin names is readable in the narrow fixed-width card. */
+.pluginPopularTitle {
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+/* Generic utility: centers only an input/textarea's placeholder text,
+   leaving an actual typed/picked value left-aligned via the field's own
+   default text-align - not achievable with a Bootstrap utility class, since
+   ::placeholder can't be targeted that way. Not component-specific -
+   apply to any field whose placeholder reads better centered (e.g. a
+   "-- Select X --" prompt). First used by the insert-variable helpers in
+   RenderSharedExpressionValueHelper/RenderVarInsertHelper (fpp.js). */
+.placeholder-center::placeholder {
+	text-align: center;
+}
+
+/* Generic utility: marks a placeholder that reads as an example or prompt
+   rather than a value, so an empty field is obviously empty at a glance.
+   Needed because this build sets .form-control::placeholder to
+   --bs-secondary-color (75% of the body colour) with opacity forced to 1,
+   which is close enough to real text that a prompt like
+   "https://www.youtube.com/watch?v=..." looks like an entered URL.
+
+   Colour alone does not carry this. Dropping to --bs-tertiary-color (the 50%
+   step) is a contrast cue, and at form-control-sm sizes it still reads as
+   text someone typed. The italic is what actually distinguishes it: a shape
+   difference survives small type, either theme, and low contrast sensitivity,
+   none of which a lighter grey reliably does. Both tokens are defined for
+   light and dark, so this stays readable in both.
+
+   Same rationale as .placeholder-center above for why this is a class at all:
+   ::placeholder is not reachable from a Bootstrap utility. */
+.placeholder-muted::placeholder {
+	color: var(--bs-tertiary-color);
+	font-style: italic;
+}
+
+/* ============================ */
+/* = Upload Drop Zone (FilePond) = */
+/* ============================ */
+
+/* Wrapper for a FilePond instance (file manager, 3D asset upload). The drop
+   target has to read as a droppable region on sight, so it carries its own
+   dashed outline and a background lifted off the page - the one place a
+   custom rule beats a utility class, since no Bootstrap utility draws a
+   dashed affordance.
+
+   Everything below is scoped under .fileponduploader on purpose. Pages load
+   css/filepond.min.css AFTER fpp.css, and FilePond paints the drop area with
+   fixed light-mode literals (#f1f0ef panel, #4f4f4f label) at single-class
+   specificity. Matching that specificity would lose on source order, so each
+   rule here is deliberately one step more specific. */
+
+/* --bs-tertiary-bg rather than a card/page token because it is the one that
+   steps away from the surrounding surface in BOTH themes - card matches the
+   white page container in light, page matches the dark body in dark, and
+   either way the zone would flatten out in one of the two. */
+.fileponduploader {
+	background-color: var(--bs-tertiary-bg);
+	border: 2px dashed var(--fpp-border-dark);
+	border-radius: 10px;
+	transition: 0.3s all cubic-bezier(0.02, 0.72, 0.32, 0.99);
+}
+
+/* Light up on hover, on keyboard focus, and while a file is actually being
+   dragged over it. FilePond flags the drag with data-hopper-state on its own
+   root, which is nested inside this wrapper - hence :has(). Browsers without
+   :has() simply keep the resting border instead of the accent one. */
+.fileponduploader:hover,
+.fileponduploader:focus-within,
+.fileponduploader:has(.filepond--hopper[data-hopper-state='drag-over']) {
+	border-color: var(--bs-primary);
+	background-color: var(--bs-primary-bg-subtle);
+}
+
+/* FilePond's panel is its own opaque light-grey sheet; let the wrapper's
+   themed background show through instead. */
+.fileponduploader .filepond--panel-root {
+	background-color: transparent;
+}
+
+.fileponduploader .filepond--root .filepond--drop-label {
+	min-height: 100px;
+	background: transparent;
+	color: var(--fpp-text-primary);
+}
+
+.fileponduploader .filepond--drop-label label {
+	min-height: 100px;
+}
+
+/* PipeWire mixer channel rows.
+   Selectors are deliberately `.pw-mixer-strip input[type='range'].pw-mixer-slider`:
+   the global `input[type='range']` rules earlier in this file (and the
+   dark-theme overrides in fpp-dark.css) are more specific than a lone class and
+   size the thumb at 35px for the big master slider, which silently overrode
+   everything here. Colours come from Bootstrap theme variables so both themes
+   work. Horizontal throughout -- a rotated (writing-mode) fader renders
+   inconsistently across browsers and is awkward to drag on touch.
+
+   Tracks and meter grounds are --bs-tertiary-color, NOT --bs-border-color: the
+   strip sits on --bs-tertiary-bg, against which the border colour is 1.7:1 in
+   dark mode and is also exactly the colour of the strip's own border, so the
+   line vanished into the frame. The tertiary *foreground* token composites to
+   a mid grey over the strip in both themes (~#868c92 dark, ~#8d9094 light), so
+   one declaration covers both rather than a theme-specific override. */
+
+/* How many strips share a row. Single column until the dialog is genuinely
+   wide: .modal-xl is only 800px at lg, and two 400px columns leave a fader
+   narrower than the readout beside it. */
+.pw-mixer-strips {
+	display: grid;
+	grid-template-columns: 1fr;
+	gap: 0.5rem;
+}
+
+@media (min-width: 1200px) {
+	.pw-mixer-strips {
+		grid-template-columns: 1fr 1fr;
+	}
+}
+
+/* An output group and the card strips it feeds are one block, so the block --
+   not each strip -- is what the section grid lays out: a group owns a full row
+   and its cards share the columns inside it. Without this a group fader and a
+   card trim could sit side by side as apparent peers, which is what made a
+   one-card group read as two independent outputs. */
+.pw-mixer-strips > .pw-mixer-group {
+	grid-column: 1 / -1;
+	display: grid;
+	gap: 0.5rem;
+}
+
+/* A group holding one card would otherwise leave that card marooned in the
+   left column of a two-column row, reading as half a pair rather than as the
+   group's only output. */
+.pw-mixer-group > .pw-mixer-strips > .pw-mixer-strip:only-child {
+	grid-column: 1 / -1;
+}
+
+/* The strip itself is a grid of named areas rather than a flex row, so the same
+   markup re-flows. A portrait phone cannot fit name + fader + readout + meter +
+   two 44px touch targets on one line (they need ~440px inside a ~320px strip),
+   which is what pushed the fader down to its minimum and overflowed the row.
+   Stacked, the fader gets the full width and the buttons stay beside it:
+
+       [LED] Name             100%   [mute][cue]
+       [========== fader ==========]
+       [========== meter ==========]
+
+   From lg up -- where the dialog is 800px or wider -- the areas collapse back
+   to the one-line channel strip. */
+.pw-mixer-strip {
+	display: grid;
+	align-items: center;
+	column-gap: 0.5rem;
+	row-gap: 0.25rem;
+	grid-template-columns: minmax(0, 1fr) auto auto;
+	grid-template-areas:
+		'label value actions'
+		'slider slider actions'
+		'meter meter actions';
+	background-color: var(--bs-tertiary-bg);
+}
+
+.pw-mixer-strip .pw-mixer-strip-label {
+	grid-area: label;
+	min-width: 0;
+}
+
+/* Names can be long (fpp_fx_g1_headphones); this is the box text-truncate
+   measures itself against, so it has to be allowed to shrink. */
+.pw-mixer-strip .pw-mixer-strip-names {
+	min-width: 0;
+}
+
+/* The name stays on one line and truncates; the sublabel under it wraps to two
+   and only then clamps. It carries the sentence that says what the strip is,
+   and a label column this narrow ended every one of them in an ellipsis --
+   "Output · bcm2835 Head…", "Direct · level is s…" -- which is exactly the
+   half that mattered. Two lines fit them all without taking width from the
+   fader. */
+.pw-mixer-strip .pw-mixer-sublabel {
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	overflow: hidden;
+	overflow-wrap: anywhere;
+}
+
+.pw-mixer-strip .pw-mixer-meter {
+	grid-area: meter;
+	width: auto;
+}
+
+.pw-mixer-strip .pw-mixer-actions {
+	grid-area: actions;
+}
+
+@media (min-width: 992px) {
+	.pw-mixer-strip {
+		grid-template-columns: 11rem minmax(4rem, 1fr) auto auto auto;
+		grid-template-areas: 'label slider value meter actions';
+	}
+
+	.pw-mixer-strip .pw-mixer-meter {
+		width: 4rem;
+	}
+}
+
+/* Fixed-width readout so the row does not jitter as the number changes. The
+   effective level sits under the number rather than beside it, so the cell
+   stays the same width whether or not it is shown. */
+.pw-mixer-strip .pw-mixer-value {
+	grid-area: value;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	line-height: 1.2;
+	min-width: 3.25rem;
+	text-align: end;
+	font-variant-numeric: tabular-nums;
+}
+
+.pw-mixer-strip .pw-mixer-eff {
+	font-size: 0.75em;
+}
+
+/* Comfortable touch targets, matching the round volume buttons rather than
+   shrinking controls to fit more channels onto a phone screen. */
+.pw-mixer-strip .btn {
+	min-width: 44px;
+	min-height: 38px;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider {
+	grid-area: slider;
+	-webkit-appearance: none;
+	appearance: none;
+	background: transparent;
+	width: 100%;
+	min-width: 0;
+	height: 1.5rem;
+	padding: 0;
+	margin: 0;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-webkit-slider-runnable-track {
+	width: 100%;
+	height: 6px;
+	border-radius: 3px;
+	background: var(--bs-tertiary-color);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-moz-range-track {
+	width: 100%;
+	height: 6px;
+	border-radius: 3px;
+	background: var(--bs-tertiary-color);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 18px;
+	height: 18px;
+	margin-top: -6px;
+	border-radius: 50%;
+	border: 2px solid var(--bs-body-bg);
+	background-color: var(--bs-primary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-moz-range-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	border: 2px solid var(--bs-body-bg);
+	background-color: var(--bs-primary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:focus-visible {
+	outline: 2px solid var(--bs-primary);
+	outline-offset: 2px;
+}
+
+/* A read-only strip reports a level that has no stage of its own to move (a
+   source wired straight into a mix bus, say). Bootstrap's own :disabled range
+   styling never showed here: the thumb rules above set the colour
+   unconditionally and outrank it, so a strip nobody could drag looked exactly
+   as draggable as the rest. The dashed frame carries at a glance, the grey
+   thumb on approach, the cursor on the attempt.
+
+   border-style needs the flag to beat Bootstrap's .border shorthand, which
+   sets all three border properties as !important; 5.3 has no border-style
+   utility to use instead. */
+.pw-mixer-strip-readonly {
+	border-style: dashed !important;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:disabled {
+	cursor: not-allowed;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:disabled::-webkit-slider-thumb {
+	background-color: var(--bs-secondary-color);
+	box-shadow: none;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:disabled::-moz-range-thumb {
+	background-color: var(--bs-secondary-color);
+	box-shadow: none;
+}
+
+/* Touch: a thumb sized for a mouse is hard to catch with a fingertip, and the
+   fader is the one control on this dialog that has to be draggable mid-show.
+   The track stays 6px, so the thumb's negative margin grows with it. */
+@media (pointer: coarse) {
+	.pw-mixer-strip input[type='range'].pw-mixer-slider {
+		height: 2rem;
+	}
+
+	.pw-mixer-strip input[type='range'].pw-mixer-slider::-webkit-slider-thumb {
+		width: 26px;
+		height: 26px;
+		margin-top: -10px;
+	}
+
+	.pw-mixer-strip input[type='range'].pw-mixer-slider::-moz-range-thumb {
+		width: 26px;
+		height: 26px;
+	}
+}
+
+/* Live level meter shown beside the preview player. Driven by the browser from
+   the stream it is already playing, so it can run at animation rate; a plain
+   div pair rather than <meter>, whose native rendering cannot be themed
+   consistently across browsers. */
+.pw-mixer-meter {
+	width: 4rem;
+	height: 8px;
+	border-radius: 4px;
+	overflow: hidden;
+	background-color: var(--bs-tertiary-color);
+}
+
+.pw-mixer-meter-lg {
+	width: 6rem;
+}
+
+.pw-mixer-meter-fill {
+	height: 100%;
+	width: 0;
+	border-radius: 4px;
+	background-color: var(--bs-success);
+}
+
+/* Near clipping. */
+.pw-mixer-meter-fill.pw-mixer-meter-hot {
+	background-color: var(--bs-warning);
+}
+
+/* The preview player is appended below the strips inside the scrolling body.
+   On a phone that puts it off-screen as soon as you scroll to the fader you
+   wanted to listen to, so it stays pinned to the bottom of the scroller; the
+   alert it contains supplies its own background. */
+.pw-mixer-preview-host {
+	position: sticky;
+	bottom: 0;
+	z-index: 3;
+}
+
+/* A default <audio> control is ~300px wide and will not shrink on its own,
+   which is enough to overflow a portrait phone. */
+.pw-mixer-preview-host audio {
+	flex: 1 1 14rem;
+	min-width: 0;
+	max-width: 100%;
+}
+
+/* Settings page search (settings.php).  Elements pruned out of the results
+   need a dedicated hide class so clearing the search can strip it without
+   touching any d-none the page itself owns. */
+#settingsManager .settingsSearchHide {
+	display: none !important;
+}
+
+/* String cape header row (co-pixelStrings.php).
+   The max-FPS note is the only elastic item in the row, so it absorbs the
+   leftover width and keeps the Testing control pinned to the right edge.
+   Once the row gets tight the note drops to a line of its own rather than
+   shoving Testing onto a second line ahead of it. */
+.pixelStringHeaderNote {
+	flex: 1 1 0;
+	min-width: 0;
+}
+
+@media (max-width: 1399.98px) {
+	.pixelStringHeaderNote {
+		order: 1;
+		flex: 0 0 100%;
+		max-width: 100%;
+	}
+}
+
+/* Crash report dialog: a disclosure popover wide enough to read its long text,
+   scrolling inside the dialog rather than past it */
+.crash-disclosure-popover {
+	--bs-popover-max-width: min(720px, 92vw);
+}
+
+.crash-disclosure-popover .popover-body {
+	max-height: 40vh;
+	overflow-y: auto;
+}
+
+/* Diagnostic Report wizard (fpp.js): wide enough for a report's file name on
+   one line, and as tall as the window below the top nav (70px + 12px) allows.
+   DoModalDialog puts modal-dialog-scrollable on the .modal itself. */
+.modal-dialog-scrollable.diagnostic-report-dialog {
+	max-height: none;
+}
+.diagnostic-report-dialog .modal-content {
+	max-width: 900px;
+	max-height: calc(100vh - 82px);
 }

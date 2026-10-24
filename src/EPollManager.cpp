@@ -1,0 +1,272 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
+ */
+
+#include "EPollManager.h"
+
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "common_mini.h"
+#include "log.h"
+
+#ifdef PLATFORM_OSX
+#include "MacOSApp.h"
+#endif
+
+EPollManager EPollManager::INSTANCE;
+
+EPollManager::EPollManager() {
+#ifdef USE_KQUEUE
+    epollf = kqueue();
+#else
+    epollf = epoll_create1(EPOLL_CLOEXEC);
+
+    // Create a single timerfd for waking epoll on timer deadlines
+    timerFd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timerFd >= 0) {
+        epoll_event event;
+        memset(&event, 0, sizeof(event));
+        event.events = EPOLLIN;
+        event.data.fd = timerFd;
+        if (epoll_ctl(epollf, EPOLL_CTL_ADD, timerFd, &event) == -1) {
+            LogWarn(VB_GENERAL, "Failed to add timerfd to epoll: %s\n", FPPstrerror(errno));
+            close(timerFd);
+            timerFd = -1;
+        }
+    } else {
+        LogWarn(VB_GENERAL, "Failed to create timerfd: %s\n", FPPstrerror(errno));
+    }
+#endif
+}
+
+EPollManager::~EPollManager() {
+    shutdown();
+}
+void EPollManager::shutdown() {
+    std::unique_lock<std::mutex> lock(timerLock);
+    if (epollf < 0) {
+        return;
+    }
+#ifndef USE_KQUEUE
+    if (timerFd >= 0) {
+        close(timerFd);
+        timerFd = -1;
+    }
+#endif
+    close(epollf);
+    epollf = -1;
+    lock.unlock();
+    callbacks.clear();
+    timerCallback = nullptr;
+}
+
+void EPollManager::addFileDescriptor(int fd, std::function<bool(int)>& callback) {
+    if (epollf == -1) {
+        // EPoll has been shutdown, cannot add file descriptor
+        return;
+    }
+#ifdef USE_KQUEUE
+    struct kevent change;
+    EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    int rc = kevent(epollf, &change, 1, NULL, 0, NULL);
+#else
+    epoll_event event;
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.fd = fd;
+    int rc = epoll_ctl(epollf, EPOLL_CTL_ADD, fd, &event);
+#endif
+    if (rc == -1) {
+        LogWarn(VB_GENERAL, "Failed to add descriptor: %d  %s\n", fd, FPPstrerror(errno));
+    } else {
+        callbacks[fd] = std::move(callback);
+    }
+}
+
+void EPollManager::removeFileDescriptor(int fd) {
+    if (epollf == -1) {
+        // EPoll has been shutdown, cannot remove file descriptor
+        return;
+    }
+    // Implementation for removing a file descriptor from the epoll instance
+#ifdef USE_KQUEUE
+    struct kevent change;
+    EV_SET(&change, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    int rc = kevent(epollf, &change, 1, NULL, 0, NULL);
+#else
+    epoll_event event;
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.fd = fd;
+    int rc = epoll_ctl(epollf, EPOLL_CTL_DEL, fd, &event);
+#endif
+    if (rc == -1) {
+        // Commonly EBADF because the caller already closed the descriptor, which
+        // takes it out of the epoll set by itself. Either way the caller is done
+        // with it.
+        LogDebug(VB_GENERAL, "Failed to remove descriptor: %d  %s\n", fd, FPPstrerror(errno));
+    }
+    // Erase unconditionally. Keeping the callback when epoll_ctl() failed used to
+    // leave a std::function behind for a descriptor nobody owns any more - and
+    // when that callback belonged to a plugin that has since been unloaded, the
+    // next addFileDescriptor() to reuse the descriptor number destroyed it by
+    // assigning over it, running a destructor in an unmapped library.
+    callbacks.erase(fd);
+}
+
+void EPollManager::setTimerCallback(std::function<void()>&& callback) {
+    timerCallback = std::move(callback);
+}
+
+void EPollManager::armTimer(long long deadlineMS) {
+    std::lock_guard<std::mutex> lock(timerLock);
+    if (epollf == -1) {
+        return;
+    }
+
+    long long nowMS = GetTimeMS();
+    long long relativeMS = deadlineMS - nowMS;
+    if (relativeMS < 1) {
+        relativeMS = 1; // fire ASAP but not zero (which disarms on Linux)
+    }
+
+#ifdef USE_KQUEUE
+    // kqueue EVFILT_TIMER default unit is milliseconds (no flag needed)
+    struct kevent change;
+    EV_SET(&change, KQUEUE_TIMER_IDENT, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, relativeMS, NULL);
+    kevent(epollf, &change, 1, NULL, 0, NULL);
+#else
+    if (timerFd < 0) {
+        return;
+    }
+    struct itimerspec its = {};
+    its.it_value.tv_sec = relativeMS / 1000;
+    its.it_value.tv_nsec = (relativeMS % 1000) * 1000000;
+    timerfd_settime(timerFd, 0, &its, NULL);
+#endif
+}
+
+void EPollManager::disarmTimer() {
+    std::lock_guard<std::mutex> lock(timerLock);
+    if (epollf == -1) {
+        return;
+    }
+#ifdef USE_KQUEUE
+    struct kevent change;
+    EV_SET(&change, KQUEUE_TIMER_IDENT, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+    kevent(epollf, &change, 1, NULL, 0, NULL);
+#else
+    if (timerFd < 0) {
+        return;
+    }
+    struct itimerspec its = {};
+    timerfd_settime(timerFd, 0, &its, NULL);
+#endif
+}
+
+void EPollManager::updateFileDescriptorEvents(int fd, uint32_t events) {
+    if (epollf == -1) {
+        return;
+    }
+#ifdef USE_KQUEUE
+    struct kevent changes[2];
+    int n = 0;
+    EV_SET(&changes[n++], fd, EVFILT_READ,
+           (events & EPOLLIN) ? (EV_ADD | EV_ENABLE) : EV_DISABLE, 0, 0, NULL);
+    EV_SET(&changes[n++], fd, EVFILT_WRITE,
+           (events & EPOLLOUT) ? (EV_ADD | EV_ENABLE) : EV_DISABLE, 0, 0, NULL);
+    kevent(epollf, changes, n, NULL, 0, NULL);
+#else
+    epoll_event event;
+    memset(&event, 0, sizeof(event));
+    event.events = events;
+    event.data.fd = fd;
+    if (epoll_ctl(epollf, EPOLL_CTL_MOD, fd, &event) == -1) {
+        LogWarn(VB_GENERAL, "Failed to update descriptor events: %d  %s\n", fd, FPPstrerror(errno));
+    }
+#endif
+}
+
+bool EPollManager::invokeCallback(int fd) {
+    // epoll_wait hands back a batch of events.  A callback earlier in the batch can
+    // remove descriptors for later events in the same batch (Bridge_Initialize tearing
+    // down its sockets when the output ranges change, avahi freeing a watch, ...), so
+    // by the time we get here the entry may be gone.  Those events are stale and the
+    // descriptor is no longer being watched, so drop them.
+    auto it = callbacks.find(fd);
+    if (it == callbacks.end() || !it->second) {
+        return false;
+    }
+    // Copy the callback out of the map before invoking it.  A callback is allowed to
+    // remove its own descriptor (fpp_watch_free() does exactly that), which would
+    // otherwise destroy the std::function while it is still executing.
+    std::function<bool(int)> callback = it->second;
+    return callback(fd);
+}
+
+EPollManager::WaitResult EPollManager::waitForEvents(int mstimeout) {
+    // Implementation for waiting for events and calling the appropriate callbacks
+    constexpr int MAX_EVENTS = 40;
+#ifdef USE_KQUEUE
+#ifdef PLATFORM_OSX
+    // With Cocoa active (fppd owns a window), the main thread must keep
+    // servicing AppKit while it waits, so do the waiting there and only
+    // collect the kqueue events below. No-op off the main thread or headless.
+    if (MacOSWaitForFd(epollf, mstimeout) >= 0) {
+        mstimeout = 0; // already waited; just collect what is ready
+    }
+#endif
+    struct kevent events[MAX_EVENTS];
+    struct timespec timeoutStruct = { mstimeout / 1000, (mstimeout % 1000) * 1000000 };
+    int epollresult = kevent(epollf, NULL, 0, events, MAX_EVENTS, &timeoutStruct);
+#else
+    epoll_event events[MAX_EVENTS];
+    int epollresult = epoll_wait(epollf, events, MAX_EVENTS, mstimeout);
+    if (epollresult < 0) {
+        if (errno == EINTR) {
+            // We get interrupted when media players finish
+            return WaitResult::INTERRUPTED;
+        } else {
+            return WaitResult::FAILED;
+        }
+    }
+#endif
+    bool retVal = false;
+    if (epollresult > 0) {
+        for (int x = 0; x < epollresult; x++) {
+#ifdef USE_KQUEUE
+            if (events[x].ident == KQUEUE_TIMER_IDENT) {
+                if (timerCallback) {
+                    timerCallback();
+                }
+                continue;
+            }
+            retVal |= invokeCallback(events[x].ident);
+#else
+            if (events[x].data.fd == timerFd) {
+                uint64_t expirations;
+                read(timerFd, &expirations, sizeof(expirations));
+                if (timerCallback) {
+                    timerCallback();
+                }
+                continue;
+            }
+            retVal |= invokeCallback(events[x].data.fd);
+#endif
+        }
+    } else {
+        return WaitResult::TIMEOUT;
+    }
+    return retVal ? WaitResult::SOME_TRUE : WaitResult::ALL_FALSE;
+}

@@ -1,97 +1,159 @@
+#pragma once
 /*
- *   ColorLight 5a-75 Channel Output driver for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _COLORLIGHT5A75_H
-#define _COLORLIGHT5A75_H
-
 #include <arpa/inet.h>
-#include <linux/if_packet.h>
+#include "fpp-json-fwd.h"
 #include <net/if.h>
+#include <netinet/in.h>
+#include <sys/uio.h>
 #include <string>
+#include <vector>
 
-#include "ChannelOutputBase.h"
+#include "ChannelOutput.h"
 #include "ColorOrder.h"
 #include "Matrix.h"
 #include "PanelMatrix.h"
 
-#define CL5A75_BUFFER_SIZE  1536
+#define CL_MAX_PIXL_PER_PACKET 497
+#define CL_MAX_CHAN_PER_PACKET (CL_MAX_PIXL_PER_PACKET * 3)
 
-class ColorLight5a75Output : public ChannelOutputBase {
-  public:
-	ColorLight5a75Output(unsigned int startChannel, unsigned int channelCount);
-	~ColorLight5a75Output();
+#define CL_PACKET_TYPE_OFFSET 12
+#define CL_PACKET_DATA_OFFSET 13
 
-	virtual int  Init(Json::Value config);
-	virtual int  Close(void);
+#define CL_SYNC_PACKET_TYPE 0x01 // sync memory to outputs
+#define CL_SYNC_PACKET_SIZE 112
+#define CL_DISC_PACKET_TYPE 0x07 // discover receivers
+#define CL_DISC_PACKET_SIZE 284
+#define CL_RESP_PACKET_TYPE 0x08 // receiver response to discovery
+#define CL_RESP_PACKET_SIZE 1070
+#define CL_BRIG_PACKET_TYPE 0x0A // brightness
+#define CL_BRIG_PACKET_SIZE 77
+#define CL_PIXL_PACKET_TYPE 0x55 // row data
+#define CL_PIXL_HEADER_SIZE 8
 
-	virtual void PrepData(unsigned char *channelData);
-	virtual int  SendData(unsigned char *channelData);
+typedef struct {
+    int model;
+    int id;
+    int majorFirmwareVersion;
+    int minorFirmwareVersion;
+    int width;
+    int height;
+    int xOffset;
+    int yOffset;
 
-	void DumpConfig(void);
+    unsigned int uptime;
+    unsigned int packets;
+} ColorLightReceiver;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+class ColorLight5a75Output : public ChannelOutput {
+public:
+    ColorLight5a75Output(unsigned int startChannel, unsigned int channelCount);
+    virtual ~ColorLight5a75Output();
 
-  private:
-	void SetHostMACs(void *data);
+    virtual std::string GetOutputType() const override {
+        return "ColorLight Panels";
+    }
 
-	int          m_width;
-	int          m_height;
-	std::string  m_layout;
-	std::string  m_ifName;
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-	FPPColorOrder m_colorOrder;
+    virtual void PrepData(unsigned char* channelData) override;
+    virtual int SendData(unsigned char* channelData) override;
 
-	int   m_fd;
+    virtual void DumpConfig(void) override;
 
-	char *m_buffer_0101;
-	int   m_buffer_0101_len;
-	char *m_buffer_0AFF;
-	int   m_buffer_0AFF_len;
-	
-	char  m_buffer[CL5A75_BUFFER_SIZE];
-	char *m_data;
-	char *m_rowData;
-	int   m_rowSize;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
 
-	struct ifreq          m_if_idx;
-	struct ifreq          m_if_mac;
-	struct ether_header  *m_eh;
-	struct sockaddr_ll    m_sock_addr;
+    virtual void OverlayTestData(unsigned char* channelData, int cycleNum, float percentOfCycle, int testType, const Json::Value& config) override;
+    virtual bool SupportsTesting() const override { return true; }
 
-	int          m_panelWidth;
-	int          m_panelHeight;
-	int          m_panels;
-	int          m_rows;
-	int          m_outputs;
-	int          m_longestChain;
-	int          m_invertedData;
-	char        *m_outputFrame;
-	Matrix      *m_matrix;
-	PanelMatrix *m_panelMatrix;
-    uint8_t      m_gammaCurve[256];
+    void GetReceiverInfo();
 
+private:
+    void BuildRemap(void);
+    void SetHostMACs(void* data);
+    int SendMessagesHelper(struct mmsghdr* msgs, int cnt);
+    bool SendMessages(std::vector<struct mmsghdr>& msgsToSend);
+    bool FrameFits(void);
+    void NoteDroppedFrame(void);
+    void RaiseSendErrorWarning(int err);
+    void ClearSendErrorWarning(void);
+
+    int m_width;
+    int m_height;
+    std::string m_layout;
+    std::string m_ifName;
+    std::string ifspeed_src;
+    int ifspeed;
+
+    FPPColorOrder m_colorOrder;
+
+    int m_fd;
+    int m_rfd;
+    int m_rowSize;
+
+    // Send-buffer accounting: what one frame's packets cost the kernel
+    // (payload plus per-packet overhead), and the buffer that holds them
+    int m_frameCharge;
+    int m_sendBufferSize;
+    bool m_frameSent;
+    int m_droppedFrames;
+    long long m_droppedLogTime;
+    std::string m_sendErrorWarning;
+
+    int m_panelWidth;
+    int m_panelHeight;
+    int m_panels;
+    int m_rows;
+    int m_outputs;
+    int m_longestChain;
+    int m_invertedData;
+    std::unique_ptr<char[]> m_outputFrame;
+    std::unique_ptr<Matrix> m_matrix;
+    std::unique_ptr<PanelMatrix> m_panelMatrix;
+    uint8_t m_gammaCurve[256];
+
+    // PrepData()'s remap, flattened by BuildRemap(): the source channel of
+    // each output-frame pixel, in frame order, consumed by runs of pixels
+    // that are contiguous in the frame and share one color order
+    struct RemapRun {
+        uint32_t dst;      // byte offset into m_outputFrame
+        uint32_t count;    // pixels
+        uint32_t order[3]; // channel offset of each output byte from the pixel's base
+    };
+    std::vector<RemapRun> m_remapRuns;
+    std::vector<uint32_t> m_remapSrc;
+    int m_flippedLayout;
+    bool m_colorlightDisable;
+
+    int m_highestFirmwareVersion;
+
+    std::vector<ColorLightReceiver> m_receivers;
+
+    // Display Frame
+    std::vector<struct mmsghdr> m_syncMsgs;
+    std::vector<struct iovec> m_synciovecs;
+
+    // Pixel Data, etc.
+    std::vector<struct mmsghdr> m_msgs;
+    std::vector<struct iovec> m_iovecs;
+
+    struct ifreq m_if_idx;
+    struct ifreq m_if_mac;
+    struct ether_header* m_eh;
+
+    std::string m_autoCreatedModelName;
+    std::list<std::string> m_warnings;
+
+    struct sockaddr_ll m_sock_addr;
 };
-
-#endif

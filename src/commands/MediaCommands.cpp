@@ -1,0 +1,905 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include "../Warnings.h" // WarningHolder -- needed directly for NOPCH builds
+#include "../common.h"   // SaveJsonToString -- needed directly for NOPCH builds
+
+#include <curl/curl.h>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "../Timers.h"
+#include "../fppversion.h"
+#include "../log.h"
+#include "../settings.h"
+
+#include "MediaCommands.h"
+#include "../mediaoutput/GStreamerOut.h"
+#include "../mediaoutput/mediaoutput.h" // ResolveVideoOutput()
+#include "../mediaoutput/StreamSlotManager.h"
+#include "../CurlSocket.h"
+
+IncreaseVolumeCommand::IncreaseVolumeCommand() :
+    Command("Volume Increase", "Increases the volume by the given amount (0 - 100)") {
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(0, 100).setDefaultValue("0"));
+}
+std::unique_ptr<Command::Result> IncreaseVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.size() != 1) {
+        return std::make_unique<Command::ErrorResult>("Not found");
+    }
+    int v = getVolume();
+    v += std::atoi(args[0].c_str());
+    setVolume(v);
+    return std::make_unique<Command::Result>("Volume Set");
+}
+
+DecreaseVolumeCommand::DecreaseVolumeCommand() :
+    Command("Volume Decrease", "Decreases the volume by the given amount (0 - 100)") {
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(0, 100).setDefaultValue("0"));
+}
+std::unique_ptr<Command::Result> DecreaseVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.size() != 1) {
+        return std::make_unique<Command::ErrorResult>("Not found");
+    }
+
+    int v = getVolume();
+    v -= std::atoi(args[0].c_str());
+    setVolume(v);
+    return std::make_unique<Command::Result>("Volume Set");
+}
+
+// A URL command's response is kept whole for the caller, so it is capped:
+// unbounded, one URL at a large or endless body (file:///dev/zero, before
+// the protocols were limited below, or any HTTP server that streams) grew it
+// until fppd was OOM-killed.  Returning short aborts the transfer.
+static constexpr size_t URL_MAX_RESPONSE = 4 * 1024 * 1024;
+static size_t URL_write_data(void* buffer, size_t size, size_t nmemb, void* userp) {
+    std::string* msg = (std::string*)userp;
+    size_t n = size * nmemb;
+    if (msg->size() + n > URL_MAX_RESPONSE) {
+        return 0;
+    }
+    msg->append(static_cast<const char*>(buffer), n);
+    return n;
+}
+
+// A URL command's transfer outlives its Result. Fire-and-forget callers
+// (presets, an If's Parallel branch, GPIO, MultiSync) drop the Result at
+// once, and ~CURLResult used to busy-wait up to a second for the transfer and
+// then abort it: every webhook to a slow or dead host stalled the calling
+// thread - usually the main loop - for a second, and any response slower than
+// that was silently cut off. The destructor now hands the still-running
+// transfer here, whole (moving the easy handle to another multi would restart
+// it, and could send a POST twice), and the main loop finishes it.
+static constexpr long URL_TRANSFER_TIMEOUT_MS = 30000;
+static constexpr long URL_CONNECT_TIMEOUT_MS = 10000;
+namespace {
+struct OrphanTransfer {
+    CURLM* multi;
+    CURL* easy;
+    long long deadline;
+    std::string url;
+};
+std::mutex s_orphanLock;
+std::vector<OrphanTransfer> s_orphans;
+bool s_reaperArmed = false;
+
+size_t DiscardBody(void*, size_t size, size_t nmemb, void*) {
+    return size * nmemb;
+}
+
+void PumpOrphanTransfers() {
+    std::vector<OrphanTransfer> work;
+    {
+        std::lock_guard<std::mutex> l(s_orphanLock);
+        work.swap(s_orphans);
+    }
+    std::vector<OrphanTransfer> keep;
+    long long now = GetMonotonicTimeMS();
+    for (auto& o : work) {
+        int running = 0;
+        CURLMcode mc = curl_multi_perform(o.multi, &running);
+        if (mc == CURLM_OK && running > 0 && now < o.deadline) {
+            keep.push_back(o);
+            continue;
+        }
+        if (running > 0) {
+            LogWarn(VB_COMMAND, "URL \"%s\" did not finish; abandoning it\n", o.url.c_str());
+        }
+        curl_multi_remove_handle(o.multi, o.easy);
+        curl_multi_cleanup(o.multi);
+        curl_easy_cleanup(o.easy);
+    }
+    std::lock_guard<std::mutex> l(s_orphanLock);
+    s_orphans.insert(s_orphans.end(), keep.begin(), keep.end());
+    if (s_orphans.empty()) {
+        s_reaperArmed = false;
+    } else {
+        Timers::INSTANCE.addTimer("URLCommandTransfers", GetTimeMS() + 10, PumpOrphanTransfers);
+    }
+}
+
+void AdoptOrphanTransfer(CURLM* multi, CURL* easy, const std::string& url) {
+    // The body has nowhere to go once the Result is gone.
+    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, DiscardBody);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, nullptr);
+    std::lock_guard<std::mutex> l(s_orphanLock);
+    s_orphans.push_back({ multi, easy, GetMonotonicTimeMS() + URL_TRANSFER_TIMEOUT_MS + 5000, url });
+    if (!s_reaperArmed) {
+        s_reaperArmed = true;
+        Timers::INSTANCE.addTimer("URLCommandTransfers", GetTimeMS() + 10, PumpOrphanTransfers);
+    }
+}
+} // namespace
+
+class CURLResult : public Command::Result {
+public:
+    CURLResult(const std::vector<std::string>& args) :
+        Command::Result() {
+        std::string url = args[0];
+        m_url = url;
+        LogDebug(VB_COMMAND, "URL: \"%s\"\n", url.c_str());
+
+        std::string method = "GET";
+        if (args.size() > 1) {
+            method = args[1];
+            if (method == "") {
+                method = "GET";
+            }
+        }
+        std::string data;
+        if (args.size() > 2) {
+            data = args[2];
+        }
+        m_curl = curl_easy_init();
+        SetCurlCloseOnExec(m_curl);
+        curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1);
+        // Without these, a plain-HTTP URL that 301/302s to HTTPS (extremely
+        // common) captures the redirect response instead of the real page -
+        // typically an empty body - and reports success with no error, since
+        // isError()/isDone() below only look at handle setup and CURLMSG_DONE,
+        // not the HTTP status or transfer result. A missing User-Agent also
+        // gets flatly blocked (empty body, no redirect) by some sites/WAFs
+        // that tolerate the same request with one set (e.g. Akamai-fronted
+        // sites) - same "FPP/<version>" string used by CurlManager/MultiSync.
+        static const std::string userAgent = std::string("FPP/") + getFPPVersionTriplet();
+        curl_easy_setopt(m_curl, CURLOPT_USERAGENT, userAgent.c_str());
+        curl_easy_setopt(m_curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(m_curl, CURLOPT_MAXREDIRS, 10L);
+        // HTTP(S) only, for the URL and every redirect.  libcurl speaks file://,
+        // gopher://, dict:// and more by default, and this command is reachable
+        // from the API and MultiSync: "file:///etc/shadow" read any file as
+        // root, and gopher:// could put arbitrary bytes on a local port.
+#if LIBCURL_VERSION_NUM >= 0x075500
+        curl_easy_setopt(m_curl, CURLOPT_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(m_curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+        curl_easy_setopt(m_curl, CURLOPT_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+        curl_easy_setopt(m_curl, CURLOPT_REDIR_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+        // A transfer may now outlive its Result (see AdoptOrphanTransfer()),
+        // so it needs its own end.
+        curl_easy_setopt(m_curl, CURLOPT_CONNECTTIMEOUT_MS, URL_CONNECT_TIMEOUT_MS);
+        curl_easy_setopt(m_curl, CURLOPT_TIMEOUT_MS, URL_TRANSFER_TIMEOUT_MS);
+
+        CURLcode status;
+        status = curl_easy_setopt(m_curl, CURLOPT_URL, url.c_str());
+        if (status != CURLE_OK) {
+            cleanupCurl();
+            return;
+        }
+        status = curl_easy_setopt(m_curl, CURLOPT_WRITEFUNCTION, URL_write_data);
+        if (status != CURLE_OK) {
+            cleanupCurl();
+            return;
+        }
+
+        status = curl_easy_setopt(m_curl, CURLOPT_WRITEDATA, &m_result);
+        if (status != CURLE_OK) {
+            cleanupCurl();
+            return;
+        }
+
+        if (method == "POST") {
+            curl_easy_setopt(m_curl, CURLOPT_POSTFIELDSIZE, data.size());
+            status = curl_easy_setopt(m_curl, CURLOPT_COPYPOSTFIELDS, data.c_str());
+            if (status != CURLE_OK) {
+                cleanupCurl();
+                return;
+            }
+        }
+
+        m_curlm = curl_multi_init();
+        CURLMcode mstatus = curl_multi_add_handle(m_curlm, m_curl);
+        if (mstatus != CURLM_OK) {
+            cleanupCurl();
+            return;
+        }
+        m_isDone = false;
+    }
+    virtual ~CURLResult() {
+        if (!isDone() && m_curl && m_curlm) {
+            AdoptOrphanTransfer(m_curlm, m_curl, m_url);
+            m_curl = nullptr;
+            m_curlm = nullptr;
+            return;
+        }
+        cleanupCurl();
+    }
+    // m_curl/m_curlm only go null on setup failure (cleanupCurl()); a transfer
+    // that completes but failed (DNS/connect/timeout/etc, msg->data.result !=
+    // CURLE_OK below) left both non-null, so isError() alone previously never
+    // caught it - callers like RecurringTasks::finish() treat !isError() as
+    // "ok" and write get()'s (empty, on a failed transfer) result straight
+    // into the target Variable with no visible error.
+    virtual bool isError() override { return m_curl == nullptr || m_curlm == nullptr || m_transferFailed; }
+    virtual bool isDone() override {
+        if (m_curl == nullptr || m_curlm == nullptr) {
+            return true;
+        }
+        if (m_isDone) {
+            return true;
+        }
+        int handleCount;
+        CURLMcode mstatus = curl_multi_perform(m_curlm, &handleCount);
+        if (mstatus != CURLM_OK) {
+            cleanupCurl();
+            return true;
+        }
+
+        if (handleCount == 0) {
+            int messagesLeft = 0;
+            CURLMsg* msg = curl_multi_info_read(m_curlm, &messagesLeft);
+            if (msg && msg->msg == CURLMSG_DONE) {
+                if (msg->data.result != CURLE_OK) {
+                    m_transferFailed = true;
+                    m_result = curl_easy_strerror(msg->data.result);
+                    LogErr(VB_COMMAND, "URL \"%s\" failed: %s\n", m_url.c_str(), m_result.c_str());
+                } else {
+                    char* ct = nullptr;
+                    if (CURLE_OK == curl_easy_getinfo(m_curl, CURLINFO_CONTENT_TYPE, &ct)) {
+                        if (ct != nullptr) {
+                            m_contentType = ct;
+                        }
+                    }
+                }
+                m_isDone = true;
+            }
+        }
+        return m_isDone;
+    }
+
+    void cleanupCurl() {
+        if (m_curlm) {
+            if (m_curl) {
+                curl_multi_remove_handle(m_curlm, m_curl);
+            }
+            curl_multi_cleanup(m_curlm);
+            m_curlm = nullptr;
+        }
+        if (m_curl) {
+            curl_easy_cleanup(m_curl);
+            m_curl = nullptr;
+        }
+    }
+
+private:
+    // Initialized here, not in the constructor: a setup failure (a URL curl
+    // rejects, curl_easy_init() returning NULL) calls cleanupCurl() before
+    // m_curlm is assigned, and it then handed a garbage pointer to
+    // curl_multi_remove_handle()/curl_multi_cleanup().
+    CURL* m_curl = nullptr;
+    CURLM* m_curlm = nullptr;
+    bool m_isDone = true;
+    bool m_transferFailed = false;
+    std::string m_url;
+};
+
+URLCommand::URLCommand() :
+    Command("URL") {
+    args.push_back(CommandArg("name", "string", "URL"));
+    args.push_back(CommandArg("method", "string", "Method").setContentList({ "GET", "POST" }).setDefaultValue("GET"));
+    args.push_back(CommandArg("data", "string", "Post Data"));
+}
+std::unique_ptr<Command::Result> URLCommand::run(const std::vector<std::string>& args) {
+    return std::make_unique<CURLResult>(args);
+}
+
+// Apply a volume to one node of the PipeWire graph rather than the global
+// master.  "target" is a flat key from GET /api/pipewire/audio/targets
+// ("sink:<node>", "slot:<n>", "input:<groupId>:<memberIndex>",
+// "route:<inputGroupId>:<outputGroupId>").  With relative set, the value is a
+// delta against the target's own current level rather than an absolute.
+//
+// Handed to the PHP API rather than resolved here: mapping a target to a
+// PipeWire node means reading the group/input-group JSON and reproducing the
+// node-naming rules, and reading a target's current level back for a relative
+// adjust -- all of which already exist in www/api/controllers/pipewire.php and
+// would otherwise have to be kept in sync in a second language.  Same loopback
+// approach ApplyRoutingPresetCommand below already uses.
+static std::unique_ptr<Command::Result> setTargetedVolume(const std::string& target, int value, bool relative) {
+    Json::Value body;
+    body["target"] = target;
+    if (relative) {
+        body["adjust"] = value;
+    } else {
+        body["volume"] = value;
+    }
+
+    std::vector<std::string> curlArgs = {
+        "http://localhost/api/system/volume",
+        "POST",
+        SaveJsonToString(body)
+    };
+    return std::make_unique<CURLResult>(curlArgs);
+}
+
+SetVolumeCommand::SetVolumeCommand() :
+    Command("Volume Set", "Sets the volume to the specific value. (0 - 100)") {
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(0, 100).setDefaultValue("70").setGetAdjustableValueURL("api/fppd/volume?simple=true"));
+    // Optional and trailing: every existing caller passes only the volume and
+    // must keep hitting the global-master path below untouched.
+    args.push_back(CommandArg("target", "string", "Target", true)
+                       .setContentListUrl("api/pipewire/audio/targets", true));
+}
+std::unique_ptr<Command::Result> SetVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        return std::make_unique<Command::ErrorResult>("Not found");
+    }
+
+    int v = std::atoi(args[0].c_str());
+    if (args.size() > 1 && !args[1].empty()) {
+        return setTargetedVolume(args[1], v, false);
+    }
+    setVolume(v);
+    return std::make_unique<Command::Result>("Volume Set");
+}
+
+AdjustVolumeCommand::AdjustVolumeCommand() :
+    Command("Volume Adjust", "Adjust volume either up or down by the given amount. (-100 - 100)") {
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(-100, 100).setDefaultValue("0"));
+    args.push_back(CommandArg("target", "string", "Target", true)
+                       .setContentListUrl("api/pipewire/audio/targets", true));
+}
+std::unique_ptr<Command::Result> AdjustVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        return std::make_unique<Command::ErrorResult>("Not found");
+    }
+
+    int delta = std::atoi(args[0].c_str());
+    if (args.size() > 1 && !args[1].empty()) {
+        return setTargetedVolume(args[1], delta, true);
+    }
+
+    int v = getVolume();
+    v += delta;
+    setVolume(v);
+    return std::make_unique<Command::Result>("Volume Set");
+}
+
+#ifdef HAS_GSTREAMER
+
+// Common data for tracking running command media
+// Recursive: Stop() runs under this lock. MEDIA_STOPPED now fires later from
+// the main loop with the lock released (RemoveRunningMedia), but it once fired
+// from inside Stop(), where a preset running Play Media re-took this lock on
+// the same thread and a plain mutex deadlocked fppd.
+std::recursive_mutex runningMediaLock;
+std::map<std::string, MediaOutputBase*> runningCommandMedia;
+
+// Called from Stopped(), which runs on a GStreamer streaming thread when the
+// media ends by itself, so everything happens on the main loop instead.  The
+// MEDIA_STOPPED preset in particular can stop playlists, start media or stop
+// this very output; run on the streaming thread, those wait on the thread
+// that is running them.
+static void RemoveRunningMedia(const std::string& filename, MediaOutputBase* self) {
+    intptr_t i = (intptr_t)self;
+    MediaOutputBase* dt = self;
+    std::string fn = filename;
+
+    Timers::INSTANCE.addTimer("RemoveRunningMedia-" + std::to_string(i), GetTimeMS() + 1, [dt, fn]() {
+        // Unregister first: the preset below can start the same file again,
+        // and it should get the name back rather than a "_" suffix.  This
+        // object stays alive until the delete at the end, so a preset that
+        // reaches it through its stream slot still finds a valid output.
+        runningMediaLock.lock();
+        auto it = runningCommandMedia.find(fn);
+        if (it != runningCommandMedia.end() && it->second == dt) {
+            runningCommandMedia.erase(it);
+            LogDebug(VB_COMMAND, "Removed cached PlayData for file: \"%s\"\n", fn.c_str());
+        }
+        runningMediaLock.unlock();
+
+        if (CommandManager::INSTANCE.HasPreset("MEDIA_STOPPED")) {
+            std::map<std::string, std::string> keywords;
+            keywords["MEDIA_NAME"] = fn;
+            CommandManager::INSTANCE.TriggerPreset("MEDIA_STOPPED", keywords);
+        }
+        delete dt;
+    });
+}
+
+static std::string RegisterRunningMedia(const std::string& file, MediaOutputBase* media) {
+    std::string filename = file;
+    runningMediaLock.lock();
+    while (runningCommandMedia.find(filename) != runningCommandMedia.end()) {
+        filename += "_";
+    }
+    runningCommandMedia[filename] = media;
+    runningMediaLock.unlock();
+    return filename;
+}
+
+#ifdef HAS_GSTREAMER
+class GStreamerPlayData : public GStreamerOutput {
+public:
+    GStreamerPlayData(const std::string& file, int l, int vol, int slot = 1,
+                      const std::string& videoOut = "");
+    virtual ~GStreamerPlayData();
+    virtual void Stopped() override;
+    virtual void RequestStop() override;
+    virtual bool NeedsSlotPump() const override { return true; }
+    // Declared first so it is destroyed last, remaining valid throughout ~GStreamerPlayData()
+    // even if the GStreamer bus fires a second Stopped() callback during our destruction.
+    std::atomic<bool> m_stoppedOnce{ false };
+    std::string filename;
+    int volumeAdjust = 0;
+    int streamSlot = 1;
+    MediaOutputStatus status;
+    // Names this output in a deferred stop.  A pointer can't: by the time the
+    // stop runs, the output may have been freed and its address reused.
+    const uint64_t playId = NextPlayId();
+
+private:
+    static uint64_t NextPlayId() {
+        static std::atomic<uint64_t> next{ 1 };
+        return next++;
+    }
+};
+
+GStreamerPlayData::GStreamerPlayData(const std::string& file, int l, int vol, int slot,
+                                     const std::string& videoOut) :
+    GStreamerOutput(file,
+                    (slot > 1 && slot <= StreamSlotManager::MAX_SLOTS)
+                        ? StreamSlotManager::Instance().GetStatus(slot)
+                        : &status,
+                    videoOut, slot),
+    filename(file),
+    volumeAdjust(vol),
+    streamSlot(slot) {
+    SetLoopCount(l > 0 ? l - 1 : 0);
+    SetVolumeAdjustment(vol);
+    // Media played by command runs beside the show; it must not pace a
+    // running sequence (a companion keeps in step through the slot manager's
+    // sync instead).
+    SetDrivesShowClock(false);
+    filename = RegisterRunningMedia(file, this);
+}
+
+GStreamerPlayData::~GStreamerPlayData() {
+    // Detach while this class is still whole. ~GStreamerOutput's Close() runs
+    // only after filename, status and the slot-1 status target are destroyed
+    // and the vtable no longer reaches RequestStop()/Stopped() here, yet until
+    // that Close() the slot manager (under its lock, from an HTTP thread) and
+    // a late bus message could still call them. Close() is idempotent, so the
+    // base destructor's own call is then a no-op.
+    //
+    // Whoever is deleting this owns it, so the Stopped() that Close() can
+    // reach must not hand it to RemoveRunningMedia's deferred delete as well
+    // (a second free, and a MEDIA_STOPPED for media that may never have
+    // played): a failed Start() can leave a pipeline for Close() to stop.
+    m_stoppedOnce.store(true);
+    Close();
+}
+
+// Stops this media from the main loop, through runningCommandMedia like every
+// other stop of command media.  Called by the slot manager while it holds its
+// own lock, so the stop itself -- up to half a second for video -- must not
+// run here.
+void GStreamerPlayData::RequestStop() {
+    uint64_t id = playId;
+    Timers::INSTANCE.addTimer("PlayMediaStop" + std::to_string(id), GetTimeMS(), [id]() {
+        std::lock_guard<std::recursive_mutex> lock(runningMediaLock);
+        for (const auto& item : runningCommandMedia) {
+            GStreamerPlayData* gpd = dynamic_cast<GStreamerPlayData*>(item.second);
+            if (gpd && gpd->playId == id) {
+                if (!gpd->m_stoppedOnce.load()) {
+                    gpd->Stop();
+                }
+                return;
+            }
+        }
+    });
+}
+
+void GStreamerPlayData::Stopped() {
+    if (m_stoppedOnce.exchange(true)) {
+        return;
+    }
+    GStreamerOutput::Stopped();
+    RemoveRunningMedia(filename, this);
+}
+
+// Stop the command-started media playing on `slot`. Returns the name it is
+// registered under, or "" if there was none.
+//
+// This is the only safe way to stop command media by slot. The slot manager
+// hands out a raw pointer with nothing keeping it alive, and a stopped
+// GStreamerPlayData is deleted on the main thread 1ms after Stopped() - so two
+// requests that both fetched the slot's output could see one stop it, the main
+// thread free it, and the other still be inside its Stop(). Here the stop runs
+// under runningMediaLock, which RemoveRunningMedia()'s deferred delete must take
+// before freeing the object, so it stays alive for the whole call, and
+// concurrent requests take turns.
+//
+// Entries already stopped stay in the map until that delete runs; skip them, or
+// a dead entry is "stopped" and the live stream on the slot keeps playing.
+static std::string StopCommandMediaInSlot(int slot) {
+    std::lock_guard<std::recursive_mutex> lock(runningMediaLock);
+    for (const auto& item : runningCommandMedia) {
+        GStreamerPlayData* gpd = dynamic_cast<GStreamerPlayData*>(item.second);
+        if (gpd && gpd->streamSlot == slot && !gpd->m_stoppedOnce.load()) {
+            std::string name = item.first;
+            gpd->Stop();
+            return name;
+        }
+    }
+    return "";
+}
+#endif
+
+// Runtime backend selection for "Play Media" command
+static bool UseGStreamerForPlayMedia() {
+#ifdef HAS_GSTREAMER
+    // GStreamer is the sole media player for all backends
+    return true;
+#endif
+    return false;
+}
+
+PlayMediaCommand::PlayMediaCommand() :
+    Command("Play Media", "Plays the media in the background") {
+    args.push_back(CommandArg("media", "string", "Media").setContentListUrl("api/media"));
+    args.push_back(CommandArg("loop", "int", "Loop Count").setDefaultValue(std::string("1")).setRange(1, 100));
+    args.push_back(CommandArg("volume", "int", "Volume Adjust").setDefaultValue(std::string("0")).setRange(-100, 100));
+    args.push_back(CommandArg("slot", "int", "Stream Slot").setDefaultValue(std::string("1")).setRange(1, StreamSlotManager::MAX_SLOTS));
+    // Video output for this stream.  Empty (the default) keeps the historical
+    // audio-only behavior; setting it to a connector (e.g. "HDMI-A-2") lets a
+    // non-primary slot drive its own display, which is what makes independent
+    // video-per-output possible.
+    args.push_back(CommandArg("videoOut", "string", "Video Output", true).setContentListUrl("api/options/PlaylistVideoOutput"));
+    // Opt-in: follow the playlist's primary media clock instead of free-running.
+    // Wanted when this stream belongs to the show (a second language feed on
+    // another audio output); not wanted for unrelated media on a second display.
+    args.push_back(CommandArg("sync", "bool", "Sync To Show", true).setDefaultValue("false"));
+}
+std::unique_ptr<Command::Result> PlayMediaCommand::run(const std::vector<std::string>& args) {
+    int loop = args.size() > 1 ? std::atoi(args[1].c_str()) : 1;
+    int volAdjust = 0;
+    if (args.size() > 2) {
+        volAdjust = std::atoi(args[2].c_str());
+    }
+    int slot = 1;
+    if (args.size() > 3) {
+        slot = std::atoi(args[3].c_str());
+        if (slot < 1 || slot > StreamSlotManager::MAX_SLOTS) slot = 1;
+    }
+    if (loop < 1) {
+        loop = 1;
+    }
+    std::string videoOut;
+    if (args.size() > 4) {
+        // An omitted video output stays "" (audio only); "--Default--" means
+        // the same display a playlist's default would use. It used to be
+        // passed through as-is and taken for a pixel overlay model name.
+        videoOut = args[4] == "--Default--" ? ResolveVideoOutput(args[4]) : args[4];
+    }
+    bool syncToShow = false;
+    if (args.size() > 5) {
+        syncToShow = (args[5] == "true" || args[5] == "1");
+    }
+
+    // A slot holds one stream at a time. Without this, a repeated "Play
+    // Media" on the same slot (e.g. pressing play twice) would build a
+    // second GStreamer pipeline that reuses the same PipeWire node name
+    // (StreamSlotManager::GetNodeName() is keyed only by slot number), while
+    // the first pipeline is left running -- StreamSlotManager only ever
+    // tracks the newest output, so the original becomes untracked and
+    // unstoppable via any command, and the two streams mix audibly. Stop
+    // whatever already holds the slot first so only one stream ever owns it.
+#ifdef HAS_GSTREAMER
+    // Stop-then-start is one step per slot. Two Play Media on the same slot at
+    // once (two HTTP or MQTT requests) both found it empty, both started, and
+    // the slot went on tracking only the later stream while the two mixed.
+    // Recursive: a preset reached from Start() may play onto the same slot on
+    // this thread. Released before the MEDIA_STARTED preset below.
+    static std::recursive_mutex slotStartLocks[StreamSlotManager::MAX_SLOTS + 1];
+    std::unique_lock<std::recursive_mutex> slotStartLock(slotStartLocks[slot]);
+    std::string stoppedMedia = StopCommandMediaInSlot(slot);
+    if (!stoppedMedia.empty()) {
+        LogInfo(VB_COMMAND, "Play Media: slot %d was playing %s, stopped it before starting %s\n", slot, stoppedMedia.c_str(), args[0].c_str());
+    } else if (StreamSlotManager::Instance().RequestStop(slot)) {
+        // Not command media - a playlist-owned stream.  Its owner stops and
+        // frees it on its own thread; stopping it from here raced the owner's
+        // Process() and its delete.  It stops on the owner's next pass.
+        LogInfo(VB_COMMAND, "Play Media: slot %d already active, asked its owner to stop it before starting %s\n", slot, args[0].c_str());
+    }
+#endif
+
+    MediaOutputBase* out = nullptr;
+#ifdef HAS_GSTREAMER
+    if (UseGStreamerForPlayMedia()) {
+        out = new GStreamerPlayData(args[0], loop, volAdjust, slot, videoOut);
+        LogInfo(VB_COMMAND, "Play Media using GStreamer backend for: %s (slot %d)\n", args[0].c_str(), slot);
+    }
+#endif
+
+    if (!out) {
+        return std::make_unique<Command::ErrorResult>("No media backend available");
+    }
+
+    if (!out->Start()) {
+        // GStreamerPlayData's ctor self-registers into runningCommandMedia
+        // (RegisterRunningMedia()). Normally the entry is removed when
+        // GStreamerOutput::Stopped() fires, but every failure path inside
+        // GStreamerOutput::Start() returns before the GStreamer bus
+        // watch/state-change thread is ever installed, so Stopped() (and
+        // thus RemoveRunningMedia()) will never be called. Without this,
+        // the object -- and its map entry -- leaks forever. Deregister
+        // directly and delete. Start() can fail with a pipeline already
+        // built (gst_parse_launch() returns one alongside a recoverable
+        // error), which the destructor's Close() stops; the destructor
+        // keeps that stop from scheduling a deferred delete of its own.
+        LogErr(VB_COMMAND, "Play Media: could not start media %s\n", args[0].c_str());
+        WarningHolder::AddWarningTimeout(60, 30, "Could not start media " + args[0]);
+        runningMediaLock.lock();
+        for (auto it = runningCommandMedia.begin(); it != runningCommandMedia.end(); ++it) {
+            if (it->second == out) {
+                runningCommandMedia.erase(it);
+                break;
+            }
+        }
+        runningMediaLock.unlock();
+        delete out;
+        return std::make_unique<Command::ErrorResult>("Could not start media " + args[0]);
+    }
+
+    // Set after a successful Start(): the slot registers its active output
+    // during Start(), so flagging earlier would target a slot that isn't
+    // populated yet.
+    if (syncToShow) {
+        StreamSlotManager::Instance().SetSyncToMaster(slot, true);
+    }
+#ifdef HAS_GSTREAMER
+    slotStartLock.unlock();
+#endif
+
+    std::map<std::string, std::string> keywords;
+    keywords["MEDIA_NAME"] = args[0];
+    keywords["STREAM_SLOT"] = std::to_string(slot);
+    if (CommandManager::INSTANCE.HasPreset("MEDIA_STARTED")) {
+        CommandManager::INSTANCE.TriggerPreset("MEDIA_STARTED", keywords);
+    }
+
+    return std::make_unique<Command::Result>("Playing");
+}
+
+StopMediaCommand::StopMediaCommand() :
+    Command("Stop Media", "Stops the media in the background started via a command") {
+    args.push_back(CommandArg("media", "string", "Media").setContentListUrl("api/media"));
+}
+std::unique_ptr<Command::Result> StopMediaCommand::run(const std::vector<std::string>& args) {
+    if (args.size() == 0) {
+        return std::make_unique<Command::Result>("Invalid Number of Arguments");
+    }
+    std::string rc = "Media Not Running";
+    runningMediaLock.lock();
+    MediaOutputBase* media_ptr = nullptr;
+    try {
+        media_ptr = runningCommandMedia.at(args[0]);
+    } catch (const std::out_of_range& oor) {
+        LogInfo(VB_COMMAND, "Media: \"%s\" is not running so can't stop via command\n", args[0].c_str());
+        media_ptr = nullptr;
+    }
+    if (media_ptr) {
+        media_ptr->Stop();
+        rc = "Stopped";
+    }
+    runningMediaLock.unlock();
+
+    return std::make_unique<Command::Result>(rc);
+}
+
+StopAllMediaCommand::StopAllMediaCommand() :
+    Command("Stop All Media", "Stops all running media that was created via a Command") {
+}
+std::unique_ptr<Command::Result> StopAllMediaCommand::run(const std::vector<std::string>& args) {
+    runningMediaLock.lock();
+    for (const auto& item : runningCommandMedia) {
+        LogDebug(VB_COMMAND, "Stopping: \"%s\"\n", item.first.c_str());
+        if (item.second) {
+            item.second->Stop();
+        }
+    }
+    runningMediaLock.unlock();
+    return std::make_unique<Command::Result>("Stopped");
+}
+
+StopMediaSlotCommand::StopMediaSlotCommand() :
+    Command("Stop Media Slot", "Stop playback on a specific stream slot (1-5)") {
+    args.push_back(CommandArg("slot", "int", "Stream Slot").setRange(1, StreamSlotManager::MAX_SLOTS).setDefaultValue("1"));
+}
+std::unique_ptr<Command::Result> StopMediaSlotCommand::run(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        return std::make_unique<Command::ErrorResult>("No slot specified");
+    }
+    int slot = std::atoi(args[0].c_str());
+    if (slot < 1 || slot > StreamSlotManager::MAX_SLOTS) {
+        return std::make_unique<Command::ErrorResult>("Invalid slot number (1-" + std::to_string(StreamSlotManager::MAX_SLOTS) + ")");
+    }
+
+    // Try command-started media first (matches by slot)
+    std::string stoppedFile;
+#ifdef HAS_GSTREAMER
+    stoppedFile = StopCommandMediaInSlot(slot);
+#endif
+
+    if (!stoppedFile.empty()) {
+        LogInfo(VB_COMMAND, "Stop Media Slot %d: stopped command media '%s'\n", slot, stoppedFile.c_str());
+        return std::make_unique<Command::Result>("Stopped slot " + std::to_string(slot));
+    }
+
+    // Fall back to StreamSlotManager (catches playlist-started media), which
+    // asks the owner to stop it on its own thread -- see Play Media above.
+    if (StreamSlotManager::Instance().RequestStop(slot)) {
+        LogInfo(VB_COMMAND, "Stop Media Slot %d: asked the slot's owner to stop it\n", slot);
+        // Not "Stopped": the owner stops it on its next pass, and only if it
+        // is still processing that output.
+        return std::make_unique<Command::Result>("Stop requested for slot " + std::to_string(slot));
+    }
+
+    return std::make_unique<Command::Result>("Slot " + std::to_string(slot) + " not playing");
+}
+
+SetSlotVolumeCommand::SetSlotVolumeCommand() :
+    Command("Set Slot Volume", "Sets the volume on a specific stream slot (1-5)") {
+    args.push_back(CommandArg("slot", "int", "Stream Slot").setRange(1, StreamSlotManager::MAX_SLOTS).setDefaultValue("1"));
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(0, 100).setDefaultValue("70"));
+}
+std::unique_ptr<Command::Result> SetSlotVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        return std::make_unique<Command::ErrorResult>("Requires slot and volume arguments");
+    }
+    int slot = std::atoi(args[0].c_str());
+    int volume = std::atoi(args[1].c_str());
+    if (slot < 1 || slot > StreamSlotManager::MAX_SLOTS) {
+        return std::make_unique<Command::ErrorResult>("Invalid slot number (1-" + std::to_string(StreamSlotManager::MAX_SLOTS) + ")");
+    }
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+
+    bool deferred = false;
+    if (StreamSlotManager::Instance().SetSlotVolume(slot, volume, &deferred)) {
+        if (deferred) {
+            return std::make_unique<Command::Result>("Slot " + std::to_string(slot) +
+                                                     " is idle; the volume applies when it next plays");
+        }
+        return std::make_unique<Command::Result>("Volume set on slot " + std::to_string(slot));
+    }
+    return std::make_unique<Command::ErrorResult>("Slot volume is not available");
+}
+
+MediaSlotStatusCommand::MediaSlotStatusCommand() :
+    Command("Media Slot Status", "Returns the current playback status of all stream slots") {
+}
+std::unique_ptr<Command::Result> MediaSlotStatusCommand::run(const std::vector<std::string>& args) {
+    Json::Value status = StreamSlotManager::Instance().GetAllSlotsStatus();
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    std::string result = Json::writeString(builder, status);
+    return std::make_unique<Command::Result>(result);
+}
+#endif
+
+#ifdef HAS_AES67_GSTREAMER
+#include "mediaoutput/AES67Manager.h"
+
+AES67ApplyCommand::AES67ApplyCommand() :
+    Command("AES67 Apply", "Apply AES67 audio-over-IP configuration") {
+}
+std::unique_ptr<Command::Result> AES67ApplyCommand::run(const std::vector<std::string>& args) {
+    if (AES67Manager::INSTANCE.ApplyConfig()) {
+        return std::make_unique<Command::Result>("AES67 config applied");
+    }
+    return std::make_unique<Command::ErrorResult>("AES67 apply failed");
+}
+
+AES67CleanupCommand::AES67CleanupCommand() :
+    Command("AES67 Cleanup", "Stop all AES67 pipelines and clean up") {
+}
+std::unique_ptr<Command::Result> AES67CleanupCommand::run(const std::vector<std::string>& args) {
+    AES67Manager::INSTANCE.Cleanup();
+    return std::make_unique<Command::Result>("AES67 cleaned up");
+}
+
+AES67TestCommand::AES67TestCommand() :
+    Command("AES67 Test", "Run AES67 subsystem self-test") {
+}
+std::unique_ptr<Command::Result> AES67TestCommand::run(const std::vector<std::string>& args) {
+    auto tests = AES67Manager::INSTANCE.RunSelfTest();
+    int passed = 0, failed = 0;
+    std::string report;
+    for (const auto& t : tests) {
+        report += (t.passed ? "PASS" : "FAIL");
+        report += ": " + t.testName + " - " + t.message + "\n";
+        if (t.passed) passed++; else failed++;
+    }
+    report += "\nTotal: " + std::to_string(tests.size()) +
+              " | Passed: " + std::to_string(passed) +
+              " | Failed: " + std::to_string(failed);
+    if (failed == 0) {
+        return std::make_unique<Command::Result>(report);
+    }
+    return std::make_unique<Command::ErrorResult>(report);
+}
+
+ApplyRoutingPresetCommand::ApplyRoutingPresetCommand() :
+    Command("Pipewire Apply Routing Preset", "Live-apply a saved PipeWire routing preset without stopping playback") {
+    args.push_back(CommandArg("Preset", "string", "Routing Preset Name")
+                       .setContentListUrl("api/pipewire/audio/routing/presets/names"));
+}
+std::unique_ptr<Command::Result> ApplyRoutingPresetCommand::run(const std::vector<std::string>& args) {
+    if (args.empty() || args[0].empty()) {
+        return std::make_unique<Command::ErrorResult>("No preset name specified");
+    }
+    // Build the API call — POST to the live-apply endpoint with the preset name
+    std::string url = "http://localhost/api/pipewire/audio/routing/presets/live-apply";
+    // Serialized, not concatenated: a preset name with a quote or backslash
+    // in it made invalid JSON (or a different request).
+    Json::Value body;
+    body["name"] = args[0];
+    std::string postData = SaveJsonToString(body);
+    std::vector<std::string> curlArgs = { url, "POST", postData };
+    return std::make_unique<CURLResult>(curlArgs);
+}
+#endif
+
+#ifdef HAS_OPUS_RTP_GSTREAMER
+#include "mediaoutput/OpusRTPManager.h"
+
+OpusRTPApplyCommand::OpusRTPApplyCommand() :
+    Command("Opus RTP Apply", "Apply Opus RTP audio streaming configuration") {
+}
+std::unique_ptr<Command::Result> OpusRTPApplyCommand::run(const std::vector<std::string>& args) {
+    if (OpusRTPManager::INSTANCE.ApplyConfig()) {
+        return std::make_unique<Command::Result>("Opus RTP config applied");
+    }
+    return std::make_unique<Command::ErrorResult>("Opus RTP apply failed");
+}
+
+OpusRTPCleanupCommand::OpusRTPCleanupCommand() :
+    Command("Opus RTP Cleanup", "Stop all Opus RTP pipelines and clean up") {
+}
+std::unique_ptr<Command::Result> OpusRTPCleanupCommand::run(const std::vector<std::string>& args) {
+    OpusRTPManager::INSTANCE.Cleanup();
+    return std::make_unique<Command::Result>("Opus RTP cleaned up");
+}
+#endif

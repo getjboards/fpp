@@ -1,244 +1,667 @@
+#pragma once
 /*
- *   Falcon Player MultiSync header file  
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
- 
-#ifndef _MULTISYNC_H
-#define _MULTISYNC_H
+
+// PLUGIN ABI: native plugins compile against this header and are loaded with
+// dlopen(), so parts of it are baked into binaries FPP did not build.
+//   - MultiSyncPlugin is subclassed by plugins and FPP calls its virtuals:
+//     inserting, removing, reordering or even appending a virtual breaks
+//     them (appending reads past the end of an older plugin's vtable).
+//   - MultiSync's data layout: plugins call the inline isMultiSyncEnabled().
+//   - The MultiSyncSystemType enum values.
+// Any such change must bump FPP_PLUGIN_API_VERSION in Plugin.h. Without the
+// bump, a plugin built against the previous header still loads and silently
+// uses the old layout - FPP 10.2 shipped exactly that and crash-looped fppd.
+// See .claude/PLUGIN-ABI.md for which plugins use what.
 
 #include <netinet/in.h>
-#include <pthread.h>
-#include <sys/socket.h>
+#include "fpp-json-fwd.h"
 #include <sys/types.h>
+#include <atomic>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <pthread.h>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
-#include <jsoncpp/json/json.h>
-
+#include "SysSocket.h"
 #include "settings.h"
 
-
 #define FPP_CTRL_PORT 32320
-#define FPP_CTRL_CSV_PORT 32321
 
-#define CTRL_PKT_CMD    0
-#define CTRL_PKT_SYNC   1
-#define CTRL_PKT_EVENT  2
-#define CTRL_PKT_BLANK  3
-#define CTRL_PKT_PING   4
+#define CTRL_PKT_CMD 0 // deprecated in favor of FPP Commands
+#define CTRL_PKT_SYNC 1
+#define CTRL_PKT_EVENT 2 // deprecated in favor of FPP Commands
+#define CTRL_PKT_BLANK 3
+#define CTRL_PKT_PING 4
+#define CTRL_PKT_PLUGIN 5
+#define CTRL_PKT_FPPCOMMAND 6
 
 typedef struct __attribute__((packed)) {
-	char     fppd[4];        // 'FPPD'
-	uint8_t  pktType;        // Control Packet Type
-	uint16_t extraDataLen;   // Length of extra data following Control Packet
+    char fppd[4];          // 'FPPD'
+    uint8_t pktType;       // Control Packet Type
+    uint16_t extraDataLen; // Length of extra data following Control Packet
 } ControlPkt;
 
 typedef struct {
-	char   command[1];       // Null-terminated Command to process
+    char command[1]; // Null-terminated Command to process
 } CommandPkt;
 
-typedef struct {
-	char eventID[5];         // Event ID MAJOR_MINOR, NULL terminated
-} EventPkt;
-
 #define SYNC_PKT_START 0
-#define SYNC_PKT_STOP  1
-#define SYNC_PKT_SYNC  2
+#define SYNC_PKT_STOP 1
+#define SYNC_PKT_SYNC 2
+#define SYNC_PKT_OPEN 3
 
-#define SYNC_FILE_SEQ   0
+#define SYNC_FILE_SEQ 0
 #define SYNC_FILE_MEDIA 1
 
 typedef struct __attribute__((packed)) {
-	uint8_t  pktType;        // Sync Packet Type
-	uint8_t  fileType;       // File Type being synced
-	uint32_t frameNumber;    // Sequence frames displayed on Master
-	float    secondsElapsed; // Seconds elapsed in file on Master
-	char     filename[1];    // Null-terminated File Name to play on Slave
-	                         // (data may continue past this header)
+    uint8_t pktType;      // Sync Packet Type
+    uint8_t fileType;     // File Type being synced
+    uint32_t frameNumber; // Sequence frames displayed on Master
+    float secondsElapsed; // Seconds elapsed in file on Master
+    char filename[1];     // Null-terminated File Name to play on Slave
+                          // (data may continue past this header)
 } SyncPkt;
 
-
 typedef enum systemType {
-	kSysTypeUnknown                      = 0x00,
-	kSysTypeFPP                          = 0x01,
-	kSysTypeFPPRaspberryPiA,
-	kSysTypeFPPRaspberryPiB,
-	kSysTypeFPPRaspberryPiAPlus,
-	kSysTypeFPPRaspberryPiBPlus,
-	kSysTypeFPPRaspberryPi2B,
-	kSysTypeFPPRaspberryPi2BNew,
-	kSysTypeFPPRaspberryPi3B,
-	kSysTypeFPPRaspberryPi3BPlus,
-	kSysTypeFPPRaspberryPiZero,
-	kSysTypeFPPRaspberryPiZeroW,
-	kSysTypeFPPBeagleBoneBlack           = 0x41,
-	kSysTypeFPPBeagleBoneBlackWireless   = 0x42,
-	kSysTypeFPPBeagleBoneGreen           = 0x43,
-	kSysTypeFPPBeagleBoneGreenWireless   = 0x44,
-	kSysTypeFPPPocketBeagle              = 0x45,
+    kSysTypeUnknown = 0x00,
+    kSysTypeFPP = 0x01,
+    kSysTypeFPPRaspberryPiA,
+    kSysTypeFPPRaspberryPiB,
+    kSysTypeFPPRaspberryPiAPlus,
+    kSysTypeFPPRaspberryPiBPlus,
+    kSysTypeFPPRaspberryPi2B,
+    kSysTypeFPPRaspberryPi2BNew,
+    kSysTypeFPPRaspberryPi3B,
+    kSysTypeFPPRaspberryPi3BPlus,
+    kSysTypeFPPRaspberryPiZero,
+    kSysTypeFPPRaspberryPiZeroW,
+    kSysTypeFPPRaspberryPi3APlus,
+    kSysTypeFPPRaspberryPi4,
+    kSysTypeFPPRaspberryPi5,
+    kSysTypeFPPRaspberryPiZero2W,
+    kSysTypeFPPBeagleBoneBlack = 0x41,
+    kSysTypeFPPBeagleBoneBlackWireless = 0x42,
+    kSysTypeFPPBeagleBoneGreen = 0x43,
+    kSysTypeFPPBeagleBoneGreenWireless = 0x44,
+    kSysTypeFPPPocketBeagle = 0x45,
     kSysTypeFPPSanCloudBeagleBoneEnhanced = 0x46,
-	kSysTypeFalconController             = 0x80,
-	kSysTypeFalconF16v2                  = 0x81,
-	kSysTypeFalconF16v3                  = 0x82,
-	kSysTypeFalconF48v1                  = 0x83,
-	kSysTypeOtherSystem                  = 0xC0,
-	kSysTypexSchedule                    = 0xC1,
-    kSysTypeESPixelStick                 = 0xC2
+    kSysTypeFPPPocketBeagle2 = 0x47,
+    kSysTypeFPPArmbian = 0x60,
+    kSysTypeMacOS = 0x70,
+    // Values under 0x80 are "FPP based" and run full FPP
+    kSysTypeFalconController = 0x80,
+    kSysTypeFalconF16v2 = 0x81,
+    kSysTypeFalconF4v2_64Mb = 0x82,
+    kSysTypeFalconF16v2R = 0x83,
+    kSysTypeFalconF4v2 = 0x84,
+    kSysTypeFalconF16v3 = 0x85,
+    kSysTypeFalconF4v3 = 0x86,
+    kSysTypeFalconF48 = 0x87,
+    kSysTypeFalconF16v4 = 0x88,
+    kSysTypeFalconF48v4 = 0x89,
+    kSysTypeFalconF16v5 = 0x8a,
+    kSysTypeFalconF48v5 = 0x8b,
+    kSysTypeFalconF32v5 = 0x8c,
+    kSysTypeExperienceGP16 = 0xA0,
+    kSysTypeExperienceGP8 = 0xA1,
+    kSysTypeExperienceGLR = 0xA2,
+    kSysTypeExperienceG16Pro = 0xA3,
+    kSysTypeExperienceG32Pro = 0xA4,
+    kSysTypeExperienceAURORACORE16 = 0xA5,
+    kSysTypeExperienceVIVID8 = 0xA6,
+    kSysTypeExperiencePIXELLINK4 = 0xA7,
+    kSysTypeExperienceGenius = 0xAF,
+    kSysTypeOtherSystem = 0xC0,
+    kSysTypexSchedule = 0xC1,
+    kSysTypeESPixelStick = 0xC2,
+    kSysTypeESPixelStickESP32 = 0xC3,
+    kSysTypeBaldrick = 0xC4,
+    kSysTypeNonMultiSyncCapable = 0xF0,
+    kSysTypeTwinkly = 0xFA,
+    kSysTypeWLED = 0xFB,
+    kSysTypeDIYLEDExpress = 0xFC,
+    kSysTypeHinksPix = 0xFD,
+    kSysTypeAlphaPix = 0xFE,
+    kSysTypeSanDevices = 0xFF
 } MultiSyncSystemType;
 
-typedef struct multiSyncSystem {
-	unsigned long        lastSeen;
-	std::string          lastSeenStr;
-	MultiSyncSystemType  type;
-	unsigned int         majorVersion;
-	unsigned int         minorVersion;
-	FPPMode              fppMode;
-	std::string          address;
-	std::string          hostname;
-	std::string          version;
-	std::string          model;
-    std::string          ranges;
-	unsigned char        ipa;
-	unsigned char        ipb;
-	unsigned char        ipc;
-	unsigned char        ipd;
-} MultiSyncSystem;
+// The two records below hold the slow-changing detail the multisync UI needs
+// about every discovered FPP remote -- OS version, host description, background
+// color, git branch/commit, whether channel inputs/outputs are enabled, and what
+// cape is installed.  None of it fits in (or belongs in) the UDP ping packet, so
+// fppd collects it over HTTP instead; see MultiSync::CheckSystemInfoRefreshes().
+//
+// Both deliberately hold plain members rather than a Json::Value: MultiSync.h
+// only forward-declares Json::Value (fpp-json-fwd.h), and spelling the fields
+// out documents exactly what is relayed to peers.
+class MultiSyncSystemInfo {
+public:
+    bool valid = false;
+
+    std::string platform;
+    std::string variant;
+    std::string subPlatform;
+    std::string osVersion;
+    std::string osRelease;
+    std::string kernel;
+    std::string hostDescription;
+    std::string backgroundColor;
+    std::string branch;
+    std::string localGitVersion;
+    std::string remoteGitVersion;
+    std::string upgradeSource;
+    std::vector<std::string> ips;
+    // Tri-state: -1 when the remote is too old to report the field at all, in
+    // which case the UI still has to go look for itself.
+    int channelInputsEnabled = -1;
+    int channelOutputsEnabled = -1;
+
+    Json::Value toJSON() const;
+};
+
+class MultiSyncCapeInfo {
+public:
+    bool valid = false;
+    // False when the remote answered but has no cape installed (/api/cape
+    // returns 404).  That is a real answer and worth caching, as distinct from
+    // valid == false meaning "we have not managed to ask yet".
+    bool present = false;
+
+    std::string id;
+    std::string name;
+    std::string description;
+    std::string version;
+    std::string designer;
+    // Deliberately NOT carrying the cape's serialNumber: it is a per-board
+    // hardware identifier with no use in the UI, and this record is handed to
+    // every peer that asks for the systems list.
+    std::string vendorName;
+    std::string vendorURL;
+    std::string vendorEmail;
+    std::string vendorImage;
+    // The cape's own opt-out of hardware detail in the usage statistics. Only
+    // a signed cape can carry it -- CapeUtils strips it from an unsigned one --
+    // and it is relayed so that a peer-side collector can honour the flag of
+    // the cape it actually describes, rather than the reporting host's.
+    // Default true: absent means the cape never asked to be excluded.
+    bool sendStats = true;
+
+    Json::Value toJSON() const;
+    // Build from a /api/cape style object (a remote's reply, or the local
+    // media/tmp/cape-info.json).  Result is valid+present.
+    static MultiSyncCapeInfo fromCapeJSON(const Json::Value& v);
+};
+
+// Identity synthesised from a device's MAC when it reports no UUID of its own.
+// The prefix marks it as a stand-in so a real UUID arriving later can replace
+// it -- see MultiSyncSystem::update().
+#define MAC_UUID_PREFIX "MAC:"
+
+class MultiSyncSystem {
+public:
+    MultiSyncSystem() {
+    }
+    unsigned long lastSeen = 0;
+    std::string lastSeenStr;
+    bool multiSync = false;
+    MultiSyncSystemType type = kSysTypeUnknown;
+    unsigned int majorVersion = 0;
+    unsigned int minorVersion = 0;
+    FPPMode fppMode = FPPMode::PLAYER_MODE;
+    bool sendingMultiSync = false;
+    // True if this is a full FPP instance running in Remote mode and is therefore
+    // a valid target for "Send MultiSync to ALL KNOWN remotes via Unicast".  This
+    // excludes non-FPP devices (WLED, ESPixelStick, Falcon controllers, etc.) and
+    // FPP instances not in Remote mode.  Computed in update().
+    bool supportsUnicast = false;
+    std::string address;
+    std::string hostname;
+    std::string version;
+    std::string model;
+    std::string ranges;
+    std::string uuid;
+
+    // Fetched by MultiSync::CheckSystemInfoRefreshes(), relayed by toJSON().
+    // All six are guarded by MultiSync::m_systemsLock.
+    MultiSyncSystemInfo systemInfo; // subset of the remote's /api/system/info
+    MultiSyncCapeInfo capeInfo;     // subset of the remote's /api/cape
+    std::string infoFetchedVersion; // 'version' the cached info was fetched for
+    // Earliest wall clock at which this remote may be fetched again.  0 means
+    // "due, but not yet scheduled": the sweep turns that into a jittered time
+    // rather than fetching immediately, so a fleet-wide event doesn't converge
+    // on one target.  See CheckSystemInfoRefreshes().
+    time_t infoNextFetch = 0;
+    bool infoFetchPending = false;  // a fetch is in flight right now
+
+    unsigned char ipa = 0;
+    unsigned char ipb = 0;
+    unsigned char ipc = 0;
+    unsigned char ipd = 0;
+
+    void update(MultiSyncSystemType type,
+                unsigned int majorVersion, unsigned int minorVersion,
+                FPPMode fppMode,
+                const std::string& address,
+                const std::string& hostname,
+                const std::string& version,
+                const std::string& model,
+                const std::string& ranges,
+                const std::string& uuid,
+                const bool multiSync,
+                const bool sendingMultiSync);
+    Json::Value toJSON(bool local, bool timestamps);
+};
+
+class MultiSyncStats {
+public:
+    MultiSyncStats(std::string ip, std::string host);
+
+    Json::Value toJSON();
+
+    std::string sourceIP;
+    std::string hostname;
+    time_t lastReceiveTime;
+    uint32_t pktCommand;
+    uint32_t pktSyncSeqOpen;
+    uint32_t pktSyncSeqStart;
+    uint32_t pktSyncSeqStop;
+    uint32_t pktSyncSeqSync;
+    uint32_t pktSyncMedOpen;
+    uint32_t pktSyncMedStart;
+    uint32_t pktSyncMedStop;
+    uint32_t pktSyncMedSync;
+    uint32_t pktBlank;
+    uint32_t pktPing;
+    uint32_t pktPlugin;
+    uint32_t pktFPPCommand;
+    uint32_t pktError;
+};
+
+class MultiSyncPlugin {
+public:
+    MultiSyncPlugin() {}
+    virtual ~MultiSyncPlugin() {}
+
+    virtual void SendSeqOpenPacket(const std::string& filename) {}
+    virtual void SendSeqSyncStartPacket(const std::string& filename) {}
+    virtual void SendSeqSyncStopPacket(const std::string& filename) {}
+    virtual void SendSeqSyncPacket(const std::string& filename, int frames, float seconds) {}
+    virtual void ShutdownSync(void) {}
+
+    virtual void SendMediaOpenPacket(const std::string& filename) {}
+    virtual void SendMediaSyncStartPacket(const std::string& filename) {}
+    virtual void SendMediaSyncStopPacket(const std::string& filename) {}
+    virtual void SendMediaSyncPacket(const std::string& filename, float seconds) {}
+
+    virtual void SendBlankingDataPacket(void) {}
+
+    virtual void SendPluginData(const std::string& name, const uint8_t* data, int len) {}
+    virtual void SendFPPCommandPacket(const std::string& host, const std::string& cmd, const std::vector<std::string>& args) {}
+
+    virtual void ReceivedSeqOpenPacket(const std::string& filename) {}
+    virtual void ReceivedSeqSyncStartPacket(const std::string& filename) {}
+    virtual void ReceivedSeqSyncStopPacket(const std::string& filename) {}
+    virtual void ReceivedSeqSyncPacket(const std::string& filename, int frames, float seconds) {}
+
+    virtual void ReceivedMediaOpenPacket(const std::string& filename) {}
+    virtual void ReceivedMediaSyncStartPacket(const std::string& filename) {}
+    virtual void ReceivedMediaSyncStopPacket(const std::string& filename) {}
+    virtual void ReceivedMediaSyncPacket(const std::string& filename, float seconds) {}
+
+    virtual void ReceivedBlankingDataPacket(void) {}
+    virtual void ReceivedPluginData(const std::string& name, const uint8_t* data, int len) {}
+    virtual void ReceivedFPPCommandPacket(const std::string& cmd, const std::vector<std::string>& args) {}
+};
+
+class NetInterfaceInfo {
+public:
+    NetInterfaceInfo();
+    ~NetInterfaceInfo();
+
+    std::string interfaceName;
+    std::string interfaceAddress;
+    uint32_t address;
+    uint32_t broadcastAddress;
+    int multicastSocket;
+};
 
 class MultiSync {
-  public:
-	MultiSync();
-	~MultiSync();
+public:
+    static MultiSync INSTANCE;
 
-	int  Init(void);
+    MultiSync();
+    ~MultiSync();
 
-	int  GetControlSocket(void) { return m_receiveSock; }
-	void ProcessControlPacket(void);
+    int Init(void);
 
-	void UpdateSystem(MultiSyncSystemType type,
+    bool isMultiSyncEnabled() { return m_multiSyncEnabled; }
+
+    int GetControlSocket(void) { return m_receiveSock; }
+    void ProcessControlPacket(bool pingOnly = false);
+
+    void UpdateSystem(MultiSyncSystemType type,
                       unsigned int majorVersion,
                       unsigned int minorVersion,
                       FPPMode fppMode,
-                      const std::string &address,
-                      const std::string &hostname,
-                      const std::string &version,
-                      const std::string &model,
-                      const std::string &range);
+                      const std::string& address,
+                      const std::string& hostname,
+                      const std::string& version,
+                      const std::string& model,
+                      const std::string& range,
+                      const std::string& uuid,
+                      const bool multiSync,
+                      const bool sendingMultiSync);
 
-	Json::Value GetSystems(bool localOnly = false, bool timestamps = true);
+    Json::Value GetSystems(bool localOnly = false, bool timestamps = true);
+    Json::Value GetSyncStats();
+    void ResetSyncStats();
 
-	void Ping(int discover = 0);
-	void Discover(void) { Ping(1); }
+    void WriteRuntimeInfoFile();
+
+    void Ping(int discover = 0, bool broadcast = true);
+    void PingSingleRemote(const char* address, int discover = 0);
+    void QueueDiscoverReply(const std::string& address, const std::string& srcIp);
+    // Detect/refresh a single non-multisync remote (e.g. a WLED node found
+    // via mDNS) by fetching its HTTP root and running controller detection.
+    void PingSingleRemoteViaHTTP(const std::string& address);
+    void Discover(void);
     void PeriodicPing();
 
-	void SendSeqSyncStartPacket(const char *filename);
-	void SendSeqSyncStopPacket(const char *filename);
-	void SendSeqSyncPacket(const char *filename, int frames, float seconds);
-	void ShutdownSync(void);
+    void SendSeqOpenPacket(const std::string& filename);
+    void SendSeqSyncStartPacket(const std::string& filename);
+    void SendSeqSyncStopPacket(const std::string& filename);
+    void SendSeqSyncPacket(const std::string& filename, int frames, float seconds);
+    void ShutdownSync(void);
 
-	void SendMediaSyncStartPacket(const char *filename);
-	void SendMediaSyncStopPacket(const char *filename);
-	void SendMediaSyncPacket(const char *filename, int frames, float seconds);
+    void SendMediaOpenPacket(const std::string& filename);
+    void SendMediaSyncStartPacket(const std::string& filename);
+    void SendMediaSyncStopPacket(const std::string& filename);
+    void SendMediaSyncPacket(const std::string& filename, float seconds);
 
-	void SendEventPacket(const char *eventID);
-	void SendBlankingDataPacket(void);
+    void SendFPPCommandPacket(const std::string& host, const std::string& cmd, const std::vector<std::string>& args);
+    void SendBlankingDataPacket(void);
 
-  private:
-    void PingSingleRemote(int sysIdx);
-    int CreatePingPacket(MultiSyncSystem &sys, char* outBuf, int discover);
+    void SendPluginData(const std::string& name, const uint8_t* data, int len);
 
-	MultiSyncSystemType ModelStringToType(std::string model);
-	void FillLocalSystemInfo(void);
-	std::string GetHardwareModel(void);
-    std::string GetTypeString(MultiSyncSystemType type);
+    void addMultiSyncPlugin(MultiSyncPlugin* p);
+    void removeMultiSyncPlugin(MultiSyncPlugin* p);
 
-	int  OpenBroadcastSocket(void);
-	void SendBroadcastPacket(void *outBuf, int len);
+    void OpenSyncedSequence(const std::string& filename);
+    void StartSyncedSequence(const std::string& filename);
+    void StopSyncedSequence(const std::string& filename);
+    void SyncSyncedSequence(const std::string& filename, int frameNumber, float secondsElapsed);
 
-	int  OpenControlSockets(void);
-	void SendControlPacket(void *outBuf, int len);
+    void OpenSyncedMedia(const std::string& filename);
+    void StartSyncedMedia(const std::string& filename, float secondsElapsed = 0.0f);
+    void StopSyncedMedia(const std::string& filename);
+    void SyncSyncedMedia(const std::string& filename, int frameNumber, float secondsElapsed);
+    void CheckSyncedMediaIdleTimeout();
 
-	int  OpenCSVControlSockets(void);
-	void SendCSVControlPacket(void *outBuf, int len);
+    void SyncPlaylistToMS(uint64_t ms, const std::string& pl = "", bool sendSyncPackets = false);
+    void SyncPlaylistToMS(uint64_t ms, int pos, const std::string& pl = "", bool sendSyncPackets = false);
+    void SyncStopAll();
 
-	void InitControlPacket(ControlPkt *pkt);
+    int OpenControlSockets();
 
-	int  OpenReceiveSocket(void);
+    static std::string GetTypeString(MultiSyncSystemType type, bool local = false);
+    static MultiSyncSystemType ModelStringToType(std::string model);
 
-	void StartSyncedSequence(char *filename);
-	void StopSyncedSequence(char *filename);
-	void SyncSyncedSequence(char *filename, int frameNumber,
-		float secondsElapsed);
+    // Was the curl write callback for the HTTP discovery scan, which now
+    // receives whole responses from CurlManager instead.  Retained as a no-op
+    // only because it is public and an external plugin could reference it.
+    void StoreHTTPResponse(std::string* ipp, uint8_t* data, int sz) {}
 
-	void StartSyncedMedia(char *filename);
-	void StopSyncedMedia(char *filename);
-	void SyncSyncedMedia(char *filename, int frameNumber, float secondsElapsed);
+    [[nodiscard]] std::vector<MultiSyncSystem> const& GetLocalSystems() { return m_localSystems; }
+    [[nodiscard]] std::vector<MultiSyncSystem> const& GetRemoteSystems() { return m_remoteSystems; }
 
-	void ProcessSyncPacket(ControlPkt *pkt, int len);
-	void ProcessCommandPacket(ControlPkt *pkt, int len);
-	void ProcessEventPacket(ControlPkt *pkt, int len);
-	void ProcessPingPacket(ControlPkt *pkt, int len);
+private:
+    bool isSupportedForMultisync(const char* address, const char* intface);
 
-	pthread_mutex_t              m_systemsLock;
-	std::vector<MultiSyncSystem> m_systems;
-    int  m_numLocalSystems;
+    void setupMulticastReceive(bool cycle);
+    void PingSingleRemote(MultiSyncSystem& sys, int discover = 0);
+    int CreatePingPacket(MultiSyncSystem& sys, char* outBuf, int discover);
 
-	int  m_broadcastSock;
-	int  m_controlSock;
-	int  m_controlCSVSock;
-	int  m_remoteCount;
-	int  m_remoteCSVCount;
-	int  m_receiveSock;
+    bool FillLocalSystemInfo(void);
+    std::string GetHardwareModel(void);
 
-	std::string         m_hostname;
-    std::string         m_localAddress;
-	struct sockaddr_in  m_srcAddr;
-	struct sockaddr_in  m_receiveSrcAddr;
-	struct sockaddr_in  m_broadcastDestAddr;
-	pthread_mutex_t     m_socketLock;
+    // Rebuild m_configuredOutputRanges from co-universes.json. Called once at
+    // startup and again whenever the file changes (via a FileMonitor watch).
+    void ReloadConfiguredOutputRanges();
 
-    unsigned long       m_lastPingTime;
-    unsigned long       m_lastCheckTime;
+    int OpenBroadcastSocket(void);
+    void SendBroadcastPacket(void* outBuf, int len);
+    void SendControlPacket(void* outBuf, int len);
+    void SendControlPacketViaMsgs(std::vector<struct mmsghdr>& msgs, struct iovec& iovec, void* outBuf, int len);
+    void SendMulticastPacket(void* outBuf, int len);
+    void SendUnicastPacket(const std::string& address, void* outBuf, int len);
+    // Rebuild the cached "all known remotes" unicast destination list from the
+    // currently-known remote systems that support unicast.  Only used when the
+    // MultiSyncUnicast ("send to ALL known remotes") setting is enabled.
+    // Neither form may be called with m_systemsLock held: they take
+    // m_unicastUpdateLock, and that lock is only ever acquired ahead of
+    // m_systemsLock, never behind it.  The no-arg form snapshots the addresses
+    // under m_systemsLock and then releases it before doing the rebuild; a
+    // caller that already holds m_systemsLock takes its own snapshot while it
+    // has the lock and passes it to the overload after releasing it.
+    void UpdateUnicastDestinations();
+    void UpdateUnicastDestinations(const std::vector<std::string>& addrsToResolve);
+    // Re-read the sync send methods (MultiSyncBroadcast/Multicast/Unicast) and
+    // the statically-configured unicast remote list (MultiSyncRemotes plus
+    // MultiSyncExtraRemotes) from the settings and swap the resulting
+    // destination list into place.  Called once from OpenControlSockets() and
+    // again from a settings listener whenever any of those settings change, so
+    // editing the remote list on the MultiSync page takes effect immediately
+    // instead of requiring an fppd restart.
+    void ReloadSyncDestinations();
+    bool FillInInterfaces();
+    bool RemoveInterface(const std::string& interface);
+
+    void InitControlPacket(ControlPkt* pkt);
+
+    int OpenReceiveSocket(void);
+
+    void PerformHTTPDiscovery(void);
+    void DiscoverViaHTTP(const std::set<std::string>& ips, const std::set<std::string>& exacts);
+
+    // Twinkly lights answer neither mDNS nor SSDP, and serve a 404 at "/", so
+    // they are invisible to the mDNS listener and are dropped by the HTTP subnet
+    // scan before any detector sees them.  They do answer a short UDP broadcast
+    // on port 5555, which is the only way to find one that has not been
+    // configured as a channel output.  See PerformTwinklyDiscovery().
+    bool OpenTwinklyDiscoverySocket();
+    void PerformTwinklyDiscovery();
+    bool ProcessTwinklyDiscoveryReplies();
+    void DiscoverIPViaHTTP(const std::string& ip, const std::string& html, bool allowUnknown = false);
+
+    // Both HTTP probe paths are queue-and-pump rather than fire-everything:
+    // each hands its addresses to a queue and then starts as many requests as
+    // the in-flight cap allows, and each completion starts the next one.  See
+    // the cap defines in MultiSync.cpp for why an unbounded fan-out is the
+    // wrong thing on a show network.
+    void PumpHTTPPings();
+    void StartHTTPPing(const std::string& address);
+    void FinishHTTPPing();
+    void PumpHTTPDiscovery();
+    void FinishHTTPDiscovery();
+
+    void ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stats);
+    void ProcessCommandPacket(ControlPkt* pkt, int len, MultiSyncStats* stats);
+    void ProcessPingPacket(ControlPkt* pkt, int len, const std::string& src, MultiSyncStats* stats, const std::string& incomingIp = "");
+    void ProcessPluginPacket(ControlPkt* pkt, int len, MultiSyncStats* stats);
+    void ProcessFPPCommandPacket(ControlPkt* pkt, int len, MultiSyncStats* stats);
+
+    std::recursive_mutex m_systemsLock;
+    std::vector<MultiSyncSystem> m_localSystems;
+    std::vector<MultiSyncSystem> m_remoteSystems;
+    // Identities learned second-hand: some vendors report a stable id for each
+    // neighbour they can see but none for themselves, so a device's identity
+    // arrives while a DIFFERENT address is being probed.  Kept rather than
+    // applied and discarded, because the neighbour is often identified before
+    // the device it describes has been discovered at all.  Guarded by
+    // m_systemsLock.  Keyed by address.
+    std::map<std::string, std::string> m_peerUUIDHints;
+
+    // Channel-output ranges parsed from co-universes.json, keyed by each output
+    // target's configured address and its resolved IP. Used to backfill the
+    // advertised channel range of non-FPP remotes that don't report their own
+    // range via MultiSync. Rebuilt only when co-universes.json changes (see
+    // ReloadConfiguredOutputRanges()) so the frequently-polled GetSystems() path
+    // is just a map lookup with no file IO or DNS resolution. Guarded by
+    // m_systemsLock.
+    std::map<std::string, std::string> m_configuredOutputRanges;
+
+    std::map<std::string, NetInterfaceInfo> m_interfaces;
+    // Which send methods are active.  Read on the output thread from
+    // SendControlPacket() without any lock and rewritten by
+    // ReloadSyncDestinations() on the settings-reload thread, hence atomic.
+    std::atomic<bool> m_sendMulticast;
+    std::atomic<bool> m_sendBroadcast;
+    std::atomic<bool> m_sendUnicast = false;
+
+    int m_broadcastSock;
+    int m_controlSock;
+    int m_receiveSock;
+    // Sends the Twinkly discovery broadcast and receives the replies.  They come
+    // back to the port the request went out from, so this stays on an ephemeral
+    // port and never binds 5555.  Registered with EPollManager, so replies are
+    // handled on the main loop.
+    int m_twinklyDiscoverySock = -1;
+
+    // Guards the one-shot listener teardown in ShutdownSync(); see the comment
+    // there for why the second call has to be a no-op.
+    std::atomic<bool> m_settingsListenersRemoved{ false };
+
+    std::string m_hostname;
+    struct sockaddr_in m_srcAddr;
+    struct sockaddr_in m_receiveSrcAddr;
+    std::mutex m_socketLock;
+
+    // Serializes UpdateUnicastDestinations() calls against each other (DNS
+    // resolution happens without any other lock held, so overlapping calls are
+    // otherwise possible).  Lock order: this lock is never acquired while
+    // m_systemsLock is held -- ReloadSyncDestinations() takes it first and then
+    // reaches m_systemsLock only indirectly, so the reverse order would be an
+    // ABBA deadlock against the discovery paths.  m_socketLock is taken under
+    // it, for the brief swap step only.
+    std::mutex m_unicastUpdateLock;
+
+    // Async HTTP enrichment of discovered FPP remotes; see the comment above
+    // the definition of CheckSystemInfoRefreshes() in MultiSync.cpp.
+    void CheckSystemInfoRefreshes();
+    // Marks a remote's cached detail stale so a later sweep re-fetches it (at a
+    // jittered time, not immediately -- see CheckSystemInfoRefreshes()).  Called
+    // when the remote announces itself with a discover ping, i.e. its fppd just
+    // started.  Public because ProcessPingPacket reaches it through the global
+    // multiSync pointer.
+public:
+    void InvalidateSystemInfo(const std::string& address);
+
+private:
+    // Makes every entry for one device agree on its identity; see the comment
+    // above the definition.  Caller must hold m_systemsLock.
+    void ReconcileDeviceIdentity(const std::string& hostname, FPPMode fppMode);
+    void ApplyPeerUUIDs(const std::map<std::string, std::string>& peerUUIDs);
+    // Fills in a system's identity from m_peerUUIDHints.  Caller holds
+    // m_systemsLock.
+    void ApplyUUIDHint(MultiSyncSystem& sys);
+    void FetchSystemInfo(const std::string& address);
+    void FetchCapeInfo(const std::string& address);
+    // Runs `apply` on every remote entry describing the same device as
+    // `address` -- the same address, or the same non-empty uuid.  A device with
+    // more than one NIC has one entry per address (the UI merges them into a
+    // single row by uuid), and one fetch should update all of them.  Takes
+    // m_systemsLock.
+    void ForEachRemoteMatching(const std::string& address,
+                               const std::function<void(MultiSyncSystem&)>& apply);
+
+    // Wall clock of the next CheckSystemInfoRefreshes() sweep, and how many of
+    // its HTTP fetches are outstanding.  Both are touched only on the main loop
+    // -- the sweep and the CurlManager completions run on the same thread.  The
+    // counter would be stranded high (and infoFetchPending stuck set) if a
+    // request were ever cancelled without running its callback, but
+    // CurlManager::cancelRequests() only ever cancels a named owner and these
+    // are issued with FPP's own empty owner, so that cannot happen.
+    time_t m_nextInfoScan = 0;
+    std::atomic<int> m_infoFetchesInFlight{ 0 };
+
+    unsigned long m_lastPingTime;
+    unsigned long m_lastCheckTime;
     int m_lastMediaHalfSecond;
-    
-	float  m_remoteOffset;
+    int m_lastFrame;
+    int m_lastFrameSent;
 
+    // Wall-clock ms of the last media sync packet we acted on as a remote.
+    // 0 when no synced media is open.  Read/written from the sync-receive path
+    // and the main loop's idle check, hence atomic.  See
+    // CheckSyncedMediaIdleTimeout().
+    std::atomic<uint64_t> m_lastSyncedMediaPacketMS{ 0 };
+
+    float m_remoteOffset;
+
+    // Statically-configured unicast remotes (MultiSyncRemotes plus
+    // MultiSyncExtraRemotes).  Rebuilt by ReloadSyncDestinations() whenever
+    // those settings change.  Guarded by m_socketLock (same as the send path).
     struct iovec m_destIovec;
     std::vector<struct mmsghdr> m_destMsgs;
-	std::vector<struct sockaddr_in> m_destAddr;
-    
-    
-    struct iovec m_destIovecCSV;
-    std::vector<struct mmsghdr> m_destMsgsCSV;
-	std::vector<struct sockaddr_in> m_destAddrCSV;
-    
-    
-    #define MAX_MS_RCV_MSG 12
-    #define MAX_MS_RCV_BUFSIZE 1500
+    std::vector<struct sockaddr_in> m_destAddr;
+
+    // Dynamic destination list for the "send to ALL KNOWN remotes via Unicast"
+    // mode.  Rebuilt by UpdateUnicastDestinations() as remotes are discovered,
+    // change mode, or time out.  Guarded by m_socketLock (same as the send path).
+    struct iovec m_unicastDestIovec;
+    std::vector<struct mmsghdr> m_unicastDestMsgs;
+    std::vector<struct sockaddr_in> m_unicastDestAddr;
+
+    // Guards m_plugins against add/removeMultiSyncPlugin() (which can run on any
+    // thread that owns a plugin) racing the many Send*/Received*/Process* sites
+    // that iterate it, some of which run on the output thread or the main loop.
+    // Iteration sites take a snapshot under this lock via getPluginsCopy() and
+    // iterate the copy so callbacks never run with the lock held.
+    std::mutex m_pluginsLock;
+    std::vector<MultiSyncPlugin*> m_plugins;
+    std::vector<MultiSyncPlugin*> getPluginsCopy();
+
+#define MAX_MS_RCV_MSG 12
+#define MAX_MS_RCV_BUFSIZE 1500
     struct mmsghdr rcvMsgs[MAX_MS_RCV_MSG];
     struct iovec rcvIovecs[MAX_MS_RCV_MSG];
-    unsigned char rcvBuffers[MAX_MS_RCV_MSG][MAX_MS_RCV_BUFSIZE+1];
+    unsigned char rcvBuffers[MAX_MS_RCV_MSG][MAX_MS_RCV_BUFSIZE + 1];
     unsigned char rcvCmbuf[MAX_MS_RCV_MSG][0x100];
     struct sockaddr_storage rcvSrcAddr[MAX_MS_RCV_MSG];
+
+    // Pending work for the two HTTP probe paths, plus how many of each are
+    // outstanding.  A lock rather than bare atomics because a CurlManager
+    // completion does not reliably land on the main loop: processCurls() is
+    // also called from UDPOutput's init and teardown, so a callback can run on
+    // whichever thread is reloading channel outputs.
+    std::mutex m_httpProbeLock;
+    std::deque<std::string> m_httpPingQueue;
+    int m_httpPingsInFlight = 0;
+    std::deque<std::pair<std::string, bool>> m_httpDiscoveryQueue; // address, isExact
+    int m_httpDiscoveriesInFlight = 0;
+    // Addresses already handed to an HTTP probe by the current Twinkly sweep.
+    // The lights answer each broadcast more than once.  Guarded by
+    // m_httpProbeLock, like the queues above.
+    std::set<std::string> m_twinklyDiscoverySeen;
+
+    std::recursive_mutex m_statsLock;
+    std::map<std::string, MultiSyncStats*> m_syncStats;
+    std::string m_syncMaster;
+    bool m_multiSyncEnabled = false;
 };
 
-extern MultiSync *multiSync;
-
-#endif /* _MULTISYNC_H */
+extern MultiSync* multiSync;

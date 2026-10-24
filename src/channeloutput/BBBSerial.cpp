@@ -1,51 +1,59 @@
 /*
- *   BeagleBone Black PRU Serial DMX/Pixelnet handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <unistd.h>
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
 #include <sys/wait.h>
 #include <fstream>
+#include <thread>
+#include <unistd.h>
 
-#define BBB_PRU  0
+#include "../Warnings.h"
+#include "../common.h"
+#include "../log.h"
+
+#define BBB_PRU 0
 //  #define USING_PRU_RAM
 
-#include <pruss_intc_mapping.h>
-#include <prussdrv.h>
-
 // FPP includes
-#include "common.h"
-#include "log.h"
 #include "BBBSerial.h"
-#include "BBBUtils.h"
-#include "settings.h"
+#include "ChannelOutputSetup.h"
 
-//reserve the TOP 84K for DMX/PixelNet data
-#define DDR_RESERVED 84*1024
+#include "../non-gpl/CapeUtils/CapeUtils.h"
+#include "util/BBBUtils.h"
 
+// reserve the TOP 84K for DMX/PixelNet data
+#define DDR_RESERVED 84 * 1024
+
+static const std::string PRU_STALLED_WARNING = "BBBSerial: PRU is not consuming frames - serial output is stalled";
+
+#include "Plugin.h"
+class BBBSerialPlugin : public FPPPlugins::Plugin, public FPPPlugins::ChannelOutputPlugin {
+public:
+    BBBSerialPlugin() :
+        FPPPlugins::Plugin("BBBSerial") {
+    }
+    virtual ChannelOutput* createChannelOutput(unsigned int startChannel, unsigned int channelCount) override {
+        return new BBBSerialOutput(startChannel, channelCount);
+    }
+};
+
+extern "C" {
+FPPPlugins::Plugin* createPlugin() {
+    return new BBBSerialPlugin();
+}
+}
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -53,55 +61,40 @@
  *
  */
 BBBSerialOutput::BBBSerialOutput(unsigned int startChannel,
-	unsigned int channelCount)
-    : ThreadedChannelOutputBase(startChannel, channelCount),
+                                 unsigned int channelCount) :
+    ThreadedChannelOutput(startChannel, channelCount),
     m_pixelnet(0),
     m_lastData(NULL),
     m_curData(NULL),
     m_curFrame(0),
     m_pru(NULL),
-    m_serialData(NULL)
-{
+    m_serialData(NULL) {
     LogDebug(VB_CHANNELOUT, "BBBSerialOutput::BBBSerialOutput(%u, %u)\n",
-            startChannel, channelCount);
+             startChannel, channelCount);
 }
 
 /*
  *
  */
-BBBSerialOutput::~BBBSerialOutput()
-{
+BBBSerialOutput::~BBBSerialOutput() {
     LogDebug(VB_CHANNELOUT, "BBBSerialOutput::~BBBSerialOutput()\n");
-    
-    if (m_lastData) free(m_lastData);
-    if (m_curData) free(m_curData);
-    if (m_pru) delete m_pru;
+
+    if (m_lastData)
+        free(m_lastData);
+    if (m_curData)
+        free(m_curData);
+    if (m_pru)
+        delete m_pru;
 }
 
-
-static void compileSerialPRUCode(std::vector<std::string> &sargs) {
-    pid_t compilePid = fork();
-    if (compilePid == 0) {
-        char * args[sargs.size() + 3];
-        args[0] = (char *)"/bin/bash";
-        args[1] = (char *)"/opt/fpp/src/pru/compileSerial.sh";
-        
-        for (int x = 0; x < sargs.size(); x++) {
-            args[x + 2] = (char*)sargs[x].c_str();
-        }
-        args[sargs.size() + 2] = NULL;
-        
-        execvp("/bin/bash", args);
-    } else {
-        wait(NULL);
-    }
+static void compileSerialPRUCode(std::vector<std::string>& sargs) {
+    CompilePRUProgram("/opt/fpp/src/pru/compileSerial.sh", sargs);
 }
 
 /*
  *
  */
-int BBBSerialOutput::Init(Json::Value config)
-{
+int BBBSerialOutput::Init(Json::Value config) {
     LogDebug(VB_CHANNELOUT, "BBBSerialOutput::Init(JSON)\n");
 
     std::vector<std::string> args;
@@ -122,7 +115,7 @@ int BBBSerialOutput::Init(Json::Value config)
 
     m_startChannels.resize(m_outputs);
 
-    // Initialize the ouputs
+    // Initialize the outputs
     for (int i = 0; i < m_outputs; i++) {
         m_startChannels[i] = -1;
     }
@@ -132,7 +125,13 @@ int BBBSerialOutput::Init(Json::Value config)
     for (int i = 0; i < config["outputs"].size(); i++) {
         Json::Value s = config["outputs"][i];
 
-        m_startChannels[s["outputNumber"].asInt()] = s["startChannel"].asInt() - 1;
+        // straight from the config: out of range it wrote past m_startChannels
+        int outputNumber = s["outputNumber"].asInt();
+        if (outputNumber < 0 || outputNumber >= m_outputs) {
+            LogErr(VB_CHANNELOUT, "BBBSerial: ignoring output %d, the cape has %d\n", outputNumber + 1, m_outputs);
+            continue;
+        }
+        m_startChannels[outputNumber] = s["startChannel"].asInt() - 1;
         int l = s["channelCount"].asInt();
         if (l > maxLen) {
             maxLen = l;
@@ -147,73 +146,60 @@ int BBBSerialOutput::Init(Json::Value config)
     }
     m_channelCount += (m_pixelnet ? 4096 : 512);
     m_channelCount -= m_startChannel;
-    
+
     m_channelCount = config["channelCount"].asInt();
 
     int pruNumber = BBB_PRU;
 
-    string pru_program = "/tmp/FalconSerial.bin";
+    string pru_program = "/tmp/FalconSerial.out";
 
-    const char *mode = BBB_PRU ? "gpio" : "pruout";
-    if (BBB_PRU) {
-        args.push_back("-DRUNNING_ON_PRU1");
-    } else {
-        args.push_back("-DRUNNING_ON_PRU0");
-    }
-    
-    std::string dirname = "bbb";
+    const char* mode = BBB_PRU ? "gpio" : "pruout";
+    args.push_back("-DRUNNING_ON_PRU" + std::to_string(BBB_PRU));
+
     std::string verPostf = "";
-    if (getBeagleBoneType() == PocketBeagle) {
-        dirname = "pb";
-    }
-    if (config["pinoutVersion"].asString() == "2.x") {
-        verPostf = "-v2";
-    }
-    if (config["pinoutVersion"].asString() == "3.x") {
-        verPostf = "-v3";
-    }
-    Json::Reader reader;
-    Json::Value root;
-    char filename[256];
     std::string device = config["device"].asString();
-    sprintf(filename, "/home/fpp/media/tmp/strings/%s%s.json", device.c_str(), verPostf.c_str());
-    if (!FileExists(filename)) {
-        sprintf(filename, "/opt/fpp/capes/%s/strings/%s%s.json", dirname.c_str(), device.c_str(), verPostf.c_str());
-    }
-    int maxOut = 8;
-    int countOut = 0;
-    if (FileExists(filename)) {
-        std::ifstream t(filename);
-        if (!reader.parse(t, root)) {
+    Json::Value root;
+    if (!CapeUtils::INSTANCE.getStringConfig(device, root)) {
+        // might have the version number on it
+        if (config["pinoutVersion"].asString() == "2.x") {
+            verPostf = "-v2";
+        }
+        if (config["pinoutVersion"].asString() == "3.x") {
+            verPostf = "-v3";
+        }
+        if (!CapeUtils::INSTANCE.getStringConfig(device + verPostf, root)) {
             LogErr(VB_CHANNELOUT, "Could not read pin configuration for %s%s\n", device.c_str(), verPostf.c_str());
+            AddOutputConfigWarning(13, "BBBSerial: Could not read pin configuration for " + device + verPostf);
             return 0;
         }
-        std::ofstream outputFile;
-        outputFile.open("/tmp/SerialPinConfiguration.hp", std::ofstream::out | std::ofstream::trunc);
-
-        
-        maxOut = root["serial"].size();
-        for (int x = 0; x < root["serial"].size(); x++)  {
-            const PinCapabilities &pin = getBBBPinByName(root["serial"][x]["pin"].asString());
-            if (m_startChannels[x] >= 0) {
-                pin.configPin(mode);
-                countOut++;
-            }
-            outputFile << "#define ser" << std::to_string(x + 1) << "_gpio  " << std::to_string(pin.gpio) << "\n";
-            outputFile << "#define ser" << std::to_string(x + 1) << "_pin  " << std::to_string(pin.pin) << "\n\n";
-            outputFile << "#define ser" << std::to_string(x + 1) << "_pru30  " << std::to_string(pin.prupin) << "\n\n";
-        }
-        
-        outputFile.close();
-    } else {
-        LogErr(VB_CHANNELOUT, "No output pin configuration for %s%s\n", device.c_str(), verPostf.c_str());
-        return 0;
     }
-    
+
+    int maxOut = 8;
+    int countOut = 0;
+    std::ofstream outputFile;
+    outputFile.open("/tmp/SerialPinConfiguration.hp", std::ofstream::out | std::ofstream::trunc);
+
+    maxOut = root["serial"].size();
+    for (int x = 0; x < root["serial"].size(); x++) {
+        std::string pinName = root["serial"][x]["pin"].asString();
+        m_usedGPIOS.push_back(pinName);
+        const PinCapabilities& pin = PinCapabilities::getPinByName(pinName);
+        if (m_startChannels[x] >= 0) {
+            pin.configPin(mode, true, "BBBSerialOutput");
+            countOut++;
+        }
+        outputFile << "#define ser" << std::to_string(x + 1) << "_gpio  " << std::to_string(pin.mappedGPIOIdx()) << "\n";
+        outputFile << "#define ser" << std::to_string(x + 1) << "_pin  " << std::to_string(pin.gpio) << "\n\n";
+
+        const BBBPinCapabilities* bp = static_cast<const BBBPinCapabilities*>(&pin);
+        outputFile << "#define ser" << std::to_string(x + 1) << "_pru30  " << std::to_string(bp->pruPin(BBB_PRU)) << "\n\n";
+    }
+    outputFile.close();
+
     for (int xx = maxOut; xx < m_outputs; xx++) {
         m_startChannels[xx] = -1;
     }
-    
+
     if (!countOut) {
         LogInfo(VB_CHANNELOUT, "No Serial Ouput Data needed\n");
         return 1;
@@ -223,32 +209,44 @@ int BBBSerialOutput::Init(Json::Value config)
         if (maxLen < 1 || maxLen > 512) {
             maxLen = 512;
         }
-        sprintf(buf,"-DDATALEN=%d", (maxLen + 1));
+        snprintf(buf, sizeof(buf), "-DDATALEN=%d", (maxLen + 1));
         args.push_back(buf);
     }
-    sprintf(buf,"-DNUMOUT=%d", maxOut);
+    snprintf(buf, sizeof(buf), "-DNUMOUT=%d", maxOut);
     args.push_back(buf);
 
     compileSerialPRUCode(args);
     if (!FileExists(pru_program.c_str())) {
         LogErr(VB_CHANNELOUT, "%s does not exist!\n", pru_program.c_str());
+        AddOutputConfigWarning(26, "BBBSerial: Could not compile PRU program");
         return 0;
     }
     LogDebug(VB_CHANNELOUT, "Using program %s\n", pru_program.c_str());
-    
+
     m_pru = new BBBPru(BBB_PRU);
     m_serialData = (BBBSerialData*)m_pru->data_ram;
-    size_t offset = m_pru->ddr_size - DDR_RESERVED;
-    m_serialData->address_dma = m_pru->ddr_addr + offset;
+    m_ddrArea = BBBPru::ddrAlloc("BBBSerial", DDR_RESERVED, m_ddrPhys);
+    if (!m_ddrArea) {
+        LogErr(VB_CHANNELOUT, "BBBSerial: no room in the PRU DDR region\n");
+        AddOutputConfigWarning(20, "BBBSerial: no room in the PRU DDR region");
+        return 0;
+    }
+    if (!m_pru->run(pru_program)) {
+        LogErr(VB_CHANNELOUT, "BBBSerial: Unable to start PRU. May require a reboot.\n");
+        AddOutputConfigWarning(20, "BBBSerial: Unable to start PRU. May require a reboot.");
+        return 0;
+    }
+    // after run(): it clears the PRU data ram, so anything written to the
+    // control block before this point is thrown away
+    m_serialData->address_dma = m_ddrPhys;
     m_serialData->command = 0;
     m_serialData->response = 0;
-    m_pru->run(pru_program);
 
-    int sz = m_pixelnet ? (4096 + 6): (512 + 1);
-    
-    m_lastData = (uint8_t*)malloc(m_outputs * sz);
-    m_curData = (uint8_t*)malloc(m_outputs * sz);
-    
+    int sz = m_pixelnet ? (4096 + 6) : (512 + 1);
+
+    m_lastData = (uint8_t*)calloc(1, m_outputs * sz);
+    m_curData = (uint8_t*)calloc(1, m_outputs * sz);
+
     for (int i = 0; i < m_outputs; i++) {
         if (m_pixelnet) {
             m_curData[i + (0 * m_outputs)] = '\xAA';
@@ -262,16 +260,13 @@ int BBBSerialOutput::Init(Json::Value config)
         }
     }
     memcpy(m_lastData, m_curData, m_outputs * sz);
-    return ThreadedChannelOutputBase::Init(config);
+    return ThreadedChannelOutput::Init(config);
 }
 
-void BBBSerialOutput::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
+void BBBSerialOutput::GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) {
     for (int i = 0; i < m_outputs; i++) {
         if (m_startChannels[i] >= 0) {
-            min = std::min(min, m_startChannels[i] + 1);
-            max = std::max(max, m_pixelnet ? m_startChannels[i] + 4095 : m_startChannels[i] + 511);
+            addRange(m_startChannels[i], m_pixelnet ? m_startChannels[i] + 4095 : m_startChannels[i] + 511);
         }
     }
 }
@@ -279,50 +274,70 @@ void BBBSerialOutput::GetRequiredChannelRange(int &min, int & max) {
 /*
  *
  */
-int BBBSerialOutput::Close(void)
-{
+int BBBSerialOutput::Close(void) {
     LogDebug(VB_CHANNELOUT, "BBBSerialOutput::Close()\n");
+
+    // Stop the output thread before anything below it goes away.  RawSendData
+    // writes through m_serialData (PRU data ram) and m_ddrArea (the shared DDR
+    // region), and deleting the last BBBPru unmaps both - on a config reload
+    // that leaves the still-running thread writing into unmapped/gated memory.
+    // ThreadedChannelOutput::Close() below calls this again; it is idempotent.
+    StopOutputThread();
 
     if (m_serialData && m_pru) {
         // Send the stop command
         m_serialData->response = 0;
         m_serialData->command = 0xFF;
-        
-        __asm__ __volatile__("":::"memory");
+
+        __asm__ __volatile__("" ::
+                                 : "memory");
         int cnt = 0;
-        while (wait && cnt < 25 && m_serialData->response != 0xFFFF) {
+        while (wait && cnt < 50 && m_serialData->response != 0xFFFF) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            __asm__ __volatile__("" ::
+                                     : "memory");
             cnt++;
         }
-        m_pru->stop(m_serialData->response != 0xFFFF ? 0 : 1);
-        
+        // Clear the command while the core is still up: m_serialData is PRU
+        // data RAM, which can be unreachable once remoteproc has stopped the
+        // core (the access then takes an external abort - see
+        // BBB48StringOutput::StopPRU()). The firmware has already acked the
+        // stop above, so it no longer reads the command.
+        m_serialData->command = 0;
+        m_pru->stop();
+
         delete m_pru;
         m_pru = NULL;
     }
-    
+
+    BBBPru::ddrRelease("BBBSerial");
+    m_ddrArea = nullptr;
+    if (m_pruStalled) {
+        m_pruStalled = false;
+        WarningHolder::RemoveWarning(20, PRU_STALLED_WARNING);
+    }
     LogDebug(VB_CHANNELOUT, "BBBSerialOutput::Close() done\n");
-    return ThreadedChannelOutputBase::Close();
+    return ThreadedChannelOutput::Close();
 }
 
 /*
  *
  */
-int BBBSerialOutput::RawSendData(unsigned char *channelData)
-{
+int BBBSerialOutput::RawSendData(unsigned char* channelData) {
     LogExcess(VB_CHANNELOUT, "BBBSerialOutput::RawSendData(%p)\n",
-            channelData);
-    
+              channelData);
+
     if (!m_serialData) {
         return m_channelCount;
     }
 
-     m_curFrame++;
-    
+    m_curFrame++;
+
     // Bypass LEDscape draw routine and format data for PRU ourselves
-    
-    uint8_t * const out = m_curData;
-    uint8_t *c = out;
-    uint8_t *s = (uint8_t*)channelData;
+
+    uint8_t* const out = m_curData;
+    uint8_t* c = out;
+    uint8_t* s = (uint8_t*)channelData;
     int chCount = m_pixelnet ? 4096 : 512;
 
     for (int i = 0; i < m_outputs; i++) {
@@ -339,7 +354,7 @@ int BBBSerialOutput::RawSendData(unsigned char *channelData)
 
         // Get the start channel for this output
         s = (uint8_t*)(channelData + m_startChannels[i] - m_startChannel);
-        
+
         // Now copy the individual channel data into each slice
         for (int ch = 0; ch < chCount; ch++) {
             *c = *s;
@@ -348,36 +363,52 @@ int BBBSerialOutput::RawSendData(unsigned char *channelData)
         }
     }
 
-    // Wait for the previous draw to finish
-    while (m_serialData->command);
+    // Wait for the previous draw to finish.  The PRU clears the command as
+    // soon as it picks the frame up, so this normally falls straight through;
+    // bound it anyway so a PRU that never answers stalls this one output
+    // visibly instead of pegging a core forever with nothing in the UI.
+    int spins = 0;
+    while (m_serialData->command) {
+        if (++spins > 1000000) {
+            if (!m_pruStalled) {
+                m_pruStalled = true;
+                LogErr(VB_CHANNELOUT, "BBBSerial: PRU is not consuming frames, serial output stalled\n");
+                WarningHolder::AddWarning(20, PRU_STALLED_WARNING);
+            }
+            return m_channelCount;
+        }
+    }
+    if (m_pruStalled) {
+        m_pruStalled = false;
+        WarningHolder::RemoveWarning(20, PRU_STALLED_WARNING);
+    }
 
-    int frame_size = m_pixelnet ? (4096 + 6): (512 + 1);
+    int frame_size = m_pixelnet ? (4096 + 6) : (512 + 1);
     frame_size *= m_outputs;
-    
+
     unsigned frame = 0;
-    //unsigned frame = m_curFrame & 1;
+    // unsigned frame = m_curFrame & 1;
     if (m_curFrame == 1 || memcmp(m_lastData, m_curData, frame_size)) {
-        //don't copy to DMA memory unless really needed to avoid bus contention on the DMA bus
-        int sz = m_pixelnet ? (4096 + 6): (512 + 1);
+        // don't copy to DMA memory unless really needed to avoid bus contention on the DMA bus
+        int sz = m_pixelnet ? (4096 + 6) : (512 + 1);
         sz *= m_outputs;
 #ifdef USING_PRU_RAM
-        uint8_t * const realout = (uint8_t *)m_pru->data_ram + 512;
+        uint8_t* const realout = (uint8_t*)m_pru->data_ram + 512;
         memcpy(realout, m_curData, sz);
 #else
-        size_t offset = m_pru->ddr_size - DDR_RESERVED;
-        uint8_t * const realout = (uint8_t *)m_pru->ddr + offset;
-        memcpy(realout, m_curData, sz);
+        memcpy(m_ddrArea, m_curData, sz);
 
-        m_serialData->address_dma = m_pru->ddr_addr + offset;
+        m_serialData->address_dma = m_ddrPhys;
 #endif
-        
-        uint8_t *tmp = m_lastData;
+
+        uint8_t* tmp = m_lastData;
         m_lastData = m_curData;
         m_curData = tmp;
     }
 
-    //make sure memory is flushed before command is set to 1
-    __asm__ __volatile__("":::"memory");
+    // make sure memory is flushed before command is set to 1
+    __asm__ __volatile__("" ::
+                             : "memory");
 
     // Send the start command
     m_serialData->command = 1;
@@ -388,12 +419,11 @@ int BBBSerialOutput::RawSendData(unsigned char *channelData)
 /*
  *
  */
-void BBBSerialOutput::DumpConfig(void)
-{
+void BBBSerialOutput::DumpConfig(void) {
     LogDebug(VB_CHANNELOUT, "BBBSerialOutput::DumpConfig()\n");
 
     LogDebug(VB_CHANNELOUT, "    Pixelnet      : %d\n", m_pixelnet);
-    LogDebug(VB_CHANNELOUT, "    Outputs       :\n" );
+    LogDebug(VB_CHANNELOUT, "    Outputs       :\n");
 
     for (int i = 0; i < m_outputs; i++) {
         LogDebug(VB_CHANNELOUT, "        #%d: %d-%d (%d Ch)\n",
@@ -403,7 +433,5 @@ void BBBSerialOutput::DumpConfig(void)
                  m_pixelnet ? 4096 : 512);
     }
 
-    ThreadedChannelOutputBase::DumpConfig();
+    ThreadedChannelOutput::DumpConfig();
 }
-
-

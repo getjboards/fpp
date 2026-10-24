@@ -7,36 +7,25 @@ BINDIR=$(cd $(dirname $0) && pwd)
 
 cd ${FPPDIR}
 
-logOutput
+startDaemonLog
 
 # Clear any restart flag
-sed -i -e "s/^restartFlag .*/restartFlag = 0/" ${FPPHOME}/media/settings
+sed -i -e "s/^restartFlag .*/restartFlag = \"0\"/" ${FPPHOME}/media/settings
 
-echo "Checking for interfaces"
-WaitForInterfacesUp
+if [ -f "/etc/fpp/container" ]
+then
+    echo "Running pre-start scripts"
+    runPreStartScripts
 
-echo "Setting up Avahi"
-updateAvahiConfig
+    echo "Starting ${FPPBINDIR}/fppd"
+    echo "HOME: ${FPPHOME}"
+    nice -n -20 ${FPPBINDIR}/fppd --daemonize
 
-echo "Setup channel outputs"
-setupChannelOutputs
+    # FIXME, find a better way to wait until fppd is up before continuing
+    sleep 2
 
-echo "Running pre-start scripts"
-runPreStartScripts
-
-if [ ! -x ${FPPBINDIR}/fppd ]; then
-   echo "${FPPBINDIR}/fppd doesn't exist, try building it"
-   cleanCompiledBinaries
-   compileBinaries
+    runPostStartScripts
+else
+    systemctl start fppd
 fi
-
-echo "Starting ${FPPBINDIR}/fppd"
-nice -n -20 ${FPPBINDIR}/fppd --config-file ${FPPHOME}/media/settings --daemonize
-
-# FIXME, find a better way to wait until fppd is up before continuing
-sleep 2
-
-startWebSocketServer
-
-runPostStartScripts
 

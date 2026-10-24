@@ -1,107 +1,57 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
 <head>
-<?php
-require_once("config.php");
-include 'common/menuHead.inc';
-
-function normalize_version($version)
-{
-	$version = preg_replace('/0\.([0-9])\.0/', '0.$1', $version);
-	$version = preg_replace('/[\.v]/', '', $version);
-	$version = preg_replace('/-.*/', '', $version);
-	$number = intval(trim($version));
-	$number = ($number * 100) / (pow(10,(substr_count($version,'.'))));
-
-	return $number;
-}
-
-if ($fppRfsVersion == "Unknown")
-	$fppRfsVersion = "9999";
-$rfs_ver = normalize_version($fppRfsVersion);
-
-?>
-<title><? echo $pageTitle; ?></title>
-<script>
-
-	function ViewRemoteScript(category, filename) {
-		$('#helpText').html("Retrieving Script");
-		$('#dialog-help').dialog({ height: 600, width: 800, title: "Script Viewer" });
-		$('#dialog-help').dialog( "moveToTop" );
-
-		$.get("fppxml.php?command=viewRemoteScript&category=" + category + "&filename=" + filename
-		).done(function(data) {
-			$('#helpText').html("<pre>" + data + "</pre>");
-		}).fail(function() {
-			$('#helpText').html("Error loading script contents from repository.");
-		});
-	}
-
-  function InstallRemoteScript(category, filename) {
-		$.get("fppxml.php?command=installRemoteScript&category=" + category + "&filename=" + filename
-		).done(function() {
-			$.jGrowl("Script installed.");
-		}).fail(function() {
-			DialogError("Install Script", "Install Failed");
-		});
-	}
-
-</script>
+    <?php
+    include 'common/htmlMeta.inc';
+    require_once "config.php";
+    require_once 'common.php';
+    include 'common/menuHead.inc';
+    ?>
+    <title><? echo $pageTitle; ?></title>
 </head>
+
 <body>
-<div id="bodyWrapper">
-	<?php include 'menu.inc'; ?>
-	<br/>
-	<div id="uiscripts" class="settings">
-		<fieldset>
-			<legend>Script Repository</legend>
-			<table id='fppScripts' cellspacing='5'>
-				<tbody>
-<?
-$indexCSV = file_get_contents("https://raw.githubusercontent.com/FalconChristmas/fpp-scripts/master/index.csv");
-$lines = explode("\n", $indexCSV);
+    <div id="bodyWrapper">
+        <?php
+        $activeParentMenuItem = 'content';
+        include 'menu.inc'; ?>
+        <div class="mainContainer">
+            <h1 class="title">Script Repository</h1>
+            <div class="pageContent">
+                <div id="uiscripts" class="settings">
+                    <div class="callout callout-warning">
+                        <b>The FPP-sanctioned Script Repository has been deprecated.</b>
 
-$count = 0;
+                        <p>&nbsp;</p>
 
-foreach ($lines as $line)
-{
-	if (preg_match("/^#/", $line))
-		continue;
-
-	$parts = explode(',', $line);
-
-	if (count($parts) < 4)
-		continue;
-
-	if (normalize_version($parts[3]) > $rfs_ver)
-		continue;
-
-	if ($count > 0)
-	{
-?>
-				<tr><td colspan='3'><hr></td></tr>
-<?
-	}
-?>
-				<tr><td rowspan='3' valign='top'><input type='button' class='buttons' value='Install' onClick='InstallRemoteScript("<? echo $parts[0]; ?>", "<? echo $parts[1]; ?>");'><br />
-						<input type='button' class='buttons' value='View' onClick='ViewRemoteScript("<? echo $parts[0]; ?>", "<? echo $parts[1]; ?>");'></td>
-						<td><b>Category:</b></td><td><? echo $parts[0]; ?></td>
-				<tr><td><b>Filename:</b></td><td><? echo $parts[1]; ?></td></tr>
-				<tr><td valign='top'><b>Description:</b></td><td><? echo $parts[2]; ?></td></tr>
-<?
-	$count++;
-}
-?>
-				</tbody>
-			</table>
-			<hr>
-			NOTE: Some scripts such as the Remote Control scripts may require editting to configure variables
-			to be functional.  After installing a script from the Script Repository you can view and download
-			the script from the Scripts tab in the <a href='uploadfile.php'>File Manager</a> screen.
-		</fieldset>
-	</div>
-	<?php include 'common/footer.inc'; ?>
-</div>
+                        <p>
+                            Scripts themselves aren't going anywhere — you can still upload, edit, and run your own
+                            scripts in FPP at any time via the Scripts tab in the
+                            <a href="filemanager.php#tab-scripts">File Manager</a> screen. What's going away is only this
+                            in-app browser for the FPP-sanctioned fpp-scripts
+                            repository. Scripts were contributed there over the years but were often never revisited
+                            or updated for later FPP versions — generally unloved — and most of what they offered has
+                            since been replaced by FPP Commands, Overlay Models, and better-maintained plugins, so
+                            keeping a separate script catalog and installer around no longer made sense.
+                        </p>
+                        <p>
+                            The <a href="https://github.com/FalconChristmas/fpp-scripts" target="_blank">fpp-scripts
+                                GitHub repository</a> is still available and its
+                            <a href="https://github.com/FalconChristmas/fpp-scripts/blob/master/README.md"
+                                target="_blank">README</a> documents which scripts are still relevant, which ones have
+                            been replaced (and by what), and which have been deprecated. If you still need one of the
+                            historical scripts, download it manually from the repository and install it via the
+                            Scripts tab in the <a href="filemanager.php#tab-scripts">File Manager</a> screen.
+                        </p>
+                        <p><em>This page will be removed in FPP 11.</em></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <?php include 'common/footer.inc'; ?>
+    </div>
 
 </body>
+
 </html>

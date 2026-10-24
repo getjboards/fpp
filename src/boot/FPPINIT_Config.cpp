@@ -1,0 +1,2065 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2024 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include <algorithm>
+#include <chrono>
+#include "fpp-json.h"
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#if __has_include(<gpiod.hpp>)
+#include <gpiod.hpp>
+#define HASGPIOD
+#if __has_include(<gpiodcxx/chip.hpp>)
+#define IS_GPIOD_CXX_V2
+#endif
+#endif
+
+#include "FPPINIT.h"
+
+void DetectCape() {
+    if (!FileExists("/etc/fpp/container")) {
+#ifdef CAPEDETECT
+        int count = 0;
+#ifdef PLATFORM_PI
+        modprobe("i2c-dev");
+#endif
+        if (!FileExists(I2C_DEV)) {
+            printf("FPP - Waiting up to 3s for %s to appear for Cape/Hat detection\n", I2C_DEV.c_str());
+        }
+        while (!FileExists(I2C_DEV) && count < 600) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            count++;
+        }
+        printf("FPP - Checking for Cape/Hat\n");
+        exec("/opt/fpp/src/fppcapedetect -no-set-permissions");
+#endif
+    }
+    PutFileContents(FPP_MEDIA_DIR + "/tmp/cape_detect_done", "1");
+}
+
+void checkSSHKeys() {
+    int keyCount = 0;
+    int pubCount = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/etc/ssh")) {
+        if (entry.is_regular_file()) {
+            const auto filename = entry.path().filename();
+            if (contains(filename, "ssh_host")) {
+                if (filename.extension() == ".pub") {
+                    pubCount++;
+                } else {
+                    keyCount++;
+                }
+            }
+        }
+    }
+    // make sure we have at least two private and public keys (really should be three, but some platforms don't support ed25519, so we'll just check for two)
+    if (keyCount >= 2 && pubCount >= 2) {
+        return;
+    }
+    printf("      - Regenerating SSH keys\n");
+    if (FileExists("/dev/hwrng")) {
+        // if the hwrng exists, use it to seed the urandom generator
+        // with some random data
+        exec("dd if=/dev/hwrng of=/dev/urandom count=1 bs=4096 status=none");
+    } else {
+        // No hardware RNG to seed from: ssh-keygen's getrandom() can block
+        // waiting for the CRNG to seed on a freshly booted board with little
+        // entropy. fppinit no longer waits for haveged on every boot (it's only
+        // needed right here -- for first-boot key generation on a board without
+        // an RNG), so start it on demand to seed the pool before generating keys.
+        exec("/usr/bin/systemctl start haveged.service");
+    }
+    execbg("/usr/bin/ssh-keygen -q -N \"\" -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key &");
+    execbg("/usr/bin/ssh-keygen -q -N \"\" -t ed25519 -f /etc/ssh/ssh_host_ed25519_key &");
+    execbg("/usr/bin/ssh-keygen -q -N \"\" -t rsa -b 2048 -f /etc/ssh/ssh_host_rsa_key &");
+}
+
+// Copies files/config from the /boot partition to /home/fpp/media
+// On the Pi, /boot (or /boot/firmware) is vfat and thus the
+// user could stick a default config on there
+void handleBootPartition() {
+    std::string bootDir = "/boot";
+    if (DirectoryExists("/boot/firmware")) {
+        bootDir = "/boot/firmware";
+    }
+    if (FileExists(bootDir + "/fpp_boot.sh")) {
+        std::string cmd = "/bin/bash " + bootDir + "/fpp_boot.sh";
+        exec(cmd);
+    }
+    if (DirectoryExists(bootDir + "/fpp")) {
+        if (!FileExists(bootDir + "/fpp/copy_done")) {
+            std::string cmd = "/usr/bin/cp -a " + bootDir + "/fpp/* " + FPP_MEDIA_DIR;
+            exec(cmd);
+            PutFileContents(bootDir + "/fpp/copy_done", "1");
+        }
+    }
+}
+
+void checkHostName() {
+    std::string hn;
+    if (FileExists("/etc/fpp/container")) {
+        std::string CID = execAndReturn("/usr/bin/head -1 /proc/1/cgroup | sed -e \"s/.*docker-//\" | cut -c1-12");
+        hn = execAndReturn("/usr/bin/hostname");
+        TrimWhiteSpace(hn);
+        TrimWhiteSpace(CID);
+        setRawSetting("HostName", hn);
+        setRawSetting("HostDescription", "Docker ID: " + CID);
+    } else {
+        getRawSetting("HostName", hn);
+        // By default on installation, hostname is fpp, but it does not appear in the settings file
+        if (hn == "") {
+            hn = "fpp";
+        }
+        // Goes to a root shell below; the UI only stores [A-Za-z0-9-] names.
+        if (!isShellSafeWord(hn)) {
+            printf("Ignoring invalid HostName setting\n");
+            return;
+        }
+        char hostname[256];
+        int result = gethostname(hostname, 256);
+        if (result == 0 && hn != hostname) {
+            // need to reset the hostname
+            printf("Changing hostname from %s to %s\n", hostname, hn.c_str());
+            std::string cmd = "/usr/bin/hostname " + hn;
+            exec(cmd);
+
+            PutFileContents("/etc/hostname", hn + "\n");
+
+            std::string hosts = GetFileContents("/etc/hosts");
+            std::vector<std::string> lines = split(hosts, '\n');
+            hosts = "";
+            bool found = false;
+            for (auto& line : lines) {
+                if (line.starts_with("127.0.1.1")) {
+                    hosts += "127.0.1.1\t";
+                    hosts += hn;
+                    found = true;
+                } else {
+                    hosts += line;
+                }
+                hosts += "\n";
+            }
+            if (!found) {
+                hosts += "127.0.1.1\t";
+                hosts += hn;
+            }
+            PutFileContents("/etc/hosts", hosts);
+            execbg("/usr/bin/systemctl restart avahi-daemon &");
+        }
+    }
+}
+
+void runScripts(const std::string tp, bool userBefore) {
+    std::string pfx = "FPPDIR=/opt/fpp SRCDIR=/opt/fpp/src ";
+
+    if (userBefore && FileExists(FPP_MEDIA_DIR + "/scripts/UserCallbackHook.sh")) {
+        printf("FPP - Running UserCallbackHook.sh %s\n", tp.c_str());
+        execbg(pfx + FPP_MEDIA_DIR + "/scripts/UserCallbackHook.sh " + tp);
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(FPP_MEDIA_DIR + "/plugins")) {
+        if (entry.is_directory()) {
+            std::string filename = entry.path().filename();
+            std::string cmd = FPP_MEDIA_DIR + "/plugins/" + filename + "/scripts/" + tp + ".sh";
+            if (FileExists(cmd)) {
+                printf("FPP - Running plugin %s script for %s\n", filename.c_str(), tp.c_str());
+                execbg(pfx + cmd);
+            }
+        }
+    }
+    if (!userBefore && FileExists(FPP_MEDIA_DIR + "/scripts/UserCallbackHook.sh")) {
+        printf("FPP - Running UserCallbackHook.sh %s\n", tp.c_str());
+        execbg(pfx + FPP_MEDIA_DIR + "/scripts/UserCallbackHook.sh " + tp);
+    }
+}
+
+void checkFSTAB() {
+    std::string cont = GetFileContents("/etc/fstab");
+    if (cont.find("home/fpp/media") == std::string::npos) {
+        cont += "\n";
+        cont += "#####################################\n";
+        cont += "#/dev/sda1     /home/fpp/media  auto    defaults,noatime,nodiratime,exec,nofail,flush,uid=1000,gid=1000  0  0\n";
+        cont += "#####################################\n";
+        PutFileContents("/etc/fstab", cont);
+    }
+}
+
+void createDirectories() {
+    static std::vector<std::string> DIRS = { "", "config", "effects", "logs", "music", "playlists", "scripts", "sequences",
+                                             "upload", "videos", "plugins", "plugindata", "exim4", "images", "cache",
+                                             "backups", "tmp", "virtualdisplay_assets" };
+    printf("FPP - Checking for required directories\n");
+    uid_t fppUid = 0;
+    gid_t fppGid = 0;
+    bool haveFppUser = GetUserIds("fpp", &fppUid, &fppGid);
+    for (auto& d : DIRS) {
+        std::string dir = FPP_MEDIA_DIR + "/" + d;
+        if (!DirectoryExists(dir)) {
+            printf("    Creating directory %s\n", dir.c_str());
+            mkdir(dir.c_str(), 0775);
+            if (haveFppUser) {
+                chown(dir.c_str(), fppUid, fppGid);
+            }
+        }
+    }
+}
+
+void setupApache() {
+    static const std::string UIPASSCONF = FPP_MEDIA_DIR + "/config/ui-password-config.conf";
+    static const std::string HTPWD = FPP_MEDIA_DIR + "/config/.htpasswd";
+    if (!FileExists(UIPASSCONF)) {
+        std::string content = "<RequireAny>\n  Require all granted\n</RequireAny>\n\nSetEnvIf Host ^ LOCAL_PROTECT=0\n";
+        PutFileContents(UIPASSCONF, content);
+    } /* else {
+        std::string content = GetFileContents(UIPASSCONF);
+        if (content.find("php_value") != std::string::npos) {
+            printf("    Modifying .htaccess file\n");
+            std::vector<std::string> lines = split(content, '\n');
+            content = "";
+            for (auto& line : lines) {
+                if (line.find("php_value") == std::string::npos) {
+                    content += line;
+                }
+                content += "\n";
+            }
+            PutFileContents(UIPASSCONF, content);
+        }
+    } */
+    if (!FileExists(HTPWD)) {
+        PutFileContents(HTPWD, "");
+    }
+    // Apache sends /api's CORS headers while this file exists; www's
+    // SetupCrossOriginAPI() keeps it in step when the setting changes.
+    static const std::string CROSSORIGIN = FPP_MEDIA_DIR + "/config/api-cross-origin";
+    std::string allow;
+    if (getRawSetting("AllowCrossOriginAPI", allow) && allow == "1") {
+        if (!FileExists(CROSSORIGIN)) {
+            PutFileContents(CROSSORIGIN, "Written by FPP for the AllowCrossOriginAPI setting\n");
+        }
+    } else if (FileExists(CROSSORIGIN)) {
+        unlink(CROSSORIGIN.c_str());
+    }
+    /*     if (!FileExists("/opt/fpp/www/proxy/.htaccess")) {
+            printf("Creating proxy .htaccess link\n");
+            if (!FileExists(FPP_MEDIA_DIR + "/config/proxies")) {
+                PutFileContents(FPP_MEDIA_DIR + "/config/proxies", "");
+            }
+            symlink((FPP_MEDIA_DIR + "/config/proxies").c_str(), "/opt/fpp/www/proxy/.htaccess");
+        } */
+}
+
+void handleBootActions() {
+    std::string v;
+    if (getRawSetting("BootActions", v) && !v.empty()) {
+        exec("/opt/fpp/scripts/handle_boot_actions");
+    }
+}
+
+inline const std::string& mapBBBLedValue(const std::string& v) {
+#ifdef PLATFORM_BB64
+    if (v == "cpu") {
+        static const std::string activity = "activity";
+        return activity;
+    }
+#endif
+    return v;
+}
+
+#ifdef PLATFORM_BB64
+//
+// The PocketBeagle2's identity lives in an on-board EEPROM that u-boot reads to
+// decide how much DDR the board has.  Some boards leave the factory with it
+// blank or half-written, and until now that was only ever noticed by the
+// flashing paths (SD/BB64-AutoFlash.sh, SD/flash_storage.sh) -- a board that
+// reached FPP any other way kept an unusable identity, which also costs it its
+// M5- stats UUID.
+//
+// The detection is done here rather than in the shell script because the script
+// is only cheap on a board that needs nothing done to it in the *industrial*
+// case: on a healthy base board its "programmed PB20 but has eMMC" cross-check
+// waits out the full eMMC timeout, ~10s, every single boot.  That check is
+// there to stop a misidentified board being FLASHED, which is not what is
+// happening here -- by the time we boot, u-boot has already sized the RAM.  So
+// read the two fields that decide whether anything needs doing, and only fork
+// the script when they say it does.  A healthy board costs one 56-byte read.
+//
+static bool pb2EepromValid(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        return false;
+    }
+    unsigned char buf[56];
+    in.read((char*)buf, sizeof(buf));
+    if (in.gcount() != (std::streamsize)sizeof(buf)) {
+        return false;
+    }
+    // Magic header, then the six ASCII digits of the unit number at 50..55.
+    // These are exactly the fields check_pb2_eeprom.sh decides NEEDS_FIX from.
+    if (buf[0] != 0xAA || buf[1] != 0x55) {
+        return false;
+    }
+    for (int i = 50; i < 56; i++) {
+        if (buf[i] < '0' || buf[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Both paths are overridable so this can be exercised against fixtures, exactly
+// as capes/drivers/bb64/*.sh already allow.  Nothing in FPP sets them, and the
+// same names are honoured by the script we fork, so a fixture run stays a
+// fixture run all the way down.
+static std::string pb2Path(const char* env, const char* dflt) {
+    const char* v = getenv(env);
+    return (v && *v) ? std::string(v) : std::string(dflt);
+}
+
+static void checkPB2EEPROM() {
+    // Only the PocketBeagle2 family has this EEPROM at this address with this
+    // layout.  The model string does not distinguish base from industrial, but
+    // it does not need to -- the script works that out if it is called.
+    std::ifstream m(pb2Path("PB2_MODEL", "/proc/device-tree/model"), std::ios::binary);
+    if (!m.good()) {
+        return;
+    }
+    std::string model((std::istreambuf_iterator<char>(m)), std::istreambuf_iterator<char>());
+    if (model.find("PocketBeagle2") == std::string::npos) {
+        return;
+    }
+
+    const std::string eeprom = pb2Path("PB2_EEPROM", "/sys/bus/i2c/devices/0-0050/eeprom");
+    if (!FileExists(eeprom)) {
+        // Nothing to repair: with 0x50 silent there is nothing to write to.
+        // The script's full diagnosis of why costs a 10s wait and cannot fix
+        // it from here, so leave that to the flashing path and just say so.
+        printf("FPP - PocketBeagle2: no EEPROM at %s, board identity unavailable\n", eeprom.c_str());
+        return;
+    }
+    if (pb2EepromValid(eeprom)) {
+        return;
+    }
+
+    printf("FPP - PocketBeagle2 EEPROM identity is blank or malformed, repairing\n");
+    exec("/bin/bash /opt/fpp/capes/drivers/bb64/check_pb2_eeprom.sh");
+    if (pb2EepromValid(eeprom)) {
+        // u-boot read the old contents at power-on, so an industrial board that
+        // came up as the 512MB base variant stays that way until it reboots.
+        printf("FPP - PocketBeagle2 EEPROM repaired; reboot for u-boot to pick up the identity\n");
+    }
+}
+#endif
+
+void configureBBB() {
+#ifdef PLATFORM_BBB
+    if (FileExists("/dev/mmcblk1")) {
+        // full size beagle, check the bootloader
+        int fd = open("/dev/mmcblk1", O_RDONLY);
+        lseek(fd, 393488, SEEK_SET);
+        uint8_t buf[25];
+        read(fd, buf, 23);
+        close(fd);
+        buf[23] = 0;
+        std::string uboot = (const char*)buf;
+        if (uboot != "U-Boot 2022.04-g5509547") {
+            printf("Installing new bootloader\n");
+            exec("/opt/fpp/bin.bbb/bootloader/install.sh");
+            setRawSetting("rebootFlag", "1");
+        }
+    } else {
+        // its a pocketbeagle
+        // bug in kernel/device tree on pcoketbeagle where in P2-36 is not
+        // properly set to be AIN so sensors won't read properly
+        exec("/usr/sbin/i2cset -y -f 0 0x24 9 5");
+    }
+
+    // Beagle LEDS
+    std::string pled;
+    if (getRawSetting("BBBLedPWR", pled) && !pled.empty()) {
+        if (pled == "0") {
+            pled = "0x00";
+        } else {
+            pled = "0x38";
+        }
+        exec("/usr/sbin/i2cset -f -y 0 0x24 0x0b 0x6e");
+        exec("/usr/sbin/i2cset -f -y 0 0x24 0x13 " + pled);
+        exec("/usr/sbin/i2cset -f -y 0 0x24 0x0b 0x6e");
+        exec("/usr/sbin/i2cset -f -y 0 0x24 0x13 " + pled);
+    }
+#endif
+#ifdef PLATFORM_BB64
+    checkPB2EEPROM();
+#endif
+#if defined(PLATFORM_BBB) || defined(PLATFORM_BB64)
+    std::string led;
+    int offset = FileExists("/sys/class/leds/beaglebone:green:usr0/trigger") ? 0 : 1;
+    if (getRawSetting("BBBLeds0", led) && !led.empty()) {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(offset) + "/trigger", mapBBBLedValue(led));
+    } else {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(offset) + "/trigger", "heartbeat");
+    }
+    if (getRawSetting("BBBLeds1", led) && !led.empty()) {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(1 + offset) + "/trigger", mapBBBLedValue(led));
+    } else {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(1 + offset) + "/trigger", "mmc0");
+    }
+    if (getRawSetting("BBBLeds2", led) && !led.empty()) {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(2 + offset) + "/trigger", mapBBBLedValue(led));
+    } else {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(2 + offset) + "/trigger", mapBBBLedValue("cpu"));
+    }
+    if (getRawSetting("BBBLeds3", led) && !led.empty()) {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(3 + offset) + "/trigger", led);
+    } else {
+        PutFileContents("/sys/class/leds/beaglebone:green:usr" + std::to_string(3 + offset) + "/trigger", "mmc1");
+    }
+#endif
+}
+
+// Fan thermal trip settings.  The web UI (PrintFanThermalSettings in
+// www/common.php) creates settings named FanTrip_<zone type stripped to
+// alphanumerics>_<trip index> holding degrees C for thermal zones that have a
+// fan cooling device bound to them (the Pi5 case/active-cooler fan, cape fans
+// wired into a thermal zone via device tree).  Trip points reset to their
+// device tree defaults on every boot, so applyThermalSettings() runs during
+// boot; it is also invoked directly ("fppinit applyThermal") when one of the
+// settings is changed in the UI.
+//
+// The first pass each boot records the untouched device tree trip values into
+// a snapshot in media/tmp (cleared on every boot) BEFORE applying any
+// settings, so resetThermalSettings() ("fppinit resetThermal", the UI's
+// "Reset to Defaults" button) can restore the hardware defaults without a
+// reboot.
+static const std::string FAN_TRIP_DEFAULTS_FILE = FPP_MEDIA_DIR + "/tmp/fan_thermal_defaults.json";
+static const std::string FAN_PROBE_FILE = FPP_MEDIA_DIR + "/tmp/fan_probe.json";
+
+static std::string fanTripKey(const std::string& ztype, int trip) {
+    std::string key;
+    for (char c : ztype) {
+        if (isalnum((unsigned char) c)) {
+            key += c;
+        }
+    }
+    key += "_";
+    key += std::to_string(trip);
+    return key;
+}
+
+// Walk every "active" trip point of every thermal zone, calling
+// cb(tripTempFile, "<sanitized zone type>_<trip index>").  Passive/critical
+// trips belong to the kernel's throttle/shutdown logic and are never visited.
+static void forEachActiveTripPoint(const std::function<void(const std::string&, const std::string&)>& cb) {
+    for (int zn = 0; zn < 32; zn++) {
+        std::string base = "/sys/class/thermal/thermal_zone" + std::to_string(zn);
+        if (!FileExists(base + "/type")) {
+            break;
+        }
+        std::string ztype = GetFileContents(base + "/type");
+        TrimWhiteSpace(ztype);
+        for (int t = 0; t < 16; t++) {
+            std::string tripFile = base + "/trip_point_" + std::to_string(t) + "_temp";
+            if (!FileExists(tripFile)) {
+                break;
+            }
+            std::string tripType = GetFileContents(base + "/trip_point_" + std::to_string(t) + "_type");
+            TrimWhiteSpace(tripType);
+            if (tripType != "active") {
+                continue;
+            }
+            cb(tripFile, fanTripKey(ztype, t));
+        }
+    }
+}
+
+// captureDefaults must ONLY be set from the boot paths, where sysfs still holds
+// the untouched device tree values.  Capturing during an on-demand apply (the
+// UI changing a setting) could record an already-customized temperature as the
+// "default" if the snapshot had been lost, which would make a later reset
+// restore the user's value instead of the hardware one.
+void applyThermalSettings(bool captureDefaults) {
+    if (FileExists("/etc/fpp/container")) {
+        return;
+    }
+    Json::Value defaults;
+    if (FileExists(FAN_TRIP_DEFAULTS_FILE)) {
+        LoadJsonFromString(GetFileContents(FAN_TRIP_DEFAULTS_FILE), defaults, JsonRoot::Object);
+    }
+    bool defaultsChanged = false;
+    forEachActiveTripPoint([&](const std::string& tripFile, const std::string& key) {
+        if (captureDefaults && !JsonHas(defaults, key)) {
+            std::string cur = GetFileContents(tripFile);
+            TrimWhiteSpace(cur);
+            if (!cur.empty()) {
+                defaults[key] = atoi(cur.c_str());
+                defaultsChanged = true;
+            }
+        }
+        // Read as a string and parse a float: the setting holds degrees C to one
+        // decimal place so that whole degrees F survive the conversion both ways
+        // (see PutSetting() in www/api/controllers/settings.php).  getRawSettingInt()
+        // must not be used here - its hand-rolled digit loop does not stop at the
+        // decimal point and would turn "29.4" into 2884.
+        std::string tempStr;
+        if (getRawSetting("FanTrip_" + key, tempStr)) {
+            double temp = strtod(tempStr.c_str(), nullptr);
+            if (temp > 0) {
+                printf("FPP - Setting fan trip point %s to %.1fC\n", key.c_str(), temp);
+                PutFileContents(tripFile, std::to_string((int) std::lround(temp * 1000.0)));
+            }
+        }
+    });
+    if (defaultsChanged) {
+        PutFileContents(FAN_TRIP_DEFAULTS_FILE, SaveJsonToString(defaults));
+    }
+}
+
+void resetThermalSettings() {
+    if (FileExists("/etc/fpp/container")) {
+        return;
+    }
+    // Remove all FanTrip_ settings (same rewrite approach as setRawSetting)
+    std::string content = GetFileContents(FPP_MEDIA_DIR + "/settings");
+    std::vector<std::string> lines = split(content, '\n');
+    content = "";
+    for (auto& line : lines) {
+        if (!line.empty() && !line.starts_with("FanTrip_")) {
+            content += line;
+            content += "\n";
+        }
+    }
+    PutFileContents(FPP_MEDIA_DIR + "/settings", content);
+
+    // Restore the device tree default temperatures captured at boot.  If the
+    // snapshot is somehow gone (media/tmp cleared by hand mid-run), the
+    // settings removed above still restore the defaults on the next boot, so
+    // warn rather than fail.
+    Json::Value defaults;
+    if (FileExists(FAN_TRIP_DEFAULTS_FILE) && LoadJsonFromString(GetFileContents(FAN_TRIP_DEFAULTS_FILE), defaults, JsonRoot::Object)) {
+        forEachActiveTripPoint([&](const std::string& tripFile, const std::string& key) {
+            if (JsonHas(defaults, key)) {
+                printf("FPP - Restoring fan trip point %s to %dmC\n", key.c_str(), defaults[key].asInt());
+                PutFileContents(tripFile, std::to_string(defaults[key].asInt()));
+            }
+        });
+    } else {
+        printf("FPP - No fan trip point defaults snapshot; settings cleared, defaults restore on next boot\n");
+    }
+}
+
+// A pwm-fan hwmon node always exposes fanN_input (the tachometer) even when no
+// fan -- or a dead fan -- is wired to it: it simply reads 0 RPM.  That is
+// indistinguishable from a healthy fan the thermal governor has merely turned
+// off, so the reading is worse than useless (it looks like a stalled fan).  To
+// tell "off" from "absent/dead", force each fan on and read its tachometer.
+//
+// Lowering a trip point does NOT reliably wake the (poll-disabled) thermal
+// governor on the Pi5/K16Pro kernels, and driving the cooling-device cur_state
+// ramps only gradually, so drive the hwmon PWM directly (pwm1_enable=1 +
+// pwm1=max).  A healthy fan spins up to thousands of RPM within ~150ms; an
+// absent/dead one stays 0.  The pre-probe PWM state is restored afterwards (the
+// governor reasserts control on the next thermal event).
+//
+// The result is written to media/tmp/fan_probe.json (wiped every boot), keyed by
+// "<hwmon name>:<fan index>", so Sensors::DetectFanSensors() in fppd can suppress
+// the RPM display for a fan whose tachometer can neither be controlled nor read.
+// This runs during the boot "start" phase, before fppd caches its sensor list.
+void probeFanPresence() {
+    if (FileExists("/etc/fpp/container")) {
+        return;
+    }
+    Json::Value result;
+    for (int h = 0; h < 32; h++) {
+        std::string hwmon = "/sys/class/hwmon/hwmon" + std::to_string(h);
+        if (!DirectoryExists(hwmon)) {
+            break;
+        }
+        std::vector<int> fans;
+        for (int f = 1; f <= 8; f++) {
+            if (FileExists(hwmon + "/fan" + std::to_string(f) + "_input")) {
+                fans.push_back(f);
+            }
+        }
+        if (fans.empty()) {
+            continue;
+        }
+        std::string name = GetFileContents(hwmon + "/name");
+        TrimWhiteSpace(name);
+        if (name.empty()) {
+            name = "hwmon" + std::to_string(h);
+        }
+
+        // Force the fan on via the hwmon PWM interface, remembering the current
+        // state so it can be restored.  pwm1 drives every fan on a pwm-fan node.
+        std::string pwmFile = hwmon + "/pwm1";
+        std::string enFile = hwmon + "/pwm1_enable";
+        bool forced = FileExists(pwmFile);
+        std::string origPwm, origEn;
+        if (forced) {
+            origPwm = GetFileContents(pwmFile);
+            TrimWhiteSpace(origPwm);
+            if (FileExists(enFile)) {
+                origEn = GetFileContents(enFile);
+                TrimWhiteSpace(origEn);
+                PutFileContents(enFile, "1");
+            }
+            PutFileContents(pwmFile, "255");
+        }
+
+        // Sample each tachometer until it reads non-zero (healthy fans spin up
+        // within ~150ms); cap at ~0.7s so an absent/dead fan can't stall boot.
+        std::vector<int> rpm(fans.size(), 0);
+        for (int s = 0; s < 7; s++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            bool anyZero = false;
+            for (size_t fi = 0; fi < fans.size(); fi++) {
+                if (rpm[fi] == 0) {
+                    std::string r = GetFileContents(hwmon + "/fan" + std::to_string(fans[fi]) + "_input");
+                    TrimWhiteSpace(r);
+                    rpm[fi] = atoi(r.c_str());
+                    if (rpm[fi] == 0) {
+                        anyZero = true;
+                    }
+                }
+            }
+            if (!anyZero) {
+                break;
+            }
+        }
+
+        // Restore the pre-probe PWM state.
+        if (forced) {
+            PutFileContents(pwmFile, origPwm);
+            if (!origEn.empty()) {
+                PutFileContents(enFile, origEn);
+            }
+        }
+
+        for (size_t fi = 0; fi < fans.size(); fi++) {
+            std::string key = name + ":" + std::to_string(fans[fi]);
+            Json::Value e;
+            e["rpm"] = rpm[fi];
+            e["present"] = rpm[fi] > 0;
+            result[key] = e;
+            printf("FPP - Fan probe %s: %d RPM (%s)\n", key.c_str(), rpm[fi],
+                   rpm[fi] > 0 ? "present" : "no tach signal, RPM display suppressed");
+        }
+    }
+    if (result.size() > 0) {
+        PutFileContents(FAN_PROBE_FILE, SaveJsonToString(result));
+    }
+}
+
+void setFileOwnership() {
+    exec("/usr/bin/chown -R fpp:fpp " + FPP_MEDIA_DIR);
+}
+
+bool checkUnpartitionedSpace() {
+    bool ret = false;
+    if (!FileExists("/etc/fpp/desktop")) {
+        std::string sourceDev = execAndReturn("/usr/bin/findmnt -n -o SOURCE " + FPP_MEDIA_DIR);
+        TrimWhiteSpace(sourceDev);
+        if (sourceDev.empty()) {
+            sourceDev = execAndReturn("/usr/bin/findmnt -n -o SOURCE /");
+            TrimWhiteSpace(sourceDev);
+        }
+        if (!sourceDev.empty()) {
+            sourceDev = sourceDev.substr(5);
+            std::string osd;
+            getRawSetting("storageDevice", osd);
+            if (osd != sourceDev) {
+                setRawSetting("storageDevice", osd);
+            }
+        }
+        std::string fs = "0";
+        if (FileExists(SD_CARD_DEVICE)) {
+            fs = execAndReturn("/usr/sbin/sfdisk -F " + SD_CARD_DEVICE + " | tail -n 1");
+            TrimWhiteSpace(fs);
+            auto splits = split(fs, ' ');
+            fs = splits.back();
+            if (endsWith(fs, "G")) {
+                fs = fs.substr(0, fs.size() - 1);
+            } else {
+                fs = "0";
+            }
+        }
+        if (FileExists("/boot/firmware/fpp_expand_rootfs") || FileExists("/boot/fpp_expand_rootfs")) {
+            fs = "0";
+            std::string rootPart = execAndReturn("/usr/bin/findmnt -n -o SOURCE /");
+            TrimWhiteSpace(rootPart);
+            if (startsWith(rootPart, SD_CARD_DEVICE)) {
+                std::string lastPartNum = execAndReturn("/usr/sbin/parted " + SD_CARD_DEVICE + " -ms unit s p | tail -n 1 | cut -f 1 -d:");
+                TrimWhiteSpace(lastPartNum);
+                std::string startPos = execAndReturn("/usr/sbin/parted " + SD_CARD_DEVICE + " -ms unit s p | grep \"^" + lastPartNum + "\" | cut -f 2 -d: | sed 's/[^0-9]//g'");
+                TrimWhiteSpace(startPos);
+                std::string fdiskInstructions = "p\nd\n" + lastPartNum + "\nn\np\n" + lastPartNum + "\n" + startPos + "\n\np\nw\n";
+                PutFileContents("/tmp/fdisk.cmds", fdiskInstructions);
+                exec("/usr/sbin/fdisk " + SD_CARD_DEVICE + " < /tmp/fdisk.cmds");
+                unlink("/tmp/fdisk.cmds");
+                exec("systemctl enable fpp-expand-rootfs.service");
+                setRawSetting("rebootFlag", "1");
+                ret = true;
+            }
+            unlink("/boot/firmware/fpp_expand_rootfs");
+            unlink("/boot/fpp_expand_rootfs");
+        }
+        std::string oldfs;
+        getRawSetting("UnpartitionedSpace", oldfs);
+        if (oldfs != fs) {
+            setRawSetting("UnpartitionedSpace", fs);
+        }
+    }
+    return ret;
+}
+void resizeRootFS() {
+    std::string rootPart = execAndReturn("/usr/bin/findmnt -n -o SOURCE /");
+    TrimWhiteSpace(rootPart);
+    exec("/usr/sbin/resize2fs " + rootPart);
+    // --no-reload is important: a bare "systemctl disable" performs an implicit
+    // daemon-reload, which on a single-core SBC (e.g. BeagleBone) takes ~11s and
+    // freezes systemd's entire job queue mid-boot -- stalling dbus, networkd, and
+    // fppinit. The removed symlink takes effect next boot regardless, so there's
+    // no reason to reload now.
+    exec("systemctl disable --no-reload fpp-expand-rootfs.service");
+}
+void setupTimezone() {
+    std::string s;
+    getRawSetting("TimeZone", s);
+    TrimWhiteSpace(s);
+    if (!s.empty()) {
+        // Debian 13 (trixie) no longer ships /etc/timezone -- the timezone is
+        // tracked solely by the /etc/localtime symlink. Reading the old file
+        // therefore always returned empty, so this used to run the expensive
+        // `timedatectl set-timezone` (a dbus round-trip to systemd-timedated
+        // that blocks ~15s on a single-core SBC) plus a backgrounded
+        // `dpkg-reconfigure tzdata` on EVERY boot, and twice (fppinit start +
+        // postNetwork). Derive the current zone by reading the /etc/localtime
+        // symlink target (a single syscall, no fork) and only reconfigure when
+        // it actually differs. The target looks like
+        // ".../usr/share/zoneinfo/America/New_York"; the zone is everything
+        // after "zoneinfo/".
+        std::string c;
+        std::error_code ec;
+        std::filesystem::path tzTarget = std::filesystem::read_symlink("/etc/localtime", ec);
+        if (!ec) {
+            std::string t = tzTarget.string();
+            size_t pos = t.find("zoneinfo/");
+            if (pos != std::string::npos) {
+                c = t.substr(pos + 9); // strlen("zoneinfo/")
+            }
+        }
+        TrimWhiteSpace(c);
+        if (!isShellSafeWord(s)) {
+            printf("Ignoring invalid TimeZone setting\n");
+        } else if (c != s) {
+            printf("Resetting timezone from %s to %s\n", c.c_str(), s.c_str());
+            exec("/usr/bin/timedatectl set-timezone " + s);
+            execbg("/usr/sbin/dpkg-reconfigure -f noninteractive tzdata &");
+        }
+    }
+}
+
+void cleanupChromiumFiles() {
+    exec("/usr/bin/rm -rf /home/fpp/.config/chromium/Singleton* 2>/dev/null > /dev/null");
+}
+
+void setupKiosk(bool force) {
+    int km = getRawSettingInt("Kiosk", 0);
+    if (km || force) {
+        std::string url = "http://localhost/";
+        getRawSetting("KioskUrl", url);
+
+        // FPP UI doesn't delete the setting, it makes it ""
+        if (url == "\"\"") {
+            url = "http://localhost/";
+        }
+
+        std::string value = "{\"RestoreOnStartup\": 4,\"RestoreOnStartupURLs\": [\"" + url + "\"]}";
+        mkdir("/etc/chromium/", 0775);
+        mkdir("/etc/chromium/policies", 0775);
+        mkdir("/etc/chromium/policies/managed", 0775);
+        PutFileContents("/etc/chromium/policies/managed/policy.json", value);
+    }
+}
+void checkInstallKiosk() {
+    int km = getRawSettingInt("Kiosk", 0);
+    if (FileExists("/fpp_kiosk")) {
+        km = true;
+    }
+
+    if (km && !FileExists("/etc/fpp/kiosk")) {
+        std::string s = execAndReturn("/usr/bin/systemctl is-enabled fpp-install-kiosk");
+        TrimWhiteSpace(s);
+        if (s == "disabled") {
+            exec("/usr/bin/systemctl enable fpp-install-kiosk");
+            exec("/usr/sbin/reboot");
+        }
+    }
+}
+void installKiosk() {
+    int km = getRawSettingInt("Kiosk", 0);
+    if (FileExists("/fpp_kiosk")) {
+        unlink("/fpp_kiosk");
+        km = true;
+    }
+    if (km && !FileExists("/etc/fpp/kiosk")) {
+        // need to re-install kiosk mode
+        exec("/opt/fpp/SD/FPP_Kiosk.sh");
+        if (FileExists("/etc/fpp/kiosk")) {
+            exec("/usr/sbin/reboot");
+        }
+        setupKiosk(true);
+    }
+}
+
+// Run "apt-get <args>" synchronously and return true only if it exited 0.
+static bool runAptGet(const std::vector<std::string>& args) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        printf("Error: Failed to fork process\n");
+        return false;
+    } else if (pid == 0) {
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>("apt-get"));
+        for (const auto& a : args) {
+            argv.push_back(const_cast<char*>(a.c_str()));
+        }
+        argv.push_back(nullptr);
+        execvp("apt-get", argv.data());
+        // If execvp fails, exit the child directly (don't fall back into the
+        // parent's control flow).
+        printf("Error: Failed to execute apt-get\n");
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+// A package name apt takes as one package and never as an option: Debian
+// policy characters, 2-255 long, optional ":arch". The PHP side validates the
+// same way before writing the list, but the file is hand-editable and
+// restorable from a backup, and every name here becomes root apt-get argv --
+// a leading '-' would be an apt option. Hand-rolled rather than std::regex so
+// it cannot throw. Apt's other trap, an unanchored regex fallback for a name
+// containing '.' that no longer exists, is closed by packageKnownToApt().
+static bool validPackageName(const std::string& n) {
+    if (n.size() < 2 || n.size() > 255) {
+        return false;
+    }
+    size_t colon = n.find(':');
+    std::string base = n.substr(0, colon);
+    auto lowerAlnum = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); };
+    if (base.size() < 2 || !lowerAlnum(base.front()) || (!lowerAlnum(base.back()) && base.back() != '+')) {
+        return false;
+    }
+    for (char c : base) {
+        if (!lowerAlnum(c) && c != '+' && c != '.' && c != '-') {
+            return false;
+        }
+    }
+    if (colon != std::string::npos) {
+        std::string arch = n.substr(colon + 1);
+        if (arch.empty()) {
+            return false;
+        }
+        for (char c : arch) {
+            if (!lowerAlnum(c) && c != '-') {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Whether apt's lists know this exact name. 'apt-get install' falls back to
+// an unanchored regex for an unknown name containing '.', so a versioned
+// name that vanished in the new release (libfoo1.2) could select something
+// else entirely; 'apt-cache pkgnames' lists exact names only, one per line
+// (--all-names so a virtual package name apt can install is not refused).
+// The name has passed validPackageName() (no shell characters), so the
+// usual execAndReturn() is fine here.
+static bool packageKnownToApt(const std::string& name) {
+    std::string base = name.substr(0, name.find(':'));
+    std::string out;
+    try {
+        out = execAndReturn("apt-cache --all-names pkgnames " + base);
+    } catch (const std::exception&) {
+        return true; // can't check: let apt decide, as before
+    }
+    return ("\n" + out).find("\n" + base + "\n") != std::string::npos;
+}
+
+// Extract a package name from a userpackages.json entry. Supports both the
+// legacy schema (a bare string) and the ownership schema
+// ({"package": "name", "requestedBy": [...], "via": [...]} written by the PHP
+// package helpers). Returns "" when the entry carries no usable package name,
+// and for an entry with a non-empty "via": that is a dependency some other
+// entry's install pulled in, and its parent's install re-pulls it under
+// whatever the new OS calls it -- replaying the recorded (often versioned)
+// name would fail on every boot once the release renames it.
+static std::string packageNameFromJson(const Json::Value& item) {
+    if (item.isString()) {
+        return item.asString();
+    }
+    if (JsonHas(item, "package") && item["package"].isString()) {
+        if (JsonHas(item, "via") && item["via"].isArray() && !item["via"].empty()) {
+            return "";
+        }
+        return item["package"].asString();
+    }
+    return "";
+}
+
+// Reads the user package list into $out: size-capped so a runaway file
+// cannot exhaust a small board's memory before it is even parsed, every name
+// validated, duplicates dropped. Returns false when the file is missing or
+// unusable -- nothing to replay, and nothing a retry would fix. jsoncpp's
+// parser throws on input nested past its stack limit; the caller catches.
+static bool readUserPackages(const std::string& filePath, std::vector<std::string>& out) {
+    std::error_code ec;
+    auto size = std::filesystem::file_size(filePath, ec);
+    if (ec) {
+        if (ec == std::errc::no_such_file_or_directory) {
+            printf("No user package list at %s, nothing to install\n", filePath.c_str());
+        } else {
+            printf("Error: user package list %s: %s; skipping\n", filePath.c_str(), ec.message().c_str());
+        }
+        return false;
+    }
+    if (size > 4 * 1024 * 1024) {
+        printf("Error: user package list is %ju bytes; refusing to process it\n", (uintmax_t)size);
+        return false;
+    }
+    Json::Value root;
+    if (!LoadJsonFromString(GetFileContents(filePath), root, JsonRoot::Array)) {
+        // Malformed or wrong-shaped; won't fix itself on retry. The loader has
+        // already said what was wrong with it.
+        printf("Error: user package list %s is not usable; skipping\n", filePath.c_str());
+        return false;
+    }
+    // A real list is tens of entries. Beyond this the de-dup below and the
+    // one-apt-call-per-name loop after it are minutes of boot.
+    if (root.size() > 1000) {
+        printf("Error: user package list has %u entries; refusing to process it\n", root.size());
+        return false;
+    }
+    int rejected = 0;
+    std::string firstRejected;
+    for (const auto& item : root) {
+        std::string pkg = packageNameFromJson(item);
+        if (pkg.empty()) {
+            continue;
+        }
+        if (!validPackageName(pkg)) {
+            if (rejected++ == 0) {
+                // Printable ASCII only, truncated: this goes to the boot log.
+                for (char c : pkg.substr(0, 64)) {
+                    firstRejected += (c >= 0x20 && c < 0x7f) ? c : '?';
+                }
+            }
+            continue;
+        }
+        bool seen = false;
+        for (const auto& have : out) {
+            if (have == pkg) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            out.push_back(pkg);
+        }
+    }
+    if (rejected) {
+        printf("Skipping %d invalid package name(s) in user package list (first: '%s')\n",
+               rejected, firstRejected.c_str());
+    }
+    return true;
+}
+
+// Returns true if there is nothing to do or every package installed; false only
+// when an apt failure occurred that is worth retrying on the next boot. The
+// DPkg::Lock::Timeout option lets apt wait for a concurrent install at boot
+// instead of failing immediately.
+bool installPackagesFromJson(const std::string& filePath) {
+    std::vector<std::string> packages;
+    try {
+        if (!readUserPackages(filePath, packages)) {
+            return true;
+        }
+    } catch (const std::exception& e) {
+        // jsoncpp throws Json::RuntimeError on a file nested deeper than its
+        // stack limit (a 1001-character "[[[[" file). This is fppinit: a bad
+        // list must never take boot down.
+        printf("Error: user package list could not be processed (%s); skipping\n", e.what());
+        return true;
+    }
+    if (packages.empty()) {
+        return true;
+    }
+
+    // Non-Debian platforms (Fedora, MacOS, ...) have no apt-get; there is
+    // nothing we can replay. Consume the trigger rather than retrying forever.
+    if (!FileExists("/usr/bin/apt-get")) {
+        printf("apt-get not available on this platform; skipping user package install\n");
+        return true;
+    }
+
+    // Refresh the package lists first. A freshly flashed OS may ship stale/empty
+    // lists, and this can run at boot before the network is fully up, so retry a
+    // few times before giving up.
+    bool updated = false;
+    for (int i = 1; i <= 3; i++) {
+        if (runAptGet({ "-o", "DPkg::Lock::Timeout=60", "update" })) {
+            updated = true;
+            break;
+        }
+        printf("Warning: apt-get update failed (attempt %d), retrying...\n", i);
+        sleep(5);
+    }
+    if (!updated) {
+        printf("Error: apt-get update never succeeded - will retry user packages on next boot\n");
+        return false;
+    }
+
+    bool allOk = true;
+    for (const auto& pkg : packages) {
+        if (!packageKnownToApt(pkg)) {
+            // Renamed or dropped in the new release. Not retryable, and not
+            // something to hand to apt's regex fallback.
+            printf("Warning: no package named %s in the new OS; skipping\n", pkg.c_str());
+            continue;
+        }
+        printf("Installing: %s\n", pkg.c_str());
+        // confdef/confold: with no stdin, dpkg's conffile prompt (a config
+        // file the old OS left behind) would fail the install and leave the
+        // package half-configured for every later apt run.
+        if (!runAptGet({ "-o", "DPkg::Lock::Timeout=60", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "install", "-y", pkg })) {
+            printf("Warning: Package installation failed for %s\n", pkg.c_str());
+            allOk = false;
+        }
+    }
+    return allOk;
+}
+
+// A plugin is considered "installed" if its directory contains a pluginInfo.json
+// manifest (same rule the web layer's GetInstalledPlugins() uses). Used to decide
+// whether the post-FPPOS-upgrade "plugins must be reinstalled" warning applies.
+static bool anyPluginsInstalled() {
+    std::string dir = FPP_MEDIA_DIR + "/plugins";
+    if (!DirectoryExists(dir)) {
+        return false;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.is_directory() && FileExists(entry.path().string() + "/pluginInfo.json")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// FPP 10 changed the default MultiSync send method from Multicast to
+// Unicast-to-known-remotes for fresh installs (see www/settings.json's
+// MultiSyncUnicast "default": 1). An FPPOS reflash replaces /opt/fpp
+// (settings.json included) but preserves /home/fpp/media/settings from the
+// prior install untouched -- so an existing multisync user who never
+// explicitly recorded a send method (multicast was implicit/default before
+// unicast existed) would otherwise silently flip to unicast the moment this
+// new code boots. Pin them to their historical multicast behavior instead.
+// (Fresh installs and normal in-place `fpp upgrade`s are handled separately,
+// by upgrade/122/upgrade.sh via the version-gated upgrade_config path.)
+static void migrateMultiSyncDefaultToMulticast() {
+    if (getRawSettingInt("MultiSyncEnabled", 0) != 1) {
+        return;
+    }
+
+    // No send method recorded at all -> the user was relying on the pre-FPP-10
+    // implicit multicast behavior.  Make it explicit.
+    if (getRawSettingInt("MultiSyncMulticast", 0) != 1 &&
+        getRawSettingInt("MultiSyncBroadcast", 0) != 1 &&
+        getRawSettingInt("MultiSyncUnicast", 0) != 1) {
+        setRawSetting("MultiSyncMulticast", "1");
+    }
+
+    // Pin MultiSyncUnicast off whenever the key is simply ABSENT, independent of
+    // what the other two are set to.  This must not be folded into the branch
+    // above: a user who had explicitly chosen multicast or broadcast skips that
+    // branch entirely, so the key stayed absent -- and an absent key is not
+    // neutral.  It resolves differently depending on who is asking:
+    //
+    //   www/common.php IfSettingEqualPrint() -> settings.json "default": 1
+    //   src/settings.cpp LoadSettingsInfo()  -> settings.json "default": 1
+    //   getRawSettingInt() (right here)      -> 0, the file is read directly
+    //
+    // So an upgraded box would show "Send MultiSync to ALL KNOWN remotes via
+    // Unicast" ticked in the UI *and* have fppd genuinely unicast to every
+    // remote, on top of whatever method the user actually chose -- while this
+    // migration, reading raw, saw nothing wrong.  Writing the key makes all
+    // three readers agree.
+    //
+    // Only absence is corrected: an explicit 0 or 1 is the user's own choice.
+    std::string existing;
+    if (!getRawSetting("MultiSyncUnicast", existing)) {
+        setRawSetting("MultiSyncUnicast", "0");
+    }
+}
+
+// FPP 10 removed the "Remote ..." commands.  Each took the remote host as its
+// first argument and forwarded the rest, unchanged, to the command named here
+// on that host; the same thing is now the plain command with Multisync turned
+// on and the host in multisyncHosts.  Rewrites one stored command in place.
+static bool convertRemoteCommand(Json::Value& cmd) {
+    static const std::map<std::string, std::string> REPLACEMENTS = {
+        { "Remote Trigger Command Preset", "Trigger Command Preset" },
+        { "Remote Trigger Command Preset Slot", "Trigger Command Preset Slot" },
+        { "Remote Effect Start", "Effect Start" },
+        { "Remote FSEQ Effect Start", "FSEQ Effect Start" },
+        { "Remote Effect Stop", "Effect Stop" },
+        { "Remote Playlist Start", "Start Playlist" },
+        { "Remote Run Script", "Run Script" },
+    };
+    if (!cmd["command"].isString() || !cmd["args"].isArray() || cmd["args"].empty()) {
+        return false;
+    }
+    auto it = REPLACEMENTS.find(cmd["command"].asString());
+    if (it == REPLACEMENTS.end() || !cmd["args"][0].isString()) {
+        return false;
+    }
+    // An empty host would become "every host", and multisyncHosts is not
+    // variable-substituted the way the old argument was; leave those for the
+    // user to fix (the playlist validator reports them).
+    std::string host = cmd["args"][0].asString();
+    if (host.empty() || host.find('%') != std::string::npos) {
+        return false;
+    }
+    Json::Value args(Json::arrayValue);
+    for (Json::ArrayIndex i = 1; i < cmd["args"].size(); i++) {
+        args.append(cmd["args"][i]);
+    }
+    cmd["command"] = it->second;
+    cmd["args"] = args;
+    cmd["multisyncCommand"] = true;
+    cmd["multisyncHosts"] = host;
+    return true;
+}
+
+// Walks any stored config -- playlist, schedule, command presets, GPIO inputs
+// -- converting every object shaped like a command.
+static int convertRemoteCommands(Json::Value& v) {
+    int count = 0;
+    if (v.isObject()) {
+        if (v.isMember("command") && convertRemoteCommand(v)) {
+            count++;
+        }
+        for (const auto& name : v.getMemberNames()) {
+            count += convertRemoteCommands(v[name]);
+        }
+    } else if (v.isArray()) {
+        for (auto& e : v) {
+            count += convertRemoteCommands(e);
+        }
+    }
+    return count;
+}
+
+// "master" mode was folded into Player in FPP 5.0 (sending sync packets became
+// the MultiSyncEnabled setting).  The loaders in settings.cpp and config.php still
+// map a stored fppMode=master to player in memory, but never write it back, so the
+// settings file kept the old value indefinitely -- invisible to the UI and API
+// (both report the mapped value), but visible to backup/restore and anything
+// reading the file directly.  Write the same mapping back once.  Runs before
+// every fppd start; idempotent, since it only acts while fppMode is "master".
+void migrateLegacyFppMode() {
+    std::string mode;
+    if (getRawSetting("fppMode", mode) && mode == "master") {
+        printf("FPP - Converting legacy fppMode=master to player with MultiSync enabled\n");
+        setRawSetting("fppMode", "player");
+        setRawSetting("MultiSyncEnabled", "1");
+    }
+}
+
+// Runs before every fppd start, so fppd never loads one of the removed
+// commands, whether the file came from an older install, a restore, or a copy
+// from another player.  Idempotent: a file is only parsed if it mentions a
+// Remote command, and only rewritten if something was converted.
+void migrateRemoteCommands() {
+    std::vector<std::string> files = {
+        FPP_MEDIA_DIR + "/config/schedule.json",
+        FPP_MEDIA_DIR + "/config/commandPresets.json",
+        FPP_MEDIA_DIR + "/config/gpio.json",
+    };
+    std::string playlistDir = FPP_MEDIA_DIR + "/playlists";
+    if (DirectoryExists(playlistDir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(playlistDir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".json") {
+                files.push_back(entry.path().string());
+            }
+        }
+    }
+    for (const auto& file : files) {
+        if (!FileExists(file)) {
+            continue;
+        }
+        std::string contents = GetFileContents(file);
+        if (contents.find("\"Remote ") == std::string::npos) {
+            continue;
+        }
+        try {
+            Json::Value root;
+            if (!LoadJsonFromString(contents, root)) {
+                continue;
+            }
+            int count = convertRemoteCommands(root);
+            if (count) {
+                Json::StreamWriterBuilder wbuilder;
+                wbuilder["indentation"] = "\t";
+                // Keep e.g. a 1.1 duration from coming back as 1.1000000000000001.
+                wbuilder["precision"] = 15;
+                PutFileContents(file, Json::writeString(wbuilder, root));
+                printf("FPP - Converted %d removed Remote command(s) to Multisync in %s\n", count, file.c_str());
+            }
+        } catch (const std::exception& e) {
+            printf("FPP - Could not convert Remote commands in %s: %s\n", file.c_str(), e.what());
+        }
+    }
+}
+
+// Touched by a restore (www/backup.php, www/copystorage.php).  It asks for
+// the part of a reflash's reconciliation a restore needs -- the restored
+// userpackages.json installed, the restored settings migrated -- and not the
+// rest: the OS and the plugins built for it are still this box's.
+static const char* FPP_RESTORED_MARKER = "/fpp_restored";
+
+// Config-state migrations that must survive an FPPOS reflash, gated on the
+// same /fppos_upgraded marker as checkInstallPackages() (touched by
+// upgradeOS-part2.sh, which is always sourced from the target image being
+// flashed -- see the note in upgradeOS-part1.sh -- so this runs with current
+// code regardless of how old the box being upgraded was). Unlike
+// checkInstallPackages(), this does NOT unlink /fppos_upgraded itself: package
+// installs may still be retrying (e.g. no network yet), and each migration
+// here is written to be safely idempotent, so simply re-running on a later
+// boot is harmless. Add future OS-upgrade-surviving config migrations here.
+void checkConfigMigrations() {
+    if (FileExists("/fppos_upgraded") || FileExists(FPP_RESTORED_MARKER)) {
+        migrateMultiSyncDefaultToMulticast();
+    }
+}
+
+// The URL a plugin checkout was cloned from ("remote.origin.url" in its
+// .git/config), or "" when it is not a git checkout.
+static std::string pluginOriginURL(const std::string& dir) {
+    std::string config = GetFileContents(dir + "/.git/config");
+    bool inOrigin = false;
+    for (auto line : split(config, '\n')) {
+        size_t b = line.find_first_not_of(" \t");
+        if (b == std::string::npos) {
+            continue;
+        }
+        line = line.substr(b);
+        if (line[0] == '[') {
+            inOrigin = line.rfind("[remote \"origin\"]", 0) == 0;
+        } else if (inOrigin && line.rfind("url", 0) == 0) {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos && line.find_first_not_of(" \t", 3) == eq) {
+                std::string url = line.substr(eq + 1);
+                size_t ub = url.find_first_not_of(" \t");
+                size_t ue = url.find_last_not_of(" \t\r");
+                return ub == std::string::npos ? "" : url.substr(ub, ue - ub + 1);
+            }
+        }
+    }
+    return "";
+}
+
+// A clone URL without what could carry a credential: the userinfo before the
+// host and any query or fragment, as PluginHistoryURL() does in PHP. A plugin
+// cloned while gitHubUser/gitHubPAT were set has the token in its origin URL
+// (InjectGitHubCredentials()), and the settings file is readable through the
+// API and carried by every backup.
+static std::string pluginURLWithoutCredentials(std::string url) {
+    url = url.substr(0, url.find_first_of("?#"));
+    size_t scheme = url.find("://");
+    size_t hostStart = scheme == std::string::npos ? 0 : scheme + 3;
+    size_t hostEnd = url.find('/', hostStart);
+    size_t at = url.rfind('@', hostEnd == std::string::npos ? std::string::npos : hostEnd);
+    if (at != std::string::npos && at >= hostStart) {
+        url.erase(hostStart, at + 1 - hostStart);
+    }
+    return url;
+}
+
+// IsOfficialPluginSrcURL(): published by the FPP project, judged on the host
+// and the owner, not on a prefix that any userinfo or port defeats.
+static bool isOfficialPluginURL(const std::string& url) {
+    size_t scheme = url.find("://");
+    if (scheme == std::string::npos) {
+        return false;
+    }
+    std::string rest = toLowerCopy(url.substr(scheme + 3));
+    size_t slash = rest.find('/');
+    std::string host = rest.substr(0, std::min(slash, rest.find(':')));
+    if (host != "github.com" || slash == std::string::npos) {
+        return false;
+    }
+    size_t owner = rest.find_first_not_of('/', slash);
+    return owner != std::string::npos && rest.compare(owner, 15, "falconchristmas") == 0 &&
+           (owner + 15 == rest.size() || rest[owner + 15] == '/');
+}
+
+// "repoName|srcURL" records, comma-separated (the PluginUnverifiedRepos form,
+// see www/api/controllers/plugin.php), for every plugin installed in
+// pluginDir that the FPP project did not publish. A linkName alias is a
+// symlink to another plugin, not one itself.
+static std::string pluginSourceRecordsToVerify(const std::string& pluginDir) {
+    std::string records;
+    if (!DirectoryExists(pluginDir)) {
+        return records;
+    }
+    std::vector<std::string> names;
+    for (const auto& entry : std::filesystem::directory_iterator(pluginDir)) {
+        if (entry.is_directory() && !entry.is_symlink() && FileExists(entry.path().string() + "/pluginInfo.json")) {
+            names.push_back(entry.path().filename().string());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        std::string url = pluginURLWithoutCredentials(pluginOriginURL(pluginDir + "/" + name));
+        // Published by the FPP project, never flagged.
+        if (isOfficialPluginURL(url)) {
+            continue;
+        }
+        // ',' and '|' separate records and fields, '"' would end the setting.
+        auto clean = [](std::string v) {
+            v.erase(std::remove_if(v.begin(), v.end(), [](char c) { return c == ',' || c == '|' || c == '"'; }), v.end());
+            return v;
+        };
+        if (!records.empty()) {
+            records += ",";
+        }
+        records += clean(name) + "|" + clean(url);
+    }
+    return records;
+}
+
+// The "Unknown Plugins" health check flag (PluginUnknownEverInstalled) is
+// sticky because an unknown plugin's uninstall can't be trusted to undo what
+// its install did to the OS. A reflash replaces the OS, so start the record
+// over -- but the plugin clones in /home/fpp/media survive, and their scripts
+// still run. So rather than simply clearing it, park every surviving plugin
+// as unverified, keyed on the URL it was cloned from: the Plugin Manager
+// settles those against the plugin list (ResolveUnverifiedPlugins()) and
+// raises the flag again only for one that is not listed. Rebuilt from what
+// is on disk each time, so the retry of /fppos_upgraded on a later boot gives
+// the same answer.
+static void resetPluginSourceAfterOS() {
+    setRawSetting("PluginUnknownEverInstalled", "");
+    setRawSetting("PluginUnknownRepos", "");
+    setRawSetting("PluginUnverifiedRepos", pluginSourceRecordsToVerify(FPP_MEDIA_DIR + "/plugins"));
+}
+
+void checkInstallPackages() {
+    bool reflashed = FileExists("/fppos_upgraded");
+    if (!reflashed && !FileExists(FPP_RESTORED_MARKER)) {
+        return;
+    }
+    if (reflashed) {
+        // Only a reflash: a restore keeps this OS, so whatever an unknown
+        // plugin's install did to it is still there, and the plugins on
+        // disk were built for it (a File Copy that brings plugins in asks
+        // for their reinstall itself, in copystorage.php).
+        resetPluginSourceAfterOS();
+        // An FPPOS reflash replaces /opt/fpp (new fppd, headers, plugin API
+        // version) while /home/fpp/media -- including the plugin clones -- is
+        // preserved, and any rootfs artifacts a plugin's fpp_install.sh dropped
+        // are gone. Native (.so) plugins were built against the old headers;
+        // the API version check only refuses them if every layout change was
+        // paired with a bump, so fppd instead declines to load a native plugin
+        // at all while it is on this list (PluginManager::
+        // awaitingReinstallAfterOS). If plugins are present, set a persisted
+        // flag so fppd can raise a (non-dismissible) warning prompting the user
+        // to Reinstall All. The Plugin Manager turns "1" into the list of
+        // plugins still to reinstall and clears it once every one has been
+        // reinstalled or uninstalled. Set independent of the apt result below;
+        // a retry next boot just rewrites the same value.
+        if (anyPluginsInstalled()) {
+            setRawSetting("pluginReinstallNeededAfterOS", "1");
+        }
+    }
+
+    printf("Installing User Packages\n");
+    // Only consume the markers once the packages actually installed. If the
+    // install can't complete (e.g. no network yet at boot), leave them in
+    // place so it is retried on the next boot rather than silently never
+    // reinstalling the user's packages.
+    if (installPackagesFromJson(FPP_MEDIA_DIR + "/config/userpackages.json")) {
+        unlink("/fppos_upgraded");
+        unlink(FPP_RESTORED_MARKER);
+    } else {
+        printf("User package install incomplete - leaving the upgrade/restore marker set to retry next boot\n");
+    }
+}
+void startZRAMSwap() {
+    if (!FileExists("/usr/sbin/zramswap")) {
+        return;
+    }
+    // Gate on whether zram is already ACTIVE as swap, not on whether the device
+    // node exists: kernels built with CONFIG_ZRAM=y (e.g. the BeagleBone) always
+    // present /dev/zram0 even when nothing has configured it, so the old
+    // FileExists("/dev/zram0") check made this a permanent no-op and zram swap
+    // never came up. (On the Pi the systemd-zram-generator/rpi-swap path may
+    // already have set it up, in which case /proc/swaps shows it and we skip.)
+    std::string swaps = GetFileContents("/proc/swaps");
+    if (swaps.find("zram") == std::string::npos) {
+        execbg("/usr/sbin/zramswap start 2>/dev/null > /dev/null &");
+    }
+}
+void startDiskSwap() {
+    // The image ships a disk swap partition (e.g. mmcblk0p2) marked "noauto" in
+    // fstab so systemd does NOT activate it during boot: swapping to eMMC/SD
+    // wears the flash, and waiting for the swap device to be tagged by udev
+    // would otherwise gate swap.target on the slow single-core coldplug. zram is
+    // the primary swap; this larger disk swap is only useful for the occasional
+    // heavy job (e.g. compiling FPP). Bring it up here, late in postNetwork, off
+    // the boot critical path. swapon is harmless/idempotent if already active.
+    exec("/usr/bin/awk '$3 == \"swap\" && $1 !~ /zram/ { print $1 }' /etc/fstab 2>/dev/null "
+         "| while read -r dev; do /sbin/swapon \"$dev\" 2>/dev/null || true; done");
+}
+
+#ifdef PLATFORM_PI
+// Shrink an oversized vc4-KMS CMA pool on boards that cannot afford it.
+//
+// The image ships "dtoverlay=vc4-kms-v3d,cma-256" for every Pi (FPP_Install.sh
+// adds it to cap the Pi4's 512MB firmware default -- issue #2679). But the
+// overlay's own README documents cma-256, and everything above cma-128, as
+// "needs 1GB", and the firmware does NOT clamp it: a 512MB Pi Zero 2 W really
+// comes up with CmaTotal 262144 kB. That is half the board handed to a GPU pool
+// on a headless controller, and it is enough to break a source rebuild -- it
+// leaves ~163MB usable, well under what cc1plus needs.
+//
+// So cap at cma-128, the largest size the overlay does not gate behind 1GB.
+// FPP's real DMA needs are far below that: the DPI envelope declared below is
+// 1920x997 RGB888, about 7.6MB.
+//
+// Only ever REDUCE: a deliberate smaller override (cma-64) is left alone, since
+// raising it would defeat the purpose. Rewrites `content` in place and sets
+// `changed` so the caller's existing reboot handles it; comparing before writing
+// keeps it idempotent, so it fires once and never loops.
+// MemTotal counts the CMA reservation, so it is the board's usable total, not
+// its marketing size: a 512MB board reports ~425-500MB, a 1GB board ~900MB+.
+// 700MB separates them with room on both sides.
+static constexpr long CMA_ONE_GB_BOARD_KB = 700000;
+static constexpr int CMA_MAX_UNDER_1GB = 128;
+
+// Pure half: no file I/O, so it can be lifted out between the markers below and
+// exercised directly against sample config.txt text. Edits `content` in place
+// and returns true if it changed anything.
+// --- BEGIN capVC4CMALine ---
+static bool capVC4CMALine(std::string& content, long memKB) {
+    if (memKB <= 0 || memKB >= CMA_ONE_GB_BOARD_KB) {
+        return false;
+    }
+    // Match the overlay line itself, never a commented-out or indented copy.
+    // Covers both the generic overlay and the -pi5 variant.
+    size_t vidx = content.find("dtoverlay=vc4-kms-v3d");
+    while (vidx != std::string::npos && vidx != 0 && content[vidx - 1] != '\n') {
+        vidx = content.find("dtoverlay=vc4-kms-v3d", vidx + 1);
+    }
+    if (vidx == std::string::npos) {
+        return false;
+    }
+    size_t eol = content.find("\n", vidx);
+    if (eol == std::string::npos) {
+        eol = content.size();
+    }
+    std::string line = content.substr(vidx, eol - vidx);
+
+    size_t cidx = line.find("cma-");
+    if (cidx == std::string::npos) {
+        return false;
+    }
+    size_t dstart = cidx + strlen("cma-");
+    size_t dend = dstart;
+    while (dend < line.size() && isdigit(static_cast<unsigned char>(line[dend]))) {
+        dend++;
+    }
+    if (dend == dstart) {
+        // "cma-size" (a raw byte count) or some other spelling -- leave it be.
+        return false;
+    }
+    int current = static_cast<int>(strtol(line.c_str() + dstart, nullptr, 10));
+    if (current <= CMA_MAX_UNDER_1GB) {
+        return false;
+    }
+    line.replace(cidx, dend - cidx, "cma-" + std::to_string(CMA_MAX_UNDER_1GB));
+    printf("FPP - %ldkB board: capping vc4 CMA at %dMB (was %dMB)\n",
+           memKB, CMA_MAX_UNDER_1GB, current);
+    content.replace(vidx, eol - vidx, line);
+    return true;
+}
+// --- END capVC4CMALine ---
+
+static void capVC4CMAForBoard(std::string& content, bool& changed) {
+    std::string meminfo = GetFileContents("/proc/meminfo");
+    size_t midx = meminfo.find("MemTotal:");
+    if (midx == std::string::npos) {
+        return;
+    }
+    long memKB = strtol(meminfo.c_str() + midx + strlen("MemTotal:"), nullptr, 10);
+    if (capVC4CMALine(content, memKB)) {
+        PutFileContents("/boot/firmware/config.txt", content);
+        changed = true;
+    }
+}
+#endif
+
+#ifdef PLATFORM_PI
+// The Pi 5 has a built-in RTC, and it wins rtc0 by probe order -- it registers
+// around 0.35s where an i2c RTC on a cape is not up until ~2.5s.  Whatever holds
+// rtc0 is what the kernel sets the system clock from (CONFIG_RTC_HCTOSYS_DEVICE
+// is "rtc0"), so on a board with no cell on the Pi's RTC header the clock is set
+// from an unset RTC early in boot and stays wrong until fpprtc runs seconds
+// later.  A cape that ships a pi5 overlay variant renumbering itself to rtc0
+// fixes the ordering, but the Pi's own RTC is still there reading 1970, and a
+// user who knows there is no battery is better off with it gone entirely.
+//
+// "dtparam=rtc=off" is a stock firmware override (the rtc entry in the Pi 5
+// DTB's __overrides__ maps to the rpi_rtc node's status), so this needs no
+// overlay of FPP's own -- just the line, under a [pi5] filter so that an SD card
+// moved to an earlier Pi does not draw an "Unknown dtparam" warning.
+//
+// The block is rewritten from the setting, which is what makes removal work:
+// clear the setting and the block goes with it.  Anything outside the markers is
+// left alone, and the block always closes with [all] so a later append does not
+// land inside the filter.
+//
+// It is rewritten IN PLACE, and created ahead of CapeUtils' cape-overlay-variant
+// block.  That block is managed by stripping it and re-appending it at EOF, so if
+// this one were written the same way the two would leapfrog: each boot one lands
+// after the other, both see a changed config.txt, and both ask for a reboot.
+// Since this runs in fppinit's "start" action -- before networking comes up --
+// that loop is a box that never reaches the network to be fixed.
+static const std::string PI_RTC_BLOCK_BEGIN = "# FPP Pi RTC - BEGIN (managed by fppinit, do not edit)";
+static const std::string PI_RTC_BLOCK_END = "# FPP Pi RTC - END";
+// Only the marker text, matched not written: CapeUtils owns that block.
+static const std::string CAPE_VARIANT_BLOCK_BEGIN = "# FPP Cape Overlay Variants - BEGIN";
+
+// Pure half: no file I/O, so it can be lifted out between the markers below and
+// exercised directly against sample config.txt text.  Edits `content` in place
+// and returns true if it changed anything.
+// --- BEGIN applyDisablePiRTCBlock ---
+static bool applyDisablePiRTCBlock(std::string& content, bool disable) {
+    const std::string orig = content;
+    std::string desired;
+    if (disable) {
+        desired = PI_RTC_BLOCK_BEGIN + "\n[pi5]\ndtparam=rtc=off\n[all]\n" + PI_RTC_BLOCK_END + "\n";
+    }
+
+    // Strip every copy written before -- more than one only from an interrupted
+    // write, and a truncated block (BEGIN with no END) cuts to end of file rather
+    // than leaving a marker the next run would nest inside.  Remember where the
+    // first one started: the replacement goes back THERE, not at EOF.  That is
+    // load bearing, see the note above on leapfrogging the cape variant block.
+    size_t at = std::string::npos;
+    size_t begin = content.find(PI_RTC_BLOCK_BEGIN);
+    while (begin != std::string::npos) {
+        if (at == std::string::npos) {
+            at = begin;
+        }
+        size_t end = content.find(PI_RTC_BLOCK_END, begin);
+        end = (end == std::string::npos) ? content.length()
+                                         : end + PI_RTC_BLOCK_END.length();
+        if (end < content.length() && content[end] == '\n') {
+            ++end;
+        }
+        content.erase(begin, end - begin);
+        begin = content.find(PI_RTC_BLOCK_BEGIN);
+    }
+
+    if (!desired.empty()) {
+        if (at == std::string::npos) {
+            // Creating it for the first time: go in AHEAD of the cape variant
+            // block so that block keeps the end of the file to itself.
+            at = content.find(CAPE_VARIANT_BLOCK_BEGIN);
+            if (at == std::string::npos) {
+                while (!content.empty() && content.back() == '\n') {
+                    content.pop_back();
+                }
+                content += "\n\n";
+                at = content.length();
+            } else {
+                desired += "\n";
+            }
+        }
+        content.insert(at, desired);
+    }
+    return content != orig;
+}
+// --- END applyDisablePiRTCBlock ---
+#endif
+
+// Reconcile config.txt with the DisablePiRTC setting.  Runs after DetectCape()
+// so a cape that ships DisablePiRTC in its defaultSettings takes effect on the
+// same boot it is first detected on -- that path reboots, since the setting only
+// means anything to the firmware.  The UI toggle calls this via `fppinit
+// setupPiRTC` with rebootIfChanged false: the setting is declared "reboot": 1, so
+// the user is already being prompted and should not have the box go down under
+// the save.
+void setupPiRTCConfig(bool rebootIfChanged) {
+#ifdef PLATFORM_PI
+    std::string content = GetFileContents("/boot/firmware/config.txt");
+    if (content.empty()) {
+        return;
+    }
+    if (applyDisablePiRTCBlock(content, getRawSettingInt("DisablePiRTC", 0) != 0)) {
+        PutFileContents("/boot/firmware/config.txt", content);
+        printf("FPP - Pi RTC configuration changed in config.txt\n");
+        if (rebootIfChanged) {
+            printf("\n\nRebooting to load new settings.\n\n");
+            exec("/usr/sbin/reboot");
+        }
+    }
+#endif
+}
+
+#ifdef PLATFORM_PI
+// Suppress the initial CEC Active Source at boot that wakes projectors/TVs
+// (e.g. Epson L210SF, issue #2938). When enabled, adds hdmi_ignore_cec_init=1
+// to config.txt. Unlike hdmi_ignore_cec=1 this only suppresses the boot
+// broadcast — the CEC plugin can still power the display on/off on demand.
+//
+// Managed block pattern mirrors applyDisablePiRTCBlock above: strip every
+// prior copy (including truncated), remember first insertion point, and
+// re-insert ahead of the cape variant block to avoid leapfrog reboot loops.
+static const std::string HDMI_CEC_BLOCK_BEGIN = "# FPP HDMI CEC - BEGIN (managed by fppinit, do not edit)";
+static const std::string HDMI_CEC_BLOCK_END = "# FPP HDMI CEC - END";
+
+// --- BEGIN applyDisableHDMICECBlock ---
+static bool applyDisableHDMICECBlock(std::string& content, bool disable) {
+    const std::string orig = content;
+    std::string desired;
+    if (disable) {
+        desired = HDMI_CEC_BLOCK_BEGIN + "\n[all]\nhdmi_ignore_cec_init=1\n[all]\n" + HDMI_CEC_BLOCK_END + "\n";
+    }
+
+    size_t at = std::string::npos;
+    size_t begin = content.find(HDMI_CEC_BLOCK_BEGIN);
+    while (begin != std::string::npos) {
+        if (at == std::string::npos) {
+            at = begin;
+        }
+        size_t end = content.find(HDMI_CEC_BLOCK_END, begin);
+        end = (end == std::string::npos) ? content.length()
+                                         : end + HDMI_CEC_BLOCK_END.length();
+        if (end < content.length() && content[end] == '\n') {
+            ++end;
+        }
+        content.erase(begin, end - begin);
+        begin = content.find(HDMI_CEC_BLOCK_BEGIN);
+    }
+
+    if (!desired.empty()) {
+        if (at == std::string::npos) {
+            at = content.find(CAPE_VARIANT_BLOCK_BEGIN);
+            if (at == std::string::npos) {
+                while (!content.empty() && content.back() == '\n') {
+                    content.pop_back();
+                }
+                content += "\n\n";
+                at = content.length();
+            } else {
+                desired += "\n";
+            }
+        }
+        content.insert(at, desired);
+    }
+    return content != orig;
+}
+// --- END applyDisableHDMICECBlock ---
+#endif
+
+void setupHDMICECConfig(bool rebootIfChanged) {
+#ifdef PLATFORM_PI
+    std::string content = GetFileContents("/boot/firmware/config.txt");
+    if (content.empty()) {
+        return;
+    }
+    // Pi 5 has no firmware HDMI path (RP1/KMS), so hdmi_ignore_cec_init is
+    // ignored. Never write the block on Pi 5; this also cleans up a stale
+    // block left from when the setting previously defaulted to on.
+    bool want = !isPi5() && getRawSettingInt("DisableHDMICECInit", 0) != 0;
+    if (applyDisableHDMICECBlock(content, want)) {
+        PutFileContents("/boot/firmware/config.txt", content);
+        printf("FPP - HDMI CEC configuration changed in config.txt\n");
+        if (rebootIfChanged) {
+            printf("\n\nRebooting to load new settings.\n\n");
+            exec("/usr/sbin/reboot");
+        }
+    }
+#endif
+}
+
+#ifdef PLATFORM_PI
+// CM4/CM5 carry both a PCB antenna and a U.FL socket; the firmware picks one via
+// dtparam=ant1 (PCB, the default) or ant2 (U.FL).  Only those base DTBs define the
+// ant2 override, which is what /proc/device-tree/__overrides__/ant2 tests for, and
+// the block is filtered to [cm4]/[cm5] anyway so a card moved into a board without
+// the param carries an inert block rather than a dterror.  ant2 disables the PCB
+// antenna outright, so selecting it with nothing on the socket leaves WiFi with
+// almost no range -- hence a setting, not a default.
+//
+// Same managed block pattern as applyDisablePiRTCBlock above.
+static const std::string WIFI_ANTENNA_BLOCK_BEGIN = "# FPP WiFi Antenna - BEGIN (managed by fppinit, do not edit)";
+static const std::string WIFI_ANTENNA_BLOCK_END = "# FPP WiFi Antenna - END";
+
+// --- BEGIN applyWifiAntennaBlock ---
+static bool applyWifiAntennaBlock(std::string& content, bool external) {
+    const std::string orig = content;
+    std::string desired;
+    if (external) {
+        desired = WIFI_ANTENNA_BLOCK_BEGIN + "\n[cm4]\ndtparam=ant2\n[cm5]\ndtparam=ant2\n[all]\n" + WIFI_ANTENNA_BLOCK_END + "\n";
+    }
+
+    size_t at = std::string::npos;
+    size_t begin = content.find(WIFI_ANTENNA_BLOCK_BEGIN);
+    while (begin != std::string::npos) {
+        if (at == std::string::npos) {
+            at = begin;
+        }
+        size_t end = content.find(WIFI_ANTENNA_BLOCK_END, begin);
+        end = (end == std::string::npos) ? content.length()
+                                         : end + WIFI_ANTENNA_BLOCK_END.length();
+        if (end < content.length() && content[end] == '\n') {
+            ++end;
+        }
+        content.erase(begin, end - begin);
+        begin = content.find(WIFI_ANTENNA_BLOCK_BEGIN);
+    }
+
+    if (!desired.empty()) {
+        if (at == std::string::npos) {
+            at = content.find(CAPE_VARIANT_BLOCK_BEGIN);
+            if (at == std::string::npos) {
+                while (!content.empty() && content.back() == '\n') {
+                    content.pop_back();
+                }
+                content += "\n\n";
+                at = content.length();
+            } else {
+                desired += "\n";
+            }
+        }
+        content.insert(at, desired);
+    }
+    return content != orig;
+}
+// --- END applyWifiAntennaBlock ---
+#endif
+
+void setupWifiAntennaConfig(bool rebootIfChanged) {
+#ifdef PLATFORM_PI
+    // Leave config.txt alone on boards without the param: there is no setting
+    // to reconcile (the UI hides it), and any block left from a CM is inert.
+    if (!FileExists("/proc/device-tree/__overrides__/ant2")) {
+        return;
+    }
+    std::string content = GetFileContents("/boot/firmware/config.txt");
+    if (content.empty()) {
+        return;
+    }
+    std::string antenna = "internal";
+    getRawSetting("WifiAntenna", antenna);
+    if (applyWifiAntennaBlock(content, antenna == "external")) {
+        PutFileContents("/boot/firmware/config.txt", content);
+        printf("FPP - WiFi antenna configuration changed in config.txt\n");
+        if (rebootIfChanged) {
+            printf("\n\nRebooting to load new settings.\n\n");
+            exec("/usr/sbin/reboot");
+        }
+    }
+#endif
+}
+
+// The 64-bit Pi images keep the Pi 5's 16K-page kernel, and its modules, but
+// park the kernel under a name the firmware never loads; a Pi 5 would otherwise
+// prefer kernel_2712.img over the 4K-page kernel8.img.  The developer-level
+// Pi16KPageKernel setting copies it back into place.  The 32-bit images, images
+// from before this, and stock Raspberry Pi OS installs have no parked copy, and
+// are left alone.
+//
+// Runs at every boot as well as from the UI: an FPPOS upgrade replaces the boot
+// partition, which drops the active copy, and the boot pass puts it back.
+void setup16KPageKernel(bool rebootIfChanged) {
+#ifdef PLATFORM_PI
+    static const std::string ACTIVE = "/boot/firmware/kernel_2712.img";
+    static const std::string PARKED = "/boot/firmware/kernel_2712.img.fpp-disabled";
+    if (!FileExists(PARKED)) {
+        return;
+    }
+    bool want = getRawSettingInt("Pi16KPageKernel", 0) != 0;
+    bool have = FileExists(ACTIVE);
+    std::error_code ec;
+    if (want && !have) {
+        // Copy to a temporary name first so a power cut mid-copy can't leave a
+        // truncated kernel_2712.img for the firmware to boot.
+        std::string tmp = ACTIVE + ".tmp";
+        std::filesystem::copy_file(PARKED, tmp, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) {
+            std::filesystem::rename(tmp, ACTIVE, ec);
+        }
+        if (ec) {
+            printf("FPP - Could not enable the 16K-page kernel: %s\n", ec.message().c_str());
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+        printf("FPP - Enabled the 16K-page kernel\n");
+    } else if (!want && have) {
+        // Park the active copy rather than deleting it: it is the one that
+        // matches the 16K module tree, should anything have updated it.
+        std::filesystem::rename(ACTIVE, PARKED, ec);
+        if (ec) {
+            printf("FPP - Could not disable the 16K-page kernel: %s\n", ec.message().c_str());
+            return;
+        }
+        printf("FPP - Disabled the 16K-page kernel\n");
+    } else {
+        return;
+    }
+    sync();
+    // Only the Pi 5 family loads kernel_2712.img; elsewhere the change is inert.
+    if (rebootIfChanged && isPi5()) {
+        printf("\n\nRebooting to load new settings.\n\n");
+        exec("/usr/sbin/reboot");
+    }
+#endif
+}
+
+void setupChannelOutputs() {
+#ifdef PLATFORM_PI
+    bool hasDPI = false;
+    bool hasRPIMatrix = false;
+    Json::Value v;
+    // Both files are read on every boot, and fppinit has no one to restart it:
+    // an entry with a field of the wrong JSON type is skipped, not thrown on.
+    auto isOutput = [](const Json::Value& co) {
+        return co.isObject() && co["type"].isConvertibleTo(Json::stringValue) &&
+               co["subType"].isConvertibleTo(Json::stringValue) && co["enabled"].isConvertibleTo(Json::intValue);
+    };
+    if (FileExists(FPP_MEDIA_DIR + "/config/channeloutputs.json")) {
+        if (LoadJsonFromString(GetFileContents(FPP_MEDIA_DIR + "/config/channeloutputs.json"), v, JsonRoot::Object)) {
+            const Json::Value& cos = v["channelOutputs"];
+            for (Json::ArrayIndex x = 0; cos.isArray() && x < cos.size(); x++) {
+                if (isOutput(cos[x]) && cos[x]["subType"].asString() == "RGBMatrix" && cos[x]["enabled"].asInt() == 1) {
+                    hasRPIMatrix = true;
+                }
+            }
+        }
+    }
+    if (FileExists(FPP_MEDIA_DIR + "/config/co-pixelStrings.json")) {
+        if (LoadJsonFromString(GetFileContents(FPP_MEDIA_DIR + "/config/co-pixelStrings.json"), v, JsonRoot::Object)) {
+            bool migrated = false;
+            for (Json::ArrayIndex x = 0; v["channelOutputs"].isArray() && x < v["channelOutputs"].size(); x++) {
+                if (!isOutput(v["channelOutputs"][x])) {
+                    continue;
+                }
+                if (v["channelOutputs"][x]["type"].asString() == "RPIWS281X") {
+                    // The RPIWS281X driver has been removed.  DPI drives the same pins without
+                    // conflicting with the onboard audio, so migrate the config to DPIPixels.
+                    // Capes we don't have a mapping for keep their subType; DPIPixels resolves
+                    // the matching string config at runtime.
+                    std::string subType = v["channelOutputs"][x]["subType"].asString();
+                    v["channelOutputs"][x]["type"] = "DPIPixels";
+                    if (subType == "PiHat") {
+                        v["channelOutputs"][x]["subType"] = "PiHat-DPIPixels";
+                    } else if (subType == "rPi-MFC") {
+                        v["channelOutputs"][x]["subType"] = "rPi-MFC-DPIPixels";
+                    } else if (subType == "rPi-28D") {
+                        // The rPi-28D's third output was ws2801 over SPI which DPI cannot drive.
+                        // The 4 output variant drives CN1's clock and data pins as WS281x instead.
+                        v["channelOutputs"][x]["subType"] = "rPi-28D-DPIPixels-4";
+                        Json::Value& outputs = v["channelOutputs"][x]["outputs"];
+                        for (Json::ArrayIndex o = 0; outputs.isArray() && o < outputs.size(); o++) {
+                            if (outputs[o].isObject() && outputs[o]["protocol"].isString() &&
+                                outputs[o]["protocol"].asString() == "ws2801") {
+                                outputs[o]["protocol"] = "ws2811";
+                            }
+                        }
+                    }
+                    migrated = true;
+                }
+                if (v["channelOutputs"][x]["type"].asString() == "DPIPixels" && v["channelOutputs"][x]["enabled"].asInt() == 1) {
+                    hasDPI = true;
+                }
+            }
+            if (migrated) {
+                PutFileContents(FPP_MEDIA_DIR + "/config/co-pixelStrings.json", SaveJsonToString(v));
+            }
+        }
+    }
+    bool changed = false;
+    // Only the RGBMatrix output still needs the onboard audio out of the way.  Pixel strings
+    // are driven by DPI now, which coexists with snd_bcm2835.
+    if (hasRPIMatrix) {
+        if (!FileExists("/etc/modprobe.d/blacklist-bcm2835.conf")) {
+            PutFileContents("/etc/modprobe.d/blacklist-bcm2835.conf", "blacklist snd_bcm2835");
+            changed = true;
+        }
+        // Preemptively load the USB sound driver so it will detect before snd-dummy is created
+        // and get the default card0 slot
+        exec("modprobe snd_usb_audio");
+
+        // load the dummy sound driver so things that expect a sound device to be there will still work
+        exec("modprobe snd-dummy");
+        exec("modprobe snd-seq-dummy");
+    } else {
+        if (FileExists("/etc/modprobe.d/blacklist-bcm2835.conf")) {
+            unlink("/etc/modprobe.d/blacklist-bcm2835.conf");
+        }
+        exec("modprobe snd-bcm2835");
+        exec("modprobe snd_usb_audio");
+    }
+    std::string content = GetFileContents("/boot/firmware/config.txt");
+    capVC4CMAForBoard(content, changed);
+    size_t idx = content.find("dtoverlay=vc4-kms-dpi-fpp");
+    std::string origLine = "";
+    if (idx != std::string::npos) {
+        size_t idx2 = content.find("\n", idx);
+        origLine = content.substr(idx, idx2 - idx);
+    }
+    if (hasDPI) {
+        // The DPI overlay only bootstraps the 1920-wide, 38.4MHz pipeline; its
+        // vertical resolution is just the boot/default mode.  DPIPixelsOutput
+        // overrides the vertical timing at runtime (sizing vactive to the longest
+        // string and setting the frame rate purely via the vertical blanking, no
+        // reboot).  Declare the tallest envelope we support - vactive=997 (the old
+        // 20fps mode, the lowest rate / longest string) - so every runtime mode is
+        // a subset of what the overlay advertises.
+        std::string width = "1920";
+        std::string height = "997";
+        std::string line = "dtoverlay=vc4-kms-dpi-fpp,rgb888,hactive=" + width + ",hfp=0,hsync=1,hbp=0,vactive=" + height + ",vfp=1,vsync=1,vbp=1";
+        if (line != origLine) {
+            if (origLine != "") {
+                content.replace(idx, origLine.size(), line);
+            } else {
+                content.append(line).append("\n");
+            }
+            PutFileContents("/boot/firmware/config.txt", content);
+            changed = true;
+        }
+    } else if (origLine != "") {
+        size_t idx2 = content.find("\n", idx);
+        content.erase(idx, idx2 - idx);
+        PutFileContents("/boot/firmware/config.txt", content);
+        changed = true;
+    }
+    if (changed) {
+        printf("\n\nRebooting to load new settings.\n\n");
+        exec("/usr/sbin/reboot");
+    }
+#endif
+}
+
+// Drive a GPIO line, looked up by the name the kernel exposes for it
+// (gpio-line-names in the device tree), to the given value.  Uses libgpiod
+// directly rather than the gpioset/gpioinfo tools whose command line and
+// output format changed incompatibly between libgpiod 1.x and 2.x.
+//
+// Like gpioset, the line is released as soon as the value has been written:
+// the pin keeps the level the driver last wrote to it.
+static bool setNamedGPIO(const std::string& pin, int val) {
+#ifdef HASGPIOD
+    bool found = false;
+    for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+        if (!entry.path().filename().string().starts_with("gpiochip")) {
+            continue;
+        }
+        std::string path = entry.path().string();
+        try {
+#ifdef IS_GPIOD_CXX_V2
+            gpiod::chip chip(path);
+            int offset = chip.get_line_offset_from_name(pin);
+            if (offset < 0) {
+                continue;
+            }
+            gpiod::line_settings settings;
+            settings.set_direction(gpiod::line::direction::OUTPUT);
+            settings.set_output_value(val ? gpiod::line::value::ACTIVE : gpiod::line::value::INACTIVE);
+            gpiod::line_request request = chip.prepare_request()
+                                              .set_consumer("FPPINIT")
+                                              .add_line_settings(offset, settings)
+                                              .do_request();
+            request.release();
+#else
+            gpiod::chip chip(path, gpiod::chip::OPEN_BY_PATH);
+            gpiod::line line = chip.find_line(pin);
+            if (!line) {
+                continue;
+            }
+            int offset = line.offset();
+            gpiod::line_request request;
+            request.consumer = "FPPINIT";
+            request.request_type = gpiod::line_request::DIRECTION_OUTPUT;
+            line.request(request, val);
+            line.release();
+#endif
+            printf("FPP - Set GPIO %s (%s line %d) to %d\n", pin.c_str(), path.c_str(), offset, val);
+            found = true;
+        } catch (const std::exception& ex) {
+            printf("FPP - Could not set GPIO %s on %s: %s\n", pin.c_str(), path.c_str(), ex.what());
+        }
+    }
+    if (!found) {
+        printf("FPP - Could not find a GPIO line named %s\n", pin.c_str());
+    }
+    return found;
+#else
+    printf("FPP - Cannot set GPIO %s, no libgpiod support\n", pin.c_str());
+    return false;
+#endif
+}
+
+void handleRebootActions() {
+    if (FileExists(FPP_MEDIA_DIR + "/tmp/cape-info.json")) {
+        Json::Value v;
+        if (LoadJsonFromString(GetFileContents(FPP_MEDIA_DIR + "/tmp/cape-info.json"), v)) {
+            if (v.isMember("rebootActions")) {
+                for (const auto& action : v["rebootActions"]) {
+                    if (action["type"].asString() == "gpio") {
+                        std::string pin = action["pin"].asString();
+                        if (pin.empty()) {
+                            continue;
+                        }
+                        int val = 0;
+                        if (pin[0] == '+') {
+                            pin = pin.substr(1);
+                            val = 1;
+                        }
+                        setNamedGPIO(pin, val);
+                    }
+                }
+            }
+        }
+    }
+}

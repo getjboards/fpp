@@ -1,31 +1,72 @@
-#include "Sensors.h"
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
 
+#include "fpp-pch.h"
 
-#include <iomanip>
-#include <iostream>
-#include <fstream>
+#include "fpp-json.h"
 
-#include <sys/types.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <fstream>
+#include <iomanip>
+#include <set>
+#include <thread>
 #include <unistd.h>
-#include <mutex>
 
+#include "../Warnings.h"
+#include "../common.h"
+#include "../settings.h"
 
-#include "common.h"
+#include "ADS7828.h"
+#include "IIOSensorSource.h"
+#include "MultiSensorSource.h"
+#include "MuxSensorSource.h"
+#include "util/I2CUtils.h"
 
+#include "Sensors.h"
 
-#ifdef PLATFORM_BBB
-#define I2C_DEV_PATH "/sys/bus/i2c/devices/i2c-2/new_device"
+#if defined(PLATFORM_BBB) || defined(PLATFORM_BB64)
+#define I2C_DEV 2
 #else
-#define I2C_DEV_PATH "/sys/bus/i2c/devices/i2c-1/new_device"
+#define I2C_DEV 1
 #endif
 
+static std::string exec(const std::string& cmd) {
+    std::array<char, 128> buffer;
+    std::string result;
+    struct PipeCloser { void operator()(FILE* f) const { if (f) pclose(f); } };
+    std::unique_ptr<FILE, PipeCloser> pipe(popen(cmd.c_str(), "r"));
+    if (!pipe) {
+        throw std::runtime_error("popen() failed!");
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
+
+SensorSource::SensorSource(Json::Value& s) {
+    if (s.isMember("id")) {
+        _id = s["id"].asString();
+    } else if (s.isMember("type")) {
+        _id = s["type"].asString();
+    }
+}
 
 class Sensor {
 public:
-    Sensor(Json::Value &s) {
-        label = s["label"].asString();
+    explicit Sensor(Json::Value& s) :
+        label(s["label"].asString()) {
         if (s.isMember("prefix")) {
             prefix = s["prefix"].asString();
         }
@@ -33,16 +74,23 @@ public:
             postfix = s["postfix"].asString();
         }
         if (s.isMember("precision")) {
-            postfix = s["precision"].asInt();
+            precision = s["precision"].asInt();
         }
         if (s.isMember("valueType")) {
             valueType = s["valueType"].asString();
         }
     }
     virtual ~Sensor() {}
+
+    Sensor(Sensor const&) = delete;
+    void operator=(Sensor const& x) = delete;
+
     virtual double getValue() = 0;
-    
-    void report(Json::Value &s) {
+    virtual SensorSource* getSensorSource() {
+        return nullptr;
+    }
+
+    void report(Json::Value& s) {
         std::unique_lock<std::mutex> lock(sensorLock);
         Json::Value v;
         v["label"] = label;
@@ -54,9 +102,9 @@ public:
 
         std::ostringstream stringStream;
         stringStream << prefix
-            << std::fixed << std::setprecision( precision )
-            << d
-            << postfix;
+                     << std::fixed << std::setprecision(precision)
+                     << d
+                     << postfix;
         v["formatted"] = stringStream.str();
         s.append(v);
     }
@@ -68,39 +116,138 @@ public:
     std::mutex sensorLock;
 };
 
+// I2C sensor addresses are hex with an optional 0x prefix (e.g. "0x48").
+// Manual checks (no new headers): anything else cannot be an address and must
+// never reach the shell command built in HasI2CDevice() below.
+static bool isValidI2CAddress(const std::string& a) {
+    size_t i = 0;
+    if (a.size() > 2 && a[0] == '0' && (a[1] == 'x' || a[1] == 'X')) {
+        i = 2;
+    }
+    if (i == a.size()) {
+        return false;
+    }
+    for (; i < a.size(); i++) {
+        char c = a[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 class I2CSensor : public Sensor {
 public:
-    I2CSensor(Json::Value &s) : Sensor(s), errcount(0) {
-        address = s["address"].asString();
-        path = s["path"].asString();
-        driver = s["driver"].asString();
+    explicit I2CSensor(Json::Value& s) :
+        Sensor(s),
+        address(s["address"].asString()),
+        path(s["path"].asString()),
+        driver(s["driver"].asString()),
+        file(-1) {
         if (s.isMember("multiplier")) {
             multiplier = s["multiplier"].asDouble();
         }
-        if (!FileExists(path)) {
-            //path doesn't exist, need to enable
-            std::ofstream out(I2C_DEV_PATH);
-            out << driver << " " << address;
-            out.close();
-        }
-        file = -1;
-    }
-    virtual ~I2CSensor() {
-        close(file);
-    }
-    virtual double getValue() override {
-        if (file == -1 && errcount < 10) {
-            //need to use low level calls for reading from sysfs
-            //to avoid any buffering that ifstream does
-            if (FileExists(path)) {
-                file = open(path.c_str(), O_RDONLY);
-                errcount++;
+        int bus = I2C_DEV;
+        if (!CheckForFile(path)) {
+            // path doesn't exist, need to enable
+            if (bus == 2 && !HasI2CDevice(bus)) {
+                // wasn't found on the default bus of the BBB, we can
+                // try the other i2c bus
+                bus = 1;
+                size_t start_pos = path.find("/i2c-2");
+                if (start_pos != std::string::npos) {
+                    path.replace(start_pos, 6, "/i2c-1");
+                }
+            }
+            if (HasI2CDevice(bus)) {
+                std::ofstream out("/sys/bus/i2c/devices/i2c-" + std::to_string(bus) + "/new_device");
+                out << driver << " " << address;
+                out.close();
             }
         }
+        int count = 0;
+        while (count < 5 && !CheckForFile(path)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            count++;
+        }
+        // after 0.5 seconds, still doesn't exist
+        if (CheckForFile(path)) {
+            file = open(path.c_str(), O_RDONLY);
+        } else if (HasI2CDevice(bus) && driver == "lm75") {
+            // Kernel 4.19 on Pi seems to not like the lm75 chips, we'll need to read the values directly
+            // switch to rawIO
+            int add = strtol(address.c_str(), nullptr, 16);
+            i2cUtils = new I2CUtils(bus, add);
+        }
+    }
+    bool CheckForFile(std::string& path) {
+        if (path.find("hwmon0") == std::string::npos) {
+            return FileExists(path);
+        }
+        // if it's a hwmon path, it MAY be on a different hwmon depending on the order that hwmon
+        // loads the drivers
+        std::string base = path.substr(0, path.find("hwmon0"));
+        std::string next = path.substr(path.find("hwmon0") + 6);
+        if (!DirectoryExists(base.c_str())) {
+            return false;
+        }
+        for (int x = 0; x < 10; x++) {
+            std::string npath = base + "hwmon" + std::to_string(x) + next;
+            if (FileExists(npath)) {
+                path = npath;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    virtual ~I2CSensor() {
         if (file != -1) {
+            close(file);
+        }
+        if (i2cUtils) {
+            delete i2cUtils;
+        }
+    }
+    bool HasI2CDevice(int i2cBus) {
+        // address comes from operator-editable sensors.json and is
+        // interpolated unquoted into a shell below. I2C addresses are hex
+        // (e.g. "0x48"), so anything else is rejected here; a rejection reads
+        // as "no device", the same outcome as a genuinely absent chip, and
+        // the bus-fallback/rawIO branches keep working off that signal.
+        if (!isValidI2CAddress(address)) {
+            return false;
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "i2cdetect -y -r %d %s %s", i2cBus, address.c_str(), address.c_str());
+        std::string result = exec(buf);
+        return result.find("--") == std::string::npos;
+    }
+
+    virtual double getValue() override {
+        if (i2cUtils) {
+            int ret = i2cUtils->readWordData(0);
+            if (ret >= 0) {
+                int t = (ret >> 8) & 0xFF;
+                t |= (ret << 8) & 0xFF00;
+                if (t & 0x8000) {
+                    // negative temperature
+                    t |= 0xFFFF0000;
+                }
+                t = t >> 5;
+                double d = t;
+                d *= 0.125;
+                return d;
+            }
+        } else if (file != -1) {
             lseek(file, 0, SEEK_SET);
-            char * buffer = new char [20];
-            int i = read(file, buffer, 20);
+            char buffer[20];
+            // Leave room for the terminator; a failed read must not index at
+            // [-1] and returns the same 0.0 as a missing file below.
+            int i = read(file, buffer, sizeof(buffer) - 1);
+            if (i <= 0) {
+                return 0.0;
+            }
             buffer[i] = 0;
             double d = atof(buffer);
             d *= multiplier;
@@ -108,28 +255,97 @@ public:
         }
         return 0.0;
     }
-    
+
     std::string address;
     std::string path;
     std::string driver;
     double multiplier = 1.0;
-    
+
+    I2CUtils* i2cUtils = nullptr;
     volatile int file;
-    volatile int errcount;
+};
+
+class SensorSourceSensor : public Sensor {
+public:
+    explicit SensorSourceSensor(Json::Value& s) :
+        Sensor(s) {
+        if (s.isMember("scale")) {
+            scale = s["scale"].asDouble();
+        }
+        if (s.isMember("offset")) {
+            offset = s["offset"].asDouble();
+        }
+        if (s.isMember("min")) {
+            min = s["min"].asDouble();
+            isMinMax = true;
+        }
+        if (s.isMember("max")) {
+            max = s["max"].asDouble();
+            isMinMax = true;
+        }
+        if (s.isMember("channel")) {
+            channel = s["channel"].asInt();
+        }
+        source = Sensors::INSTANCE.getSensorSource(s["sensor"].asString());
+        if (source) {
+            source->enable(channel);
+        }
+    }
+    virtual ~SensorSourceSensor() {
+    }
+    virtual SensorSource* getSensorSource() override {
+        return source;
+    }
+    virtual double getValue() override {
+        if (source) {
+            double d = source->getValue(channel);
+            d -= offset;
+            d *= scale;
+            if (isMinMax) {
+                d *= (max - min + 1);
+                d += min;
+            }
+            return d;
+        }
+        return 0.0f;
+    }
+    SensorSource* source = nullptr;
+    double scale = 1.0;
+    double offset = 0.0;
+    double min = 0.0;
+    double max = 0.0;
+    bool isMinMax = false;
+    int channel = 0;
 };
 
 class AINSensor : public Sensor {
 public:
-    AINSensor(Json::Value &s) : Sensor(s), errcount(0) {
-        address = s["address"].asString();
-        path = s["path"].asString();
+    explicit AINSensor(Json::Value& s) :
+        Sensor(s),
+        errcount(0),
+        address(s["address"].asString()),
+        path(s["path"].asString()),
+        file(-1) {
         if (s.isMember("max")) {
             max = s["max"].asDouble();
         }
         if (s.isMember("min")) {
             min = s["min"].asDouble();
         }
-        file = -1;
+        if (s.isMember("vScale")) {
+            vScale = s["vScale"].asFloat();
+        } else {
+#ifdef PLATFORM_BB64
+            std::string vs = GetFileContents("/sys/bus/iio/devices/iio:device0/in_voltage_scale");
+            vScale = std::atof(vs.c_str());
+            // original reference is 1.8V which for 12bit would be 0.439453125.
+            // If the cape doesn't specify a reference scale, we'll adjust and assume
+            // the params are based on 1.8 ref, but we're reading to 3.3V
+            vScale = vScale / 0.439453125;
+#else
+            vScale = 1.0f;
+#endif
+        }
     }
     virtual ~AINSensor() {
         close(file);
@@ -138,23 +354,29 @@ public:
     virtual double getValue() override {
         if (file == -1 && errcount < 10) {
             char path[256];
-            sprintf(path, "/sys/bus/iio/devices/iio:device0/in_voltage%s_raw", address.c_str());
-            //need to use low level calls for reading from sysfs
-            //to avoid any buffering that ifstream does
+            snprintf(path, sizeof(path), "/sys/bus/iio/devices/iio:device0/in_voltage%s_raw", address.c_str());
+            // need to use low level calls for reading from sysfs
+            // to avoid any buffering that ifstream does
             if (FileExists(path)) {
                 file = open(path, O_RDONLY);
-                errcount++;
+                errcount = errcount + 1;
             }
         }
 
         if (file != -1) {
             lseek(file, 0, SEEK_SET);
-            char * buffer = new char [20];
-            int i = read(file, buffer, 20);
+            char buffer[20];
+            // Leave room for the terminator: a full-size read leaves no room
+            // for buffer[i] = 0, and a failed read must not index at [-1].
+            int i = read(file, buffer, sizeof(buffer) - 1);
+            if (i <= 0) {
+                return 0.0;
+            }
             buffer[i] = 0;
             double d = atof(buffer);
-            
-            d /= 4096;  //12 bit a2d
+            d *= vScale;
+
+            d /= 4096; // 12 bit a2d
             d *= (max - min + 1);
             d += min;
             return d;
@@ -163,22 +385,344 @@ public:
         return 0.0;
     }
 
-    
     std::string address;
     std::string path;
     std::string driver;
     double min = 0.0;
     double max = 100.0;
-    
+    double vScale = 1.0;
+
     volatile int file;
     volatile int errcount;
 };
 
+class ThermalSensor : public Sensor {
+public:
+    explicit ThermalSensor(Json::Value& s) :
+        Sensor(s),
+        path(s["path"].asString()) {
+        file = open(path.c_str(), O_RDONLY);
+    }
+    virtual ~ThermalSensor() {
+        close(file);
+    }
+
+    virtual double getValue() override {
+        if (file != -1) {
+            lseek(file, 0, SEEK_SET);
+            char buffer[20];
+            int i = read(file, buffer, sizeof(buffer) - 1);
+            double d = 0;
+            if (i > 0) {
+                buffer[i] = 0;
+                d = std::atof(buffer);
+                d /= 1000;
+            }
+            return d;
+        }
+
+        return 0.0;
+    }
+
+    volatile int file;
+    std::string path;
+};
+
+class FanSensor : public Sensor {
+public:
+    explicit FanSensor(Json::Value& s) :
+        Sensor(s),
+        path(s["path"].asString()) {
+        file = open(path.c_str(), O_RDONLY);
+    }
+    virtual ~FanSensor() {
+        if (file != -1) close(file);
+    }
+
+    virtual double getValue() override {
+        if (file != -1) {
+            lseek(file, 0, SEEK_SET);
+            char buffer[20];
+            int i = read(file, buffer, sizeof(buffer) - 1);
+            double d = 0;
+            if (i > 0) {
+                buffer[i] = 0;
+                d = std::atof(buffer);
+            }
+            return d;
+        }
+
+        return 0.0;
+    }
+
+    volatile int file;
+    std::string path;
+};
 
 Sensors Sensors::INSTANCE;
 
-void Sensors::Init() {
-    
+Sensors::Sensors() {
+}
+// sensorSources is walked on the OutputMonitor and string tester threads and
+// appended to by getSensorSource() during an output reload (the default
+// "iio" source, created on first use).  Sources are never removed while
+// fppd runs.  Recursive: a source's constructor looks up the one it reads.
+static std::recursive_mutex sensorSourcesLock;
+
+Sensors::~Sensors() {
+    for (auto x : sensorSources) {
+        delete x;
+    }
+    sensorSources.clear();
+}
+void Sensors::Init(std::map<int, std::function<bool(int)>>& callbacks) {
+    for (auto it = sensorSources.rbegin(); it != sensorSources.rend(); ++it) {
+        (*it)->Init(callbacks);
+    }
+}
+
+void Sensors::addSensorSources(Json::Value& config) {
+    std::lock_guard<std::recursive_mutex> lk(sensorSourcesLock);
+    if (!config.isArray()) {
+        return;
+    }
+    for (int x = 0; x < config.size(); x++) {
+        // Read from the cape's config at startup: a source with a value of the
+        // wrong JSON type is skipped, as addSensors() does, not thrown on.
+        SensorSource* ss = nullptr;
+        try {
+            Json::Value v = config[x];
+            std::string type = v["type"].asString();
+            if (type == "ads7828" || type == "ads7830") {
+                ss = new ADS7828Sensor(v);
+            } else if (type == "iio") {
+                ss = new IIOSensorSource(v);
+            } else if (type == "mux") {
+                ss = new MuxSensorSource(v);
+            } else if (type == "multi") {
+                ss = new MultiSensorSource(v);
+            }
+        } catch (const std::exception& e) {
+            WarningHolder::InvalidConfigEntry("sensorSources", e.what());
+            continue;
+        }
+        if (ss && ss->isOK()) {
+            sensorSources.push_back(ss);
+        } else if (ss) {
+            WarningHolder::AddWarning(53, "Could not create SensorSource: " + ss->getID());
+            delete ss;
+        }
+    }
+}
+void Sensors::updateSensorSources(bool forceInstant) {
+    std::lock_guard<std::recursive_mutex> lk(sensorSourcesLock);
+    for (auto& ss : sensorSources) {
+        ss->update(forceInstant);
+    }
+}
+SensorSource* Sensors::getSensorSource(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> lk(sensorSourcesLock);
+    for (auto ss : sensorSources) {
+        if (ss->getID() == name) {
+            return ss;
+        }
+    }
+    if (name == "iio") {
+        // default the iio name if requested
+        Json::Value v;
+        v["type"] = "iio";
+        v["id"] = "iio";
+        SensorSource* ss = new IIOSensorSource(v);
+        if (ss->isOK()) {
+            sensorSources.push_back(ss);
+        } else {
+            WarningHolder::AddWarning(53, "Could not create SensorSource: " + ss->getID());
+            delete ss;
+            ss = nullptr;
+        }
+        return ss;
+    }
+    return nullptr;
+}
+void Sensors::lockToGroup(int i) {
+    std::lock_guard<std::recursive_mutex> lk(sensorSourcesLock);
+    for (auto ss : sensorSources) {
+        ss->lockToGroup(i);
+    }
+}
+
+void Sensors::DetectHWSensors() {
+    int i = 0;
+    char path[256] = { 0 };
+    snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
+    while (FileExists(path)) {
+        Json::Value v;
+        v["path"] = path;
+        v["valueType"] = "Temperature";
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", i);
+        if (FileExists(path)) {
+            int file = open(path, O_RDONLY);
+            if (file == -1) {
+                v["label"] = "CPU: ";
+            } else {
+                // Cap the read below the buffer so there is always room for
+                // the terminator; short/failed reads fall back like a missing
+                // type file instead of indexing out of bounds.
+                int r = read(file, path, sizeof(path) - 1);
+                close(file);
+                if (r <= 0) {
+                    v["label"] = "CPU: ";
+                } else {
+                    path[r] = 0;
+                    if (path[r - 1] == '\n') {
+                        path[r - 1] = 0; // remove trailing newline
+                        --r;
+                    }
+                    std::string label = path;
+                    // Each strip removes the suffix plus its separator, so only
+                    // strip when a non-empty prefix is left: an exact-length
+                    // match would otherwise index before the buffer.
+                    if ((endsWith(label, "thermal_zone") || endsWith(label, "thermal-zone")) && (int)label.size() > 13) {
+                        path[r - 13] = 0; // remove the "thermal_zone" suffix
+                    } else if (endsWith(label, "thermal") && (int)label.size() > 8) {
+                        path[r - 8] = 0; // remove the "thermal" suffix
+                    }
+                    bool hasUpper = false;
+                    for (int x = 0; path[x]; x++) {
+                        if (isupper(path[x])) {
+                            hasUpper = true;
+                        }
+                    }
+                    if (!hasUpper) {
+                        // convert to lower case
+                        for (int x = 0; path[x]; x++) {
+                            path[x] = toupper(path[x]);
+                        }
+                    }
+                    label = path;
+                    if (endsWith(label, "_THERMAL_ZONE")) {
+                        label = label.substr(0, label.size() - 13);
+                    } else if (endsWith(label, "_THERMAL")) {
+                        label = label.substr(0, label.size() - 8);
+                    }
+                    label += ": ";
+                    v["label"] = label;
+                }
+            }
+        } else {
+            v["label"] = "CPU: ";
+        }
+        sensors.push_back(new ThermalSensor(v));
+        i++;
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
+    }
+    DetectFanSensors();
+}
+void Sensors::DetectFanSensors() {
+    // A pwm-fan hwmon node exposes fanN_input even when no working fan is wired
+    // to it -- it just reads 0, which looks like a stalled fan. fppinit's
+    // boot-time probe (probeFanPresence in FPPINIT_Config.cpp) forces each fan on
+    // and records whether its tachometer actually reported RPM into
+    // media/tmp/fan_probe.json, keyed by "<hwmon name>:<fan index>". Skip the RPM
+    // sensor for any fan that probed as absent -- there is nothing useful to
+    // show. A missing file or entry means "unknown", so we register as before.
+    // fppinit only writes the probe file when it finds a fanN_input to probe, so
+    // a board with no tachometer-capable fan node -- the overwhelming majority --
+    // never has one.  That is the "unknown" case handled above, not a problem, so
+    // skip the load entirely rather than have it report the file as missing.
+    Json::Value fanProbe;
+    std::string fanProbeFile = FPP_DIR_MEDIA("/tmp/fan_probe.json");
+    if (FileExists(fanProbeFile)) {
+        LoadJsonFromFile(fanProbeFile, fanProbe, JsonRoot::Object);
+    }
+
+    for (int h = 0; h < 32; h++) {
+        char hwmonPath[256];
+        snprintf(hwmonPath, sizeof(hwmonPath), "/sys/class/hwmon/hwmon%d", h);
+        if (!DirectoryExists(hwmonPath)) {
+            break;
+        }
+
+        char namePath[256];
+        snprintf(namePath, sizeof(namePath), "%s/name", hwmonPath);
+        std::string deviceName = "hwmon" + std::to_string(h);
+        if (FileExists(namePath)) {
+            int f = open(namePath, O_RDONLY);
+            if (f != -1) {
+                char buf[64] = {0};
+                int r = read(f, buf, 63);
+                if (r > 0) {
+                    if (buf[r - 1] == '\n') buf[r - 1] = 0;
+                    deviceName = buf;
+                }
+                close(f);
+            }
+        }
+
+        // Pick the nicest available base name for the label:
+        //   1. a cape-supplied DT override:  of_node/fpp,fan-label   (e.g. "K16-Pro Fan")
+        //   2. the DT node name:             of_node/name            (e.g. Pi5 "cooling_fan")
+        //   3. the hwmon device name:        e.g. "pwmfan"
+        auto readDTString = [](const std::string& path) {
+            std::string s = FileExists(path) ? GetFileContents(path) : "";
+            // device-tree strings are NUL-terminated; trim NUL/whitespace
+            while (!s.empty() && (s.back() == '\0' || isspace((unsigned char)s.back())))
+                s.pop_back();
+            return s;
+        };
+        std::string baseName = readDTString(std::string(hwmonPath) + "/of_node/fpp,fan-label");
+        if (baseName.empty()) {
+            std::string nodeName = readDTString(std::string(hwmonPath) + "/of_node/name");
+            if (nodeName != "pwm-fan" && nodeName != "pwm_fan" && nodeName != "fan") {
+                // prettify, e.g. "cooling_fan" -> "Cooling Fan"
+                bool up = true;
+                for (auto& c : nodeName) {
+                    if (c == '_' || c == '-') { c = ' '; up = true; }
+                    else if (up && islower((unsigned char)c)) { c = toupper((unsigned char)c); up = false; }
+                    else up = false;
+                }
+                baseName = nodeName;
+            }
+        }
+        if (baseName.empty())
+            baseName = deviceName;
+
+        // count fans on this device so we only append an index when there's more than one
+        int fanCount = 0;
+        for (int f = 1; f <= 8; f++) {
+            char fp[256];
+            snprintf(fp, sizeof(fp), "%s/fan%d_input", hwmonPath, f);
+            if (FileExists(fp)) fanCount++;
+        }
+
+        for (int fan = 1; fan <= 8; fan++) {
+            char fanPath[256];
+            snprintf(fanPath, sizeof(fanPath), "%s/fan%d_input", hwmonPath, fan);
+            if (FileExists(fanPath)) {
+                Json::Value v;
+                v["path"] = fanPath;
+                v["valueType"] = "FanSpeed";
+                // "<base> Fan", skipping a redundant trailing "Fan", and adding the
+                // index only when the device actually has more than one fan
+                std::string label = baseName;
+                if (!(endsWith(label, "fan") || endsWith(label, "Fan") || endsWith(label, "FAN")))
+                    label += " Fan";
+                if (fanCount > 1)
+                    label += " " + std::to_string(fan);
+                v["label"] = label + ": ";
+                v["postfix"] = " RPM";
+
+                std::string probeKey = deviceName + ":" + std::to_string(fan);
+                if (fanProbe.isMember(probeKey) && !fanProbe[probeKey]["present"].asBool()) {
+                    LogInfo(VB_GENERAL, "Fan '%s' (%s) reported no tachometer signal when forced on at boot; suppressing RPM display\n",
+                            label.c_str(), probeKey.c_str());
+                    continue;
+                }
+                sensors.push_back(new FanSensor(v));
+            }
+        }
+    }
 }
 void Sensors::Close() {
     for (auto x : sensors) {
@@ -187,31 +731,54 @@ void Sensors::Close() {
     sensors.clear();
 }
 
-Sensor* Sensors::createSensor(Json::Value &s) {
+Sensor* Sensors::createSensor(Json::Value& s) {
     if (s["type"].asString() == "i2c") {
         return new I2CSensor(s);
     } else if (s["type"].asString() == "ain") {
         return new AINSensor(s);
+    } else if (s["type"].asString() == "sensor") {
+        return new SensorSourceSensor(s);
     }
     return nullptr;
 }
 
-void Sensors::addSensors(Json::Value &config) {
+void Sensors::addSensors(Json::Value& config) {
+    if (!config.isArray()) {
+        return;
+    }
     for (int x = 0; x < config.size(); x++) {
-        Json::Value v = config[x];
-        Sensor *sensor = createSensor(v);
-        if (sensor) {
-            sensors.push_back(sensor);
+        // A sensor with a value of the wrong JSON type threw out of its
+        // constructor at startup, to std::terminate; skip that one.  The
+        // constructors read all their fields before doing anything.
+        try {
+            Json::Value v = config[x];
+            Sensor* sensor = createSensor(v);
+            if (sensor) {
+                sensors.push_back(sensor);
+            }
+        } catch (const std::exception& e) {
+            WarningHolder::InvalidConfigEntry("sensors", e.what());
         }
     }
 }
 
-void Sensors::reportSensors(Json::Value &root) {
+void Sensors::reportSensors(Json::Value& root) {
     if (!sensors.empty()) {
-        Json::Value &s = root["sensors"];
+        std::set<SensorSource*> sensorSources;
+        Json::Value& s = root["sensors"];
         for (auto a : sensors) {
+            SensorSource* ss = a->getSensorSource();
+            if (ss) {
+                // only trigger updates on the sensor sources that
+                // actually report via the normal reporting and not
+                // all the sensor sources that may be used for
+                // current monitoring or other things
+                if (!sensorSources.contains(ss)) {
+                    ss->update(false);
+                    sensorSources.emplace(ss);
+                }
+            }
             a->report(s);
         }
     }
 }
-

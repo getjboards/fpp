@@ -58,10 +58,10 @@
 define('LIMONADE',              '0.5.0');
 define('LIM_NAME',              'Un grand cru qui sait se faire attendre');
 define('LIM_START_MICROTIME',   microtime(true));
-define('LIM_SESSION_NAME',      'LIMONADE'.str_replace('.','x',LIMONADE));
+//define('LIM_SESSION_NAME',      'LIMONADE'.str_replace('.','x',LIMONADE));
+define('LIM_SESSION_NAME',      false);
 define('LIM_SESSION_FLASH_KEY', '_lim_flash_messages');
-if(function_exists('memory_get_usage'))
-	define('LIM_START_MEMORY',      memory_get_usage());
+define('LIM_START_MEMORY',      memory_get_usage());
 define('E_LIM_HTTP',            32768);
 define('E_LIM_PHP',             65536);
 define('E_LIM_DEPRECATED',      35000);
@@ -71,59 +71,6 @@ define('ENV_PRODUCTION',        10);
 define('ENV_DEVELOPMENT',       100);
 define('X-SENDFILE',            10);
 define('X-LIGHTTPD-SEND-FILE',  20);
-
-# for PHP 5.3.0 <
-if(!defined('E_DEPRECATED'))         define('E_DEPRECATED',        8192);
-if(!defined('E_USER_DEPRECATED'))    define('E_USER_DEPRECATED',   16384);
-# for PHP 5.2.0 <
-if (!defined('E_RECOVERABLE_ERROR')) define('E_RECOVERABLE_ERROR', 4096);
-
-
-## SETTING BASIC SECURITY _____________________________________________________
-
-# A. Unsets all global variables set from a superglobal array
-
-/**
- * @access private
- * @return void
- */
-function unregister_globals()
-{
-  $args = func_get_args();
-  foreach($args as $k => $v)
-    if(array_key_exists($k, $GLOBALS)) unset($GLOBALS[$k]);
-}
-
-if(ini_get('register_globals'))
-{
-  unregister_globals( '_POST', '_GET', '_COOKIE', '_REQUEST', '_SERVER', 
-                      '_ENV', '_FILES');
-  ini_set('register_globals', 0);
-}
-
-# B. removing magic quotes
-
-/**
- * @access private
- * @param string $array 
- * @return array
- */
-function remove_magic_quotes($array)
-{
-  foreach ($array as $k => $v)
-    $array[$k] = is_array($v) ? remove_magic_quotes($v) : stripslashes($v);
-  return $array;
-}
-
-if (get_magic_quotes_gpc())
-{
-  $_GET    = remove_magic_quotes($_GET);
-  $_POST   = remove_magic_quotes($_POST);
-  $_COOKIE = remove_magic_quotes($_COOKIE);
-  ini_set('magic_quotes_gpc', 0);
-}
-
-if(function_exists('set_magic_quotes_runtime') && get_magic_quotes_runtime()) set_magic_quotes_runtime(false);
 
 # C. Disable error display
 #    by default, no error reporting; it will be switched on later in run().
@@ -370,7 +317,6 @@ function run($env = null)
 
   # 3. Loading libs
   require_once_dir(option('lib_dir'));
-  fallbacks_for_not_implemented_functions();
 
   # 4. Starting session
   if(!defined('SID') && option('session'))
@@ -519,8 +465,13 @@ function env($reset = null)
     $varname = "_$method";
     if ((isset($_SERVER['CONTENT_TYPE'])) && (strpos($_SERVER['CONTENT_TYPE'], 'application/json') === 0))
     {
-      // handle PUT/POST requests which have JSON in request body
-      $GLOBALS[$varname] = json_decode(file_get_contents('php://input'), true);
+      // handle PUT//POST requests which have JSON in request body
+      $decoded = json_decode(file_get_contents('php://input'), true);
+      // Always an array, like the request globals everywhere else: a body
+      // that is valid JSON but a scalar ("x", 42, true) left a scalar here,
+      // and request_method() then died on array_key_exists() before any
+      // route ran.  The handlers read the raw body when they want it.
+      $GLOBALS[$varname] = is_array($decoded) ? $decoded : array();
     }
     elseif($method == 'PUT' || $method == 'DELETE')
     {
@@ -906,7 +857,7 @@ function request_method($env = null)
 {
   if(is_null($env)) $env = env();
   $m = array_key_exists('REQUEST_METHOD', $env['SERVER']) ? $env['SERVER']['REQUEST_METHOD'] : null;
-  if($m == "POST" && array_key_exists('_method', $env['POST'])) 
+  if($m == "POST" && !is_null($env['POST']) && array_key_exists('_method', $env['POST'])) 
     $m = strtoupper($env['POST']['_method']);
   if(!in_array(strtoupper($m), request_methods()))
   {
@@ -1281,7 +1232,7 @@ function route_build($method, $path_or_array, $callback, $options = array())
 
   if($path[0] == "^")
   {
-    if($path{strlen($path) - 1} != "$") $path .= "$";
+    if($path[strlen($path) - 1] != "$") $path .= "$";
      $pattern = "#".$path."#i";
   }
   else if(empty($path) || $path == "/")
@@ -1592,7 +1543,7 @@ function txt($content_or_func, $layout = '', $locals = array())
 function json($data, $json_option = 0)
 {
   send_header('Content-Type: application/json; charset='.strtolower(option('encoding')));
-  return version_compare(PHP_VERSION, '5.3.0', '>=') ? json_encode($data, $json_option) : json_encode($data);
+  return json_encode($data, $json_option);
 }
 
 /**
@@ -1615,13 +1566,28 @@ function render_file($filename, $return = false)
   // {
   //   
   // }
-  $filename = str_replace('../', '', $filename);
-  if(file_exists($filename))
+   // Defense-in-depth: single-pass str_replace bypassable via ....// -> ../
+   $filename = str_replace(chr(0), '', $filename);
+   if (strpos($filename, '..') !== false) {
+       $rp = @realpath($filename);
+       if ($rp === false) halt(NOT_FOUND, "invalid path");
+       $filename = $rp;
+   }
+   if(file_exists($filename))
   {
     $content_type = mime_type(file_extension($filename));
     $header = 'Content-type: '.$content_type;
     if(file_is_text($filename)) $header .= '; charset='.strtolower(option('encoding'));
     send_header($header);
+    // Every config file the API serves comes through here, and none of them
+    // carried a validator of any kind -- no ETag, no Last-Modified -- so a
+    // client re-fetching an unchanged channel output or model config was sent
+    // the whole thing every time with no way to ask whether it needed to be.
+    // The tag comes from a stat(), so a client that is already current costs
+    // one stat and no read. Not applied when $return is set: that contract is
+    // "hand me the bytes", and the caller may not be sending them as the
+    // response at all.
+    if(!$return && function_exists('fppSendFileCacheValidators') && fppSendFileCacheValidators($filename)) return 0;
     return file_read($filename, $return);
   }
   else halt(NOT_FOUND, "unknown filename $filename");
@@ -2603,49 +2569,14 @@ function file_list_dir($dir)
 
 ## Extra utils  ________________________________________________________________
 
-if(!function_exists('array_replace'))
-{
-  /**
-   * For PHP 5 < 5.3.0 (backward compatibility)
-   * (from {@link http://www.php.net/manual/fr/function.array-replace.php#92549 this php doc. note})
-   * 
-   * @see array_replace()
-   * @param string $array 
-   * @param string $array1 
-   * @return $array
-   */
-  function array_replace( array &$array, array &$array1 )
-  {
-    $args  = func_get_args();
-    $count = func_num_args();
-
-    for ($i = 0; $i < $count; ++$i)
-    {
-      if(is_array($args[$i]))
-      {
-        foreach ($args[$i] as $key => $val) $array[$key] = $val;
-      }
-      else
-      {
-        trigger_error(
-          __FUNCTION__ . '(): Argument #' . ($i+1) . ' is not an array',
-          E_USER_WARNING
-        );
-        return null;
-      }
-    }
-    return $array;
-  }
-}
-
 /**
  * Check if a string is an url
  *
- * This implementation no longer requires 
- * {@link http://www.php.net/manual/en/book.filter.php the filter extenstion}, 
+ * This implementation no longer requires
+ * {@link http://www.php.net/manual/en/book.filter.php the filter extenstion},
  * so it will improve compatibility with older PHP versions.
  *
- * @param string $str 
+ * @param string $str
  * @return false, str   the string if true, false instead
  */
 function filter_var_url($str)
@@ -2654,54 +2585,6 @@ function filter_var_url($str)
   $options = array( "options" => array("regexp" => $regexp ));
   return preg_match($regexp, $str) ? $str : false;
 }
-
-
-/**
- * For PHP 5 < 5.1.0 (backward compatibility)
- * (from {@link http://www.php.net/manual/en/function.htmlspecialchars-decode.php#82133})
- * 
- * @param string $string 
- * @param string $quote_style, one of: ENT_COMPAT, ENT_QUOTES, ENT_NOQUOTES 
- * @return the decoded string
- */
-function limonade_htmlspecialchars_decode($string, $quote_style = ENT_COMPAT)
-{
-	$table = array_flip(get_html_translation_table(HTML_SPECIALCHARS, $quote_style));
-	if($quote_style === ENT_QUOTES)
-		$table['&#039;'] = $table['&#39;'] = '\'';
-	return strtr($string, $table);
-}
-
-if(!function_exists('htmlspecialchars_decode'))
-{
-	function htmlspecialchars_decode($string, $quote_style = ENT_COMPAT)
-	{
-		return limonade_htmlspecialchars_decode($string, $quote_style);
-	}
-}
-
-/**
- * Called just after loading libs, it provides fallback for some 
- * functions if they don't exists.
- *
- */
-function fallbacks_for_not_implemented_functions()
-{
-  if(!function_exists('json_encode'))
-  {
-    /**
-     * for PHP 5 < PHP 5.2.0
-     *
-     */
-    function json_encode()
-    {
-      trigger_error(
-        __FUNCTION__ . '(): no JSON functions available. Please provide your own implementation of ' . __FUNCTION__ . '() in order to use it.', E_USER_WARNING
-      );
-    }
-  }
-}
-
 
 
 #   ================================= END ==================================   #

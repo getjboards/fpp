@@ -1,0 +1,85 @@
+<?
+//stop settings javascript output in results
+$skipJSsettings = 1;
+// This file runs each command when called via the specified key
+// and returns the raw results
+
+require_once 'config.php';
+require_once 'common.php';
+
+putenv("PATH=/bin:/usr/bin:/sbin:/usr/sbin");
+
+$rtcDevice = "/dev/rtc0";
+$i2cDevice = "1";
+
+if ($settings['BeaglePlatform']) {
+    if (file_exists("/sys/class/rtc/rtc0/name")) {
+        $rtcname = file_get_contents("/sys/class/rtc/rtc0/name");
+        if (strpos($rtcname, "omap_rtc") !== false) {
+            $rtcDevice = "/dev/rtc1";
+        }
+    }
+    $i2cDevice = "2";
+} else if ($settings['Platform'] == "Raspberry Pi") {
+    if (file_exists("/sys/class/rtc/rtc0/name")) {
+        $drv = file_get_contents("/sys/class/rtc/rtc0/name");
+        if (str_contains($drv, ":rpi_rtc") && file_exists("/dev/rtc1")) {
+            // Raspberry Pi 5 RTC, we are configuring the cape clock which would be rtc1
+            $rtcDevice = "/dev/rtc1";
+        }
+    }
+}
+
+//Load commands from JSON
+LoadTroubleShootingCommands();
+
+foreach ($troubleshootingCommandGroups as $commandGrpID => $commandGrp) {
+
+    foreach ($commandGrp["commands"] as $commandKey => $commandID) {
+        $commands[$commandKey] = $commandID["cmd"];
+        $formats[$commandKey] = $commandID["format"] ?? "text";
+    }
+}
+
+//Process command and return result base on command key passed in URL
+$found = 0;
+if (isset($_GET['key'])) {
+    $key = $_GET['key'];
+    if (isset($commands[$key])) {
+        $found = 1;
+        $command = $commands[$key];
+        // Plain text unless the command says HTML: output can carry text a
+        // plugin or a hand-edited config file controls, and this URL can be
+        // opened on its own, outside the page that inserts it as text.
+        if ($formats[$key] != "html") {
+            header('Content-Type: text/plain; charset=utf-8');
+        }
+
+        ////////// Substitute PHP variables denoted by [[ variable name (without $) ]] in command string to allow accessing normal settings variables and any specials declared above
+        preg_match_all('/\[\[(.*?)\]\]/', $command, $matches);
+
+        foreach ($matches[1] as $value) {
+            $command = str_replace('[[' . $value . ']]', ${$value}, $command);
+        }
+        ////////
+
+        // fold is for reading text in a <pre>.  An HTML result is rendered, and
+        // fold hard-wraps runs with no spaces -- phpinfo's base64 logo, long
+        // attribute values -- which breaks the markup.
+        $fold = ($formats[$key] == "html") ? "" : " | fold -w 160 -s";
+        exec($SUDO . ' ' . "/bin/sh -c '" . $command . "' 2>&1" . $fold, $output, $return_val);
+        if ($return_val == 0) {
+            echo (implode("\n", $output) . "\n");
+        } else {
+            echo "Failed to return valid result";
+        }
+
+        unset($output);
+    }
+}
+
+if (!$found) {
+    echo ("Unknown Command");
+}
+
+?>

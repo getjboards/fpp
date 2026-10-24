@@ -1,173 +1,84 @@
-=============================================================================
-Instructions for creating a new FPP SD image package for the Raspberry Pi
-=============================================================================
+FPP Raspberry Pi Image Build
+=============================
 
-Install the latest Raspbian Stretch Lite image to the SD card.  The last
-version tested is 2018-06-27-raspbian-stretch-lite.zip
+The Raspberry Pi image builder produces flashable .img.zip files for both
+32-bit (armhf / "Pi") and 64-bit (arm64 / "Pi64") Raspbian Trixie Lite.
 
-Resize the root partition to 2.4GiB using fdisk (substitute the proper device
-for your SD card).
+The base image is the 2026-06 Raspberry Pi OS Trixie Lite release, which ships
+Linux 6.18 LTS out of the box -- so unlike earlier builds there is no longer a
+kernel-update step by default (see --kernel-update below). Note the base image
+URL uses two dates: the file is named 2026-06-18 but lives in a 2026-06-19
+directory; the script handles this via --base-image-dir-date.
 
-    fdisk /dev/sdg
-    p
-	(Note the original start block of partition 2, you will need this later)
-    d
-    2
-    n
-    p
-    2
-	(Replace 98304 with the original start block of partition 2 noted earlier)
-    98304
-	(FIXME, downsize this value once install is tested)
-    +3000M
-    p
-    w
+See SD/README.md for host requirements (qemu binfmt setup, build packages)
+and the full common-flag reference.
 
-FSCK and resize the root partition (again, use your device name.
+Quick start
+-----------
 
-    e2fsck -f /dev/sdg2
-    resize2fs /dev/sdg2
+64-bit (Pi3/4/5/Zero 2 -- recommended for new builds):
 
-Disable the auto partition resize script on the SD and enable the SSH server while
-we have the partition mounted:
+    sudo ./SD/build-image-pi.sh --arch arm64 --version 10.0-dev --use-local-src
 
-	# Make a temp mount location
-	mkdir /mnt/tmp
-	# Mount the boot partition
-	mount /dev/sdg1 /mnt/tmp
-	# Backup the cmdline.txt file
-	cp /mnt/tmp/cmdline.txt /mnt/tmp/cmdline.org
-	# Disable the auto-resize of the root partition
-	sed -i -e "s# init=/usr/lib/raspi-config/init_resize.sh##" /mnt/tmp/cmdline.txt
-	# Enable ssh by default
-	touch /mnt/tmp/ssh
-	# Unmount the file system
-	umount /mnt/tmp
-	# Sync the changes so it's safe to remove the SD card
-	sync
+32-bit (compatible with every Pi model including Pi 1 / Zero):
 
-Remove the SD card and boot it up in a Pi.
+    sudo ./SD/build-image-pi.sh --arch armhf --version 10.0-dev --use-local-src
 
-On the Pi, run the FPP installer:
-	wget -O ./FPP_Install.sh \
-		http://raw.githubusercontent.com/FalconChristmas/fpp/master/SD/FPP_Install.sh
-	chmod 700 ./FPP_Install.sh
-	sudo ./FPP_Install.sh --build-omxplayer
+Output:
+    output/FPP-v10.0-dev-Pi64.img.zip    (or -Pi.img.zip for armhf)
+    output/Pi64-10.0-dev_2026-04.fppos   (or Pi-... for armhf)
 
-This will install FPP and perform all required changes to the root filesystem
-and add the FPP user, install required packages, etc.
+Pi-specific flags
+-----------------
 
-If you are installing for your own use, you can reboot the Pi and FPP should start
-up.
+  --arch {armhf|arm64}         Target architecture. Default: armhf.
+                               armhf -> FPP-vX-Pi.img.zip
+                               arm64 -> FPP-vX-Pi64.img.zip
 
-	su - fpp
-	sudo shutdown -r now
+  --skip-kernel-update         Skip rpi-update of the kernel. This is now the
+                               DEFAULT: the 2026-06 Trixie base image already
+                               ships Linux 6.18 LTS (kernel 6.18.34), which is
+                               what FPP10 requires. Flag kept for explicitness.
 
-If you are installing to create a SD image zip, do the following:
-    If you did the above on a armv7 Pi, you will need to boot the new image up
-    on a armv6 device (or vice versa) to compile the Wifi drivers for the other
-    architecture/kernel.  Boot up and then run:
-    cd /opt/fpp/SD
-    sudo ./FPP-Wifi-Drivers.sh
+  --kernel-update              Force the rpi-update kernel step back ON. The
+                               whole rpi-update path is retained (just disabled)
+                               for the next time RPi ships a base image whose
+                               stock kernel predates the LTS FPP needs.
 
+What the script does
+--------------------
 
-	# Reboot to make sure things take
-	sudo shutdown -r now
+1. Downloads (and caches) the latest Raspbian Trixie Lite base image for the
+   chosen architecture from downloads.raspberrypi.com.
+2. Loop-mounts it, grows partition 2 to fill the target image size, and
+   resize2fs's the rootfs.
+3. Disables Raspbian's first-boot mechanism in cmdline.txt (FPP creates the
+   fpp user itself; first-boot would prompt the user instead).
+4. (Only with --kernel-update) Pre-stages a fresh rpi-update from upstream
+   (the in-chroot self-update over qemu-arm hits TLS issues), then resolves
+   the firmware branch -> commit SHA on the host. Skipped by default now that
+   the base image already ships 6.18 LTS.
+5. Bind-mounts dev/proc/sys, fresh tmpfs at /run, copies qemu-user-static
+   into the image, then chroots and runs:
+     - apt-get update + upgrade
+     - SD/FPP_Install.sh --img --yes --branch ${FPPBRANCH}
+     - (Only with --kernel-update) rpi-update <SHA> with PRUNE_MODULES=1
+       WANT_PI5=1 SKIP_BACKUP=1 SKIP_BOOTLOADER=1 SKIP_VCLIBS=1 SKIP_SDK=1,
+       followed by old-kernel cleanup (modules + headers)
+     - 16K-page Pi5 kernel out of the boot path so the Pi5 boots the 4K
+       kernel8.img -- always done, FPP libs dislike 16K pages. 32-bit images
+       delete kernel_2712.img and its modules; 64-bit images rename it to
+       kernel_2712.img.fpp-disabled and keep its modules, and the
+       developer-level "Use 16K-Page Kernel" setting copies it back
+     - apt clean, log/key/machine-id reset, etc.
+6. Touches /boot/firmware/fpp_expand_rootfs (FPP first-boot expand marker).
+7. Drops the chroot bind mounts, mksquashfs's the rootfs into a .fppos.
+8. zerofree's the rootfs, detaches the loop, zips the .img, moves to output/.
 
-	Once the Pi reboots, login as the new fpp user and run the following:
+Manual workflow (legacy)
+------------------------
 
-	# Reset the SSH keys
-	sudo rm -rf /etc/ssh/ssh_host*key*
-	# Remove old pi user's home directory
-	sudo rm -rf /home/pi
-	# Clean up fppd logs
-	sudo systemctl stop fppd.service
-	sudo systemctl stop apache2.service
-	cd /home/fpp/media/logs ; ls -al ; /bin/ls -1 | while read FILE; do > ${FILE}; done ; ls -al
-	# Zero out free space so the SD image will compress better
-	sudo dd if=/dev/zero of=zero.dd bs=4M ; sudo rm zero.dd ; df -k
-	# Shutdown the Pi
-	sudo shutdown -h now
-
-Put the SD card back in a Linux system and run the following (substitute
-the proper device name for your SD card in place of '/dev/sdg'):
-
-	NOTE: The 3000 on the "BLOCK=" line below must match the new size of the
-	      second partition created at the top of this document using fdisk.
-
-	VERSION=v2.x-Pi
-	BLOCKS=$(echo "(50 + 3000) / 4" | bc)
-	sudo time dd if=/dev/sdg bs=4M count=${BLOCKS} > FPP-${VERSION}.img
-	time zip -9 FPP-$VERSION.zip FPP-${VERSION}.img
-	unzip -v FPP-$VERSION.zip
-
-This will create a file called FPP-${VERSION}.zip that can be distributed
-for testing/release.
-
-=============================================================================
-
-ALPHA set of instructions for switching Pi root file system to btrfs. The
-current SD images will still use ext4.
-
-NOTE: There are several known issues with this, including the fact that
-upgrading the kernel will prevent the Pi from booting because the initrd may
-not be rebuilt and the initrd filename in config.txt will be incorrect.
-
-# update /boot/cmdline.txt to change root location to "root=/dev/mmcblk0p2"
-
-sudo apt-get update
-sudo apt-get -y install btrfs-tools btrfs-progs
-
-# append "btrfs" to /etc/initramfs-tools/modules
-echo "btrfs" | sudo tee -a /etc/initramfs-tools/modules
-
-#make sure we have the latest supported bootloader and kernel
-sudo apt-get dist-upgrade -y
-sudo apt-get install --reinstall raspberrypi-bootloader raspberrypi-kernel
-
-sudo update-initramfs -c -k `uname -r`
-
-# update /boot/config.txt to add 'initramfs initrd.img-4.14.18+' (or correct
-# kernel version) to the end of the file
-
-# reboot to make sure system still boots correctly
-
-# now copy /dev/mmcblk0p2, reformat as btfs, mount with compress option,
-# and copy data back.  NOTE: This should be done on a newer system so that
-# 'zstd' compression is used instead of zlib or lzo
-
-sudo mkfs.btrfs -L root -f /dev/sdg2
-sudo mount -o compress /dev/sdg2 /mnt/tmp
-
-sudo losetup /dev/loop0 ${IMGFILE}
-sudo kpartx -av /dev/loop0
-sudo mount /dev/mapper/loop0p2 /mnt/tmp2
-sudo rsync -avxHW /mnt/tmp2/ /mnt/tmp/
-sudo umount /mnt/tmp2
-sudo kpartx -d /dev/loop0
-sudo losetup -d /dev/loop0
-
-# update /mnt/tmp/etc/fstab to set btrfs filesystem and compress mount option
-/dev/mmcblk0p2  /               btrfs   compress=zstd,noatime  0    1
-
-# also update /boot to read-only at the same time.
-
-sudo umount /mnt/tmp
-
-# boot the SD up in the Pi
-
-TODO
-- setup something to rebuild the initrd and update /boot/config.txt whenever a
-  new kernel is installed.
-
-
-Attempt to expand root filesystem to fill SD card
-sudo sfdisk --force --no-reread /dev/mmcblk0 <<-EOF
-8192,85045,0x0C,*
-94208,,,-
-EOF
-
-sudo partprobe /dev/mmcblk0
-
-sudo btrfs filesystem resize max /
-
+The hand-driven workflow that this script automates is preserved in git
+history: see commits prior to the introduction of build-image-pi.sh, or
+inspect the build-image-pi.sh script itself -- each phase comment quotes
+the original README step it replaces.

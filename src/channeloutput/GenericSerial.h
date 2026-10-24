@@ -1,61 +1,43 @@
+#pragma once
 /*
- *   Generic Serial handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _GENERICSERIAL_H
-#define _GENERICSERIAL_H
-
 #include <string>
+#include "fpp-json-fwd.h"
 
-#include "ThreadedChannelOutputBase.h"
+#include "SerialChannelOutput.h"
+#include "ThreadedChannelOutput.h"
 
 #define GENERICSERIAL_MAX_CHANNELS 2048
 
-class GenericSerialOutput : public ThreadedChannelOutputBase {
-  public:
-	GenericSerialOutput(unsigned int startChannel, unsigned int channelCount);
-	~GenericSerialOutput();
+class GenericSerialOutput : public ThreadedChannelOutput, SerialChannelOutput {
+public:
+    GenericSerialOutput(unsigned int startChannel, unsigned int channelCount);
+    virtual ~GenericSerialOutput();
 
-	int Init(char *configStr);
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-	int Close(void);
+    virtual int RawSendData(unsigned char* channelData) override;
 
-	int RawSendData(unsigned char *channelData);
+    virtual void DumpConfig(void) override;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
 
-	void DumpConfig(void);
-    virtual void GetRequiredChannelRange(int &min, int & max);
-
-  private:
-	std::string m_deviceName;
-	int         m_fd;
-	int         m_speed;
-	int         m_headerSize;
-	std::string m_header;
-	int         m_footerSize;
-	std::string m_footer;
-	int         m_packetSize;
-	char       *m_data;
+private:
+    int m_speed;
+    int m_headerSize;
+    std::string m_header;
+    int m_footerSize;
+    std::string m_footer;
+    int m_packetSize;
+    char* m_data;
 };
-
-#endif /* #ifdef _GENERICSERIAL_H */

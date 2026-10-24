@@ -1,0 +1,65 @@
+# This docker-compose-dev.yml file is suited for developers wishing to
+# build or develop FPP without using the docker container image on
+# dockerhub.  docker-compose-dev.yml is run directly from the cloned
+# fpp source.  To use the pre-built image, use docker-compose.yml and
+# read the notes included at the top of that file for setup.
+
+# The `context` and 'volumes' directives are relative to THIS directory, while
+# the `dockerfile` directive is relative to the `context` directory.  For best
+# results, run the `docker-compose` command in the fpp/ root directory.
+#
+# Additionally, you should NOT have a node_modules folder under www/ as the
+# node_nodules binaries need to be from the container.
+#
+# fpp> FPPBRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+#      docker-compose -f Docker/docker-compose-dev.yml up --build
+
+services:
+  fpp:
+    build:
+      args:
+        EXTRA_INSTALL_FLAG: --skip-clone
+        FPPBRANCH: ${FPPBRANCH}
+      context: ../
+      dockerfile: ./Docker/Dockerfile
+    hostname: fpp-docker
+    volumes:
+      - ../:/opt/fpp
+    restart: always
+    ports:
+      - "8080:80/tcp"
+      - "4048:4048/udp"
+      - "5568:5568/udp"
+      - "32320:32320/udp"
+      #devices:
+      # To pass through an audio card, entries similar to the following
+      # should work.  The device names may be different depending on
+      # how many sound cards are present in the host system.  The 'C0'
+      # portion of the file names is Card 0, 'D0' is Device 0.
+      #- /dev/snd/controlC0
+      #- /dev/snd/pcmC0D0c
+      #- /dev/snd/pcmC0D0p
+      #- /dev/snd/seq
+      #- /dev/snd/timer
+    cap_add:
+      - SYS_PTRACE
+      - SYS_NICE
+    networks:
+      default:
+        aliases:
+          - fpp-docker
+
+  node:
+    build:
+      context: ../
+      dockerfile: ./Docker/Dockerfile.node
+    command: /bin/sh -c "( /bin/ln -f -s /opt/node_modules /opt/fpp/www/;
+      /opt/node_modules/.bin/gulp -f /opt/fpp/www/gulpfile.js watch-bs; )"
+    restart: always
+    volumes:
+      - ../:/opt/fpp
+    ports:
+      - "3180:3180/tcp"
+      - "3181:3181/tcp"
+      - "3182:3182/tcp"
+      - "3183:3183/tcp"

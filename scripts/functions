@@ -1,615 +1,70 @@
 #!/bin/bash
 
-#############################################################################
-# Setup default /etc/network/interfaces and wpa_supplicant.conf files
-SetupDefaultNetworkConfig () {
-	if [ ! -f "/etc/network/interfaces.default" ]
-	then
-		cat <<-EOF > /etc/network/interfaces.default
-		auto lo
-		iface lo inet loopback
 
-		allow-hotplug eth0
-
-		iface eth0 inet dhcp
-
-		iface wlan0 inet dhcp
-		  wpa-roam /etc/wpa_supplicant/wpa_supplicant.conf
-
-		iface eth0:0 inet static
-		  address 192.168.0.10
-		  netmask 255.255.255.0
-		  network 192.168.0.0
-		EOF
-	fi
-
-	cp /etc/network/interfaces.default /etc/network/interfaces
-
-	if [ ! -f "/etc/wpa_supplicant/wpa_supplicant.conf.default" ]
-	then
-		cat <<-EOF > /etc/wpa_supplicant/wpa_supplicant.conf.default
-		ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-		update_config=1
-		EOF
-	fi
-
-	cp /etc/wpa_supplicant/wpa_supplicant.conf.default /etc/wpa_supplicant/wpa_supplicant.conf
-
-	persistent_net_rules="/etc/udev/rules.d/70-persistent-net.rules"
-	[ $persistent_net_rules ] && sed -i '/ NAME="wlan/d' $persistent_net_rules
-
-	if [ ! -f "/etc/resolv.conf.default" ]
-	then
-		touch /etc/resolv.conf.default
-	fi
-
-	cp /etc/resolv.conf.default /etc/resolv.conf
-}
-
-#############################################################################
-# netcalc function found online on linuxquestions.org
-# http://www.linuxquestions.org/questions/programming-9/bash-cidr-calculator-646701/
-netcalc(){
-	local IFS='.' ip i
-	local -a oct msk
-
-	read -ra oct <<<"$1"
-	read -ra msk <<<"$2"
-
-	for i in ${!oct[@]}; do
-		ip+=( "$(( oct[i] & msk[i] ))" )
-	done
-
-	echo "${ip[*]}"
-}
-
-
-SetupFPPNetworkConfigViaConnMann() {
-
-    CONFIGS=`ls ${FPPHOME}/media/config/interface.w*; ls ${FPPHOME}/media/config/interface.e*`
-
-    DEFGW="none"
-    DNS1=""
-    DNS2=""
-    if [ -f "${FPPHOME}/media/config/dns" ]
-    then
-        . ${FPPHOME}/media/config/dns
-    fi
-    DNS=""
-    if [ "x$DNS1" != "x" ]
-    then
-        DNS="$DNS1"
-    fi
-    if [ "x$DNS2" != "x" ]
-    then
-        DNS="$DNS1,$DNS2"
-    fi
-
-    TMPFILE="/var/tmp/fpp.config"
-    rm -f ${TMPFILE}
-
-    for f in $CONFIGS; do
-	unset SSID
-	unset PSK
-	unset INTERFACE
-	unset MAC
-	unset HIDDEN
-	unset PROTO
-	unset GATEWAY
-	unset NETMASK
-	unset ADDRESS
-    unset DOWAIT
-        . ${f}
-
-
-        DOWAIT=0
-        echo "[service_$INTERFACE]" >> ${TMPFILE}
-        if [ "x$SSID" != "x" ]
-        then
-            echo "Name=${SSID}" >> $TMPFILE
-            DOWAIT=1
-        fi
-        if [ "x$PSK" != "x" ]
-        then
-            echo "Security=psk" >> $TMPFILE
-            echo "Passphrase=${PSK}" >> $TMPFILE
-            DOWAIT=1
-        fi
-
-        if [[ "$INTERFACE" == "wlan"* ]] ; then
-            echo "Type=wifi"  >> $TMPFILE
-            if [ "$HIDDEN" == "1" ]; then
-                echo "Hidden=true" >> $TMPFILE
-            fi
-        else
-            echo "Type=ethernet"  >> $TMPFILE
-        fi
-        if [ "$PROTO" = "dhcp" ]; then
-            echo "IPv4=dhcp"  >> $TMPFILE
-            if [ "x$DNS" != "x" ]; then
-                echo "Nameservers=${DNS}" >> $TMPFILE
-            fi
-        else
-            DOWAIT=1
-            if [ "x$GATEWAY" != "x" ]; then
-                DEFGW="$GATEWAY"
-                echo "IPv4=$ADDRESS/$NETMASK/$GATEWAY" >> $TMPFILE
-                if [ "x$DNS" != "x" ]; then
-                    echo "Nameservers=${DNS}" >> $TMPFILE
-                fi
-            elif [ "$DEFGW" == "none" ]; then
-                echo "IPv4=$ADDRESS/$NETMASK" >> $TMPFILE
-            else
-                echo "IPv4=$ADDRESS/$NETMASK/$DEFGW" >> $TMPFILE
-            fi
-        fi
-        if [ "$DOWAIT" == "1" ]; then
-            for i in {1..10}
-            do
-                # wait up to 10 seconds for interface to become available
-                if [ ! -f "/sys/class/net/${INTERFACE}/address" ]; then
-                    echo "Waiting for ${INTERFACE} to be available..."
-                    sleep 1
-                fi
-            done
-        fi
-        if [ -f "/sys/class/net/${INTERFACE}/address" ]; then
-            MACA=$(<"/sys/class/net/${INTERFACE}/address")
-            echo "MAC=${MACA}" >> $TMPFILE
-        fi
-
-        echo ""  >> $TMPFILE
-        echo ""  >> $TMPFILE
-    done
-    rm -rf /var/lib/connman/wifi_*
-    rm -rf /var/lib/connman/ethernet_*
-    rm -f /var/lib/connman/fpp.config
-    if [ -f "$TMPFILE" ]; then
-        cp $TMPFILE /var/lib/connman/fpp.config
-    fi
-    TetherEnabled=$(getSetting EnableTethering)
-    if [ "$TetherEnabled" != "1" ]; then
-        # make sure tethering is off
-        sed -i -e 's/Tethering=true/Tethering=false/g' /var/lib/connman/settings
-        if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-            check_dnsmasq=$(systemctl is-enabled dnsmasq.service || true)
-            if [ "x${check_dnsmasq}" = "xdisabled" ] ; then
-                systemctl enable dnsmasq &
-            fi
-        fi
-    elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-        check_dnsmasq=$(systemctl is-enabled dnsmasq.service || true)
-        if [ "x${check_dnsmasq}" = "xenabled" ] ; then
-            systemctl disable dnsmasq &
-        fi
-    fi
-
-    #ifconfig -a > /var/tmp/conm.txt
-    #ls -l /sys/class/net/ >>  /var/tmp/conm.txt
-    # connmanctl services > /var/tmp/services.txt
-}
 
 
 #############################################################################
-# Create our version of /etc/network/interfaces and wpa_supplicant.conf files
-SetupFPPNetworkConfigViaInterfaces () {
-
-	if [ ! -f "${FPPHOME}/media/config/interface.eth0" -a ! -f "${FPPHOME}/media/config/interface.wlan0" ]
-	then
-		echo "FPP - Using default network config"
-		return
-	fi
-
-	echo "FPP - Configuring Network"
-
-	TMPFILE="/etc/network/interfaces.FPP"
-	INITETH0="no"
-	UPWLAN0="no"
-
-	cat <<-EOF > ${TMPFILE}
-	auto lo
-	iface lo inet loopback
-
-	EOF
-
-	PROTO="dhcp"
-	if [ -f "${FPPHOME}/media/config/interface.eth0" ]
-	then
-		. ${FPPHOME}/media/config/interface.eth0
-	fi
-
-	kill -9 $(ps auxw | grep ifplugd | grep -v grep | grep eth0 | awk '{print $2}') > /dev/null 2>&1
-
-	if [ "x${PROTO}" = "xdhcp" ]
-	then
-		cat <<-EOF >> ${TMPFILE}
-		auto eth0
-		iface eth0 inet dhcp
-		EOF
-	else
-		# Re-initialize eth0 since it is not using DHCP
-		INITETH0="yes"
-
-		kill -9 $(ps auxw | grep dhclient | grep -v grep | grep eth0 | awk '{print $2}') > /dev/null 2>&1
-
-		NETWORK=$(netcalc ${ADDRESS} ${NETMASK})
-
-		cat <<-EOF >> ${TMPFILE}
-		auto eth0
-		iface eth0 inet static
-		  address ${ADDRESS}
-		  netmask ${NETMASK}
-		  network ${NETWORK}
-		EOF
-
-		if [ "x${GATEWAY}" != "x" ]
-		then
-			echo "  gateway ${GATEWAY}" >> ${TMPFILE}
-		fi
-	fi
-
-	echo >> ${TMPFILE}
-
-	if [ -f "${FPPHOME}/media/config/interface.wlan0" ]
-	then
-		UPWLAN0="yes"
-
-		. ${FPPHOME}/media/config/interface.wlan0
-
-		kill -9 $(ps auxw | grep ifplugd | grep -v grep | grep wlan0 | awk '{print $2}') > /dev/null 2>&1
-
-		if [ "x${PROTO}" = "xdhcp" ]
-		then
-			cat <<-EOF >> ${TMPFILE}
-			allow-hotplug wlan0
-			iface wlan0 inet manual
-			  wpa-roam /etc/wpa_supplicant/wpa_supplicant.conf
-			wireless-power off
-
-			iface FPP-wlan0 inet dhcp
-
-			EOF
-		else
-			NETWORK=$(netcalc ${ADDRESS} ${NETMASK})
-
-			kill -9 $(ps auxw | grep dhclient | grep -v grep | grep wlan0 | awk '{print $2}') > /dev/null 2>&1
-
-			cat <<-EOF >> ${TMPFILE}
-			allow-hotplug wlan0
-			iface wlan0 inet manual
-			  wpa-roam /etc/wpa_supplicant/wpa_supplicant.conf
-			wireless-power off
-
-			iface FPP-wlan0 inet static
-			  address ${ADDRESS}
-			  netmask ${NETMASK}
-			  network ${NETWORK}
-			EOF
-
-			if [ "x${GATEWAY}" != "x" ]
-			then
-				echo "  gateway ${GATEWAY}" >> ${TMPFILE}
-			fi
-
-			echo >> ${TMPFILE}
-			echo "iface default inet dhcp" >> ${TMPFILE}
-		fi
-		echo >> ${TMPFILE}
-
-		cat <<-EOF > /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-		update_config=1
-
-		network={
-		  ssid="${SSID}"
-		EOF
-
-		if [ "x${PSK}" != "x" ]
-		then
-			echo "  psk=\"${PSK}\"" >> /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		else
-			echo "  key_mgmt=NONE" >> /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		fi
-
-		cat <<-EOF >> /etc/wpa_supplicant/wpa_supplicant.conf.FPP
-		  scan_ssid=1
-		  id_str="FPP-wlan0"
-		}
-
-		EOF
-
-		cp /etc/wpa_supplicant/wpa_supplicant.conf.FPP /etc/wpa_supplicant/wpa_supplicant.conf
-	fi
-
-	cat <<-EOF >> ${TMPFILE}
-	iface eth0:0 inet static
-	  address 192.168.0.10
-	  netmask 255.255.255.0
-	  network 192.168.0.0
-	EOF
-
-	echo >> ${TMPFILE}
-
-	cp ${TMPFILE} /etc/network/interfaces
-
-	if [ "x${INITETH0}" = "xyes" ]
-	then
-		echo "FPP - Taking eth0 down"
-		ifdown eth0 > /dev/null 2>&1
-
-		echo "FPP - Bringing eth0 back up"
-		ifup eth0
-	fi
-
-	if [ "x${UPWLAN0}" = "xyes" ]
-	then
-		echo "FPP - Taking wlan0 down"
-		ifdown wlan0 > /dev/null 2>&1
-
-		#wpa_cli reconfigure > /dev/null 2>&1
-
-		echo "FPP - Bringing wlan0 up"
-		ifup wlan0 > /dev/null 2>&1
-
-		# Shouldn't need this since we have "wireless-power off" but leave it
-		# in here just in case for now.
-		#echo "FPP - Disabling power management on wlan0"
-		#iwconfig wlan0 power off > /dev/null 2>&1
-	else
-		if [ "x${SSID}" = "x" ]
-		then
-			echo "FPP - Empty SSID, taking wlan0 down"
-			ifdown wlan0 > /dev/null 2>&1
-		fi
-	fi
+# Serialize git operations that mutate the ${FPPDIR} repository.
+#
+# The FPP clone is configured with pull.rebase=true, so a plain "git pull"
+# rebases. A rebasing pull picks its target from FETCH_HEAD, and if a second
+# "git fetch" writes FETCH_HEAD at the same instant (e.g. the About page's
+# pending-changes panel runs scripts/git_fetch while the user clicks Upgrade)
+# FETCH_HEAD can momentarily hold more than one "for-merge" line -- at which
+# point git aborts the upgrade with:
+#     fatal: Cannot rebase onto multiple branches.
+# The pull paths below now fetch and then rebase onto the remote-tracking ref
+# (git rebase origin/<branch> does NOT consult FETCH_HEAD, so it is immune to
+# that race and to any stray multi-value branch.<name>.merge config). As an
+# extra guard, every repo-mutating git call is serialized through this lock so
+# concurrent fetches cannot collide on ref locks either.
+#
+# The lock lives under the media dir (NOT /tmp) so it is shared across apache
+# and the shell even when the web server runs with systemd PrivateTmp.
+gitRepoLockFile() {
+    echo "${MEDIADIR}/tmp/fpp-git-repo.lock"
 }
-SetupFPPNetworkConfig () {
-    if [ -f "/usr/bin/connmanctl" -o -f "/usr/sbin/connmanctl" ]
-    then
-        SetupFPPNetworkConfigViaConnMann
+
+# runGitLocked "<sh command string>"
+#   Run the command string (via sh -c) while holding an exclusive lock on the
+#   FPP git repo, waiting up to 300s for the lock rather than failing outright.
+#   The whole thing runs under ${SUDO} so the lock file is always opened by the
+#   same (root) user; falls back to running unlocked when flock is unavailable
+#   (e.g. macOS). Returns the wrapped command's exit status.
+runGitLocked() {
+    local lock
+    lock="$(gitRepoLockFile)"
+    mkdir -p "$(dirname "${lock}")" 2>/dev/null || true
+    # Exec bash explicitly rather than flock's "-c" form: the latter runs the
+    # command via $SHELL, which for the apache user can be /usr/sbin/nologin.
+    if [ -x /usr/bin/flock ]; then
+        ${SUDO} flock -w 300 -x "${lock}" bash -c "$1"
     else
-        SetupFPPNetworkConfigViaInterfaces
+        ${SUDO} bash -c "$1"
     fi
-
-    ENABLEROUTING=$(getSetting EnableRouting)
-	if [ "x${ENABLEROUTING}" = "x1" ]
-	then
-		sysctl -w net.ipv4.ip_forward=1
-	else
-        sysctl -w net.ipv4.ip_forward=0
-	fi
 }
 
 #############################################################################
-# Configure fallback IP address if necessary
-ConfigureFallbackIP() {
-	if [ -f "${CFGDIR}/interface.eth0" ]
-	then
-		. ${CFGDIR}/interface.eth0
-		if [ "x${PROTO}" = "xstatic" ]
-		then
-			return
-		fi
-	fi
-
-	#####################################################################
-	# Don't configure fallback IP if no link is detected
-	ethtool eth0 | grep -q "Link detected: yes"
-	if [ $? -eq 1 ]
-	then
-		return
-	fi
-
-
-	ETH0GATEWAY=$(netstat -rn | grep "^0\.0\.0\.0.*eth0$" | awk '{print $2}')
-	WLAN0GATEWAY=$(netstat -rn | grep "^0\.0\.0\.0.*wlan0$" | awk '{print $2}')
-	WLAN0NETWORK=$(ifconfig wlan0 2> /dev/null | grep "inet addr:" | awk '{print $2}' | cut -f2 -d: | cut -f1-3 -d\.)
-	NEEDFALLBACKIP=1
-	NEEDFALLBACKGW=1
-
-	if [ ! -z "${ETH0GATEWAY}" ]
-	then
-		ping -c 1 ${ETH0GATEWAY} > /dev/null 2>&1
-		if [ $? -eq 0 ]
-		then
-			# Have a default gateway on eth0 and it is pingable
-			NEEDFALLBACKIP=0
-			NEEDFALLBACKGW=0
-		fi
-	fi
-
-	if [ ! -z "${WLAN0GATEWAY}" ]
-	then
-		ping -c 1 ${WLAN0GATEWAY} > /dev/null 2>&1
-		if [ $? -eq 0 ]
-		then
-			# Have a default gateway on wlan0 and it is pingable
-			NEEDFALLBACKGW=0
-		fi
-	fi
-
-	if [ ${NEEDFALLBACKIP} -eq 1 ]
-	then
-		OTHERNET=1
-		IP=192.168.0.10
-		NETMASK=255.255.255.0
-		BROADCAST=192.168.0.255
-		GATEWAY=192.168.0.1
-
-		arping -q -c 1 -w 1000000 -I eth0 192.168.1.1 2> /dev/null
-		if [ $? -eq 0 ]
-		then
-			# we're on the 192.168.1.0/24 network
-			OTHERNET=0
-			IP=192.168.1.10
-			NETMASK=255.255.255.0
-			BROADCAST=192.168.1.255
-			GATEWAY=192.168.1.1
-		fi
-
-		FBNETWORK=$(echo ${IP} | cut -f1-3 -d\.)
-		if [ "x${WLAN0NETWORK}" = "x${FBNETWORK}" ]
-		then
-			IP=192.168.${OTHERNET}.10
-			NETMASK=255.255.255.0
-			BROADCAST=192.168.${OTHERNET}.255
-			GATEWAY=192.168.${OTHERNET}.1
-		fi
-		ifconfig eth0:0 ${IP} netmask ${NETMASK} broadcast ${BROADCAST} up
-
-		if [ ${NEEDFALLBACKGW} -eq 1 ]
-		then
-			route add default gw ${GATEWAY} eth0:0
-		fi
-	fi
-}
-
-#############################################################################
-# Get a list of all interfaces using dhclient to get an IP and
-# waits for them to all recieve IPs.  If any interface does not
-# have an IP, then the function will sleep for a little while
-# and then jump back to the top of the loop to check again.
-WaitForDHCPIPs() {
-	DHCP_INTERFACES="$(ps auxw | grep "dhclient\.\([a-z0-9]*\)\.pid" | grep -v grep | sed -e 's/.*client\.\([a-z0-9]*\)\.pid.*/\1/' | sort | uniq)"
-	SLEEPTIME=2
-
-	if [ -z "${DHCP_INTERFACES}" ]
-	then
-		return 0
-	fi
-
-	echo "Waiting for DHCP to receive IP addresses: '${DHCP_INTERFACES}'"
-
-	# Loop up to 5 times, so max wait time is 5 * ${SLEEPTIME}
-	for i in {1..5}
-	do
-		IP=""
-		for INTERFACE in ${DHCP_INTERFACES}
-		do
-			LINKUP="N/A"
-			if [ "x${INTERFACE}" = "xeth0" ]
-			then
-				LINKUP=$(ethtool eth0 | grep "Link detected: yes")
-			fi
-
-			IP=$(ifconfig ${INTERFACE} | grep "inet " | sed -e "s/addr://" | awk '{print $2}')
-			if [ -n "${LINKUP}" -a -z "${IP}" ]
-			then
-				echo "${INTERFACE} does not have an IP, waiting for ${SLEEPTIME} seconds"
-				sleep ${SLEEPTIME}
-				continue
-			fi
-		done
-		if [ -z "${IP}" ]
-		then
-			continue
-		fi
-
-		break
-	done
-}
-
-
-WaitForInterfacesUp() {
-    IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
-    if [ -z "$IPS" ]; then
-        # Loop up to 4 times, so max wait time is 4 * 2
-        for i in {1..4}
-        do
-            sleep 2
-            IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
-            #echo "y:  $IPS" >> /tmp/ips.txt
-            if [ -z "$IPS" ]
-            then
-                continue
-            fi
-
-            break
-        done
-	    if [ -z "$IPS" ]; then
-            #on some adapters, we need to down/up in order for connman to be able
-            #to detect the link on it and attach to wifi
-            ifconfig wlan0 down
-            ifconfig wlan0 up
-            connmanctl scan wifi
-            # Loop up to 8 times, so max wait time is 8 * 2
-            for i in {1..8}
-            do
-               sleep 2
-               IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
-                   if [ -z "$IPS" ]; then
-               continue
-               fi
-               break
-            done
-        fi
-    fi
-
-    connmanctl services >> /tmp/services.txt
-
-    CONFIGS=`ls ${FPPHOME}/media/config/interface.w* 2> /dev/null; ls ${FPPHOME}/media/config/interface.e* 2> /dev/null`
-    for f in $CONFIGS; do
-	. ${f}
-	if [ "x$GATEWAY" != "x" ]; then
-	     DEFGW=${GATEWAY}
-	fi
-    done
-    if [ "x$DEFGW" == "x" ]; then
-        # no gateway defined
-	    CURDIR=$(pwd)
-        ETHS=`ls -d ether* 2> /dev/null`
-        WIFIS=`ls -d wifi* 2> /dev/null`
-        if [ "x$WIFIS" != "x" ]; then
-            for f in $ETHS; do
-	            connmanctl move-before $WIFIS $f
-            done
-        fi
-        cd "${CURDIR}"
-    fi
-    #turn off power management on wireless... not all adapters
-    # support this so just /dev/null any output
-    iwconfig wlan0 power off 2>/dev/null >/dev/null
-}
-
-MaybeEnableTethering() {
-    TetherEnabled=$(getSetting EnableTethering)
-
-    if [ "x${TetherEnabled}" == "x" ]; then
-        if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-            # many USB wifi adapters on the BBB don't support AP mode
-            # it also disables the reliable USB connection
-            # thus, on the BBB, make the default to not have Tether mode
-            # and make the user specifically have to enable it
-            setSetting EnableTethering 2
-            TetherEnabled=2
-        else
-            TetherEnabled=0
-        fi
-    fi
-
-    if [ "$TetherEnabled" == "0" ]; then
-        IPS="$(ip -o -4 addr | grep -v usb | grep -v 127.0)"
-        HASLINK="$(ethtool eth0 | grep \"Link detected: yes\")"
-        if [ "x${HASLINK}" = "x" ]; then
-            # no link on eth0
-            if [ -z "$IPS" ]; then
-                #No IPS from anywhere either, lets turn on tethering
-                TetherEnabled=1
-            fi
-        fi
-    fi
-    if [ ! -e /sys/class/net/wlan0 ]; then
-        # no wifi adapter, no point enabling tethering
-        TetherEnabled=2
-    fi 
-    if [ "$TetherEnabled" == "1" ]; then
-        TetherSSID=$(getSetting TetherSSID)
-        TetherPSK=$(getSetting TetherPSK)
-        if [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-            systemctl disable dnsmasq
-            systemctl stop dnsmasq
-        fi
-        connmanctl tether wifi on "${TetherSSID:=FPP}" "${TetherPSK:=Christmas}"
+# Stop fppd ahead of a rebuild (branch switch / version upgrade), in a way
+# that won't race the rebuild.
+#
+# fppd.service has Restart=always with a 5-restart/200s burst limit, and its
+# ExecStop is this same fppd_stop script -- so fppd_stop can't safely call
+# "systemctl stop" itself (systemd would still be mid-way through running it
+# as ExecStop, and a second stop request for the same job just blocks
+# waiting on the first, deadlocking). Callers that are about to delete and
+# rebuild the fppd binary need systemd to know the stop is intentional
+# *before* the binary disappears, so it doesn't spend its whole restart
+# burst failing against a missing/half-built binary and land the unit in
+# "failed" -- which then also refuses the legitimate restart once the build
+# finishes, if that happens inside the same burst window. Going through
+# "systemctl stop" (which invokes fppd_stop as ExecStop, once, cleanly)
+# does that; fppd_stop run directly does not.
+stopFppdForRebuild() {
+    if [ ! -f "/etc/fpp/container" ] && [ "${FPPPLATFORM}" != "MacOS" ]; then
+        systemctl stop fppd
+    else
+        ${SUDO} ${FPPDIR}/scripts/fppd_stop
     fi
 }
 
@@ -617,69 +72,531 @@ MaybeEnableTethering() {
 # Functions for compiling and cleaning up compiled binaries
 BINARIES="fppd fpp fppmm"
 cleanCompiledBinaries() {
-	if [ "x${FPPDIR}" = "x/opt/fpp" ]
-	then
+    echo "in Clean stage"
+
+	if [ "x${FPPDIR}" = "x/opt/fpp" ]; then
 		cd ${FPPDIR}/src && ${SUDO} make clean
 	else
 		cd ${FPPDIR}/src && sudo -u ${FPPUSER} make clean
 	fi
+
+    for p in ${MEDIADIR}/plugins/*; do
+        if [ -d "$p" ]; then
+            if [ -f "${p}/Makefile" ]; then
+                echo "Cleaning plugin $p"
+                if [ "x${FPPDIR}" = "x/opt/fpp" ]; then
+                    ${SUDO} make -C "${p}" -f "${p}/Makefile" SRCDIR=${FPPDIR}/src clean
+                else
+                    sudo -u ${FPPUSER} make -C "${p}" -f "${p}/Makefile" SRCDIR=${FPPDIR}/src clean
+                fi
+            fi
+        fi
+    done
+}
+populateCCACHE() {
+    FPPPLATFORM=$(cat /etc/fpp/platform 2> /dev/null)
+
+    # Map platform (and arch, for the Pi) to the ccache asset suffix the image
+    # build produces: ccache-<PLAT>.tar.gz (Pi, Pi64, BBB, BB64).
+    if [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
+        if [ "$(uname -m)" = "aarch64" ]; then PLAT=Pi64; else PLAT=Pi; fi
+    elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
+        PLAT=BBB
+    elif [ "${FPPPLATFORM}" = "BeagleBone 64" ]; then
+        PLAT=BB64
+    else
+        PLAT=""
+        echo "populateCCACHE: unknown platform '${FPPPLATFORM}', skipping cache download"
+    fi
+
+    # The published caches are built under 4K-page kernels. A precompiled
+    # header is only valid under the page size it was built with, and every
+    # PCH-using object is keyed on the .gch, so on any other page size (the
+    # Pi's 16K kernel) nothing in the download can ever hit.
+    PAGESIZE=$(getconf PAGESIZE 2>/dev/null)
+    if [ -n "${PLAT}" ] && [ "${PAGESIZE}" != "4096" ]; then
+        PLAT=""
+        echo "populateCCACHE: ${PAGESIZE}-byte kernel pages, the published 4K-page cache can't help, skipping cache download"
+    fi
+
+    # The ccache tarballs are GitHub release assets attached to each release
+    # tag (and to the rolling "nightly" pre-release). A custom UpgradeSource
+    # mirror has no such assets, so only fetch when pulling from github.com.
+    SOURCEIP=$(getSetting UpgradeSource)
+    if [ -n "${PLAT}" ] && { [ "x${SOURCEIP}" = "x" ] || [ "${SOURCEIP}" = "github.com" ]; }; then
+        # Most appropriate tag = the nearest release tag at/before HEAD, so
+        # e.g. 10.2 plus a few commits still grabs the 10.2 cache. On master,
+        # or when only a dev tag (e.g. 10.x-master) or no tag is found, fall
+        # back to the rolling nightly cache -- master moves too fast for an
+        # older release cache to help much.
+        BRANCH=$(cd "${FPPDIR}" && sudo git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        TAG=$(cd "${FPPDIR}" && sudo git describe --tags --abbrev=0 2>/dev/null)
+        if [ "${BRANCH}" = "master" ] || [ -z "${TAG}" ] || [ "${TAG%-master}" != "${TAG}" ]; then
+            TAG="nightly"
+        fi
+
+        FILETOGET="ccache-${PLAT}.tar.gz"
+        FULLURL="https://github.com/FalconChristmas/fpp/releases/download/${TAG}/${FILETOGET}"
+        ETAG_GIT="/tmp/etag.$$"
+        ETAG_LOCAL="/root/.cache/ccache/etag"
+        NEEDS_UPDATED=0
+
+        echo "Checking CCACHE - ${FILETOGET} - ${FULLURL}"
+
+        sudo test -f "$ETAG_LOCAL"
+        ETAG_LOCAL_NOTFOUND=$?
+
+        # -L: release-download URLs redirect to the asset CDN; follow so we
+        # read the asset's ETag, not the redirect's. Missing asset -> no etag.
+        curl -sIL "$FULLURL" | grep -i '^etag:' | tail -1 > "$ETAG_GIT"
+        ETAG_SIZE=$(wc -c "$ETAG_GIT" | awk '{print $1}')
+
+        if (($ETAG_SIZE < 5)); then
+            echo "Updating CCache -- no asset for ${TAG} (building without cache)"
+            NEEDS_UPDATED=1
+        elif [ "$ETAG_LOCAL_NOTFOUND" == "1" ]; then
+            echo "Updating CCache -- not cached locally"
+            NEEDS_UPDATED=1
+        else
+            if ! sudo diff -q "$ETAG_LOCAL" "$ETAG_GIT" >/dev/null 2>&1; then
+                echo "Updating CCache -- eTag has changed"
+                NEEDS_UPDATED=1
+            fi
+        fi
+
+        if [ $NEEDS_UPDATED -eq 0 ]; then
+            echo "CCache is up to date"
+            rm -f "$ETAG_GIT"
+        elif curl -f -L --fail-early "$FULLURL" --output "/tmp/$FILETOGET"; then
+            sudo mkdir -p /root/.cache/ccache
+            # Merge, do NOT wipe: overlay the shipped entries on top of whatever
+            # is already cached locally so existing objects survive. Tarball is
+            # XDG layout, so it extracts straight into the cache dir.
+            sudo tar -x -z -C /root/.cache/ccache -f "/tmp/$FILETOGET"
+            rm -f "/tmp/$FILETOGET"
+            sudo mv "$ETAG_GIT" "$ETAG_LOCAL"
+            sudo chmod 644 "$ETAG_LOCAL"
+        else
+            echo "CCache download failed for tag '${TAG}', building without it"
+            rm -f "$ETAG_GIT"
+        fi
+    fi
+
+    # Config lives at the XDG user path (/root/.config/ccache/ccache.conf),
+    # not in the per-cache-dir -- ccache 4.12+ rejects several settings
+    # (e.g. max_size) in the cache-dir config. Cache itself lives at
+    # /root/.cache/ccache (also XDG). Clean up any stale legacy configs
+    # from older installs. Match FPP_Install.sh.
+    sudo rm -f /root/.ccache/ccache.conf
+    sudo rm -f /root/.cache/ccache/ccache.conf
+    sudo mkdir -p /root/.config/ccache
+    export CCACHE_CONFIGPATH=/root/.config/ccache/ccache.conf
+    sudo -E ccache -M 500M
+    sudo -E ccache --set-config=temporary_dir=/tmp
+    sudo -E ccache --set-config=sloppiness=pch_defines,time_macros,include_file_mtime,include_file_ctime,locale,modules
+    sudo -E ccache --set-config=pch_external_checksum=true
+    sudo -E ccache --set-config=hard_link=true
+    # Must match FPP_Install.sh. compiler_check=content hashes the g++
+    # binary bytes, which can differ between the chroot that populated the
+    # shipped cache and the Pi running this upgrade -- that invalidates the
+    # entire shipped cache. -dumpversion + -dumpmachine is stable across
+    # binary rewrites but still changes on a real compiler upgrade.
+    sudo -E ccache --set-config=compiler_check='%compiler% -dumpversion; %compiler% -dumpmachine'
+}
+
+
+# Total DISK-backed swap, in kB.
+#
+# /proc/meminfo's SwapTotal must not be used for "can this box lean on swap?"
+# decisions: it counts zram, which is compressed swap living in RAM. zram buys
+# effective capacity, but it cannot hand a compile headroom the box does not
+# physically have, so a zram-only board looks well-provisioned and then gets
+# cc1plus OOM-killed anyway.
+#
+# /proc/swaps is also the right source rather than a filtered SwapTotal: on the
+# Trixie Pi images rpi-swap runs in "zram+file" mode, where /var/swap is looped
+# in as zram0's writeback backing device rather than swapped on. It adds no
+# capacity and correctly never appears here. Field 3 is the size in kB.
+function DiskBackedSwapKB() {
+    awk 'NR > 1 && $1 !~ /^\/dev\/zram/ { s += $3 } END { print s + 0 }' /proc/swaps 2>/dev/null
+}
+
+function ComputeMakeParallelism() {
+    local CPUS=1
+    if [ -f "/proc/cpuinfo" ]; then
+        CPUS=$(grep "^processor" /proc/cpuinfo | wc -l)
+
+        if [[ ${CPUS} -gt 1 ]]; then
+            MEMORY=$(grep MemTot /proc/meminfo | awk '{print $2}')
+            ARMV=$(uname -m)
+
+            # MemTotal includes the CMA pool, but on the Pi the vc4-KMS driver
+            # reserves a large CMA region (512MB by default on a Pi4). Those
+            # pages are dedicated to DMA/GPU buffers and migration out of CMA
+            # fails under pressure, so for the purpose of sizing the compile we
+            # treat CMA as unavailable. Without this, a 1GB Pi4 reports ~730MB
+            # MemTotal, lands in the -j3 bucket, and the OOM-killer kills cc1plus
+            # mid-build (see issue #2679). CmaTotal is absent on non-CMA kernels.
+            CMATOTAL=$(grep "^CmaTotal" /proc/meminfo | awk '{print $2}')
+            if [[ -n "${CMATOTAL}" && ${CMATOTAL} -gt 0 && ${MEMORY} -gt ${CMATOTAL} ]]; then
+                MEMORY=$((MEMORY - CMATOTAL))
+            fi
+            if [[ ${MEMORY} -lt 425000 ]]; then
+                # very limited memory, only use one core or we'll fail or
+                # will be very slow as we constantly swap in/out
+                CPUS=1
+            elif [[ ${MEMORY} -lt 512000 ]]; then
+                if [ "$ARMV" = "aarch64" ]; then
+                    # 64bit compiles take more memory so if we are less than 512M, 
+                    # we need to stick with a single core or it will swap
+                    CPUS=1
+                else
+                    # Disk-backed swap only -- see DiskBackedSwapKB. A BeagleBone
+                    # ships ~240MB of zram and no disk swap, which used to satisfy
+                    # this test and pick -j2; two cc1plus at ~200MB each on a 493MB
+                    # board just thrashes it.
+                    SWAPTOTAL=$(DiskBackedSwapKB)
+                    # Limited memory, if we have some swap, we'll go ahead with -j 2
+                    # otherwise we'll need to stick with -j 1 or we run out of memory
+                    if [[ ${SWAPTOTAL} -gt 49000 ]]; then
+                        CPUS=2
+                    else
+                        CPUS=1
+                    fi
+                fi
+            elif [[ ${MEMORY} -lt 1000000 ]]; then
+                if [[ ${CPUS} -gt 3 ]]; then
+                    CPUS=3
+                fi
+            fi
+        fi
+    else
+        CPUS=$(sysctl -n hw.ncpu)
+    fi
+    echo "$CPUS"
+}
+
+# Recommended make -j for a distcc/nocc build. Start from the helper compile
+# capacity (sum of the "/N" job slots in the host list, default 4/host, +2), then
+# clamp by what the LOCAL box can sustain -- make uses ONE -j for the whole build
+# and the local bottleneck differs by mode:
+#   * distcc preprocesses every file LOCALLY, so the local cores bound throughput
+#     -> cap at nCPU + 2 (e.g. -j3 on a single-core BeagleBone).
+#   * nocc offloads compile AND preprocessing, so locally we only run the LINKs.
+#     With the mold linker (memory-light) even a ~480MB BeagleBone sustains ~6
+#     parallel links, so size the ceiling by RAM, not cores. Without mold (the
+#     heavier ld/gold load every object at once) fall back to the core-based cap.
+# $1 = host list, $2 = mode ("distcc" | "nocc").
+function ComputeDistccParallelism() {
+    local hosts="$1" mode="$2" total=0 tok n ncpu cap mem
+    if [ -z "${hosts}" ] || echo "${hosts}" | grep -qi "zeroconf"; then
+        total=8
+    else
+        for tok in ${hosts}; do
+            n=$(echo "${tok}" | sed -n 's@^[^/]*/\([0-9][0-9]*\).*@\1@p')
+            if [ -n "${n}" ]; then
+                total=$((total + n))
+            else
+                total=$((total + 4))
+            fi
+        done
+        total=$((total + 2))
+    fi
+    ncpu=1
+    if [ -f /proc/cpuinfo ]; then
+        ncpu=$(grep -c "^processor" /proc/cpuinfo)
+    elif command -v sysctl >/dev/null 2>&1; then
+        ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    fi
+    # -e /usr/bin/ld.mold mirrors src/makefiles/common/setup.mk's mold selection.
+    if [ "${mode}" = "nocc" ] && [ -e /usr/bin/ld.mold ]; then
+        # Only mold links run locally; size the link ceiling by RAM.
+        mem=$(grep MemTot /proc/meminfo 2>/dev/null | awk '{print $2}')
+        if   [ -n "${mem}" ] && [ "${mem}" -ge 2000000 ]; then cap=16
+        elif [ -n "${mem}" ] && [ "${mem}" -ge 1000000 ]; then cap=12
+        elif [ -n "${mem}" ] && [ "${mem}" -ge 512000  ]; then cap=8
+        else cap=6   # <512MB (BeagleBone): measured good at -j6 with mold+nocc
+        fi
+    else
+        # distcc (local preprocessing) or nocc without mold (heavy local links).
+        cap=$((ncpu + 2))
+    fi
+    [ "${total}" -gt "${cap}" ] && total=${cap}
+    [ "${total}" -lt 2 ] && total=2
+    [ "${total}" -gt 24 ] && total=24
+    echo "${total}"
+}
+
+# Discover distcc helpers advertised on the LAN via mDNS and emit a DISTCC_HOSTS
+# list ("addr:port/jobs,lzo ..."). We browse _distcc._tcp with avahi ourselves
+# instead of using distcc's built-in "+zeroconf" because distcc's zeroconf
+# discovery filters helpers by CPU architecture and silently drops a cross-arch
+# helper (an aarch64 Pi advertises "aarch64", so an armhf BeagleBone ignores it).
+# Feeding the discovered helpers as EXPLICIT hosts skips that filter; helpers set
+# up via setup_distcc_host.sh carry both the native and the armhf cross
+# toolchains, so any of them can serve any client. Empty if avahi or no helper
+# is found.
+function DiscoverDistccHosts() {
+    command -v avahi-browse >/dev/null 2>&1 || return 0
+    local out="" marker iface proto name typ domain host addr port rest jobs
+    while IFS=';' read -r marker iface proto name typ domain host addr port rest; do
+        [ "${marker}" = "=" ] && [ "${proto}" = "IPv4" ] || continue
+        [ -n "${addr}" ] && [ -n "${port}" ] || continue
+        jobs=$(echo "${rest}" | grep -oE 'jobs=[0-9]+' | head -1 | cut -d= -f2)
+        [ -n "${jobs}" ] || jobs=4
+        out="${out} ${addr}:${port}/${jobs},lzo"
+    done < <(timeout 4 avahi-browse -rp _distcc._tcp 2>/dev/null)
+    echo "${out# }"
+}
+
+# Discover nocc helpers advertised on the LAN via mDNS and emit a list of
+# "host:port" (space separated; SetupBuildEnv joins them with ';'). Helpers
+# advertise _nocc._tcp when set up with setup_nocc_host.sh.
+#
+# We ask nocc itself rather than browsing with avahi-browse as the distcc path
+# does. A helper with more than one interface announces more than one address,
+# and nocc resolves each helper to ONE address that is routable from here --
+# a raw browse would list that helper twice (handing it a double share of the
+# build, since nocc shards files across the server list by index) and might
+# pick the address on a subnet this board cannot reach. Empty if nocc is too
+# old to know the flag, or if no helper answers.
+function DiscoverNoccHosts() {
+    command -v nocc-daemon >/dev/null 2>&1 || return 0
+    local out="" line
+    # nocc listens for mDNS answers for 500 ms by default, which is plenty on a
+    # wired network but not on Wi-Fi: an access point holds multicast traffic back
+    # until its next beacon, so on a Wi-Fi client the answers arrive late and no
+    # helper is found.  "Enable NOCC discovery across Wireless Networks" (a Developer
+    # setting, off by default) gives the answers 3 more seconds.
+    local -a nocc_env=()
+    [ "$(getSetting NoccDiscoverWireless)" = "1" ] && nocc_env=(NOCC_DISCOVER_TIMEOUT=3500ms)
+    while read -r line; do
+        # Accept only bare "host:port". An older nocc-daemon does not know the flag
+        # and prints its whole usage text instead, which must not be parsed as hosts.
+        case "${line}" in
+            *[[:space:]]*) continue ;;
+            *:[0-9]*)      out="${out} ${line}" ;;
+        esac
+    done < <(env "${nocc_env[@]}" timeout 10 nocc-daemon -print-discovered-servers 2>/dev/null)
+    echo "${out# }"
+}
+
+# Prepare the environment for a source rebuild based on the "Distributed Compile"
+# developer setting (off | distcc | distcc-zeroconf | nocc | nocc-zeroconf). MUST be called
+# directly (not in a $(...) subshell) so the exports survive into the make that
+# follows. Sets these globals:
+#   DISTCC_HOSTS / NOCC_SERVERS / NOCC_GO_EXECUTABLE / NOCC_LOG_FILENAME
+#                  exported as appropriate. When distcc OR nocc is active,
+#                  src/makefiles disable the PCH and select the target-triplet
+#                  compiler so the helper cross-compiles -- no CXXCOMPILER
+#                  override needed here. distcc runs behind ccache; nocc becomes
+#                  the launcher itself (CCACHE=nocc in src/makefiles) so nothing
+#                  is preprocessed locally to compute a ccache key.
+#   BUILD_CPUS     the -j value to pass to make
+function SetupBuildEnv() {
+    local mode hosts _nh _h
+
+    mode=$(getSetting DistributedCompile)
+    # Back-compat: derive from the pre-dropdown checkbox settings until the
+    # config migration (upgrade/116) runs or the user picks a value.
+    if [ -z "${mode}" ]; then
+        if [ "$(getSetting DistccEnabled)" = "1" ]; then
+            if [ "$(getSetting DistccUseMDNS)" = "1" ]; then
+                mode="distcc-zeroconf"
+            else
+                mode="distcc"
+            fi
+        else
+            mode="off"
+        fi
+    fi
+
+    # Clear anything a previous invocation exported.
+    unset DISTCC_HOSTS NOCC_SERVERS NOCC_GO_EXECUTABLE CCACHE_PREFIX CCACHE_DEPEND
+
+    case "${mode}" in
+        distcc|distcc-zeroconf)
+            if [ "${mode}" = "distcc-zeroconf" ]; then
+                # Browse the LAN for advertised helpers ourselves (works
+                # cross-arch, unlike distcc's "+zeroconf" -- see DiscoverDistccHosts).
+                hosts=$(DiscoverDistccHosts)
+                [ -z "${hosts}" ] && echo "distcc: mDNS enabled but no helpers were discovered on the network"
+            else
+                hosts=$(getSetting DistccHosts)
+            fi
+            if [ -n "${hosts}" ]; then
+                # DISTCC_DIR (distcc's lock dir) is pinned by src/makefiles (HOME
+                # is unreliable across the PHP -> sudo build chain), not here.
+                export DISTCC_HOSTS="${hosts}"
+                BUILD_CPUS=$(ComputeDistccParallelism "${hosts}" distcc)
+                echo "Building with distcc: DISTCC_HOSTS='${DISTCC_HOSTS}', -j ${BUILD_CPUS} (PCH disabled; makefile selects the triplet compiler)"
+            else
+                echo "distcc selected but no Compile Hosts configured -- building locally"
+                BUILD_CPUS=$(ComputeMakeParallelism)
+            fi
+            ;;
+        nocc|nocc-zeroconf)
+            if [ "${mode}" = "nocc-zeroconf" ]; then
+                # Ask nocc what is advertising itself on the LAN (see DiscoverNoccHosts).
+                hosts=$(DiscoverNoccHosts)
+                [ -z "${hosts}" ] && echo "nocc: mDNS enabled but no helpers were discovered on the network"
+            else
+                hosts=$(getSetting DistccHosts)
+            fi
+            if [ -n "${hosts}" ]; then
+                # nocc wants a ';'-delimited list of host:port and REQUIRES the
+                # port (unlike distcc's space-delimited host[:port][/jobs,opts]).
+                # Normalise the shared Compile Hosts field: drop any distcc
+                # "/jobs,opts" suffix, append the default nocc port (43210) to a
+                # bare host, and join with ';'.
+                _nh=""
+                for _h in ${hosts}; do
+                    _h="${_h%%/*}"
+                    case "${_h}" in *:*) : ;; *) _h="${_h}:43210" ;; esac
+                    _nh="${_nh:+${_nh};}${_h}"
+                done
+                # nocc is the compiler launcher DIRECTLY (src/makefiles sets
+                # CCACHE=nocc), NOT wrapped as "ccache nocc": ccache would run the
+                # preprocessor locally (cc1plus -E) to compute its cache key --
+                # exactly the single-core bottleneck nocc removes -- and a NOPCH
+                # build never matches the PCH-built shared ccache anyway. nocc does
+                # a light include scan and preprocesses+compiles on the helper, and
+                # keeps its own object cache on the helper.
+                export NOCC_SERVERS="${_nh}"
+                export NOCC_GO_EXECUTABLE=/usr/bin/nocc-daemon
+                # Give the nocc daemon a logfile so build issues are diagnosable
+                # (otherwise it warns "logs won't be available").
+                export NOCC_LOG_FILENAME=/tmp/nocc-build.log
+                BUILD_CPUS=$(ComputeDistccParallelism "${hosts}" nocc)
+                echo "Building with nocc: NOCC_SERVERS='${NOCC_SERVERS}', -j ${BUILD_CPUS} (PCH disabled; makefile selects the triplet compiler)"
+            else
+                if [ "${mode}" = "nocc-zeroconf" ]; then
+                    echo "nocc + mdns selected but no helpers were discovered -- building locally"
+                else
+                    echo "nocc selected but no Compile Hosts configured -- building locally"
+                fi
+                BUILD_CPUS=$(ComputeMakeParallelism)
+            fi
+            ;;
+        *)
+            BUILD_CPUS=$(ComputeMakeParallelism)
+            ;;
+    esac
 }
 
 compileBinaries() {
-	cleanCompiledBinaries
 
-	if [ "x${FPPDIR}" = "x/opt/fpp" ]
-	then
-		cd ${FPPDIR}/src && ${SUDO} make clean && ${SUDO} make optimized
+    cleanCompiledBinaries
+    if [ "${FPPPLATFORM}" != "MacOS" ]; then
+        populateCCACHE
+    fi
+
+    # export CCACHE_LOGFILE=/tmp/cache.debug
+    export LANG=en_US.UTF-8
+    export TERM=linux
+
+    # Honor the distcc developer settings: SetupBuildEnv exports DISTCC_HOSTS
+    # (which ${SUDO} == "sudo -E" then passes to make) and sizes -j; the
+    # makefiles switch to ccache distcc + NOPCH + the triplet compiler. No-op
+    # when distcc is disabled (BUILD_CPUS == ComputeMakeParallelism).
+    SetupBuildEnv
+    CPUS=${BUILD_CPUS}
+
+    # Need to unset HOME so that ccache will user /root instead of /home/fpp
+    unset HOME
+
+    if [ "${FPPPLATFORM}" != "MacOS" ]; then
+        MEMORY=$(grep MemTot /proc/meminfo | awk '{print $2}')
+        FPPDPID=$(pgrep fppd)
+        if [ ${MEMORY} -lt 512000 -a "${FPPDPID}" != "" ]; then
+            # Count only DISK-backed swap. /proc/meminfo's SwapTotal also counts
+            # zram, which is compressed swap living in RAM -- it cannot hand
+            # cc1plus headroom the box does not already have, so it must not
+            # satisfy the "do we need a build swapfile?" test. A Pi Zero 2 W
+            # ships ~415MB of zram and no disk swap: that sailed past the old
+            # SwapTotal check, no swapfile was created, and the PCH compile was
+            # OOM-killed on roughly two runs in three.
+            #
+            # See DiskBackedSwapKB for why /proc/swaps rather than SwapTotal.
+            SWAPTOTAL=$(DiskBackedSwapKB)
+
+            if [ ${SWAPTOTAL} -lt 384000 ]; then
+                echo "System has less than 512MB RAM and little swap, activating more swap."
+                # Create swapfile in fpp media so it will go onto the
+                # storage location most likely having space on it (not
+                # eMMC on Beagles)
+                #
+                # some of the larger C++ files are consuming a lot of memory
+                # and are starting to cause compile failures on the devices
+                # with limitted memory (PiZeros, older Pi's, etc...) so
+                # we'll allocate a swap file so it shouldn't fail, but
+                # will likely be slow.   We DON'T want an "always" swapfile
+                # to avoid killing the SD cards.
+                ${SUDO} fallocate -l 448M "${FPPHOME}/media/tmp/swapfile"
+                ${SUDO} chmod 600 "${FPPHOME}/media/tmp/swapfile"
+                ${SUDO} mkswap -q "${FPPHOME}/media/tmp/swapfile"
+                ${SUDO} swapon "${FPPHOME}/media/tmp/swapfile"
+            fi
+        fi
+    fi
+
+	# nocc-daemon is a persistent process on a fixed socket (/tmp/nocc.sock) that
+	# caches NOCC_SERVERS from its FIRST start and ignores later changes -- a
+	# daemon left running from a prior build (different/no hosts) would serve this
+	# one with stale config (e.g. dialing a host with no port). Stop it so make
+	# spawns a fresh daemon with the current NOCC_SERVERS. No-op when nocc is off.
+	# BUILD_RC carries the main src build status to the caller: without it the
+	# function's exit status is whatever the swap cleanup below returns (0),
+	# so git_pull exits 0 when the build fails and the update UI reports a
+	# failed build as "complete". Plugin builds stay best-effort.
+	BUILD_RC=0
+	if [ "x${FPPDIR}" = "x/opt/fpp" ]; then
+		${SUDO} pkill -x nocc-daemon 2>/dev/null || true
+		cd ${FPPDIR}/src && ${SUDO} make clean && ${SUDO} -E make -j ${CPUS} optimized
+		BUILD_RC=$?
 	else
-		cd ${FPPDIR}/src && ${SUDO} -u ${FPPUSER} make clean && sudo -u ${FPPUSER} make optimized
+		sudo -u ${FPPUSER} pkill -x nocc-daemon 2>/dev/null || true
+		cd ${FPPDIR}/src && sudo -u ${FPPUSER} make clean && sudo -u ${FPPUSER} make -j ${CPUS} optimized
+		BUILD_RC=$?
 	fi
 
-	if [ "x${FPPBINDIR}" != "x${FPPDIR}/src" ]
-	then
-		# Clean up any installed binaries that are identical to the one in git
-		for FILE in ${BINARIES}
-		do
-			if [ "x${FPPDIR}" = "x/opt/fpp" ]
-			then
-				${SUDO} strip ${FPPDIR}/src/${FILE}
-			else
-				${SUDO} -u ${FPPUSER} strip ${FPPDIR}/src/${FILE}
-			fi
+    for p in ${MEDIADIR}/plugins/*; do
+        if [ -d "$p" ]; then
+            if [ -f "${p}/Makefile" ]; then
+                echo "Building plugin $p"
+                if [ "x${FPPDIR}" = "x/opt/fpp" ]; then
+                    ${SUDO} make -C "${p}" -f "${p}/Makefile" -j ${CPUS} SRCDIR=${FPPDIR}/src
+                    ${SUDO} chown -R ${FPPUSER}:${FPPGROUP} "${p}"
+                else
+                    sudo -u ${FPPUSER} make -C "${p}" -f "${p}/Makefile" -j ${CPUS} SRCDIR=${FPPDIR}/src
+                fi
+            fi
+        fi
+    done
 
-			BINMD5=$(md5sum ${FPPBINDIR}/${FILE} | awk '{print $1}')
-			SRCMD5=$(md5sum ${FPPDIR}/src/${FILE} | awk '{print $1}')
-			if [ "${BINMD5}" = "${SRCMD5}" ]
-			then
-				${SUDO} rm -f ${FPPDIR}/src/${FILE}
-			fi
-		done
-	fi
+    if [ "${FPPPLATFORM}" != "MacOS" ]; then    
+        if [ -f "${FPPHOME}/media/tmp/swapfile" ]; then
+            #remove the swap that was created
+            ${SUDO} swapoff "${FPPHOME}/media/tmp/swapfile"
+            ${SUDO} rm -f "${FPPHOME}/media/tmp/swapfile"
+        fi
+    fi
+    # Flush the new binaries before fppd restarts; a power loss can zero them (#3120).
+    sync
+
+    # Propagate the src build status (see above): the swap cleanup must not
+    # mask a failed make with its own success.
+    return ${BUILD_RC:-0}
 }
 
 #############################################################################
 # Helper script for running the User hook script with a specified hook
 runUserHookScript() {
-	if [ -f "${FPPHOME}/media/scripts/UserCallbackHook.sh" ]
+	if [ -f "${MEDIADIR}/scripts/UserCallbackHook.sh" ]
 	then
-		/bin/bash ${FPPHOME}/media/scripts/UserCallbackHook.sh $1
+		/bin/bash ${MEDIADIR}/scripts/UserCallbackHook.sh $1
 	fi
 }
-
-#############################################################################
-# Helper scripts for running at boot time
-runBootHookScripts() {
-	runUserHookScript boot
-
-	/bin/ls -1 ${PLUGINDIR}/*/scripts/boot.sh 2> /dev/null | while read FILE
-	do
-		echo "Running: ${FILE}"
-		/bin/bash ${FILE}
-	done
-}
-
-#############################################################################
-# Helper scripts for running the User and Plugin pre/post start/stop scripts.
 # These are normally run from fppd_start and fppd_stop
 runPreStartScripts() {
 	runUserHookScript preStart
@@ -721,328 +638,14 @@ runPostStopScripts() {
 	runUserHookScript postStop
 }
 
-#############################################################################
-# Update the Avahi daemon service config file for fpp
-updateAvahiConfig() {
-	TMPFILE="/var/tmp/fpp.service"
-	AVAHICFGFILE="/etc/avahi/services/fpp.service"
-
-	fppMode=$(getSetting fppMode)
-	platform=$(cat /etc/fpp/platform)
-
-	cat > ${TMPFILE} <<-EOF
-		<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
-		<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-
-		<service-group>
-		  <name replace-wildcards="yes">%h</name>
-		  <service>
-		    <type>_fpp-httpd._tcp</type>
-		    <port>80</port>
-		  </service>
-		  <service>
-		    <type>_fpp-fppd._udp</type>
-		    <port>32320</port>
-		    <txt-record>fppMode=${fppMode},platform=${platform}</txt-record>
-		  </service>
-		</service-group>
-		EOF
-
-	cp ${TMPFILE} ${AVAHICFGFILE}
-}
 
 #############################################################################
-# Start/Stop OLA Daemon
-startOLADaemonIfNecessary() {
-	# Start OLA daemon if necessary
-	cat ${FPPHOME}/media/config/channeloutputs.json 2> /dev/null | tr -d "\r\n" | egrep -q 'OLA",[ 	a-zA-Z0-9:",]*"enabled": 1'
-	if [ $? -eq 0 ]
-	then
-		OLAPID=$(pgrep olad)
-		if [ -z "${OLAPID}" ]
-		then
-			sudo -u ${FPPUSER} olad -f -c ${FPPHOME}/media/config/ola
-		fi
-	fi
-}
-
-stopOLADaemonIfUnused() {
-	# Start OLA daemon if necessary
-	cat ${FPPHOME}/media/config/channeloutputs.json 2> /dev/null | tr -d "\r\n" | egrep -q 'OLA",[ 	a-zA-Z0-9:",]*"enabled": 1'
-	if [ $? -ne 0 ]
-	then
-		OLAPID=$(pgrep olad)
-		if [ -n "${OLAPID}" ]
-		then
-			killall -9 olad
-		fi
-	fi
-}
-
-#############################################################################
-# Configure Channel Outputs
-setupChannelOutputs() {
-
-	if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]
-	then
-		# Check for RGBMatrix channel output
-		cat ${FPPHOME}/media/config/channeloutputs.json 2> /dev/null | tr -d "\r\n" | egrep -q 'RGBMatrix",[ 	a-zA-Z0-9:",]*"enabled": 1'
-		RGBMatrix=$?
-
-		# RPIWS281X and onboard sound are incompatible
-		cat ${FPPHOME}/media/config/co-pixelStrings.json 2> /dev/null | tr -d "\r\n" | egrep -q 'RPIWS281X",[ 	a-zA-Z0-9:",]*"enabled": 1'
-		RPIWS281X=$?
-
-		if [ ${RGBMatrix} -eq 0 -o ${RPIWS281X} -eq 0 ]
-		then
-			# Make sure onboard sound is disabled
-			if [ ! -f /etc/modprobe.d/blacklist-bcm2835.conf ]
-			then
-				echo "blacklist snd_bcm2835" | sudo tee /etc/modprobe.d/blacklist-bcm2835.conf > /dev/null
-				shutdown -r now
-			fi
-		else
-			# Re-enable onboard sound if it is disabled
-			if [ -f /etc/modprobe.d/blacklist-bcm2835.conf ]
-			then
-				# Re-enable sound
-				rm /etc/modprobe.d/blacklist-bcm2835.conf
-				modprobe snd-bcm2835
-			fi
-		fi
-	fi
-
-	startOLADaemonIfNecessary
-}
-
-#############################################################################
-# Start/Stop the Web Socket Server
-startWebSocketServer() {
-	/usr/bin/nohup ${SCRIPTDIR}/fppwss > ${LOGDIR}/fppwss.log 2>&1 &
-}
-
-stopWebSocketServer() {
-	killall -9 fppwss 2> /dev/null
-}
-
-#############################################################################
-# Detect PiFace
-detectPiFace() {
-	/usr/local/bin/gpio -p write 207 1
-	PIFACEFOUND=$(/usr/local/bin/gpio -p read 215)
-	/usr/local/bin/gpio -p write 207 0
-
-	grep -q PiFaceDetected ${CFGFILE}
-	if [ $? -eq 0 ]
-	then
-		sed -i "s/^PiFaceDetected =.*/PiFaceDetected = ${PIFACEFOUND}/" ${CFGFILE}
-	else
-		echo "PiFaceDetected = ${PIFACEFOUND}" >> ${CFGFILE}
-	fi
-}
-
-#############################################################################
-# Detect Falcon hardware on SPI port
-detectFalconHardware() {
-	${FPPD} -H > /dev/null 2>&1
-	FHWFOUND=$?
-
-	grep -q FalconHardwareDetected ${CFGFILE}
-	if [ $? -eq 0 ]
-	then
-		sed -i "s/^FalconHardwareDetected =.*/FalconHardwareDetected = ${FHWFOUND}/" ${CFGFILE}
-	else
-		echo "FalconHardwareDetected = ${FHWFOUND}" >> ${CFGFILE}
-	fi
-}
-
-#############################################################################
-# Check for audio control files
-checkAudioConfig() {
-	if [ ! -e /root/.asoundrc ]
-	then
-		cat <<EOF > /root/.asoundrc
-pcm.!default {
-	type hw
-	card 0
-}
-
-ctl.!default {
-	type hw
-	card 0
-}
-EOF
-	fi
-
-	if [ ! -e /root/.libao ]
-	then
-		cat <<EOF > /root/.libao
-dev=default
-EOF
-	fi
-}
-
-#############################################################################
-# Check local time against U.S. Naval Observatory time, set if too far out
-checkTimeAgainstUSNO() {
-	# www.usno.navy.mil is not pingable, so check github.com instead
-	ping -q -c 1 github.com > /dev/null 2>&1
-
-	if [ $? -eq 0 ]
-	then
-		echo "FPP: Checking local time against U.S. Naval Observatory"
-
-		# allow clocks to differ by 24 hours to handle time zone differences
-		THRESHOLD=86400
-		USNOSECS=$(curl -m 10 -s http://www.usno.navy.mil/cgi-bin/time.pl | sed -e "s/.*\">//" -e "s/<\/t.*//" -e "s/...$//" -e "s/[^0-9]//g")
-
-		if [ "x${USNOSECS}" != "x" ]
-		then
-			LOCALSECS=$(date +%s)
-			MINALLOW=$(expr ${USNOSECS} - ${THRESHOLD})
-			MAXALLOW=$(expr ${USNOSECS} + ${THRESHOLD})
-
-			#echo "FPP: USNO Secs  : ${USNOSECS}"
-			#echo "FPP: Local Secs : ${LOCALSECS}"
-			#echo "FPP: Min Valid  : ${MINALLOW}"
-			#echo "FPP: Max Valid  : ${MAXALLOW}"
-
-			echo "FPP: USNO Time  : $(date --date=@${USNOSECS})"
-			echo "FPP: Local Time : $(date --date=@${LOCALSECS})"
-
-			if [ ${LOCALSECS} -gt ${MAXALLOW} -o ${LOCALSECS} -lt ${MINALLOW} ]
-			then
-				echo "FPP: Local Time is not within 24 hours of USNO time, setting to USNO time"
-				date $(date --date="@${USNOSECS}" +%m%d%H%M%Y.%S)
-
-				LOCALSECS=$(date +%s)
-				echo "FPP: New Local Time: $(date --date=@${LOCALSECS})"
-			else
-				echo "FPP: Local Time is OK"
-			fi
-		else
-			echo "FPP: Incorrect result or timeout from query to U.S. Naval Observatory"
-		fi
-	else
-		echo "FPP: Not online, unable to check time against U.S. Naval Observatory."
-	fi
-}
-
-#############################################################################
-# Setup RTC on the Pi.
-setupRTC () {
-
-    if  [ "${FPPPLATFORM}" = "Raspberry Pi" ]; then
-        # RTC Setup
-        # to get the RPi board version:
-        REV=$(cat /proc/cpuinfo|grep Revision)
-        # Extract revision
-        REV=${REV##*: }
-        # Make it readable as hex
-        REV=0x$REV
-        # Convert hex to dec
-        REV=$((REV))
-
-        if [ $REV -lt 4 ]; then
-            I2CBUS="i2c-0"
-        else
-            I2CBUS="i2c-1"
-        fi
-    elif [ "${FPPPLATFORM}" = "BeagleBone Black" ]; then
-        I2CBUS="i2c-2"
-    else
-        return
-    fi
-
-	# Read Clock Setting From Settings File
-	piRTC=$(awk -f ${FPPDIR}/scripts/readSetting.awk ${SETTINGSFILE} setting=piRTC)
-
-	case "$piRTC" in
-	1)
-	  # rasClock chip
-      echo "FPP - Configuring RTC, Setting to rasClock/${I2CBUS}"
-      echo "pcf2127 0x51" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	2)
-	  # DS1307 chip
-      echo "FPP - Configuring RTC, Setting to DS1307/${I2CBUS}"
-      echo "ds1307 0x68" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	3)
-	  # PiFace Chip
-      echo "FPP - Configuring RTC, Settting to mcp7941x/${I2CBUS}"
-	  echo "mcp7941x 0x6f" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	4)
-	  # AdaFruit
-      echo "FPP - Configuring RTC, Settting to pcf8523/${I2CBUS}"
-	  echo "pcf8523 0x68" > /sys/bus/i2c/devices/${I2CBUS}/new_device
-      sleep 1
-	  ;;
-	*)
-	  # None
-      echo "FPP - Configuring RTC, None Selected"
-	  ;;
-	esac
-}
-
-#############################################################################
-# Functions to remount root read-write if read-only and switch back if necessary
-remountRootReadWrite() {
-	if [ "x${MOUNTSTATE}" = "x" ]
-	then
-		export MOUNTSTATE=$(mount | grep "on / type" | cut -f2 -d\( | cut -f1 -d,)
-	fi
-
-	if [ "x${MOUNTSTATE}" = "xro" ]
-	then
-		echo "Remounting root filesystem Read-Write"
-		sudo mount -o remount,rw /
-	fi
-}
-
-remountRootReadOnlyIfNeeded() {
-	if [ "x${MOUNTSTATE}" = "xro" ]
-	then
-		echo "Remounting root filesystem Read-Only"
-		sudo mount -o remount,ro /
-	fi
-}
-
-#############################################################################
-# Some fixups related to running the v1.x SD image read-only.  These are pure
-# hacks for now until we get a new SD image that is designed to be read-only
-# from the start.
-applyReadOnlySDFixups() {
-	if [ "x${MOUNTSTATE}" = "x" ]
-	then
-		export MOUNTSTATE=$(mount | grep "on / type" | cut -f2 -d\( | cut -f1 -d,)
-	fi
-
-	SDVER=$(cat /etc/fpp/rfs_version | cut -f1 -d\.)
-
-	if [ "x${SDVER}" = "xv1" -a "x${MOUNTSTATE}" = "xro" ]
-	then
-		echo "FPP: Root is mounted read-only on a v1.x SD image, applying read-only fixups."
-
-		# Samba's smbd won't start if it can't write to /var/lib/samba
-		cp -rp /var/lib/samba /tmp/
-		mkdir /var/log/samba
-		mount -o bind /tmp/samba /var/lib/samba
-		/etc/init.d/samba restart
-
-		remountRootReadWrite
-
-		# Our startup script can't copy php.ini into place if root is read-only
-		cp /opt/fpp/etc/php.ini /etc/
-		/etc/init.d/apache2 restart
-
-		remountRootReadOnlyIfNeeded
-	fi
-}
-
-#############################################################################
+# Handle calling a function directly
+#
+# Example: /opt/fpp/scripts/functions runPreStartScripts
+BASENAME=$(basename -- $0)
+if [ "${BASENAME}" = "functions" -a -n "$1" ]
+then
+    $@
+fi
 

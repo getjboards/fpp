@@ -1,0 +1,387 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <unistd.h>
+
+#if __has_include(<xf86drm.h>)
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <libdrm/drm_fourcc.h>
+#define HAS_KMS_FB
+#endif
+
+#include "common.h"
+#include "fppversion.h"
+#include "settings.h"
+#include "commands/Commands.h"
+
+#include "fpp.h"
+
+int socket_fd;
+struct sockaddr_un server_address;
+struct sockaddr_un client_address;
+int bytes_received, bytes_sent;
+
+char command[8192];
+// fppd's replies are up to 1500 bytes (MAX_RESPONSE_SIZE in command.cpp); one
+// byte is kept back for the terminating NUL added after recvfrom().
+char response[2048];
+
+void SendCommand(const char* com);
+void SetupDomainSocket(void);
+void Usage(char* appname);
+
+socklen_t address_length;
+
+#ifdef HAS_KMS_FB
+static inline std::string FourCCToString(uint32_t f) {
+    char buf[5] = { (char)(f & 0xff),
+                    (char)((f >> 8) & 0xff),
+                    (char)((f >> 16) & 0xff),
+                    (char)((f >> 24) & 0xff),
+                    0 };
+    return std::string(buf);
+}
+#endif
+
+void GetFrameBufferDevices(Json::Value& v, bool debug) {
+#ifdef HAS_KMS_FB
+    for (int cn = 0; cn < 10; cn++) {
+        std::string path = "/dev/dri/card" + std::to_string(cn);
+        if (FileExists(path)) {
+            int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0) continue;
+            drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+
+            drmModeResPtr res = drmModeGetResources(fd);
+            if (!res) {
+                close(fd);
+                continue;
+            }
+
+            for (int ci = 0; ci < res->count_connectors; ci++) {
+                drmModeConnectorPtr conn = drmModeGetConnector(fd, res->connectors[ci]);
+                if (!conn) continue;
+
+                const char* typeName = drmModeGetConnectorTypeName(conn->connector_type);
+                std::string cname = std::string(typeName ? typeName : "Unknown") + "-" + std::to_string(conn->connector_type_id);
+
+                if (debug) {
+                    Json::Value v2(Json::objectValue);
+
+                    // Get formats from primary plane if connector has an active CRTC
+                    if (conn->encoder_id) {
+                        drmModeEncoderPtr enc = drmModeGetEncoder(fd, conn->encoder_id);
+                        if (enc && enc->crtc_id) {
+                            int crtcIndex = -1;
+                            for (int k = 0; k < res->count_crtcs; k++) {
+                                if (res->crtcs[k] == enc->crtc_id) {
+                                    crtcIndex = k;
+                                    break;
+                                }
+                            }
+
+                            if (crtcIndex >= 0) {
+                                drmModePlaneResPtr planes = drmModeGetPlaneResources(fd);
+                                if (planes) {
+                                    std::set<std::string> formats;
+                                    for (uint32_t pi = 0; pi < planes->count_planes; pi++) {
+                                        drmModePlanePtr plane = drmModeGetPlane(fd, planes->planes[pi]);
+                                        if (plane && (plane->possible_crtcs & (1u << crtcIndex))) {
+                                            for (uint32_t fi = 0; fi < plane->count_formats; fi++) {
+                                                formats.insert(FourCCToString(plane->formats[fi]));
+                                            }
+                                            drmModeFreePlane(plane);
+                                            break; // primary plane found
+                                        }
+                                        if (plane) drmModeFreePlane(plane);
+                                    }
+                                    drmModeFreePlaneResources(planes);
+                                    for (auto& a : formats) {
+                                        v2["formats"].append(a);
+                                    }
+                                }
+                            }
+                            drmModeFreeEncoder(enc);
+                        }
+                    }
+
+                    for (int mi = 0; mi < conn->count_modes; mi++) {
+                        drmModeModeInfo& m = conn->modes[mi];
+                        std::string modeStr = std::to_string(m.hdisplay) + "x" + std::to_string(m.vdisplay);
+                        if (m.vrefresh) {
+                            modeStr += "@" + std::to_string(m.vrefresh);
+                        }
+                        v2["modes"].append(modeStr);
+                    }
+                    v[cname] = v2;
+                } else {
+                    v.append(cname);
+                }
+                drmModeFreeConnector(conn);
+            }
+            drmModeFreeResources(res);
+            close(fd);
+        }
+    }
+#endif
+
+    if (v.size() == 0) {
+#ifdef PLATFORM_OSX
+        if (debug) {
+            v["fb0"] = Json::Value(Json::objectValue);
+            v["fb1"] = Json::Value(Json::objectValue);
+            v["fb2"] = Json::Value(Json::objectValue);
+        } else {
+            v.append("fb0");
+            v.append("fb1");
+            v.append("fb2");
+        }
+#else
+        std::string devString = getSetting("framebufferControlSocketPath", "/dev") + "/";
+        for (int x = 0; x < 10; x++) {
+            std::string fb = "fb";
+            fb += std::to_string(x);
+            if (FileExists(devString + fb)) {
+                if (debug) {
+                    Json::Value v2(Json::objectValue);
+                    v[fb] = v2;
+                } else {
+                    v.append(fb);
+                }
+            }
+        }
+#endif
+    }
+}
+
+int main(int argc, char* argv[]) {
+    LoadSettings(argv[0]);
+    memset(command, 0, sizeof(command));
+    SetupDomainSocket();
+    if (argc > 1) {
+        // Shutdown fppd daemon used by scripts/fppd_stop
+        if (strncmp(argv[1], "-q", 2) == 0) {
+            snprintf(command, sizeof(command), "q");
+            SendCommand(command);
+        }
+        // Reload schedule example "fpp -R"
+        else if (strncmp(argv[1], "-R", 2) == 0) {
+            snprintf(command, sizeof(command), "R");
+            SendCommand(command);
+        }
+        // Set the log level of every logger, or of one:
+        //   "fpp --log-level debug"   "fpp --log-level MediaOut debug"
+        // The socket command is LogLevel,LOGGER,LEVEL; this used to send
+        // LogLevel,LEVEL, which fppd always refused.
+        else if ((strcmp(argv[1], "--log-level") == 0) && argc == 3) {
+            snprintf(command, sizeof(command), "LogLevel,All,%s,", argv[2]);
+            SendCommand(command);
+        } else if ((strcmp(argv[1], "--log-level") == 0) && argc == 4) {
+            snprintf(command, sizeof(command), "LogLevel,%s,%s,", argv[2], argv[3]);
+            SendCommand(command);
+        }
+        // Configure the given GPIO to the given mode
+        else if ((strncmp(argv[1], "-G", 2) == 0) && argc == 3) {
+            snprintf(command, sizeof(command), "SetupExtGPIO,%s,", argv[2]);
+            SendCommand(command);
+        } else if ((strncmp(argv[1], "-G", 2) == 0) && argc == 4) {
+            snprintf(command, sizeof(command), "SetupExtGPIO,%s,%s,", argv[2], argv[3]);
+            SendCommand(command);
+            // Set the given GPIO to the given value
+        } else if ((strncmp(argv[1], "-g", 2) == 0) && argc == 3) {
+            snprintf(command, sizeof(command), "ExtGPIO,%s", argv[2]);
+            SendCommand(command);
+        } else if ((strncmp(argv[1], "-g", 2) == 0) && argc == 5) {
+            snprintf(command, sizeof(command), "ExtGPIO,%s,%s,%s", argv[2], argv[3], argv[4]);
+            SendCommand(command);
+        } else if (strncmp(argv[1], "-r", 2) == 0) {
+            // Restart fppd daemon
+            snprintf(command, sizeof(command), "restart");
+            SendCommand(command);
+        } else if ((strncmp(argv[1], "-FBdebug", 8) == 0)) {
+            Json::Value val;
+            GetFrameBufferDevices(val, true);
+            if (val.size() == 0) {
+                printf("[]");
+            } else {
+                std::string js = SaveJsonToString(val);
+                printf("%s", js.c_str());
+            }
+        } else if ((strncmp(argv[1], "-FB", 3) == 0)) {
+            Json::Value val;
+            GetFrameBufferDevices(val, false);
+            if (val.size() == 0) {
+                printf("[]");
+            } else {
+                std::string js = SaveJsonToString(val);
+                printf("%s", js.c_str());
+            }
+        } else {
+            Usage(argv[0]);
+        }
+    } else {
+        return 0;
+    }
+
+    return 0;
+}
+
+/*
+ *
+ */
+void SetupDomainSocket(void) {
+    if ((socket_fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
+        perror("fpp client socket");
+        return;
+    }
+
+    mkdir(FPP_SOCKET_PATH, 0777);
+    chmod(FPP_SOCKET_PATH, 0777);
+
+    memset(&client_address, 0, sizeof(struct sockaddr_un));
+    client_address.sun_family = AF_UNIX;
+    strcpy(client_address.sun_path, FPP_CLIENT_SOCKET);
+
+    unlink(FPP_CLIENT_SOCKET);
+    if (bind(socket_fd, (const struct sockaddr*)&client_address,
+             sizeof(struct sockaddr_un)) < 0) {
+        perror("fpp client bind");
+        return;
+    }
+    memset(&server_address, 0, sizeof(struct sockaddr_un));
+    server_address.sun_family = AF_UNIX;
+    strcpy(server_address.sun_path, FPP_SERVER_SOCKET);
+
+    symlink(FPP_SERVER_SOCKET, FPP_SERVER_SOCKET_OLD);
+    symlink(FPP_CLIENT_SOCKET, FPP_CLIENT_SOCKET_OLD);
+}
+
+/*
+ *
+ */
+void SendCommand(const char* com) {
+    int max_timeout = 4000;
+    int i = 0;
+    bytes_sent = sendto(socket_fd, com, strlen(com), 0,
+                        (struct sockaddr*)&server_address,
+                        sizeof(struct sockaddr_un));
+
+    address_length = sizeof(struct sockaddr_un);
+    while (i < max_timeout) {
+        i++;
+        bytes_received = recvfrom(socket_fd, response, sizeof(response) - 1, MSG_DONTWAIT,
+                                  (struct sockaddr*)&(server_address),
+                                  &address_length);
+        if ((bytes_received > 0) || ((bytes_received < 0) && (errno != EAGAIN))) {
+            break;
+        }
+        usleep(500);
+    }
+
+    close(socket_fd);
+    unlink(FPP_CLIENT_SOCKET);
+    if (bytes_received > 0) {
+        response[bytes_received] = '\0';
+        printf("%s", response);
+    } else {
+        printf("false");
+    }
+}
+
+/*
+ *
+ */
+void Usage(char* appname) {
+    printf("Usage: %s [OPTION...]\n"
+           "\n"
+           "fpp is the Falcon Player CLI helper utility.  It can be used to query\n"
+           "certain information and send commands to a running fppd daemon.\n"
+           "\n"
+           "Options:\n"
+           "  -q                           - Shutdown fppd daemon\n"
+           "  -R                           - Reload schedule config file\n"
+           "  -G GPIO MODE                 - Configure the given GPIO to MODE. MODEs include:\n"
+           "                                 Input    - Set to Input. For PiFace inputs this only enables the pull-up\n"
+           "                                 Output   - Set to Output. (This is not needed for PiFace outputs)\n"
+           "                                 SoftPWM  - Set to Software PWM.\n"
+           "  -g GPIO MODE VALUE           - Set the given GPIO to VALUE applicable to the given MODEs defined above\n"
+           "                                 VALUE is ignored for Input mode\n"
+           "  -FB                          - Query usable framebuffer devices\n"
+           "  --log-level [LOGGER] LEVEL   - Set the log level of every logger, or of LOGGER\n"
+           "                                 (General, MediaOut, ...): error, warn, info, debug, excess\n\n\n"
+           " The following commands are now deprecated and the FPP API should be used instead, by POST.  Eg\n"
+           "   curl -X POST -d '[\"PLAYLISTNAME\", \"true\"]' 'http://<fpp hostname>/api/command/Start%20Playlist'\n"
+           " Below, /api/command/<COMMAND>/<ARG1>/<ARG2> lists a command's arguments in order: they go in the POST\n"
+           " body as a JSON array.  Run as a GET, that path form is deprecated and FPP 11 will refuse it.\n"
+           " Further information on the FPP API can be found at http://<fpp hostname>/api/\n\n"
+           "  -V                           - Print version information\n"
+           "                                            /api/fppd/version\n"
+           "  -r                           - Restart fppd daemon\n"
+           "                                            /api/system/fppd/restart\n"
+           "  -s                           - Get fppd status\n"
+           "                                            /api/system/status\n"
+           "  -c PLAYLIST_ACTION           - Perform a playlist action.\n"
+           "                                 next     - skip to next item in the playlist\n"
+           "                                            /api/command/Next Playlist Item\n"
+           "                                 prev     - jump back to previous item\n"
+           "                                            /api/command/Prev Playlist Item\n"
+           "                                 stop     - stop the playlist immediately\n"
+           "                                            /api/command/Stop Now\n"
+           "                                 graceful - stop the playlist gracefully\n"
+           "                                            /api/command/Stop Gracefully\n"
+           "                                 pause    - pause a sequence (not media)\n"
+           "                                            /api/command/Pause Playlist\n"
+           "                                 step     - single-step a paused sequence\n"
+           "                                            No direct replacement\n"
+           "                                 stepback - step a paused sequence backwards\n"
+           "                                            No direct replacement\n"
+           "  -p PLAYLISTNAME [STARTITEM]  - Play Playlist PLAYLISTNAME in repeat mode\n"
+           "                                 /api/command/Start Playlist/<PLAYLISTNAME>/<1 or STARTITEM>/true\n"
+           "  -P PLAYLISTNAME [STARTITEM]  - Play Playlist PLAYLISTNAME once, optionally\n"
+           "                                 starting on item STARTITEM in the playlist\n"
+           "                                 /api/command/Start Playlist/<PLAYLISTNAME>/<1 or STARTITEM>/false\n"
+           "  -S                           - Stop Playlist gracefully\n"
+           "                                 /api/command/Stop Gracefully\n"
+           "  -L                           - Stop Playlist gracefully after current loop\n"
+           "                                 /api/command/Stop Gracefully/true\n"
+           "  -d                           - Stop Playlist immediately\n"
+           "                                 /api/command/Stop Now\n"
+           "  -e EFFECTNAME[,CH[,LOOP]]    - Start Effect EFFECTNAME with optional\n"
+           "                                 start channel set to CH and optional\n"
+           "                                 looping if LOOP is set to 1\n"
+           "                                 /api/command/Effect Start/EFFECTNAME/[CH]/[True for Loop]\n"
+           "  -E EFFECTNAME                - Stop Effect EFFECTNAME\n"
+           "                                 /api/command/Effect Stop/EFFECTNAME\n"
+           "  -C FPPCOMMAND ARG1 ARG2 ...  - Trigger the FPP Command\n"
+           "                                 /api/command/<FPPCOMMAND/ARG1/ARG2/etc\n"
+           "  -t CommandPresetSlot         - Trigger FPP Command Preset via Slot # or Preset Name\n"
+           "                                 /api/command/Trigger Command Preset Slot/<Slot #>\n"
+           "                                 /api/command/Trigger Command Preset/<Preset Name>\n"
+           "  -v VOLUME                    - Set volume to 'VOLUME'\n"
+           "                                 /api/command/Volume Set/VOLUME\n"
+           "\n",
+           appname);
+}

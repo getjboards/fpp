@@ -1,48 +1,50 @@
+#pragma once
 /*
- *   E131 / ArtNet Universe structure definition for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _UNIVERSE_H
-#define _UNIVERSE_H
+#include <cstdint>
 
-#define E131_TYPE_MULTICAST   0
-#define E131_TYPE_UNICAST     1
+#define E131_TYPE_MULTICAST 0
+#define E131_TYPE_UNICAST 1
 #define ARTNET_TYPE_BROADCAST 2
-#define ARTNET_TYPE_UNICAST   3
+#define ARTNET_TYPE_UNICAST 3
+#define DMX_TYPE 4
 
-typedef struct {
-	int           active;
-	int           universe;
-	int           size;
-	int           startAddress;
-	int           type;
-	char          unicastAddress[16];
-	unsigned long bytesReceived;
-	unsigned long packetsReceived;
-    unsigned long errorPackets;
-    int           lastSequenceNumber;
-	int           priority;
-} UniverseEntry;
+class UniverseEntry {
+public:
+    uint32_t active = 0;
+    uint32_t universe = -1;
+    uint32_t size = 512;
+    uint32_t startAddress = 0;
+    uint32_t type = 0;
+    char unicastAddress[16];
+    uint32_t bytesReceived = 0;
+    uint32_t packetsReceived = 0;
+    uint32_t errorPackets = 0;
+    uint32_t suppressedPackets = 0;
+    uint32_t lastSequenceNumber = 0;
+    uint32_t priority = 0;
 
-#endif /* _UNIVERSE_H */
+    std::string dmxDevice;
+    uint64_t lastTimestamp = 0;
+    uint32_t lastIndex = 0;
+    int inFile = -1;
+
+    // Per-universe active source for priority-based selection. Populated
+    // only when the BridgeSourcePriority setting is enabled. The id is a
+    // 16-byte opaque identifier: for E1.31 it holds the sender CID; for
+    // ArtNet it holds the source IPv4 address in the first 4 bytes.
+    bool activeSourceValid = false;
+    uint8_t activeSourceId[16] = {};
+    uint8_t activeSourcePriority = 0;
+    long long activeSourceLastTime = 0;
+};

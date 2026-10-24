@@ -1,963 +1,2098 @@
 /*
- *   HTTP API for the Falcon Player Daemon 
- *   Falcon Player project (FPP) 
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include "channeloutput/channeloutput.h"
-#include "channeloutput/channeloutputthread.h"
+// Include drogon framework header before FPP headers to avoid
+// macro conflicts between trantor's LOG_* macros and FPP's LogLevel enum
+#include <drogon/HttpAppFramework.h>
+#include <drogon/version.h>
+#undef LOG_WARN
+#undef LOG_INFO
+#undef LOG_DEBUG
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+#include "fpphttp.h" // drogon/HTTP helpers used here; no longer pulled transitively (see fpphttp_types.h)
+#include "fpphttp_clientip.h" // getEffectiveClientIP() - FPP-internal, not in the plugin API
+#include "StatusWebSocket.h"
+#include <atomic>
+#include <fcntl.h>
+#include <signal.h>
+
+// Defined in fppd.cpp; setting it to 0 breaks the main loop and triggers
+// FPP's normal shutdown sequence, same as SIGQUIT or a graceful stop.
+extern std::atomic_int runMainFPPDLoop;
+
+#ifdef PLATFORM_OSX
+#include <sys/sysctl.h>
+#else
+#include <sys/ioctl.h>
+#include <sys/sysinfo.h>
+#endif
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include <cstdlib>
+#include <ctime>
+#include <cxxabi.h>
+#include <iomanip>
+#include <iostream>
+#include <list>
+#include <stdint.h>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+#include "MultiSync.h"
+#include "OutputMonitor.h"
+#include "mediaoutput/VideoInputManager.h"
+#include "RecurringTasks.h"
+#include "Player.h"
+#include "Plugins.h"
+#include "Timers.h"
+
+#include <chrono>
+#include <condition_variable>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <trantor/net/EventLoop.h>
+#include "Scheduler.h"
+#include "Sequence.h"
+#include "Variables.h"
+#include "Warnings.h"
 #include "common.h"
 #include "e131bridge.h"
-#include "fpp.h"
-#include "fppd.h"
+#include "effects.h"
 #include "fppversion.h"
-#include "httpAPI.h"
+#include "gpio.h"
 #include "log.h"
-#include "MultiSync.h"
-#include "playlist/Playlist.h"
-#include "Scheduler.h"
+#include "mqtt.h"
 #include "settings.h"
-
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <iomanip>
-#include <ctime>
-
-#include "stdlib.h"
-#include <boost/algorithm/string/predicate.hpp>
-#include <boost/algorithm/string/replace.hpp>
-#include <jsoncpp/json/json.h>
-
+#include "channeloutput/ChannelOutputSetup.h"
+#include "channeloutput/channeloutputthread.h"
+#include "channeltester/ChannelTester.h"
+#include "commands/Commands.h"
+#include "commands/Condition.h"
+#include "mediaoutput/AES67Manager.h"
+#include "mediaoutput/AudioSourceRegistry.h"
+#include "mediaoutput/AudioLevelMonitor.h"
+#include "mediaoutput/MediaOutputBase.h"
+#include "mediaoutput/MediaOutputStatus.h"
+#include "mediaoutput/OpusRTPManager.h"
+#include "mediaoutput/RTSPOutputManager.h"
+#include "mediaoutput/StreamSlotManager.h"
 #include "mediaoutput/mediaoutput.h"
+#include "overlays/PixelOverlay.h"
+#include "playlist/Playlist.h"
 #include "sensors/Sensors.h"
-#include "PixelOverlay.h"
 
+#include "httpAPI.h"
 
-/*
- *
- */
-APIServer::APIServer()
-{
-}
-
-/*
- *
- */
-APIServer::~APIServer()
-{
-	m_ws->sweet_kill();
-	m_ws->stop();
-
-	m_ws->unregister_resource("/fppd");
-    m_ws->unregister_resource("/models");
-    m_ws->unregister_resource("/overlays");
-
-	delete m_pr;
-	delete m_ws;
-
-	m_ws = NULL;
-}
+// Monotonic, so the reported uptime survives a wall-clock step (NTP, an RTC
+// that boots in the past) instead of going negative or jumping by hours.
+static long long startupTimeMS = GetMonotonicTimeMS();
+// Read by status requests on the HTTP threads, written by periodicWork() on
+// the main loop.
+static std::atomic<bool> piPowerBad{ false };
 
 /*
- *
- */
-void APIServer::Init(void)
-{
-	m_params = create_webserver(FPP_HTTP_PORT).max_threads(5);
-
-	m_ws = new webserver(m_params);
-
-	m_pr = new PlayerResource;
-	m_ws->register_resource("/fppd", m_pr, true);
-    m_ws->register_resource("/models", &PixelOverlayManager::INSTANCE, true);
-    m_ws->register_resource("/overlays", &PixelOverlayManager::INSTANCE, true);
-
-	m_ws->start(false);
-}
-
-/*
- *
- */
-void LogRequest(const http_request &req)
-{
-	LogDebug(VB_HTTP, "API Req: %s%s\n", req.get_path().c_str(),
-		req.get_querystring().c_str());
-}
-
-/*
- *
- */
-void LogResponse(const http_request &req, int responseCode, const std::string &content)
-{
-	if (LogLevelIsSet(LOG_EXCESSIVE))
-	{
-		LogDebug(VB_HTTP, "API Res: %s%s %d %s\n",
-			req.get_path().c_str(),
-			req.get_querystring().c_str(),
-			responseCode,
-			content.c_str());
-	}
-}
-
-/*
- *
- */
-const http_response PlayerResource::render_GET(const http_request &req)
-{
-	LogRequest(req);
-
-	Json::Value result;
-	std::string url = req.get_path();
-
-	boost::replace_first(url, "/fppd/", "");
-
-	LogDebug(VB_HTTP, "URL: %s %s\n", url.c_str(), req.get_querystring().c_str());
-
-	// Keep IF statement in alphabetical order
-    if (url == "effects")
-	{
-		GetRunningEffects(result);
-	}
-	else if (url == "events")
-	{
-		GetRunningEvents(result);
-	}
-	else if (url == "log")
-	{
-		GetLogSettings(result);
-	}
-	else if (url == "status")
-	{
-		GetCurrentStatus(result);
-	}
-	else if (url == "e131stats")
-	{
-		GetE131BytesReceived(result);
-	}
-	else if (url == "multiSyncSystems")
-	{
-		GetMultiSyncSystems(result);
-	}
-    else if (url == "playlists")
-    {
-        GetCurrentPlaylists(result);
-    }
-	else if (url == "playlist/filetime")
-	{
-		GetPlaylistFileTime(result);
-	}
-	else if (url == "playlist/config")
-	{
-		GetPlaylistConfig(result);
-	}
-	else if (url == "schedule")
-	{
-		LogDebug(VB_HTTP, "API - Getting current schedule information\n");
-	}
-	else if (url == "version")
-	{
-		result["version"] = getFPPVersion();
-		result["branch"] = getFPPBranch();
-		result["fppdAPI"] = FPPD_API_VERSION;
-
-		SetOKResult(result, "");
-	}
-	else if (url == "volume")
-	{
-		result["volume"] = getVolume();
-		SetOKResult(result, "");
-	}
-	else if (url == "sequence")
-	{
-		LogDebug(VB_HTTP, "API - Getting list of running sequences\n");
-	}
-	else if (url == "testing")
-	{
-		LogDebug(VB_HTTP, "API - Getting test mode status\n");
-		result["config"] = JSONStringToObject(channelTester->GetConfig().c_str());
-		SetOKResult(result, "");
-	}
-	else
-	{
-		LogErr(VB_HTTP, "API - Error unknown GET request: %s\n", url.c_str());
-
-		result["status"] = "ERROR";
-		result["respCode"] = 404;
-		result["message"] = std::string("endpoint fppd/") + url + " does not exist";
-	}
-
-    int responseCode = 200;
-	if (result.empty()) {
-		result["status"] = "ERROR";
-		result["respCode"] = 400;
-		result["message"] = "GET endpoint helper did not set result JSON";
-    } else if (result.isMember("respCode")) {
-        responseCode = result["respCode"].asInt();
-    }
-
-	Json::FastWriter fastWriter;
-	std::string resultStr = fastWriter.write(result);
-	LogResponse(req, responseCode, resultStr);
-
-	return http_response_builder(resultStr, responseCode, "application/json");;
-}
-
-/*
- *
- */
-const http_response PlayerResource::render_POST(const http_request &req)
-{
-	LogRequest(req);
-
-	Json::Value data;
-	Json::Reader reader;
-	Json::Value result;
-	std::string url = req.get_path();
-
-	boost::replace_first(url, "/fppd/", "");
-
-	LogDebug(VB_HTTP, "POST URL: %s %s\n", url.c_str(), req.get_querystring().c_str());
-
-	if (req.get_content() != "")
-	{
-		bool success = reader.parse(req.get_content(), data);
-		if (!success)
-		{
-			LogErr(VB_CHANNELOUT, "Error parsing POST content\n");
-			return http_response_builder("Error parsing POST content", 400).string_response();
-		}
-	}
-
-	// Keep IF statement in alphabetical order
-    if (boost::starts_with(url, "effects/"))
-	{
-		boost::replace_first(url, "effects/", "");
-
-		PostEffects(url, data, result);
-	}
-	else if (boost::starts_with(url, "events/"))
-	{
-		boost::replace_first(url, "events/", "");
-
-		PostEvents(url, data, result);
-	}
-	else if (boost::starts_with(url, "falcon/hardware"))
-	{
-		PostFalconHardware(result);
-	}
-	else if (boost::starts_with(url, "gpio/ext"))
-	{
-		PostGPIOExt(data, result);
-	}
-	else if (boost::starts_with(url, "log/level/"))
-	{
-		boost::replace_first(url, "log/level/", "");
-
-		SetLogLevel(url.c_str());
-		SetOKResult(result, "Log Level set");
-	}
-	else if (boost::starts_with(url, "log/mask/"))
-	{
-		boost::replace_first(url, "log/mask/", "");
-
-		SetLogMask(url.c_str());
-		SetOKResult(result, "Log Mask set");
-	}
-	else if (url == "outputs")
-	{
-		PostOutputs(data, result);
-	}
-	else if (url == "outputs/remap")
-	{
-		PostOutputsRemap(data, result);
-	}
-	else if (url.find("playlists/") == 0)
-	{
-		boost::replace_first(url, "playlists/", "");
-
-		if (url == "stop")
-		{
-			// Stop all running playlists
-			LogDebug(VB_HTTP, "API - Stopping all running playlists w/ content '%s'\n", req.get_content().c_str());
-		}
-		else if (boost::ends_with(url, "/start"))
-		{
-			// Start a playlist
-			boost::replace_last(url, "/start", "");
-			LogDebug(VB_HTTP, "API - Starting playlist '%s' w/ content '%s'\n", url.c_str(), req.get_content().c_str());
-		}
-		else if (boost::ends_with(url, "/nextItem"))
-		{
-			boost::replace_last(url, "/nextItem", "");
-			LogDebug(VB_HTTP, "API - Skipping to next entry in playlist '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/restartItem"))
-		{
-			boost::replace_last(url, "/restartItem", "");
-			LogDebug(VB_HTTP, "API - Restarting current item in playlist '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/prevItem"))
-		{
-			boost::replace_last(url, "/prevItem", "");
-			LogDebug(VB_HTTP, "API - Skipping to prev entry in playlist '%s'\n", url.c_str());
-		}
-		else if (url.find("/section/") != std::string::npos)
-		{
-			std::string playlistName = url.substr(0, url.find("/section/"));
-			std::string section = url.substr(url.rfind("/section/") + 6);
-			LogDebug(VB_HTTP, "API - Jumping to section '%s' in playlist '%s'\n", section.c_str(), url.c_str());
-		}
-		else if (url.find("/item/") != std::string::npos)
-		{
-			std::string playlistName = url.substr(0, url.find("/item/"));
-			int item = atoi(url.substr(url.rfind("/item/") + 6).c_str());
-			LogDebug(VB_HTTP, "API - Jumping to item %d in playlist '%s'\n", item, playlistName.c_str());
-		}
-		else if (boost::ends_with(url, "/stop"))
-		{
-			boost::replace_last(url, "/stop", "");
-			LogDebug(VB_HTTP, "API - Stopping playlist '%s' w/ content '%s'\n", url.c_str(), req.get_content().c_str());
-		}
-	}
-	else if (url == "schedule")
-	{
-		PostSchedule(data, result);
-	}
-	else if (url.find("volume/") == 0)
-	{
-		int volume = atoi(url.substr(7).c_str());
-		setVolume(volume);
-		result["volume"] = volume;
-		SetOKResult(result, "Volume set");
-	}
-	else if (url.find("sequences/") == 0)
-	{
-		boost::replace_first(url, "sequences/", "");
-
-		if (boost::ends_with(url, "/start"))
-		{
-			boost::replace_last(url, "/start", "");
-			LogDebug(VB_HTTP, "API - Starting sequence '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/stop"))
-		{
-			boost::replace_last(url, "/stop", "");
-			LogDebug(VB_HTTP, "API - Stopping sequence '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/pause"))
-		{
-			boost::replace_last(url, "/pause", "");
-			LogDebug(VB_HTTP, "API - (un)Pausing sequence '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/pause/0"))
-		{
-			LogDebug(VB_HTTP, "API - UnPausing sequence '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/pause/1"))
-		{
-			LogDebug(VB_HTTP, "API - Pausing sequence '%s'\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/step"))
-		{
-			boost::replace_last(url, "/step", "");
-			LogDebug(VB_HTTP, "API - Stepping sequence '%s' by 1 frame\n", url.c_str());
-		}
-		else if (boost::ends_with(url, "/back"))
-		{
-			boost::replace_last(url, "/back", "");
-			LogDebug(VB_HTTP, "API - Stepping sequence '%s' BACK by 1 frame\n", url.c_str());
-		}
-		else if (url.find("/step/") != std::string::npos)
-		{
-			std::string sequenceName = url.substr(0, url.find("/step/"));
-			int frames = atoi(url.substr(url.find("/step/") + 6).c_str());
-			LogDebug(VB_HTTP, "API - Stepping sequence '%s' by %d frame(s)\n", sequenceName.c_str(), frames);
-		}
-		else if (url.find("/back/") != std::string::npos)
-		{
-			std::string sequenceName = url.substr(0, url.find("/back/"));
-			int frames = atoi(url.substr(url.find("/back/") + 6).c_str());
-			LogDebug(VB_HTTP, "API - Stepping sequence '%s' BACK by %d frame(s)\n", sequenceName.c_str(), frames);
-		}
-	}
-	else if (url == "testing")
-	{
-		PostTesting(data, result);
-	}
-	else if (url == "settings/reload")
-	{
-		LogDebug(VB_HTTP, "API - Reloading all settings\n");
-	}
-	else if (url.find("settings/reload/") == 0)
-	{
-		boost::replace_first(url, "settings/reload/", "");
-		LogDebug(VB_HTTP, "API - Reloading setting: %s\n", url.c_str());
-	}
-	else if (url == "restart")
-	{
-		LogDebug(VB_HTTP, "API - Restarting fppd daemon\n");
-	}
-	else if (url == "shutdown")
-	{
-		SetOKResult(result, "Shutting down fppd");
-		ShutdownFPPD();
-	}
-	else
-	{
-		LogErr(VB_HTTP, "API - Error unknown POST request: %s\n", url.c_str());
-
-		result["status"] = "ERROR";
-		result["respCode"] = 404;
-		result["message"] = std::string("endpoint fppd/") + url + " does not exist";
-	}
-
-
-	if (!result.isMember("status"))
-	{
-		result["status"] = "ERROR";
-		result["respCode"] = 400;
-		result["message"] = "POST endpoint helper did not set result JSON";
-	}
-
-	Json::FastWriter fastWriter;
-	std::string resultStr = fastWriter.write(result);
-	LogResponse(req, result["respCode"].asInt(), resultStr);
-
-    return http_response_builder(resultStr.c_str(), result["respCode"].asInt(), "application/json").string_response();
-}
-
-
-/*
- *
- */
-const http_response PlayerResource::render_DELETE(const http_request &req)
-{
-	LogRequest(req);
-
-	Json::Value result;
-	std::string url = req.get_path();
-
-	boost::replace_first(url, "/fppd/", "");
-
-	LogDebug(VB_HTTP, "DELETE URL: %s %s\n", url.c_str(), req.get_querystring().c_str());
-
-	// Keep IF statement in alphabetical order
-	if (url.find("event/") == 0)
-	{
-		boost::replace_first(url, "event/", "");
-		int id = atoi(url.c_str());
-		LogDebug(VB_HTTP, "API - Deleting event with running ID %d\n", id);
-	}
-	else
-	{
-		LogErr(VB_HTTP, "API - Error unknown DELETE request: %s\n", url.c_str());
-
-		result["status"] = "ERROR";
-		result["respCode"] = 404;
-		result["message"] = std::string("endpoint fppd/") + url + " does not exist";
-	}
-
-
-	if (!result.isMember("status"))
-	{
-		result["status"] = "ERROR";
-		result["respCode"] = 400;
-		result["message"] = "DELETE endpoint helper did not set result JSON";
-	}
-
-	Json::FastWriter fastWriter;
-	std::string resultStr = fastWriter.write(result);
-
-	LogResponse(req, result["respCode"].asInt(), resultStr);
-
-	return http_response_builder(resultStr.c_str(), result["respCode"].asInt()).string_response();
-}
-
-
-/*
- *
- */
-const http_response PlayerResource::render_PUT(const http_request &req)
-{
-	LogRequest(req);
-
-	Json::Value result;
-	std::string url = req.get_path();
-
-	boost::replace_first(url, "/fppd/", "");
-
-	LogDebug(VB_HTTP, "PUT URL: %s %s\n", url.c_str(), req.get_querystring().c_str());
-
-	// Keep IF statement in alphabetical order
-	if (url.find("playlists/") == 0)
-	{
-		boost::replace_first(url, "playlists/", "");
-
-		if (boost::ends_with(url, "/settings"))
-		{
-			boost::replace_last(url, "/settings", "");
-
-			LogDebug(VB_HTTP, "API - Updating runtime settings for playlist '%s'\n", url.c_str());
-		}
-	}
-	else
-	{
-		LogErr(VB_HTTP, "API - Error unknown PUT request: %s\n", url.c_str());
-
-		result["status"] = "ERROR";
-		result["respCode"] = 404;
-		result["message"] = std::string("endpoint fppd/") + url + " does not exist";
-	}
-
-
-
-	if (!result.isMember("status"))
-	{
-		result["status"] = "ERROR";
-		result["respCode"] = 400;
-		result["message"] = "PUT endpoint helper did not set result JSON";
-	}
-
-	Json::FastWriter fastWriter;
-	std::string resultStr = fastWriter.write(result);
-
-	LogResponse(req, result["respCode"].asInt(), resultStr);
-
-	return http_response_builder(resultStr.c_str(), result["respCode"].asInt()).string_response();;
-}
-
-/*
- *
- */
-void PlayerResource::SetOKResult(Json::Value &result, const std::string &msg)
-{
-	result["status"] = "OK";
-	result["respCode"] = 200;
-	result["message"] = msg;
-}
-
-/*
- *
- */
-void PlayerResource::SetErrorResult(Json::Value &result, const int respCode, const std::string &msg)
-{
-	result["status"] = "ERROR";
-	result["respCode"] = respCode;
-	result["message"] = msg;
-}
-
-/*
- *
- */
-void PlayerResource::GetRunningEffects(Json::Value &result)
-{
-	LogDebug(VB_HTTP, "API - Getting list of running effects\n");
-}
-
-/*
- *
- */
-void PlayerResource::GetRunningEvents(Json::Value &result)
-{
-	LogDebug(VB_HTTP, "API - Getting list of running events\n");
-}
-
-/*
- *
- */
-void PlayerResource::GetLogSettings(Json::Value &result)
-{
-	SetOKResult(result, "");
-	Json::Value log;
-
-	log["level"] = logLevelStr;
-	log["mask"] = logMaskStr;
-	result["log"] = log;
-}
-
-inline std::string toStdStringAndFree(char * v) {
-    std::string s = v;
-    free(v);
-    return s;
-}
-inline std::string secondsToTime(int i) {
-    std::stringstream sstr;
-    int min = i / 60;
-    int sec = i % 60;
-    sstr << std::setw(2) << std::setfill('0') << min;
-    sstr << ":";
-    sstr << std::setw(2) << std::setfill('0') << sec;
-    return sstr.str();
-}
-/*
- *
- */
-void PlayerResource::GetCurrentStatus(Json::Value &result)
-{
-	LogDebug(VB_HTTP, "API - Getting fppd status\n");
+ Build a Status JSON String
+*/
+void GetCurrentFPPDStatus(Json::Value& result) {
+    std::string UUID = getSetting("SystemUUID");
+    static std::string host_name = getSetting("HostName");
+    static std::string host_description = getSetting("HostDescription");
+    static std::string fpp_version = getFPPVersion();
+    static std::string fppd_branch = getFPPBranch();
+    static std::string platform = getPlatform();
 
     int mode = getFPPmode();
     result["fppd"] = "running";
+    result["version"] = fpp_version;
+    result["branch"] = fppd_branch;
+    result["platform"] = platform;
+    result["uuid"] = UUID;
+    result["host_name"] = host_name;
+    result["host_description"] = host_description;
     result["mode"] = mode;
     result["mode_name"] = toStdStringAndFree(modeToString(getFPPmode()));
-    result["status"] = FPPstatus;
-    result["status_name"] = channelTester->Testing() ? "testing" : (FPPstatus == 0 ? "idle" : (FPPstatus == 1 ? "playing" : "stopping gracefully"));
+    result["status"] = Player::INSTANCE.GetStatus();
+    result["bridging"] = HasBridgeData();
+    result["multisync"] = multiSync->isMultiSyncEnabled();
+    result["powerBad"] = piPowerBad.load();
+
+    result["channelInputsEnabled"] = InputsEnabled();
+    result["channelOutputsEnabled"] = HasUniverseOutputs();
+
+    if (ChannelTester::INSTANCE.Testing()) {
+        result["status_name"] = "testing";
+        // Which test is running (same shape as GET api/testmode, minus any
+        // per-output "config" blob).  Pushed over the status WebSocket, so
+        // every open page can track a test started or stopped elsewhere.
+        Json::Value tm = ChannelTester::INSTANCE.GetStatusJson();
+        if (!tm.isNull())
+            result["testMode"] = tm;
+    } else {
+        switch (result["status"].asInt()) {
+        case FPP_STATUS_IDLE:
+            result["status_name"] = "idle";
+            break;
+        case FPP_STATUS_PLAYLIST_PLAYING:
+            result["status_name"] = "playing";
+            break;
+        case FPP_STATUS_STOPPING_GRACEFULLY:
+            result["status_name"] = "stopping gracefully";
+            break;
+        case FPP_STATUS_STOPPING_GRACEFULLY_AFTER_LOOP:
+            result["status_name"] = "stopping gracefully after loop";
+            break;
+        case FPP_STATUS_STOPPING_NOW:
+            result["status_name"] = "stopping now";
+            break;
+        case FPP_STATUS_PLAYLIST_PAUSED:
+            result["status_name"] = "paused";
+            break;
+        default:
+            result["status_name"] = "unknown";
+        }
+    }
+
     result["volume"] = getVolume();
 
     auto t = std::time(nullptr);
-    auto tm = *std::localtime(&t);
+    struct tm tm;
+    localtime_r(&t, &tm);
     std::stringstream sstr;
     sstr << std::put_time(&tm, "%a %b %d %H:%M:%S %Z %Y");
     std::string str = sstr.str();
     result["time"] = str;
-    
+
+    std::string fmt = getSetting("TimeFormat");
+    replaceAll(fmt, "%M", "%M:%S");
+    result["timeStrFull"] = GetTimeStr(fmt.c_str());
+    result["timeStr"] = GetTimeStr(getSetting("TimeFormat"));
+    result["dateStr"] = GetDateStr(getSetting("DateFormat"));
+
+    // FPPD process uptime (time since fppd started)
+    int totalseconds = (int)((GetMonotonicTimeMS() - startupTimeMS) / 1000);
+    int days = totalseconds / 86400;
+    int hours = (totalseconds % 86400) / 3600;
+    int minutes = (totalseconds % 3600) / 60;
+    int seconds = totalseconds % 60;
+
+    result["uptime"] = secondsToTime(totalseconds);
+    result["uptimeTotalSeconds"] = totalseconds;
+    result["uptimeSeconds"] = seconds;
+    result["uptimeMinutes"] = minutes;
+    result["uptimeHours"] = hours;
+    result["uptimeDays"] = days;
+
+    std::stringstream totalTime;
+    totalTime << days << " days, " << hours << " hours, " << minutes << " minutes, " << seconds << " seconds";
+    result["uptimeStr"] = totalTime.str();
+
+    // System uptime
+    int systemUptimeSecs = 0;
+#ifdef PLATFORM_OSX
+    struct timeval boot;
+    struct timeval now;
+    int mib[] = { CTL_KERN, KERN_BOOTTIME };
+    size_t size = sizeof(boot);
+    if (sysctl(mib, 2, &boot, &size, 0, 0) == 0 && gettimeofday(&now, 0) == 0) {
+        systemUptimeSecs = (int)(now.tv_sec - boot.tv_sec);
+    }
+#else
+    struct sysinfo sysInf;
+    if (sysinfo(&sysInf) == 0) {
+        systemUptimeSecs = (int)sysInf.uptime;
+    }
+#endif
+    result["systemUptimeTotalSeconds"] = systemUptimeSecs;
+
+    Sensors::INSTANCE.reportSensors(result);
+    for (auto& warn : WarningHolder::GetWarnings()) {
+        result["warnings"].append(warn.message());
+        result["warningInfo"].append(warn.toJsonValue());
+    }
     if (mode == 1) {
-        //bridge mode only returns the base information
+        // bridge mode only returns the base information
         return;
     }
 
-    // base data returned by all the other modes
-    result["current_playlist"]["playlist"] = "";
-    result["current_playlist"]["type"] = "";
-    result["current_playlist"]["index"] = "0";
-    result["current_playlist"]["count"] = "0";
-    result["current_sequence"] = "";
-    result["current_song"] = "";
-    result["seconds_played"] = "0";
-    result["seconds_remaining"] = "0";
-    result["time_elapsed"] = "00:00";
-    result["time_remaining"] = "00:00";
+    // MQTT
+    result["MQTT"]["configured"] = false;
+    result["MQTT"]["connected"] = false;
+    if (mqtt) {
+        result["MQTT"]["configured"] = true;
+        result["MQTT"]["connected"] = mqtt->IsConnected();
+    }
 
-    char NextPlaylist[128] = "No playlist scheduled.";
-    char NextScheduleStartText[64] = "";
-    scheduler->GetNextScheduleStartText(NextScheduleStartText);
-    scheduler->GetNextPlaylistText(NextPlaylist);
-    
     if (getFPPmode() == REMOTE_MODE) {
         int secsElapsed = 0;
         int secsRemaining = 0;
         std::string seqFilename;
         std::string mediaFilename;
         if (sequence->IsSequenceRunning()) {
-            seqFilename = sequence->m_seqFilename;
-            secsElapsed = sequence->m_seqSecondsElapsed;
-            secsRemaining = sequence->m_seqSecondsRemaining;
+            seqFilename = sequence->GetSeqFilenameCopy();
+            secsElapsed = sequence->m_seqMSElapsed / 1000;
+            secsRemaining = sequence->m_seqMSRemaining / 1000;
         }
-        if (mediaOutput) {
-            mediaFilename = mediaOutput->m_mediaFilename;
-            secsElapsed = mediaOutputStatus.secondsElapsed;
-            secsRemaining = mediaOutputStatus.secondsRemaining;
+        {
+            // CloseMediaOutput() deletes mediaOutput under mediaOutputLock at
+            // every media transition, and this status build runs on the HTTP
+            // threads, the drogon status-push timer and the warning notify
+            // thread. Copy the fields out under the lock rather than reading
+            // through the raw pointer while building the JSON. Nothing in here
+            // re-enters media code, so the hold is a string copy long.
+            std::unique_lock<std::mutex> lock(mediaOutputLock);
+            if (mediaOutput) {
+                mediaFilename = mediaOutput->m_mediaFilename;
+                std::lock_guard<std::mutex> fl(MediaOutputStatus::FieldsLock());
+                secsElapsed = mediaOutputStatus.secondsElapsed;
+                secsRemaining = mediaOutputStatus.secondsRemaining;
+            }
         }
-        
+
         if (seqFilename != "" || mediaFilename != "") {
             result["status"] = 1;
             result["status_name"] = "playing";
         }
-        
+
         result["playlist"] = seqFilename;
         result["sequence_filename"] = seqFilename;
-        result["media_filename"] = mediaFilename;
+        result["media_filename"] = mediaFilename.substr(mediaFilename.find_last_of("/\\") + 1);
         result["current_sequence"] = seqFilename;
-        result["current_song"] = mediaFilename;
+        result["current_song"] = result["media_filename"];
         result["seconds_played"] = std::to_string(secsElapsed);
         result["seconds_elapsed"] = std::to_string(secsElapsed);
         result["seconds_remaining"] = std::to_string(secsRemaining);
         result["time_elapsed"] = secondsToTime(secsElapsed);
         result["time_remaining"] = secondsToTime(secsRemaining);
-    } else if (FPPstatus == FPP_STATUS_IDLE) {
-        result["next_playlist"]["playlist"] = NextPlaylist;
-        result["next_playlist"]["start_time"] = NextScheduleStartText;
-        result["repeat_mode"] = "0";
     } else {
-        Json::Value pl = playlist->GetInfo();
-        if (pl["currentEntry"].isMember("dynamic")) {
-            pl["currentEntry"] = pl["currentEntry"]["dynamic"];
-        }
-        result["repeat_mode"] = pl["repeat"].asInt();
+        std::string NextPlaylist = scheduler->GetNextPlaylistName();
+        std::string NextPlaylistStart = scheduler->GetNextPlaylistStartStr();
         result["next_playlist"]["playlist"] = NextPlaylist;
-        result["next_playlist"]["start_time"] = NextScheduleStartText;
+        result["next_playlist"]["start_time"] = NextPlaylistStart;
 
-        std::string plname = pl["name"].asString();
-        plname = plname.substr(plname.find_last_of("\\/") + 1);
-        plname = plname.substr(0, plname.find_last_of("."));
-        result["current_playlist"]["playlist"] = plname;
-        result["current_playlist"]["index"] = std::to_string(playlist->GetPosition());
-        result["current_playlist"]["count"] = std::to_string(pl["size"].asInt());
-        result["current_playlist"]["type"] = pl["currentEntry"]["type"].asString();
+        Player::INSTANCE.GetCurrentStatus(result);
+        result["scheduler"] = scheduler->GetInfo();
 
-        int secsElapsed = 0;
-        int secsRemaining = 0;
-  
-        std::string currentSeq;
-        std::string currentSong;
+        // Add multi-stream slot status
+        Json::Value slots = StreamSlotManager::Instance().GetAllSlotsStatus();
+        result["streamSlots"] = slots;
 
-        if ((pl["currentEntry"]["type"] == "both") ||
-            (pl["currentEntry"]["type"] == "media")) {
-            
-            currentSeq = pl["currentEntry"]["type"].asString() == "both"
-                ? pl["currentEntry"]["sequence"]["sequenceName"].asString() : "";
-            currentSong = pl["currentEntry"]["type"].asString() == "both"
-                ? pl["currentEntry"]["media"]["mediaFilename"].asString()
-                : pl["currentEntry"]["mediaFilename"].asString();
-
-            secsElapsed = pl["currentEntry"]["type"].asString() == "both"
-                ? pl["currentEntry"]["media"]["secondsElapsed"].asInt()
-                : pl["currentEntry"]["secondsElapsed"].asInt();
-            secsRemaining = pl["currentEntry"]["type"].asString() == "both"
-                ? pl["currentEntry"]["media"]["secondsRemaining"].asInt()
-                : pl["currentEntry"]["secondsRemaining"].asInt();
-        } else if (pl["currentEntry"]["type"] == "sequence") {
-            currentSeq = pl["currentEntry"]["sequenceName"].asString();
-            secsElapsed = sequence->m_seqSecondsElapsed;
-            secsRemaining = sequence->m_seqSecondsRemaining;
-        } else {
-            secsElapsed = pl["currentEntry"]["type"].asString() == "pause" ? pl["currentEntry"]["duration"].asInt() - pl["currentEntry"]["remaining"].asInt() : 0;
-            secsRemaining = pl["currentEntry"]["type"].asString() == "pause" ? pl["currentEntry"]["remaining"].asInt() : 0;
+        // Media started outside a playlist -- "Play Media", a PSA, background
+        // music -- runs on a stream slot rather than through the player, so
+        // status_name read "idle" while audio was audibly playing.  The slot
+        // data was already here; nothing looked at it.  That cost real
+        // debugging time more than once: a box was declared silent on the
+        // strength of this field while a track was running.
+        //
+        // Only the display fields move.  result["status"] deliberately stays
+        // FPP_STATUS_IDLE, because the scheduler gates on it in eight places
+        // and Player::StopNowAllLevels() stops levels while
+        // `GetStatus() != FPP_STATUS_IDLE`.  It stops the playlist, not a
+        // slot, so reporting a slot as player activity would make it think
+        // a level was still playing.
+        bool anyForeground = false, anyBackground = false;
+        int lead = -1;
+        for (Json::ArrayIndex i = 0; i < slots.size(); i++) {
+            if (slots[i]["status"].asString() != "playing") {
+                continue;
+            }
+            // StreamSlot::isBackground exists but nothing currently sets it,
+            // so it cannot be the only test or this never fires.  The manager
+            // already treats slots 2-5 as background everywhere else --
+            // StopBackgroundSlots() and ProcessBackgroundSlots() both operate
+            // on exactly that range -- so follow the same rule here, and keep
+            // honouring the flag for when it does get populated.
+            const bool bg = slots[i]["isBackground"].asBool() ||
+                            slots[i]["slot"].asInt() > 1;
+            anyForeground |= !bg;
+            anyBackground |= bg;
+            // Prefer a foreground slot as the one to describe; fall back to a
+            // background slot so a PSA or background music still names itself.
+            if (lead < 0 || (!bg && slots[lead]["isBackground"].asBool())) {
+                lead = (int)i;
+            }
         }
-        result["current_sequence"] = currentSeq;
-        result["current_song"] = currentSong;
-        result["seconds_played"] = std::to_string(secsElapsed);
-        result["seconds_elapsed"] = std::to_string(secsElapsed);
-        result["seconds_remaining"] = std::to_string(secsRemaining);
-        result["time_elapsed"] = secondsToTime(secsElapsed);
-        result["time_remaining"] = secondsToTime(secsRemaining);
+
+        result["media_playing"] = anyForeground || anyBackground;
+        // Only describe a stream slot when the player itself is idle.  Slot 1
+        // IS the playlist's own media, so an active playlist always has a
+        // "playing" slot; overwriting status_name here would demote a
+        // "playing" playlist (sequence + media) to "playing media" and hide
+        // the sequence name on consumers such as the multisync page.
+        // Testing also sets its own status_name; leave that alone too.
+        if (lead >= 0 && result["status"].asInt() == FPP_STATUS_IDLE &&
+            result["status_name"].asString() == "idle") {
+            result["status_name"] = anyForeground ? "playing media" : "playing background";
+            const std::string f = slots[lead]["mediaFilename"].asString();
+            result["current_song"] = f.substr(f.find_last_of("/\\") + 1);
+            // Only publish a position when the slot actually tracks one.
+            // Nothing drives slot 1's Process() when media is started outside
+            // a playlist -- both StreamSlotManager loops begin at slot 2,
+            // because slot 1 is normally the playlist's own media and the
+            // playlist pumps it -- so setMediaElapsed() never runs and these
+            // stay 0 for the whole track.  Reporting that as a real position
+            // is worse than omitting it.
+            const int elapsed = slots[lead]["secondsElapsed"].asInt();
+            const int remaining = slots[lead]["secondsRemaining"].asInt();
+            if (elapsed > 0 || remaining > 0) {
+                result["seconds_played"] = std::to_string(elapsed);
+                result["seconds_remaining"] = std::to_string(remaining);
+            }
+        }
+
+        // A sequence started outside a playlist -- /api/sequence/.../start,
+        // the file manager's Play button, a "StartSequence" command preset --
+        // runs on the sequence engine, not through the player, so the idle
+        // branch above left current_sequence empty and status_name read
+        // "idle" (or "playing media" when media was also started on a slot)
+        // while channel data was visibly playing.  Surface it the same way a
+        // playlist's sequence entry surfaces: status_name "playing" with
+        // current_sequence named, so the header badge and the multisync page
+        // agree on what is playing.  A concurrent media slot keeps its
+        // current_song, so sequence + media outside a playlist names both.
+        //
+        // Only the display fields move.  result["status"] deliberately stays
+        // FPP_STATUS_IDLE for the same reason as above: the scheduler gates
+        // on it and Player::StopNow()/Scheduler wait on it.
+        //
+        // The allowlist matters: "testing" sets its own status_name above and
+        // must keep it, and the paused/stopping states are never idle, so
+        // only the three idle-family names can arrive here.
+        if (result["status"].asInt() == FPP_STATUS_IDLE &&
+            (result["status_name"].asString() == "idle" ||
+             result["status_name"].asString() == "playing media" ||
+             result["status_name"].asString() == "playing background") &&
+            sequence->IsSequenceRunning()) {
+            const std::string sf = sequence->GetSeqFilenameCopy();
+            if (sf != "") {
+                result["current_sequence"] = sf.substr(sf.find_last_of("/\\") + 1);
+                result["status_name"] = "playing";
+            }
+        }
     }
-    Sensors::INSTANCE.reportSensors(result);
 }
 
 /*
  *
  */
-void PlayerResource::GetCurrentPlaylists(Json::Value &result)
-{
-	LogDebug(VB_HTTP, "API - Getting current playlist\n");
-
-	Json::Value names(Json::arrayValue);
-
-	if (playlist->IsPlaying())
-		names.append(playlist->GetPlaylistName());
-
-	result["playlists"] = names;
-
-	SetOKResult(result, "");
+APIServer::APIServer() {
 }
 
 /*
  *
  */
-void PlayerResource::GetE131BytesReceived(Json::Value &result)
-{
-	result = GetE131UniverseBytesReceived(); // e131bridge.cpp
+// Set once fppd is stopping: the sync advice registered in Init() then turns
+// every new request (and WebSocket upgrade) away before it reaches a router.
+static std::atomic<bool> s_httpQuiescing{ false };
 
-	if (result.isMember("universes"))
-		SetOKResult(result, "");
-	else
-		SetErrorResult(result, 400, "GetE131UniverseBytesReceived() did not return any universes.");
+// drogon's quit() frees its routers on the main loop *before* it stops the IO
+// loops: an IO thread still routing a request (the UI's status poll, say)
+// then reads a freed router (TSan: StaticFileRouter::route() reading the
+// default handler of a router the main loop just deleted). So before quit(),
+// new requests are refused, and each IO loop is made to run a task: a loop
+// runs queued tasks only between requests, so once every loop has run one,
+// none is inside a router, and none will enter one again.
+static void QuiesceHttpServer() {
+    s_httpQuiescing = true;
+    if (!drogon::app().isRunning()) {
+        return;
+    }
+    struct Barrier {
+        std::mutex lock;
+        std::condition_variable done;
+        size_t left = 0;
+    };
+    // Shared with the tasks: one still queued when the wait gives up runs later.
+    auto barrier = std::make_shared<Barrier>();
+    size_t loops = drogon::app().getThreadNum();
+    for (size_t i = 0; i < loops; i++) {
+        trantor::EventLoop* loop = drogon::app().getIOLoop(i);
+        if (!loop) {
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> l(barrier->lock);
+            barrier->left++;
+        }
+        loop->queueInLoop([barrier]() {
+            std::lock_guard<std::mutex> l(barrier->lock);
+            barrier->left--;
+            barrier->done.notify_all();
+        });
+    }
+    std::unique_lock<std::mutex> l(barrier->lock);
+    if (!barrier->done.wait_for(l, std::chrono::seconds(2), [&barrier]() { return barrier->left == 0; })) {
+        LogWarn(VB_HTTP, "%d HTTP IO loops still busy at shutdown\n", (int)barrier->left);
+    }
+}
+
+APIServer::~APIServer() {
+    // Before drogon stops: the status push registers a WarningHolder listener
+    // and holds connection pointers, both of which outlive quit() (which only
+    // queues teardown, so the close callbacks may never run). Init() turned it
+    // on from here, so it gets turned off from here too.
+    StatusWebSocketShutdown();
+
+    QuiesceHttpServer();
+    drogon::app().quit();
+    // Join the server thread so Drogon is fully stopped before we return.
+    // PluginManager::Cleanup() (called from main() after MainLoop() exits)
+    // will dlclose() plugin libraries; if Drogon IO threads are still running
+    // at that point they may execute or release plugin handler lambdas whose
+    // code is in those libraries -> SEGV_MAPERR. Joining here ensures all
+    // Drogon threads have exited before any dlclose() can happen.
+    if (m_serverThread && m_serverThread->joinable()) {
+        m_serverThread->join();
+    }
+    delete m_serverThread;
+    m_serverThread = nullptr;
+    m_pr.reset();
+}
+
+// drogon's registerHandler/registerHandlerViaRegex take the callable by
+// rvalue reference and move out of it, so a handler that is registered on
+// more than one route must be copied for each registration. Re-using the
+// same variable would register a moved-from closure: harmless for the
+// captureless lambdas below, but for capturing ones (e.g. handleFppd's
+// shared_ptr) the later route ends up dereferencing a nulled capture and
+// crashes. Every registration below goes through this explicit copy so
+// adding a capture to any handler stays safe.
+template<typename T>
+static T copyHandler(const T& handler) {
+    return handler;
 }
 
 /*
  *
  */
-void PlayerResource::GetMultiSyncSystems(Json::Value &result)
-{
-	result = multiSync->GetSystems();
+// "1.9.13" -> "1.9"
+static std::string drogonMajorMinor(const std::string& v) {
+    size_t first = v.find('.');
+    if (first == std::string::npos) {
+        return v;
+    }
+    size_t second = v.find('.', first + 1);
+    return second == std::string::npos ? v : v.substr(0, second);
+}
 
-	if (result.isMember("systems"))
-		SetOKResult(result, "");
-	else
-		SetErrorResult(result, 400, "MultiSync did not return any systems.");
+// registerHandler() and friends are templates instantiated in fppd from the
+// drogon headers it was compiled against, and they call into libdrogon by
+// vtable slot. Built against one drogon's headers and run against another's
+// library - headers from a drogon source install in /usr/local, library from
+// the distro package, say - the first route registration jumps through the
+// wrong slot and fppd segfaults on every start. drogon's SONAME stays
+// libdrogon.so.1 across those releases, so the dynamic linker cannot catch it.
+// Compare what we were built with against what we loaded, and refuse to run
+// on a major.minor mismatch with a message that says what to fix. A patch
+// difference (a distro update within a release) is only noted.
+static bool drogonVersionMatches() {
+    std::string built = DROGON_VERSION;
+    std::string loaded = drogon::getVersion();
+    if (built == loaded) {
+        return true;
+    }
+    if (drogonMajorMinor(built) != drogonMajorMinor(loaded)) {
+        LogErr(VB_HTTP, "fppd was built against drogon %s headers but loaded libdrogon %s. "
+                        "These are not compatible; rebuild fppd against the drogon that is installed "
+                        "(or remove the other drogon's headers or library)\n",
+               built.c_str(), loaded.c_str());
+        fprintf(stderr, "fppd: built against drogon %s headers but loaded libdrogon %s; rebuild fppd\n",
+                built.c_str(), loaded.c_str());
+        return false;
+    }
+    LogWarn(VB_HTTP, "fppd was built against drogon %s headers and loaded libdrogon %s\n",
+            built.c_str(), loaded.c_str());
+    return true;
+}
+
+void APIServer::Init(void) {
+    if (!drogonVersionMatches()) {
+        // _exit(), not exit(): fppd is half started, and the static
+        // destructors exit() runs can block on, or free memory under, the
+        // threads already running (see ExitWithoutTeardown() in fppd.cpp).
+        fflush(nullptr);
+        _exit(EXIT_FAILURE);
+    }
+    m_pr = std::make_shared<PlayerResource>();
+
+    auto& app = drogon::app();
+
+    // Register all handlers with path patterns that match the old libhttpserver routes.
+    // The "true" flag in the old register_resource() meant "family" (prefix match),
+    // so we register with {1} catch-all patterns.
+
+    // PlayerResource (/fppd/*)
+    auto handleFppd = [pr = m_pr](const HttpRequestPtr& req,
+                                  std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = pr->render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = pr->render_POST(req);
+        else if (req->method() == drogon::Put)
+            resp = pr->render_PUT(req);
+        else if (req->method() == drogon::Delete)
+            resp = pr->render_DELETE(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    // Register /fppd exact match first; the catch-all regex is registered after
+    // the more specific /fppd/* routes below so they take priority. Bare /fppd
+    // has no content of its own -- it 404s from PlayerResource just like a bad
+    // sub-path would (confirmed directly against fppd:32322). Intentionally
+    // left undocumented, same reasoning as bare /command below.
+    app.registerHandler("/fppd", copyHandler(handleFppd), {drogon::Get, drogon::Post, drogon::Put, drogon::Delete, drogon::Head});
+
+    // OutputMonitor (/fppd/ports/*)
+    auto handlePorts = [](const HttpRequestPtr& req,
+                          std::function<void(const HttpResponsePtr&)>&& callback) {
+        callback(OutputMonitor::INSTANCE.render_GET(req));
+    };
+    app.registerHandlerViaRegex("/fppd/ports", copyHandler(handlePorts), {drogon::Get, drogon::Head});
+    app.registerHandlerViaRegex("/fppd/ports/.*", copyHandler(handlePorts), {drogon::Get, drogon::Head});
+
+    // ChannelTester (/fppd/testing/*)
+    auto handleTesting = [](const HttpRequestPtr& req,
+                            std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = ChannelTester::INSTANCE.render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = ChannelTester::INSTANCE.render_POST(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    app.registerHandlerViaRegex("/fppd/testing(/.*)?", copyHandler(handleTesting), {drogon::Get, drogon::Post, drogon::Head});
+
+#ifdef HAS_AES67_GSTREAMER
+    /**
+     * Get AES67 status: whether it's active, PTP sync state, discovered
+     * streams and pipelines.
+     *
+     * @route GET /api/aes67
+     * @response 200 AES67 status.
+     */
+    // AES67 status/test endpoint
+    auto handleAES67 = [](const HttpRequestPtr& req,
+                          std::function<void(const HttpResponsePtr&)>&& callback) {
+        callback(AES67Manager::INSTANCE.render_GET(req));
+    };
+    app.registerHandler("/aes67", copyHandler(handleAES67), {drogon::Get, drogon::Head});
+    app.registerHandlerViaRegex("/aes67/.*", copyHandler(handleAES67), {drogon::Get, drogon::Head});
+#endif
+
+#ifdef HAS_OPUS_RTP_GSTREAMER
+    /**
+     * Get Opus RTP status: whether it's active and the current pipelines.
+     *
+     * @route GET /api/opusrtp
+     * @response 200 Opus RTP status.
+     */
+    auto handleOpusRTP = [](const HttpRequestPtr& req,
+                            std::function<void(const HttpResponsePtr&)>&& callback) {
+        callback(OpusRTPManager::INSTANCE.render_GET(req));
+    };
+    app.registerHandler("/opusrtp", copyHandler(handleOpusRTP), {drogon::Get, drogon::Head});
+    app.registerHandlerViaRegex("/opusrtp/.*", copyHandler(handleOpusRTP), {drogon::Get, drogon::Head});
+#endif
+
+#ifdef HAS_RTSP_OUTPUT_GSTREAMER
+    /**
+     * Get RTSP output status: whether the server is running, its port, and
+     * the URL and audio state of each configured mount.
+     *
+     * @route GET /api/rtspoutput
+     * @response 200 RTSP output status.
+     */
+    auto handleRTSPOutput = [](const HttpRequestPtr& req,
+                               std::function<void(const HttpResponsePtr&)>&& callback) {
+        callback(RTSPOutputManager::INSTANCE.render_GET(req));
+    };
+    app.registerHandler("/rtspoutput", copyHandler(handleRTSPOutput), {drogon::Get, drogon::Head});
+    app.registerHandlerViaRegex("/rtspoutput/.*", copyHandler(handleRTSPOutput), {drogon::Get, drogon::Head});
+#endif
+
+#ifdef HAS_AUDIO_LEVEL_MONITOR
+    // Subscribe to live signal levels for a set of PipeWire nodes. Internal to
+    // fppd -- the browser reaches it through the PHP passthrough at
+    // /api/pipewire/audio/meters, and reads the levels themselves off the
+    // /fppdws WebSocket rather than polling for them.
+    //
+    // Body: {"nodes":[{"name":"fpp_group_x","sink":true}, ...], "ttl": 6000}
+    // "sink" says how to capture the node -- see AudioLevelMonitor::StartMeter.
+    //
+    // Metering is kept alive by time rather than by a connection: a caller
+    // re-posts to hold it open, so a browser that goes away silently stops
+    // costing anything once the TTL lapses. An empty list stops it at once.
+    auto handleMeters = [](const HttpRequestPtr& req,
+                           std::function<void(const HttpResponsePtr&)>&& callback) {
+        Json::Value body;
+        std::vector<AudioLevelMonitor::Target> nodes;
+        int ttl = 6000;
+        if (LoadJsonFromString(std::string(req->getBody()), body)) {
+            if (body.isMember("nodes") && body["nodes"].isArray()) {
+                for (const auto& n : body["nodes"]) {
+                    AudioLevelMonitor::Target t;
+                    // Objects carry the node's kind; a bare string is assumed
+                    // to be a sink, which is what most metered nodes are.
+                    if (n.isObject()) {
+                        t.name = n.get("name", "").asString();
+                        t.isSink = n.get("sink", true).asBool();
+                    } else {
+                        t.name = n.asString();
+                    }
+                    nodes.push_back(t);
+                }
+            }
+            if (body.isMember("ttl")) {
+                ttl = body["ttl"].asInt();
+            }
+        }
+        AudioLevelMonitor::INSTANCE.Subscribe(nodes, ttl);
+        callback(makeStringResponse("{\"status\":\"OK\"}", 200, "application/json"));
+    };
+    app.registerHandler("/fppd/meters", copyHandler(handleMeters), {drogon::Post});
+#endif
+
+    // Plugin-published PipeWire audio sources (AudioSourceRegistry). Internal
+    // to fppd -- the publicly documented route is the PHP passthrough,
+    // GetPipeWirePluginSources() in www/api/controllers/pipewire.php, which
+    // is what actually sits at /api/pipewire/audio/plugin-sources (this raw
+    // fppd path isn't Apache-proxied directly, so it has no /api/ route of
+    // its own to document here).
+    auto handlePluginSources = [](const HttpRequestPtr& req,
+                                  std::function<void(const HttpResponsePtr&)>&& callback) {
+        std::string body = SaveJsonToString(AudioSourceRegistry::INSTANCE.toJson());
+        callback(makeStringResponse(body, 200, "application/json"));
+    };
+    app.registerHandler("/pipewire/audio/plugin-sources", copyHandler(handlePluginSources), {drogon::Get, drogon::Head});
+
+    // Internal-only endpoint, deliberately undocumented (no @route
+    // docblock) -- lists every HTTP route currently registered with the
+    // embedded Drogon server, FPP's own included, plus the loaded plugins'
+    // routes from FPP's plugin route registry, so ServeOpenApiSpec() in
+    // www/api/index.php can diff it against known @route docblocks and
+    // surface whatever's left over as plugin-supplied (e.g. fpp-brightness's
+    // /Brightness). Registered under /internal, not /fppd, specifically so
+    // it does NOT appear in Apache's direct-proxy namespace whitelist
+    // (etc/apache2.site) -- PHP reaches it the same way it reaches every
+    // other fppd endpoint, a direct call to localhost:32322, never through
+    // Apache. It's still technically reachable externally via the generic
+    // /api/plugin-apis/<path> passthrough (that rule proxies any fppd path
+    // unconditionally -- it's what makes third-party plugin routes work at
+    // all, so it can't be restricted just for this one path), but it's no
+    // longer listed anywhere or reachable at a guessable /api/ path.
+    auto handlePluginApiRoutes = [](const HttpRequestPtr& req,
+                                    std::function<void(const HttpResponsePtr&)>&& callback) {
+        static const char* methodNames[] = {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS", "PATCH", "INVALID"};
+        Json::Value result(Json::arrayValue);
+        for (auto& info : drogon::app().getHandlersInfo()) {
+            Json::Value entry;
+            entry["path"] = std::get<0>(info);
+            drogon::HttpMethod m = std::get<1>(info);
+            entry["method"] = (m >= 0 && m <= drogon::Invalid) ? methodNames[m] : "UNKNOWN";
+            entry["description"] = std::get<2>(info);
+            result.append(entry);
+        }
+        // Plugin paths are dispatched by FPP, not registered with drogon.
+        for (auto& [path, m] : FPPPlugins::listPluginApiRoutes()) {
+            Json::Value entry;
+            entry["path"] = path;
+            entry["method"] = (m >= 0 && m <= drogon::Invalid) ? methodNames[m] : "UNKNOWN";
+            entry["description"] = "";
+            result.append(entry);
+        }
+        callback(makeStringResponse(SaveJsonToString(result), 200, "application/json"));
+    };
+    app.registerHandler("/internal/pluginApiRoutes", copyHandler(handlePluginApiRoutes), {drogon::Get, drogon::Head});
+
+    // Builds a -manual crash report for POST /api/crashes/report.  The build
+    // runs off the event loop.
+    app.registerHandler("/internal/crashReport", [](const HttpRequestPtr&, std::function<void(const HttpResponsePtr&)>&& callback) {
+        std::thread([callback = std::move(callback)]() {
+            Json::Value result;
+            std::string error;
+            std::string file = BuildManualCrashReport(error);
+            if (file.empty()) {
+                result["Status"] = "ERROR";
+                result["Code"] = error;
+            } else {
+                result["Status"] = "OK";
+                result["File"] = file;
+            }
+            // fppd may have stopped drogon while the report was building
+            if (drogon::app().isRunning()) {
+                callback(makeStringResponse(SaveJsonToString(result), 200, "application/json"));
+            }
+        }).detach();
+    }, {drogon::Post});
+
+    /**
+     * Load or unload a plugin without restarting fppd, so installing a plugin can
+     * take effect and uninstalling one can stop having effect mid-show.
+     *
+     * PluginManager mutates state the main loop walks every tick, and unloading
+     * calls into the plugin to stop its threads, so the work is handed to the
+     * main loop via a one-shot timer and this thread waits for the result. The
+     * wait is bounded: a wedged main loop returns 503 rather than pinning one of
+     * drogon's small pool of I/O threads forever.
+     *
+     * Documented under readable parameter names rather than the positional
+     * {1}/{2} drogon registers it as - see the skip list in docs.php.
+     *
+     * @route POST /api/fppd/plugin/{PluginName}/{action}
+     * @response 200 The plugin was loaded or unloaded.
+     * ```json
+     * {"Status": "OK", "Message": "", "plugin": "fpp-brightness", "loaded": false}
+     * ```
+     * @response 503 The main loop did not answer in time; nothing was changed.
+     */
+    auto handlePluginLifecycle = [](const HttpRequestPtr& req,
+                                    std::function<void(const HttpResponsePtr&)>&& callback,
+                                    const std::string& name, const std::string& action) {
+        std::string clientIP = getEffectiveClientIP(req);
+        // name and action are raw URL path segments - unvalidated at this point
+        // (action isn't checked against "load" until below, and the reject branch
+        // is by definition reached with a malformed name), so truncate before
+        // logging rather than let a caller choose how many bytes of fppd.log a
+        // single rejected request consumes.
+        // The name becomes a path under the plugin directory, so "." and ".."
+        // would name the plugin directory itself or the media directory above
+        // it.  Same rule as the PHP plugin API: ^[A-Za-z0-9_.-]+$, less those
+        // two.
+        bool validName = !name.empty() && name != "." && name != "..";
+        for (char c : name) {
+            if (!validName) {
+                break;
+            }
+            validName = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '.' || c == '-';
+        }
+        if (!validName) {
+            LogWarn(VB_PLUGIN, "API - Rejected plugin %s request for invalid plugin name \"%s\" from %s\n",
+                    TruncateForLog(action).c_str(), TruncateForLog(name).c_str(), clientIP.c_str());
+            callback(makeStringResponse("{\"Status\":\"ERROR\",\"Message\":\"invalid plugin name\"}",
+                                        400, "application/json"));
+            return;
+        }
+        bool load = (action == "load");
+        LogInfo(VB_PLUGIN, "API - %s plugin \"%s\" requested from %s\n",
+                load ? "Loading" : "Unloading", TruncateForLog(name).c_str(), clientIP.c_str());
+        // Timers replace a same-named entry, so a second request arriving while
+        // one is queued would silently drop the first. Keep the names distinct.
+        static std::atomic<uint64_t> seq{ 0 };
+        std::string timerName = "PluginLifecycle-" + std::to_string(seq++);
+
+        // The result carries whether the plugin is loaded afterwards too: the
+        // plugin lists are the main loop's, so they are read there, not here.
+        auto result = std::make_shared<std::promise<std::tuple<bool, std::string, bool>>>();
+        auto done = result->get_future();
+        Timers::INSTANCE.addTimer(timerName, GetTimeMS(), [result, name, load]() {
+            // This runs plugin code (constructor, registerApis, shutdown,
+            // destructor) on the main loop, where nothing else catches.
+            std::string err;
+            bool ok = false;
+            try {
+                ok = load ? PluginManager::INSTANCE.loadPlugin(name, err)
+                          : PluginManager::INSTANCE.unloadPlugin(name, err);
+            } catch (const std::exception& ex) {
+                err = std::string("plugin threw: ") + ex.what();
+                LogErr(VB_PLUGIN, "%s plugin \"%s\" threw: %s\n", load ? "Loading" : "Unloading",
+                       TruncateForLog(name).c_str(), ex.what());
+            } catch (...) {
+                err = "plugin threw a non-standard exception";
+                LogErr(VB_PLUGIN, "%s plugin \"%s\" threw a non-standard exception\n", load ? "Loading" : "Unloading",
+                       TruncateForLog(name).c_str());
+            }
+            result->set_value({ ok, err, PluginManager::INSTANCE.isPluginLoaded(name) });
+        });
+
+        if (done.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+            LogErr(VB_PLUGIN, "API - %s plugin \"%s\" (from %s) timed out waiting for the main loop\n",
+                   load ? "Loading" : "Unloading", TruncateForLog(name).c_str(), clientIP.c_str());
+            callback(makeStringResponse("{\"Status\":\"ERROR\",\"Message\":\"timed out waiting for the main loop\"}",
+                                        503, "application/json"));
+            return;
+        }
+        auto [ok, err, loaded] = done.get();
+        // err can carry dlerror() text, which is not length-bounded either.
+        LogInfo(VB_PLUGIN, "API - %s plugin \"%s\" (from %s): %s%s%s\n",
+                load ? "Load" : "Unload", TruncateForLog(name).c_str(), clientIP.c_str(),
+                ok ? "OK" : "FAILED", err.empty() ? "" : " - ", TruncateForLog(err).c_str());
+        Json::Value resp(Json::objectValue);
+        resp["Status"] = ok ? "OK" : "ERROR";
+        resp["Message"] = err;
+        resp["plugin"] = name;
+        resp["loaded"] = loaded;
+        callback(makeStringResponse(SaveJsonToString(resp), ok ? 200 : 400, "application/json"));
+    };
+    app.registerHandler("/fppd/plugin/{1}/{2}", handlePluginLifecycle, {drogon::Post});
+
+    // PlayerResource catch-all for all other /fppd/* paths (registered AFTER
+    // specific /fppd/ports and /fppd/testing routes so they match first)
+    app.registerHandlerViaRegex("/fppd/.*", copyHandler(handleFppd), {drogon::Get, drogon::Post, drogon::Put, drogon::Delete, drogon::Head});
+
+    /**
+     * List/manage pixel overlay models. See /api/models/* and /api/overlays/*
+     * for per-model operations.
+     *
+     * @route GET /api/models
+     * @response 200 Array of overlay models.
+     */
+    // PixelOverlayManager (/models/*, /overlays/*). NOTE: despite the shared
+    // handler, methods are NOT uniformly supported across paths -- render_POST()
+    // only acts on p1=="models" and render_PUT() only acts on p1=="overlays"
+    // with a /model/{id}/... suffix (bare PUT /api/models 404s: "PUT Not
+    // found /models"). Confirmed live; verify before adding more @route
+    // docblocks here rather than assuming symmetry.
+    auto handleModels = [](const HttpRequestPtr& req,
+                           std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = PixelOverlayManager::INSTANCE.render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = PixelOverlayManager::INSTANCE.render_POST(req);
+        else if (req->method() == drogon::Put)
+            resp = PixelOverlayManager::INSTANCE.render_PUT(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    app.registerHandler("/models", copyHandler(handleModels), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
+    app.registerHandlerViaRegex("/models/.*", copyHandler(handleModels), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
+    // No bare "/overlays" registration: it was never a documented,
+    // intentional endpoint (checked the full doc history -- the pre-FPP10
+    // endpoints.json help page only ever listed "overlays/models" and
+    // "overlays/model/:ModelName", never bare "overlays"), Apache has never
+    // proxied it externally, and grep finds zero internal callers anywhere
+    // in the codebase. Only the real sub-paths are registered.
+    app.registerHandlerViaRegex("/overlays/.*", copyHandler(handleModels), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
+
+    // CommandManager (/command/*, /commands/*, /commandPresets/*)
+    auto handleCommands = [](const HttpRequestPtr& req,
+                             std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = CommandManager::INSTANCE.render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = CommandManager::INSTANCE.render_POST(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    // Bare /command has no content of its own -- it 404s from CommandManager
+    // just like a bad sub-path would (confirmed by hitting it directly against
+    // fppd:32322). Registered anyway because /command/* needs a parent match;
+    // intentionally left undocumented since there's nothing real to document.
+    app.registerHandler("/command", copyHandler(handleCommands), {drogon::Get, drogon::Post, drogon::Head});
+    app.registerHandlerViaRegex("/command/.*", copyHandler(handleCommands), {drogon::Get, drogon::Post, drogon::Head});
+    /**
+     * List all defined commands.
+     *
+     * @route GET /api/commands
+     * @response 200 Array of commands.
+     */
+    // render_POST() only acts when the path's first segment is literally
+    // "command" (POST /api/command/{name}, already documented there) --
+    // bare POST here, and POST /api/commandPresets below, both 404
+    // "Not Found". Confirmed live.
+    app.registerHandler("/commands", copyHandler(handleCommands), {drogon::Get, drogon::Post, drogon::Head});
+    app.registerHandlerViaRegex("/commands/.*", copyHandler(handleCommands), {drogon::Get, drogon::Post, drogon::Head});
+    /**
+     * List all defined command presets.
+     *
+     * @route GET /api/commandPresets
+     * @response 200 Array of command presets.
+     */
+    app.registerHandler("/commandPresets", copyHandler(handleCommands), {drogon::Get, drogon::Post, drogon::Head});
+    app.registerHandlerViaRegex("/commandPresets/.*", copyHandler(handleCommands), {drogon::Get, drogon::Post, drogon::Head});
+
+    // GPIOManager (/gpio/*)
+    auto handleGpio = [](const HttpRequestPtr& req,
+                         std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = GPIOManager::INSTANCE.render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = GPIOManager::INSTANCE.render_POST(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    /**
+     * List all GPIO pins and their current state/configuration.
+     *
+     * @route GET /api/gpio
+     * @response 200 Array of GPIO pins.
+     */
+    // render_POST() only acts on POST /api/gpio/{pin} (already documented
+    // there); bare POST here 404s "Not Found". Confirmed live.
+    app.registerHandler("/gpio", copyHandler(handleGpio), {drogon::Get, drogon::Post, drogon::Head});
+    app.registerHandlerViaRegex("/gpio/.*", copyHandler(handleGpio), {drogon::Get, drogon::Post, drogon::Head});
+
+    // Variables (/variables/*, reachable externally as /api/variables/* via the
+    // Apache proxy whitelist in etc/apache2.site — same pattern as /gpio above)
+    auto handleVariables = [](const HttpRequestPtr& req,
+                              std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = Variables::INSTANCE.render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = Variables::INSTANCE.render_POST(req);
+        else if (req->method() == drogon::Delete)
+            resp = Variables::INSTANCE.render_DELETE(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    /**
+     * List all variables and their current values.
+     *
+     * @route GET /api/variables
+     * @response 200 Array of variables.
+     */
+    // Variables::render_POST()/render_DELETE() both require a name segment
+    // (POST /variables/{name}, DELETE /variables/{name} -- already
+    // documented there); bare POST/DELETE 400 "Bad Request". Confirmed live.
+    app.registerHandler("/variables", copyHandler(handleVariables), { drogon::Get, drogon::Post, drogon::Delete, drogon::Head });
+    app.registerHandlerViaRegex("/variables/.*", copyHandler(handleVariables), { drogon::Get, drogon::Post, drogon::Delete, drogon::Head });
+
+    // Player (/player/*)
+    auto handlePlayer = [](const HttpRequestPtr& req,
+                           std::function<void(const HttpResponsePtr&)>&& callback) {
+        HttpResponsePtr resp;
+        if (req->method() == drogon::Get || req->isHead())
+            resp = Player::INSTANCE.render_GET(req);
+        else if (req->method() == drogon::Post)
+            resp = Player::INSTANCE.render_POST(req);
+        else if (req->method() == drogon::Put)
+            resp = Player::INSTANCE.render_PUT(req);
+        else
+            resp = makeStringResponse("Method Not Allowed", 405);
+        callback(resp);
+    };
+    /**
+     * Get the current player state (playing/stopped, volume, current media, etc.).
+     *
+     * @route GET /api/player
+     * @response 200 Current player state.
+     */
+    // Player::render_POST()/render_PUT() are both unconditional
+    // `return makeStringResponse("Not Found", 404, ...)` -- registered for
+    // completeness/future use but dead code today. Confirmed live. Do not
+    // document POST/PUT here without checking Player.cpp again.
+    app.registerHandler("/player", copyHandler(handlePlayer), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
+    app.registerHandlerViaRegex("/player/.*", copyHandler(handlePlayer), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
+
+    // Video input preview (/videoinput/preview?id=N)
+    //
+    // Returns a single JPEG frame tapped off a running video input source's
+    // intervideo channel, so the config page can show the operator what the
+    // capture device is actually producing.  Tapping the channel (rather than
+    // opening /dev/videoN again) means the preview works while the source is
+    // live -- UVC cameras only allow a single opener.
+    auto handleVideoInputPreview = [](const HttpRequestPtr& req,
+                                      std::function<void(const HttpResponsePtr&)>&& callback) {
+        int id = 0;
+        auto idStr = req->getParameter("id");
+        if (!idStr.empty()) {
+            id = std::atoi(idStr.c_str());
+        }
+        int width = 320;
+        auto wStr = req->getParameter("width");
+        if (!wStr.empty()) {
+            width = std::atoi(wStr.c_str());
+        }
+
+        std::vector<uint8_t> jpeg;
+        if (id <= 0 || !VideoInputManager::Instance().GrabSnapshotJPEG(id, width, 2000, jpeg)) {
+            auto resp = makeStringResponse("No frame available", 503);
+            resp->addHeader("Cache-Control", "no-store");
+            callback(resp);
+            return;
+        }
+
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        resp->setStatusCode(drogon::k200OK);
+        resp->setContentTypeCode(drogon::CT_IMAGE_JPG);
+        resp->setBody(std::string(reinterpret_cast<const char*>(jpeg.data()), jpeg.size()));
+        resp->addHeader("Cache-Control", "no-store");
+        callback(resp);
+    };
+    /**
+     * Get a JPEG snapshot of a running video input source, for UI preview.
+     *
+     * @route GET /api/videoinput/preview
+     * @response 200 JPEG image of the most recent frame.
+     * @response 503 Source is not running or produced no frame.
+     */
+    app.registerHandler("/videoinput/preview", copyHandler(handleVideoInputPreview), {drogon::Get, drogon::Head});
+
+    // Let plugins register their own routes. These live in FPP's plugin
+    // route registry, reached through drogon's default handler, so plugins
+    // loaded after run() can add routes too.
+    FPPPlugins::installPluginApiRouter();
+    PluginManager::INSTANCE.registerApis();
+
+    // Configure and start drogon in a separate thread (since app().run() blocks).
+    // Bind both v4 and v6 loopback so Apache's reverse-proxy works no
+    // matter how libc resolves "localhost" (modern glibc returns ::1
+    // first per RFC 6724).
+    app.addListener(FPP_BIND_ADDRESS, FPP_HTTP_PORT);
+    app.addListener("::1", FPP_HTTP_PORT);
+    app.setThreadNum(10);
+    app.disableSession();
+
+    // Drogon's defaults are a 1MB max request body and a 64KB in-memory body,
+    // above which it spools the body to a temp file. Both are too small for
+    // FPP. The bulk pixel endpoints (PUT /api/overlays/model/{m}/data) send a
+    // whole frame per request -- a 1024x1024 RGB model is 3MB, well past the
+    // 1MB cap -- and spooling every frame of a repeating client to the SD card
+    // would make that endpoint slower than the per-pixel API it replaces.
+    // POST /api/models (model-overlays.json) was silently capped at 1MB too.
+    //
+    // The in-memory limit is what bounds worst-case RAM: setThreadNum(10) means
+    // up to 10 concurrent bodies held in memory, so 4MB each is ~40MB worst
+    // case -- affordable even on a 480MB BeagleBone. Requests larger than that
+    // still work, they just go through a temp file.
+    app.setClientMaxBodySize(32 * 1024 * 1024);
+    app.setClientMaxMemoryBodySize(4 * 1024 * 1024);
+
+    // A sync advice runs before any router, for plain requests and WebSocket
+    // upgrades alike; see QuiesceHttpServer().
+    app.registerSyncAdvice([](const drogon::HttpRequestPtr&) -> drogon::HttpResponsePtr {
+        if (!s_httpQuiescing) {
+            return nullptr;
+        }
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        resp->setStatusCode(drogon::k503ServiceUnavailable);
+        resp->setCloseConnection(true);
+        return resp;
+    });
+
+    // SIGINT and SIGTERM are FPP's, not drogon's. Drogon's handlers only stop
+    // drogon's own threads, leaving the main loop spinning, and they log (so
+    // allocate) and then run any callback given to them inside the signal
+    // handler: a signal landing in malloc could deadlock the shutdown. This
+    // handler only clears runMainFPPDLoop, a lock-free atomic. The main loop
+    // sees it and runs FPP's normal shutdown, which stops drogon from
+    // ~APIServer().
+    app.disableSigtermHandling();
+    struct sigaction stopAct = {};
+    stopAct.sa_handler = [](int) { runMainFPPDLoop = 0; };
+    sigemptyset(&stopAct.sa_mask);
+    sigaction(SIGINT, &stopAct, nullptr);
+    sigaction(SIGTERM, &stopAct, nullptr);
+
+    // Register the /fppdws status push endpoint and its 1s change-poll timer.
+    // The explicit call also keeps StatusWebSocket.o's controller
+    // self-registration from being dropped by the linker.
+    StatusWebSocketInit();
+
+    m_serverThread = new std::thread([]() {
+        drogon::app().run();
+    });
+    // Do NOT detach: ~APIServer() joins this thread after quit() so Drogon is
+    // fully stopped before PluginManager::Cleanup() calls dlclose() on plugin
+    // libraries. Plugin route handlers are lambdas with code in those libraries;
+    // Drogon IO threads running after dlclose() -> SEGV_MAPERR on the vtable.
 }
 
 /*
  *
  */
-void PlayerResource::GetPlaylistFileTime(Json::Value &result)
-{
-	if (playlist->IsPlaying())
-	{
-		uint64_t fileTime = playlist->GetFileTime();
-
-		result["fileTime"] = (Json::UInt64)fileTime;
-	}
-	else
-	{
-		result["fileTime"] = 0;
-	}
-
-	SetOKResult(result, "");
+void LogRequest(const HttpRequestPtr& req) {
+    // LOG_EXCESSIVE, not LOG_DEBUG: /fppd/status is polled about once a second
+    // by fppoled, the web UI and anything else watching the player, so at debug
+    // these three lines are a steady 3/sec.  They never reach fppd.log at the
+    // default level, but the crash-time log ring keeps everything <= LOG_DEBUG
+    // (CrashLogRingWillCapture), and 256 slots of status polling is all a crash
+    // report was left with - roughly 85 seconds of nothing.  See log.cpp.
+    LogExcess(VB_HTTP, "API Req: %s%s from %s\n", req->path().c_str(),
+              req->query().c_str(), getEffectiveClientIP(req).c_str());
 }
 
 /*
  *
  */
-void PlayerResource::GetPlaylistConfig(Json::Value &result)
-{
-	if (playlist->IsPlaying())
-		result = playlist->GetConfig();
+void LogResponse(const HttpRequestPtr& req, int responseCode, const std::string& content) {
+    if (WillLog(LOG_EXCESSIVE, VB_HTTP)) {
+        LogExcess(VB_HTTP, "API Res: %s%s %d %s\n",
+                  req->path().c_str(),
+                  req->query().c_str(),
+                  responseCode,
+                  content.c_str());
+    }
+}
 
-	SetOKResult(result, "");
+PlayerResource::PlayerResource() {
+#ifdef PLATFORM_PI
+#define DEVICE_FILE_NAME "/dev/vcio"
+#define MAJOR_NUM 100
+#define IOCTL_MBOX_PROPERTY _IOWR(MAJOR_NUM, 0, char*)
+#define MAX_STRING 1024
+#define GET_GENCMD_RESULT 0x00030080
+    piPowerFile = open(DEVICE_FILE_NAME, 0);
+#else
+    piPowerFile = -1;
+#endif
+}
+PlayerResource::~PlayerResource() {
+    if (piPowerFile > 0) {
+        close(piPowerFile);
+    }
 }
 
 /*
  *
  */
-void PlayerResource::PostEffects(const std::string &effectName, const Json::Value &data, Json::Value &result)
-{
-	if (!data.isMember("command"))
-	{
-		SetErrorResult(result, 400, "'command' field not specified");
-		return;
-	}
+// --------------------------------------------------------------------------
+// OpenAPI docs for the /fppd/* GET endpoints handled below.
+// These @route docblocks are parsed by www/api/tools/generate_openapi.py; the
+// fppd daemon serves them on port 32322 and Apache proxies them under /api/*.
+// --------------------------------------------------------------------------
 
-	std::string command = data["command"].asString();
+/**
+ * List the effects currently running on the player.
+ *
+ * @route GET /api/fppd/effects
+ * @response 200 Object with a `runningEffects` array.
+ */
 
-	LogDebug(VB_HTTP, "API - PostEffect(%s) cmd: %s\n", effectName.c_str(), command.c_str());
+/**
+ * Get the current fppd logging configuration (log level and enabled channels).
+ *
+ * @route GET /api/fppd/log
+ * @response 200 Current log settings.
+ */
 
-	SetOKResult(result, "PostEffect result would go here");
+/**
+ * Get the full current player status (playlist, sequence, time, mode, etc.).
+ *
+ * @route GET /api/fppd/status
+ * @response 200 Current player status JSON.
+ */
+
+/**
+ * List the messages for all currently active warnings.
+ *
+ * @route GET /api/fppd/warnings
+ * @response 200 Array of warning message strings.
+ * ```json
+ * ["Low disk space", "No network connection"]
+ * ```
+ */
+
+/**
+ * List all currently active warnings as full objects (message plus metadata).
+ *
+ * @route GET /api/fppd/warnings_full
+ * @response 200 Array of warning objects.
+ */
+
+/**
+ * Get the number of E1.31/sACN bytes received per universe.
+ *
+ * @route GET /api/fppd/e131stats
+ * @response 200 E1.31 receive statistics.
+ */
+
+/**
+ * List the MultiSync systems discovered on the network.
+ *
+ * @route GET /api/fppd/multiSyncSystems
+ * @param int localOnly Set to 1 to return only the local system.
+ * @response 200 MultiSync systems.
+ */
+
+/**
+ * Get MultiSync packet statistics.
+ *
+ * @route GET /api/fppd/multiSyncStats
+ * @param int reset Set to 1 to reset the statistics after reading them.
+ * @response 200 MultiSync statistics.
+ */
+
+/**
+ * List the playlists that are currently running.
+ *
+ * @route GET /api/fppd/playlists
+ * @response 200 Currently running playlists.
+ */
+
+/**
+ * Get the last-modified time of the running playlist file.
+ *
+ * @route GET /api/fppd/playlist/filetime
+ * @response 200 Playlist file time.
+ */
+
+/**
+ * Get the configuration of the running playlist.
+ *
+ * @route GET /api/fppd/playlist/config
+ * @response 200 Playlist configuration.
+ */
+
+/**
+ * Get the currently loaded schedule.
+ *
+ * @route GET /api/fppd/schedule
+ * @response 200 Object with a `schedule` member.
+ */
+
+/**
+ * Expand the schedule over an arbitrary date range.
+ *
+ * Unlike `/api/fppd/schedule`, which reports only the rolling window fppd has
+ * actually scheduled out, this expands the configured schedule rules across any
+ * requested range so past and future dates can be previewed. Occurrences are
+ * advisory - they describe what the schedule says should happen, not what fppd
+ * has committed to running.
+ *
+ * @route GET /api/fppd/schedule/range
+ * @param int start Range start as epoch seconds.
+ * @param int end Range end as epoch seconds. Must be after `start` and no more than 420 days later.
+ * @param boolean includeDisabled Set to `1` to also expand disabled schedule entries.
+ * @param boolean summary Set to `1` to collapse to one item per schedule entry per day, each carrying a `count` of that day's occurrences. Intended for month and other coarse views, where a repeating entry would otherwise return thousands of items.
+ * @response 200 Object with a `schedule` member containing `entries`, `items`, `rangeStart` and `rangeEnd`.
+ * @response 400 Missing, malformed, or excessively large range.
+ */
+
+/**
+ * Get FPP version information.
+ *
+ * @route GET /api/fppd/version
+ * @response 200 Version details.
+ * ```json
+ * {"version": "9.0", "majorVersion": 9, "minorVersion": 0, "branch": "master", "fppdAPI": 4, "Status": "OK"}
+ * ```
+ */
+
+/**
+ * Get (or set) the master output volume.
+ *
+ * @route GET /api/fppd/volume
+ * @param int set New volume (0-100) to apply before returning.
+ * @param boolean simple Return the volume as a bare text/plain integer instead of JSON.
+ * @response 200 Object with a `volume` member (0-100).
+ */
+
+/**
+ * Get the list of running sequences.
+ *
+ * @route GET /api/fppd/sequence
+ * @response 200 Running sequences.
+ */
+
+/**
+ * Dump the cached MQTT messages.
+ *
+ * @route GET /api/fppd/mqtt/cache
+ * @response 200 Object keyed by topic, each value the topic's last cached message as a plain string.
+ *   Per-topic last-updated timestamps are exposed separately via
+ *   `GET /api/variables?mqtt=true` (`mqtt-<topic>` entries), not on this route.
+ * @response 400 MQTT is not initialized.
+ */
+HttpResponsePtr PlayerResource::render_GET(const HttpRequestPtr& req) {
+    LogRequest(req);
+
+    Json::Value result;
+    std::string resultStr = "";
+    std::string url(req->path());
+
+    if (!replaceStart(url, "/fppd/", ""))
+        replaceStart(url, "/fppd", "");
+
+    // Strip trailing slash to match endpoint definitions
+    if (endsWith(url, "/"))
+        url = url.substr(0, url.length() - 1);
+
+    // LOG_EXCESSIVE for the same reason as LogRequest() above.
+    LogExcess(VB_HTTP, "URL: %s %s\n", url.c_str(), req->query().c_str());
+
+    // Keep IF statement in alphabetical order
+    if (url == "effects") {
+        GetRunningEffects(result);
+    } else if (url == "log") {
+        GetLogSettings(result);
+    } else if (url == "status") {
+        GetCurrentStatus(result);
+    } else if (url == "warnings") {
+        result = Json::Value(Json::ValueType::arrayValue);
+        for (auto& warn : WarningHolder::GetWarnings()) {
+            result.append(warn.message());
+        }
+    } else if (url == "warnings_full") {
+        result = Json::Value(Json::ValueType::arrayValue);
+        for (auto& warn : WarningHolder::GetWarnings()) {
+            result.append(warn.toJsonValue());
+        }
+    } else if (url == "e131stats") {
+        GetE131BytesReceived(result);
+    } else if (url == "multiSyncSystems") {
+        bool localOnly = false;
+
+        if (getRequestArg(req, "localOnly") == "1")
+            localOnly = true;
+
+        GetMultiSyncSystems(result, localOnly);
+    } else if (url == "multiSyncStats") {
+        bool reset = false;
+
+        if (getRequestArg(req, "reset") == "1")
+            reset = true;
+
+        GetMultiSyncStats(result, reset);
+    } else if (url == "playlists") {
+        GetCurrentPlaylists(result);
+    } else if (url == "playlist/filetime") {
+        GetPlaylistFileTime(result);
+    } else if (url == "playlist/config") {
+        GetPlaylistConfig(result);
+    } else if (url == "recurringtasks") {
+        GetRecurringTasks(result);
+    } else if (url == "condition/preview") {
+        GetConditionPreview(req, result);
+    } else if (url == "schedule") {
+        result["schedule"] = scheduler->GetSchedule();
+        SetOKResult(result, "");
+    } else if (url == "schedule/range") {
+        // Expanding the schedule costs time proportional to the range, so cap
+        // what a single request can ask for rather than letting a stray query
+        // hold the scheduler lock.
+        constexpr int MAX_SCHEDULE_RANGE_DAYS = 420;
+
+        time_t rangeStart = (time_t)std::atoll(getRequestArg(req, "start").c_str());
+        time_t rangeEnd = (time_t)std::atoll(getRequestArg(req, "end").c_str());
+
+        if ((rangeStart <= 0) || (rangeEnd <= rangeStart)) {
+            SetErrorResult(result, 400, "start and end must be epoch seconds with end after start");
+        } else if ((rangeEnd - rangeStart) > ((time_t)MAX_SCHEDULE_RANGE_DAYS * 86400)) {
+            SetErrorResult(result, 400, "range may not exceed " + std::to_string(MAX_SCHEDULE_RANGE_DAYS) + " days");
+        } else {
+            bool includeDisabled = getRequestArg(req, "includeDisabled") == "1";
+            bool daySummary = getRequestArg(req, "summary") == "1";
+
+            result["schedule"] = scheduler->GetScheduleRange(rangeStart, rangeEnd,
+                                                             includeDisabled, daySummary);
+            SetOKResult(result, "");
+        }
+    } else if (url == "version") {
+        result["version"] = getFPPVersion();
+        result["majorVersion"] = getFPPMajorVersion();
+        result["minorVersion"] = getFPPMinorVersion();
+        result["branch"] = getFPPBranch();
+        result["fppdAPI"] = FPPD_API_VERSION;
+
+        SetOKResult(result, "");
+    } else if (url == "volume") {
+        if (getRequestArg(req, "set") != "") {
+            int i = std::atoi(getRequestArg(req, "set").c_str());
+            setVolume(i);
+        }
+        if (getRequestArg(req, "simple") == "true") {
+            std::string v = std::to_string(getVolume());
+            return makeStringResponse(v, 200, "text/plain");
+        }
+        result["volume"] = getVolume();
+        SetOKResult(result, "");
+    } else if (url == "sequence") {
+        LogDebug(VB_HTTP, "API - Getting list of running sequences\n");
+    } else if (url == "mqtt/cache") {
+        LogDebug(VB_HTTP, "API - Getting MQTT Cached data\n");
+        if (mqtt) {
+            result["respCode"] = 200;
+            result["Status"] = "OK";
+            mqtt->dumpMessageCache(result);
+        } else {
+            result["Status"] = "ERROR";
+            result["respCode"] = 400;
+            result["Message"] = "Mqtt not Initialized";
+        }
+    } else {
+        // url is an unvalidated caller-supplied path - truncate so an unknown
+        // endpoint can't let a caller choose how many bytes of fppd.log each
+        // request costs (bounded only by Apache's request-line limit).
+        LogErr(VB_HTTP, "API - Error unknown GET request: %s\n", TruncateForLog(url).c_str());
+
+        result["Status"] = "ERROR";
+        result["respCode"] = 404;
+        result["Message"] = std::string("endpoint fppd/") + url + " does not exist";
+    }
+
+    int responseCode = 200;
+    if (resultStr.empty() && !result.isArray()) {
+        if (result.empty()) {
+            result["Status"] = "ERROR";
+            result["respCode"] = 400;
+            result["Message"] = "GET endpoint helper did not set result JSON";
+        } else if (result.isMember("respCode")) {
+            responseCode = result["respCode"].asInt();
+        }
+    }
+    if (resultStr.empty()) {
+        resultStr = SaveJsonToString(result);
+    }
+    LogResponse(req, responseCode, resultStr);
+
+    return makeStringResponse(resultStr, responseCode, "application/json");
 }
 
 /*
  *
  */
-void PlayerResource::PostEvents(const std::string &eventID, const Json::Value &data, Json::Value &result)
-{
-	if (!data.isMember("command"))
-	{
-		SetErrorResult(result, 400, "'command' field not specified");
-		return;
-	}
+// --------------------------------------------------------------------------
+// OpenAPI docs for the /fppd/* POST endpoints handled below.
+// --------------------------------------------------------------------------
 
-	std::string command = data["command"].asString();
+/**
+ * Start (or update) a named overlay effect on the player.
+ *
+ * @route POST /api/fppd/effects/{name}
+ * @response 200 Effect started.
+ */
 
-	LogDebug(VB_HTTP, "API - PostEvent(%s) cmd: %s\n", eventID.c_str(), command.c_str());
+/**
+ * Re-read the Falcon hardware (e.g. cape/receiver) configuration.
+ *
+ * @route POST /api/fppd/falcon/hardware
+ * @response 200 Hardware refreshed.
+ */
 
-	SetOKResult(result, "PostEvent result would go here");
+/**
+ * Set an external GPIO input state.
+ *
+ * @route POST /api/fppd/gpio/ext
+ * @response 200 GPIO state updated.
+ */
+
+/**
+ * Set logging levels.
+ *
+ * There is no separate channel parameter: the {level} path segment carries both
+ * the level and the optional channel targeting. A bare level name - one of
+ * error, warn, info, debug, or excess - sets that level globally for every log
+ * channel. To target specific channels instead, use level:channel,channel and
+ * separate multiple groups with a semicolon, e.g. debug:Schedule,Player;info:Sync.
+ * Channel names are case-sensitive and match those returned by GET /api/fppd/log
+ * (for example Command, Control, HTTP, Schedule, Sync).
+ *
+ * @route POST /api/fppd/log/level/{level}
+ * @pathparam level enum:error,warn,info,debug,excess example:debug Log level to apply globally, or a level:channel[,channel] targeting expression.
+ * @response 200 Log level updated.
+ * @response 400 Invalid or unrecognized log level.
+ */
+
+/**
+ * Apply a new channel-output configuration.
+ *
+ * @route POST /api/fppd/outputs
+ * @response 200 Outputs updated.
+ */
+
+/**
+ * Remap channel outputs.
+ *
+ * @route POST /api/fppd/outputs/remap
+ * @response 200 Outputs remapped.
+ */
+
+/**
+ * Replace the active schedule.
+ *
+ * @route POST /api/fppd/schedule
+ * @response 200 Schedule updated.
+ */
+
+/**
+ * Set the master output volume (0-100).
+ *
+ * @route POST /api/fppd/volume/{volume}
+ * @response 200 Object with the new `volume`.
+ */
+
+/**
+ * Shut down the fppd daemon.
+ *
+ * @route POST /api/fppd/shutdown
+ * @response 200 fppd shutting down.
+ */
+HttpResponsePtr PlayerResource::render_POST(const HttpRequestPtr& req) {
+    LogRequest(req);
+
+    Json::Value data;
+    Json::Value result;
+    std::string url(req->path());
+
+    if (!replaceStart(url, "/fppd/", ""))
+        replaceStart(url, "/fppd", "");
+
+    // Strip trailing slash to match endpoint definitions
+    if (endsWith(url, "/"))
+        url = url.substr(0, url.length() - 1);
+
+    LogDebug(VB_HTTP, "POST URL: %s %s\n", url.c_str(), req->query().c_str());
+
+    if (getRequestContent(req) != "") {
+        if (!LoadJsonFromString(getRequestContent(req), data)) {
+            LogErr(VB_CHANNELOUT, "Error parsing POST content\n");
+            return makeStringResponse("Error parsing POST content", 400);
+        }
+    }
+
+    // Keep IF statement in alphabetical order
+    if (replaceStart(url, "effects/")) {
+        PostEffects(url, data, result);
+    } else if (replaceStart(url, "falcon/hardware")) {
+        PostFalconHardware(result);
+    } else if (replaceStart(url, "gpio/ext")) {
+        PostGPIOExt(data, result);
+    } else if (replaceStart(url, "log/level/")) {
+        // SetLogLevelComplex returns false when the level (or targeted channel)
+        // is not recognized and nothing was changed.  Report that back rather
+        // than falsely claiming success.
+        if (SetLogLevelComplex(url)) {
+            // Persist the resulting per-channel levels to the settings file so
+            // they survive a restart and stay in sync with the Logging settings
+            // page (which reads/writes the LogLevel_* settings).
+            for (FPPLoggerInstance* logger : FPPLogger::INSTANCE.allInstances()) {
+                setSetting("LogLevel_" + logger->name, LogLevelToString(FacilityLevel(*logger)), true);
+            }
+            WarningHolder::UpdateLogLevelWarnings();
+            SetOKResult(result, "Log Level Updated");
+        } else {
+            SetErrorResult(result, 400, "Invalid or unrecognized log level: " + url);
+        }
+    } else if (url == "outputs") {
+        PostOutputs(data, result);
+    } else if (url == "outputs/remap") {
+        PostOutputsRemap(data, result);
+    } else if (url == "recurringtasks") {
+        PostRecurringTasks(data, result);
+    } else if (url == "schedule") {
+        PostSchedule(data, result);
+    } else if (url.find("volume/") == 0) {
+        // A whole number, or nothing changes: atoi() read garbage ("x", a
+        // number too big for an int) as 0 or -1, and that muted the show.
+        std::string v = url.substr(7);
+        char* endp = nullptr;
+        errno = 0;
+        long volume = strtol(v.c_str(), &endp, 10);
+        // the whole value must be digits: an embedded NUL ("%00") stops
+        // strtol() as if the string had ended
+        if (v.empty() || endp != v.c_str() + v.size() || errno == ERANGE) {
+            SetErrorResult(result, 400, "Volume must be a whole number, 0-100");
+        } else {
+            setVolume((int)std::clamp(volume, 0L, 100L));
+            result["volume"] = getVolume();
+            SetOKResult(result, "Volume set");
+        }
+    } else if (url == "shutdown") {
+        SetOKResult(result, "Shutting down fppd");
+        ShutdownFPPD();
+    } else {
+        LogErr(VB_HTTP, "API - Error unknown POST request: %s\n", TruncateForLog(url).c_str());
+
+        result["Status"] = "ERROR";
+        result["respCode"] = 404;
+        result["Message"] = std::string("endpoint fppd/") + url + " does not exist";
+    }
+
+    if (!result.isMember("Status")) {
+        result["Status"] = "ERROR";
+        result["respCode"] = 400;
+        result["Message"] = "POST endpoint helper did not set result JSON";
+    }
+
+    std::string resultStr = SaveJsonToString(result);
+    LogResponse(req, result["respCode"].asInt(), resultStr);
+
+    return makeStringResponse(resultStr.c_str(), result["respCode"].asInt(), "application/json");
 }
 
 /*
  *
  */
-void PlayerResource::PostFalconHardware(Json::Value &result)
-{
-	LogDebug(VB_HTTP, "API - Reloading hardware config\n");
+/**
+ * Reset the E1.31/sACN receive statistics.
+ *
+ * @route DELETE /api/fppd/e131stats
+ * @response 200 Statistics cleared.
+ */
+HttpResponsePtr PlayerResource::render_DELETE(const HttpRequestPtr& req) {
+    LogRequest(req);
 
-	SetOKResult(result, "PostFalconHardware result would go here");
+    Json::Value result;
+    std::string url(req->path());
+
+    if (!replaceStart(url, "/fppd/", ""))
+        replaceStart(url, "/fppd", "");
+
+    // Strip trailing slash to match endpoint definitions
+    if (endsWith(url, "/"))
+        url = url.substr(0, url.length() - 1);
+
+    LogDebug(VB_HTTP, "DELETE URL: %s %s\n", url.c_str(), req->query().c_str());
+
+    // Keep IF statement in alphabetical order
+    if (url == "e131stats") {
+        LogDebug(VB_HTTP, "Resetting E131 Statistics");
+        ResetBytesReceived();
+        SetOKResult(result, "Stats Cleared");
+    } else {
+        LogErr(VB_HTTP, "API - Error unknown DELETE request: %s\n", TruncateForLog(url).c_str());
+
+        result["Status"] = "ERROR";
+        result["respCode"] = 404;
+        result["Message"] = std::string("endpoint fppd/") + url + " does not exist";
+    }
+
+    if (!result.isMember("Status")) {
+        result["Status"] = "ERROR";
+        result["respCode"] = 400;
+        result["Message"] = "DELETE endpoint helper did not set result JSON";
+    }
+
+    std::string resultStr = SaveJsonToString(result);
+
+    LogResponse(req, result["respCode"].asInt(), resultStr);
+
+    return makeStringResponse(resultStr.c_str(), result["respCode"].asInt());
 }
 
 /*
  *
  */
-void PlayerResource::PostGPIOExt(const Json::Value &data, Json::Value &result)
-{
-	if (!data.isMember("config"))
-	{
-		SetErrorResult(result, 400, "'config' field not specified");
-		return;
-	}
+HttpResponsePtr PlayerResource::render_PUT(const HttpRequestPtr& req) {
+    LogRequest(req);
 
-	LogDebug(VB_HTTP, "API - Doing something with gpio\n");
+    Json::Value result;
+    std::string url(req->path());
+
+    if (!replaceStart(url, "/fppd/", ""))
+        replaceStart(url, "/fppd", "");
+
+    // Strip trailing slash to match endpoint definitions
+    if (endsWith(url, "/"))
+        url = url.substr(0, url.length() - 1);
+
+    LogDebug(VB_HTTP, "PUT URL: %s %s\n", url.c_str(), req->query().c_str());
+
+    // No PUT endpoints are currently implemented under /fppd/*.
+    LogErr(VB_HTTP, "API - Error unknown PUT request: %s\n", TruncateForLog(url).c_str());
+
+    result["Status"] = "ERROR";
+    result["respCode"] = 404;
+    result["Message"] = std::string("endpoint fppd/") + url + " does not exist";
+
+    std::string resultStr = SaveJsonToString(result);
+
+    LogResponse(req, result["respCode"].asInt(), resultStr);
+
+    return makeStringResponse(resultStr.c_str(), result["respCode"].asInt());
 }
 
 /*
  *
  */
-void PlayerResource::PostOutputs(const Json::Value &data, Json::Value &result)
-{
-	if (!data.isMember("command"))
-	{
-		SetErrorResult(result, 400, "'command' field not specified");
-		return;
-	}
-
-	if (data["command"].asString() == "enable")
-	{
-		EnableChannelOutput();
-		SetOKResult(result, "channel output enabled");
-	}
-	else if (data["command"].asString() == "disable")
-	{
-		DisableChannelOutput();
-		SetOKResult(result, "channel output disabled");
-	}
+void PlayerResource::SetOKResult(Json::Value& result, const std::string& msg) {
+    result["Status"] = "OK";
+    result["respCode"] = 200;
+    result["Message"] = msg;
 }
 
 /*
  *
  */
-void PlayerResource::PostOutputsRemap(const Json::Value &data, Json::Value &result)
-{
-	if (!data.isMember("command"))
-	{
-		SetErrorResult(result, 400, "'command' field not specified");
-		return;
-	}
-
-	if (data["command"].asString() == "reload")
-	{
-		// FIXME, need to fix this function to lock the remap array
-		//LoadChannelRemapData();
-		SetOKResult(result, "channel remaps reloaded");
-	}
+void PlayerResource::SetErrorResult(Json::Value& result, const int respCode, const std::string& msg) {
+    result["Status"] = "ERROR";
+    result["respCode"] = respCode;
+    result["Message"] = msg;
 }
 
 /*
  *
  */
-void PlayerResource::PostSchedule(const Json::Value data, Json::Value &result)
-{
-	if (!data.isMember("command"))
-	{
-		SetErrorResult(result, 400, "'command' field not specified");
-		return;
-	}
-
-	if (data["command"].asString() == "reload")
-	{
-		if(FPPstatus==FPP_STATUS_IDLE)
-			scheduler->ReLoadCurrentScheduleInfo();
-
-		scheduler->ReLoadNextScheduleInfo();
-
-		SetOKResult(result, "Schedule reload triggered");
-	}
+void PlayerResource::GetRunningEffects(Json::Value& result) {
+    LogDebug(VB_HTTP, "API - Getting list of running effects\n");
+    SetOKResult(result, "");
+    result["runningEffects"] = GetRunningEffectsJson();
 }
 
 /*
  *
  */
-void PlayerResource::PostTesting(const Json::Value data, Json::Value &result)
-{
-	Json::FastWriter fastWriter;
-	std::string config = fastWriter.write(data);
+void PlayerResource::GetLogSettings(Json::Value& result) {
+    SetOKResult(result, "");
+    Json::Value log;
+    std::vector<FPPLoggerInstance*> allLoggers = FPPLogger::INSTANCE.allInstances();
+    std::vector<FPPLoggerInstance*>::iterator it;
 
-	if (channelTester->SetupTest(config))
-	{
-		SetOKResult(result, "Test Mode Activated");
-	}
-	else
-	{
-		SetOKResult(result, "Test Mode Deactivated");
-	}
+    for (it = allLoggers.begin(); it != allLoggers.end(); it++) {
+        FPPLoggerInstance* ptr = *it;
+        log[ptr->name] = LogLevelToString(FacilityLevel(*ptr));
+    }
+
+    result["log"] = log;
 }
 
+/*
+ *
+ */
+void PlayerResource::GetCurrentStatus(Json::Value& result) {
+    // LOG_EXCESSIVE for the same reason as LogRequest() above.
+    LogExcess(VB_HTTP, "API - Getting fppd status\n");
+    GetCurrentFPPDStatus(result);
+}
+
+/*
+ *
+ */
+void PlayerResource::GetCurrentPlaylists(Json::Value& result) {
+    LogDebug(VB_HTTP, "API - Getting current playlist\n");
+
+    Json::Value names(Json::arrayValue);
+
+    if (Player::INSTANCE.IsPlaying())
+        names.append(Player::INSTANCE.GetPlaylistName());
+
+    result["playlists"] = names;
+
+    SetOKResult(result, "");
+}
+
+/*
+ *
+ */
+void PlayerResource::GetE131BytesReceived(Json::Value& result) {
+    result = GetE131UniverseBytesReceived(); // e131bridge.cpp
+
+    if (result.isMember("universes"))
+        SetOKResult(result, "");
+    else
+        SetErrorResult(result, 400, "GetE131UniverseBytesReceived() did not return any universes.");
+}
+
+/*
+ *
+ */
+void PlayerResource::GetMultiSyncSystems(Json::Value& result, bool localOnly) {
+    result = multiSync->GetSystems(localOnly);
+
+    if (result.isMember("systems"))
+        SetOKResult(result, "");
+    else
+        SetErrorResult(result, 400, "MultiSync did not return any systems.");
+}
+
+void PlayerResource::GetMultiSyncStats(Json::Value& result, bool reset) {
+    if (reset)
+        multiSync->ResetSyncStats();
+
+    result = multiSync->GetSyncStats();
+
+    if (result.isMember("systems"))
+        SetOKResult(result, "");
+    else
+        SetErrorResult(result, 400, "MultiSync did not return any systems.");
+}
+
+/*
+ *
+ */
+void PlayerResource::GetPlaylistFileTime(Json::Value& result) {
+    if (Player::INSTANCE.IsPlaying()) {
+        uint64_t fileTime = Player::INSTANCE.GetFileTime();
+
+        result["fileTime"] = (Json::UInt64)fileTime;
+    } else {
+        result["fileTime"] = 0;
+    }
+
+    SetOKResult(result, "");
+}
+
+/*
+ *
+ */
+void PlayerResource::GetPlaylistConfig(Json::Value& result) {
+    if (Player::INSTANCE.IsPlaying())
+        result = Player::INSTANCE.GetConfig();
+
+    SetOKResult(result, "");
+}
+
+/**
+ * Report the configured Recurring Tasks merged with last-run status, for the
+ * Recurring Tasks admin page (www/recurringtasks.php).
+ *
+ * @route GET /api/fppd/recurringtasks
+ * @response 200 {"tasks": [...]}
+ */
+void PlayerResource::GetRecurringTasks(Json::Value& result) {
+    result["tasks"] = Json::Value(Json::arrayValue);
+    RecurringTasks::INSTANCE.reportStatus(result["tasks"]);
+    SetOKResult(result, "");
+}
+
+/**
+ * Preview a single If/Conditional Check leaf - the same lookup evaluate()
+ * uses internally (Variable/Expression/Time/GPIO Pin/Sun), before any
+ * comparator/Value is applied. Backs the If condition editor's "Show Current
+ * Value" button, so picking the right Value to compare against isn't
+ * guesswork.
+ *
+ * When a "comparator" param is also supplied (the consolidated eye-preview
+ * modal's full-leaf mode), also evaluates Value the same way Value is
+ * unconditionally evaluated at runtime and applies the comparator, returning
+ * the RHS value and the boolean result too - reuses
+ * ConditionNode::PreviewLeafResult(), the exact same evaluation path a real
+ * saved leaf's evaluate() takes, so this can never drift from runtime
+ * behavior.
+ *
+ * @route GET /api/fppd/condition/preview
+ * @param string source One of the If Check "Source" dropdown values (e.g. "Variable", "GPIO Pin").
+ * @param string name The Name/Expression field for that source.
+ * @param string comparator Optional - one of the Check "Comparator" values. Enables full-leaf mode.
+ * @param string value Optional - the Value field, only used when "comparator" is also given.
+ * @param string not Optional - "true" to negate the result, only used when "comparator" is also given.
+ * @response 200 {"found": true, "value": "..."} (source/name-only mode) or
+ *           {"found": true, "value": "...", "rhsValue": "...", "result": true} (full-leaf mode, LHS resolved) or
+ *           {"found": false, "rhsValue": "...", "result": true} (full-leaf mode, LHS not found - rhsValue/result
+ *           are still evaluated, since Value always evaluates and a missing LHS just yields `negate`) or
+ *           {"found": false} if the source/name doesn't currently resolve (source/name-only mode).
+ */
+void PlayerResource::GetConditionPreview(const HttpRequestPtr& req, Json::Value& result) {
+    std::string source = getRequestArg(req, "source");
+    std::string name = getRequestArg(req, "name");
+    if (req->getParameter("comparator").empty()) {
+        LogDebug(VB_HTTP, "API - Getting condition preview for source \"%s\" name \"%s\"\n", source.c_str(), name.c_str());
+        bool found = false;
+        std::string value = ConditionNode::PreviewSourceValue(source, name, found);
+        result["found"] = found;
+        if (found) {
+            result["value"] = value;
+        }
+        SetOKResult(result, "");
+        return;
+    }
+    std::string comparator = getRequestArg(req, "comparator");
+    std::string value = getRequestArg(req, "value");
+    bool negate = getRequestArg(req, "not") == "true";
+    LogDebug(VB_HTTP, "API - Getting full condition preview for source \"%s\" name \"%s\" %s%s \"%s\"\n",
+             source.c_str(), name.c_str(), negate ? "NOT " : "", comparator.c_str(), value.c_str());
+    bool lhsFound = false;
+    std::string lhsValue, rhsValue;
+    bool leafResult = false;
+    ConditionNode::PreviewLeafResult(source, name, comparator, value, negate, lhsFound, lhsValue, rhsValue, leafResult);
+    result["found"] = lhsFound;
+    if (lhsFound) {
+        result["value"] = lhsValue;
+    }
+    // rhsValue/result are always resolvable (Value is unconditionally
+    // evaluated, and a not-found LHS still yields a definite result of
+    // `negate`), so return them regardless of lhsFound - lets the eye-preview
+    // modal show what Value evaluates to instead of stopping cold when only
+    // the LHS side is missing.
+    result["rhsValue"] = rhsValue;
+    result["result"] = leafResult;
+    SetOKResult(result, "");
+}
+
+/*
+ *
+ */
+void PlayerResource::PostEffects(const std::string& effectName, const Json::Value& data, Json::Value& result) {
+    if (!data.isMember("command")) {
+        SetErrorResult(result, 400, "'command' field not specified");
+        return;
+    }
+
+    std::string command = data["command"].asString();
+
+    LogDebug(VB_HTTP, "API - PostEffect(%s) cmd: %s\n", effectName.c_str(), command.c_str());
+
+    SetOKResult(result, "PostEffect result would go here");
+}
+
+/*
+ *
+ */
+void PlayerResource::PostFalconHardware(Json::Value& result) {
+    LogDebug(VB_HTTP, "API - Reloading hardware config\n");
+
+    SetOKResult(result, "PostFalconHardware result would go here");
+}
+
+/*
+ *
+ */
+void PlayerResource::PostGPIOExt(const Json::Value& data, Json::Value& result) {
+    if (!data.isMember("config")) {
+        SetErrorResult(result, 400, "'config' field not specified");
+        return;
+    }
+
+    LogDebug(VB_HTTP, "API - Doing something with gpio\n");
+}
+
+/*
+ *
+ */
+void PlayerResource::PostOutputs(const Json::Value& data, Json::Value& result) {
+    if (!data.isMember("command")) {
+        SetErrorResult(result, 400, "'command' field not specified");
+        return;
+    }
+
+    if (data["command"].asString() == "enable") {
+        EnableChannelOutput();
+        SetOKResult(result, "channel output enabled");
+    } else if (data["command"].asString() == "disable") {
+        DisableChannelOutput();
+        SetOKResult(result, "channel output disabled");
+    }
+}
+
+/*
+ *
+ */
+void PlayerResource::PostOutputsRemap(const Json::Value& data, Json::Value& result) {
+    if (!data.isMember("command")) {
+        SetErrorResult(result, 400, "'command' field not specified");
+        return;
+    }
+
+    if (data["command"].asString() == "reload") {
+        // FIXME, need to fix this function to lock the remap array
+        // LoadChannelRemapData();
+        SetOKResult(result, "channel remaps reloaded");
+    }
+}
+
+/**
+ * Re-read config/recurringtasks.json and re-schedule all Recurring Task
+ * timers to match, so a save on www/recurringtasks.php (which writes that
+ * file via the generic api/configfile endpoint) takes effect without an
+ * fppd restart. Also handles an immediate "Test Run" of one task, run
+ * synchronously against the posted task definition (not a saved name), so
+ * the admin page can preview unsaved edits.
+ *
+ * @route POST /api/fppd/recurringtasks
+ * @body {"command": "reload"}
+ * @body {"command": "test", "task": {"name": "...", "type": "command", "command": "URL", "args": [...], "filterType": "json", "filterJsonPath": "data.temp"}}
+ * @response 200 Recurring tasks reloaded, or {"ok":bool,"raw":string,"filtered":string,"error":string} for "test".
+ * @response 400 'command' field not specified.
+ */
+void PlayerResource::PostRecurringTasks(const Json::Value& data, Json::Value& result) {
+    if (!data.isMember("command")) {
+        SetErrorResult(result, 400, "'command' field not specified");
+        return;
+    }
+
+    std::string command = data["command"].asString();
+    if (command == "reload") {
+        RecurringTasks::INSTANCE.Reload();
+        SetOKResult(result, "Recurring tasks reloaded");
+    } else if (command == "test") {
+        Json::Value testResult = RecurringTasks::INSTANCE.TestRunTask(data["task"]);
+        for (auto const& key : testResult.getMemberNames()) {
+            result[key] = testResult[key];
+        }
+        SetOKResult(result, "");
+    }
+}
+
+/*
+ *
+ */
+void PlayerResource::PostSchedule(const Json::Value data, Json::Value& result) {
+    if (!data.isMember("command")) {
+        SetErrorResult(result, 400, "'command' field not specified");
+        return;
+    }
+
+    if (data["command"].asString() == "reload") {
+        scheduler->ReloadScheduleFile();
+
+        SetOKResult(result, "Schedule reload triggered");
+    }
+}
+
+void PlayerResource::periodicWork() {
+    if (piPowerFile > 0) {
+#ifdef PLATFORM_PI
+        int i = 0;
+        int32_t p[(MAX_STRING >> 2) + 7];
+        p[i++] = 0;          // size
+        p[i++] = 0x00000000; // process request
+
+        p[i++] = GET_GENCMD_RESULT; // (the tag id)
+        p[i++] = MAX_STRING;        // buffer_len
+        p[i++] = 0;                 // request_len (set to response length)
+        p[i++] = 0;                 // error repsonse
+
+        memcpy(p + i, "get_throttled", strlen("get_throttled") + 1);
+        i += MAX_STRING >> 2;
+        p[i++] = 0x00000000;  // end tag
+        p[0] = i * sizeof *p; // actual size
+
+        int ret_val = ioctl(piPowerFile, IOCTL_MBOX_PROPERTY, p);
+        std::string s = (char*)&p[6];
+        if (s.starts_with("throttled=0x")) {
+            s = s.substr(12);
+            uint32_t res = std::stol(s, nullptr, 16);
+            bool bad = res & 0x1;
+            piPowerBad = bad;
+            // Shared by the add and the remove: RemoveWarning() matches on the
+            // exact text.
+            constexpr int PI_POWER_WARNING_ID = 15;
+            constexpr const char* PI_POWER_WARNING_MSG = "Raspberry Pi Voltage Too Low";
+            // The banner goes up after more than 5 bad readings in a row and
+            // comes down after more than 5 good ones, so a supply hovering at
+            // the threshold doesn't flap it.  It used to stay up until fppd
+            // restarted, long after the supply had been fixed.
+            static int goodCount = 0;
+            if (bad) {
+                goodCount = 0;
+                piPowerWarningCount++;
+                if (piPowerWarningCount > 5 && !piPowerWarningAdded) {
+                    WarningHolder::AddWarning(PI_POWER_WARNING_ID, PI_POWER_WARNING_MSG);
+                    piPowerWarningAdded = true;
+                }
+            } else {
+                piPowerWarningCount = 0;
+                if (piPowerWarningAdded && ++goodCount > 5) {
+                    WarningHolder::RemoveWarning(PI_POWER_WARNING_ID, PI_POWER_WARNING_MSG);
+                    piPowerWarningAdded = false;
+                    goodCount = 0;
+                }
+            }
+        }
+#endif
+    }
+}
+
+void APIServer::periodicWork() {
+    if (m_pr) {
+        m_pr->periodicWork();
+    }
+}

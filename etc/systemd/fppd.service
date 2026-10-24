@@ -1,15 +1,37 @@
 [Unit]
 Description=FPPd
-After=network.target generic-board-startup.service remote-fs.target
-Requires=network.target 
+After=fpp_postnetwork.service
+Requires=fpp_postnetwork.service
+# fppd is an Avahi client, so avahi-daemon has to outlive it: systemd stops units in
+# the reverse of the start order, and without this ordering it is free to stop
+# avahi-daemon while fppd is still running.  dbus.service is here for the same reason
+# and is the one that actually matters -- avahi-daemon exits on its own the moment the
+# system bus goes away ("Disconnected from D-Bus, exiting"), so ordering against avahi
+# alone still let it die seconds before fppd was told to stop.
+# Wants, not Requires: no mDNS is a degraded FPP, not a broken one.
+After=avahi-daemon.service dbus.service
+Wants=avahi-daemon.service
+Conflicts=shutdown.target
+Before=shutdown.target
 DefaultDependencies=no
-
+StartLimitIntervalSec=200
+StartLimitBurst=5
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/opt/fpp/scripts/fpp_boot
+Type=simple
+EnvironmentFile=-/run/fppd/fpp-audio.env
+ExecStart=/opt/fpp/src/fppd -f
 ExecStop=/opt/fpp/scripts/fppd_stop
+ExecStartPre=-/opt/fpp/src/fppinit bootPre
+ExecStartPost=-/opt/fpp/src/fppinit bootPost
+ExecReload=/opt/fpp/src/fpp -r
+Restart=always
+TimeoutStopSec=15
+# The AES67 sender raises its packet-pacing thread to SCHED_FIFO; without a
+# ceiling here that call fails with EPERM and the stream transmits packets up
+# to a full ptime late every few thousand.  95 matches the PipeWire units.
+# It is a ceiling, not a request -- nothing runs RT unless it asks.
+LimitRTPRIO=95
 
 
 [Install]

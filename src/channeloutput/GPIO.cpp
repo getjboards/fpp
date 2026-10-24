@@ -1,181 +1,173 @@
 /*
- *   GPIO Pin Channel Output driver for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#include <stdlib.h>
+#include "fpp-pch.h"
 
-#include "common.h"
+#include "fpp-json.h"
+
+#include "../Warnings.h"
+#include "../log.h"
+
 #include "GPIO.h"
-#include "log.h"
+#include "ChannelOutputSetup.h"
+#include "../common_mini.h"
 
-#ifdef USEWIRINGPI
-#   include "wiringPi.h"
-#   include <softPwm.h>
-#   define supportsPWM(a) 1
-#elif defined(PLATFORM_BBB)
-#   include "channeloutput/BBBUtils.h"
-#   define INPUT "in"
-#   define OUTPUT "out"
-#   define HIGH   1
-#   define LOW   0
-#   define pinMode(a, b)         configBBBPin(a, "gpio", b)
-#   define digitalWrite(a,b)     setBBBPinValue(a, b)
-#   define softPwmCreate(a, b, c) setupBBBPinPWM(a)
-#   define softPwmWrite(a, b)    setBBBPinPWMValue(a, b)
-#   define supportsPWM(a)        supportsPWMOnBBBPin(a)
-#else
-#   define pinMode(a, b)
-#   define digitalWrite(a, b)
-#   define softPwmCreate(a, b, c)
-#   define softPwmWrite(a, b)
-#   define supportsPWM(a) 0
-#endif
+#include "Plugin.h"
+class GPIOPlugin : public FPPPlugins::Plugin, public FPPPlugins::ChannelOutputPlugin {
+public:
+    GPIOPlugin() :
+        FPPPlugins::Plugin("GPIO") {
+    }
+    virtual ChannelOutput* createChannelOutput(unsigned int startChannel, unsigned int channelCount) override {
+        return new GPIOOutput(startChannel, channelCount);
+    }
+};
 
-/*
- *
- */
-GPIOOutput::GPIOOutput(unsigned int startChannel, unsigned int channelCount)
-  : ChannelOutputBase(startChannel, channelCount),
-	m_GPIOPin(-1),
-	m_invertOutput(0),
-	m_softPWM(0)
-{
-	LogDebug(VB_CHANNELOUT, "GPIOOutput::GPIOOutput(%u, %u)\n",
-		startChannel, channelCount);
-
-	m_maxChannels = 1;
+extern "C" {
+FPPPlugins::Plugin* createPlugin() {
+    return new GPIOPlugin();
+}
 }
 
 /*
  *
  */
-GPIOOutput::~GPIOOutput()
-{
-	LogDebug(VB_CHANNELOUT, "GPIOOutput::~GPIOOutput()\n");
+GPIOOutput::GPIOOutput(unsigned int startChannel, unsigned int channelCount) :
+    ChannelOutput(startChannel, channelCount),
+    m_GPIOPin(nullptr),
+    m_invertOutput(0),
+    m_pwm(0) {
+    LogDebug(VB_CHANNELOUT, "GPIOOutput::GPIOOutput(%u, %u)\n",
+             startChannel, channelCount);
 }
 
 /*
  *
  */
-int GPIOOutput::Init(char *configStr)
-{
-	LogDebug(VB_CHANNELOUT, "GPIOOutput::Init('%s')\n", configStr);
+GPIOOutput::~GPIOOutput() {
+    LogDebug(VB_CHANNELOUT, "GPIOOutput::~GPIOOutput()\n");
+}
+int GPIOOutput::Init(Json::Value config) {
+    LogDebug(VB_CHANNELOUT, "GPIOOutput::Init()\n");
 
-	std::vector<std::string> configElems = split(configStr, ';');
+    m_invertOutput = config["invert"].asInt();
+    if (config.isMember("softPWM")) {
+        m_pwm = config["softPWM"].asInt();
+    }
+    if (config.isMember("pwm")) {
+        m_pwm = config["pwm"].asInt();
+    }
 
-	for (int i = 0; i < configElems.size(); i++)
-	{
-		std::vector<std::string> elem = split(configElems[i], '=');
-		if (elem.size() < 2)
-			continue;
+    if (config.isMember("pin")) {
+        std::string pinName = config["pin"].asString();
+        m_GPIOPin = PinCapabilities::getPinByName(pinName).ptr();
+        if (m_GPIOPin == nullptr) {
+            LogErr(VB_CHANNELOUT, "GPIO Pin '%s' not found\n", pinName.c_str());
+            AddOutputConfigWarning(51, "GPIO Pin '" + pinName + "' not found");
+            return 0;
+        }
+        m_usedGPIOS.push_back(pinName);
+    } else {
+        int gpio = config["gpio"].asInt();
+        m_GPIOPin = PinCapabilities::getPinByGPIO(0, gpio).ptr();
+        if (m_GPIOPin == nullptr) {
+            LogErr(VB_CHANNELOUT, "GPIO %d not found\n", gpio);
+            AddOutputConfigWarning(51, "GPIO " + std::to_string(gpio) + " not found");
+            return 0;
+        }
+        m_usedGPIOS.push_back(m_GPIOPin->name);
+    }
 
-		if (elem[0] == "gpio")
-			m_GPIOPin = atoi(elem[1].c_str());
-		else if (elem[0] == "invert")
-			m_invertOutput = atoi(elem[1].c_str());
-		else if (elem[0] == "softPWM")
-			m_softPWM = atoi(elem[1].c_str());
-	}
-
-	if (m_GPIOPin < 0)
-	{
-		LogErr(VB_CHANNELOUT, "GPIO Pin not configured\n");
-		return 0;
-	}
-
-	if (m_softPWM)
-	{
-        if (!supportsPWM(m_GPIOPin)) {
+    if (m_pwm) {
+        if (!m_GPIOPin->supportPWM()) {
             LogErr(VB_CHANNELOUT, "GPIO Pin does now support PWM\n");
             return 0;
         }
-		softPwmCreate(m_GPIOPin, 0, 255);
+        m_GPIOPin->setupPWM(25500);
 
-		if (m_invertOutput)
-			softPwmWrite(m_GPIOPin, 255);
-		else
-			softPwmWrite(m_GPIOPin, 0);
-	}
-	else
-	{
-		pinMode(m_GPIOPin, OUTPUT);
+        if (m_invertOutput)
+            m_GPIOPin->setPWMValue(25500);
+        else
+            m_GPIOPin->setPWMValue(0);
+    } else {
+        m_GPIOPin->configPin("gpio", true);
 
-		if (m_invertOutput)
-			digitalWrite(m_GPIOPin, HIGH);
-		else
-			digitalWrite(m_GPIOPin, LOW);
-	}
+        if (m_invertOutput)
+            m_GPIOPin->setValue(1);
+        else
+            m_GPIOPin->setValue(0);
+    }
 
-	return ChannelOutputBase::Init(configStr);
+    return ChannelOutput::Init(config);
 }
 
 /*
  *
  */
-int GPIOOutput::Close(void)
-{
-	LogDebug(VB_CHANNELOUT, "GPIOOutput::Close()\n");
+int GPIOOutput::Close(void) {
+    LogDebug(VB_CHANNELOUT, "GPIOOutput::Close()\n");
 
-	return ChannelOutputBase::Close();
+    return ChannelOutput::Close();
 }
 
 /*
  *
  */
-int GPIOOutput::SendData(unsigned char *channelData)
-{
-	LogExcess(VB_CHANNELOUT, "GPIOOutput::SendData(%p)\n", channelData);
+int GPIOOutput::SendData(unsigned char* channelData) {
+    LogExcess(VB_CHANNELOUT, "GPIOOutput::SendData(%p)\n", channelData);
 
-	if (m_softPWM)
-	{
-		if (m_invertOutput)
-			softPwmWrite(m_GPIOPin, (int)(255-channelData[0]));
-		else
-			softPwmWrite(m_GPIOPin, (int)(channelData[0]));
-	}
-	else
-	{
-		if (m_invertOutput)
-			digitalWrite(m_GPIOPin, !channelData[0]);
-		else
-			digitalWrite(m_GPIOPin, channelData[0]);
-	}
+    std::string warning;
+    try {
+        if (m_pwm) {
+            if (m_invertOutput)
+                m_GPIOPin->setPWMValue(100 * (int)(255 - channelData[0]));
+            else
+                m_GPIOPin->setPWMValue(100 * (int)(channelData[0]));
+        } else {
+            if (m_invertOutput)
+                m_GPIOPin->setValue(!channelData[0]);
+            else
+                m_GPIOPin->setValue(channelData[0]);
+        }
+    } catch (const std::exception& e) {
+        warning = std::string("Exception in GPIO output: ") + std::string(e.what());
+    } catch (...) {
+        warning = std::string("Exception in GPIO output");
+    }
+    if (!warning.empty()) {
+        // A timed warning, refreshed while the error keeps happening: it
+        // comes down by itself once the pin works again.  lastWarning was
+        // never set before, so the banner was re-added every frame and never
+        // removed.  Refreshing at most every 10s keeps this off the frame path.
+        uint64_t now = GetTimeMS();
+        if (warning != lastWarning || now - lastWarningMS > 10000) {
+            WarningHolder::AddWarningTimeout(30, 51, warning);
+            lastWarning = warning;
+            lastWarningMS = now;
+        }
+    }
 
-	return m_channelCount;
+    return m_channelCount;
 }
 
 /*
  *
  */
-void GPIOOutput::DumpConfig(void)
-{
-	LogDebug(VB_CHANNELOUT, "GPIOOutput::DumpConfig()\n");
+void GPIOOutput::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "GPIOOutput::DumpConfig()\n");
 
-	LogDebug(VB_CHANNELOUT, "    GPIO Pin       : %d\n", m_GPIOPin);
-	LogDebug(VB_CHANNELOUT, "    Inverted Output: %s\n", m_invertOutput ? "Yes" : "No");
-	LogDebug(VB_CHANNELOUT, "    Soft PWM       : %s\n", m_softPWM ? "Yes" : "No");
+    LogDebug(VB_CHANNELOUT, "    GPIO Pin       : %s\n", m_GPIOPin ? m_GPIOPin->name.c_str() : "");
+    LogDebug(VB_CHANNELOUT, "    Inverted Output: %s\n", m_invertOutput ? "Yes" : "No");
+    LogDebug(VB_CHANNELOUT, "    PWM            : %s\n", m_pwm ? "Yes" : "No");
 
-	ChannelOutputBase::DumpConfig();
+    ChannelOutput::DumpConfig();
 }
-

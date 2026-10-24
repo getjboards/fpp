@@ -1,90 +1,189 @@
+#pragma once
 /*
- *   Log handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
- 
-#ifndef __LOG_H__
-#define __LOG_H__
 
-///////////////////////////////////////////////////////////////////////////////
-// LogFacility is a mask allowing multiple log facilities on at the same time.
-///////////////////////////////////////////////////////////////////////////////
-// WARNING: Do not update this enum by placing new items in the middle unless
-//          you also update the VB_MOST mask at the end.  The default of
-//          VB_MOST does not include VB_CHANNELDATA which can be very verbose.
-///////////////////////////////////////////////////////////////////////////////
-typedef enum {
-	VB_NONE        = 0x00000000,
-	VB_GENERAL     = 0x00000001,
-	VB_CHANNELOUT  = 0x00000002,
-	VB_CHANNELDATA = 0x00000004,
-	VB_COMMAND     = 0x00000008,
-	VB_E131BRIDGE  = 0x00000010,
-	VB_EFFECT      = 0x00000020,
-	VB_EVENT       = 0x00000040,
-	VB_MEDIAOUT    = 0x00000080,
-	VB_PLAYLIST    = 0x00000100,
-	VB_SCHEDULE    = 0x00000200,
-	VB_SEQUENCE    = 0x00000400,
-	VB_SETTING     = 0x00000800,
-	VB_CONTROL     = 0x00001000,
-	VB_SYNC        = 0x00002000,
-	VB_PLUGIN      = 0x00004000,
-	VB_GPIO        = 0x00008000,
-	VB_HTTP        = 0x00010000,
-	VB_ALL         = 0x7FFFFFFF,
-	VB_MOST        = 0x7FFFFFFB
-} LogFacility;
+#include <string>
+#include <vector>
 
+/* 
+ * Define the allowed levels of Logging
+ */
 typedef enum {
-	LOG_ERR      = 1,
-	LOG_WARN,
-	LOG_INFO,
-	LOG_DEBUG,
-	LOG_EXCESSIVE
+    LOG_ERR = 1,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG,
+    LOG_EXCESSIVE
 } LogLevel;
 
-extern int logLevel;
-extern char logLevelStr[16];
-extern int logMask;
-extern char logMaskStr[1024];
+/* 
+ * A Logger Instance. 
+ * In the future, this could be adjusted to allow different Instances
+ * to go to different files
+ */
 
-#define LogErr(facility, format, args...)   _LogWrite(__FILE__, __LINE__, LOG_ERR, facility, format, ## args)
-#define LogInfo(facility, format, args...)  _LogWrite(__FILE__, __LINE__, LOG_INFO, facility, format, ## args)
-#define LogWarn(facility, format, args...)  _LogWrite(__FILE__, __LINE__, LOG_WARN, facility, format, ## args)
-#define LogDebug(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_DEBUG, facility, format, ## args)
-#define LogExcess(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_EXCESSIVE, facility, format, ## args)
+// LAYOUT RULE: this class is plugin ABI, even though no plugin ever names it.
+// The VB_* macros below expand to a member of the single FPPLogger::INSTANCE, so
+// a plugin bakes in "INSTANCE + N * sizeof(FPPLoggerInstance)" at compile time
+// and passes that address to libfpp's _LogWrite() as an FPPLoggerInstance&.
+// Change sizeof(FPPLoggerInstance) -- or insert/remove a facility in FPPLogger --
+// and every already-built plugin points at the middle of some other facility.
+// What comes back is not a std::string, so facility.name.c_str() hands strlen() a
+// pointer made of raw character bytes and fppd dies on the plugin's first log
+// line.  Adding the crashRingCapture bool below did exactly that: it grew this
+// class from 28 to 32 bytes on 32-bit ARM, and plugins built against the older
+// header resolved VB_PLUGIN 52 bytes short, landing inside the SSO buffer of
+// Control's name.  Plugin.h publishes fingerprints for this layout (they live
+// there, not here, because that is the header every plugin includes textually
+// rather than through the PCH) and the loader compares them, so a slip is
+// refused at dlopen -- but only for plugins built since those fingerprints
+// existed.  If a member is genuinely needed here, treat it as an ABI change and
+// weigh a FPP_PLUGIN_API_VERSION bump, which is the only thing that reaches
+// binaries already in the field.
+class FPPLoggerInstance {
+public:
+    FPPLoggerInstance(std::string name, bool crashRingCapture = true) {
+        this->name = name;
+        this->crashRingCapture = crashRingCapture;
+    }
+    LogLevel level = LOG_INFO;
+    std::string name;
 
-void _LogWrite(const char *file, int line, int level, int facility, const char *format, ...);
+    // Whether this facility's lines are kept in the crash-time ring (see
+    // CrashLogRingDump).  Off for the per-frame data facilities: HexDump()
+    // emits at LogInfo, and DebugOutput::SendData calls it ungated on every
+    // frame, so a single such output would both burn CPU formatting into the
+    // ring and evict the entire history within a frame or two.  The ring is
+    // for reconstructing state changes, and channel data is not one.
+    bool crashRingCapture = true;
+};
 
-void SetLogFile(const char *filename);
-int SetLogLevel(const char *newLevel);
-int SetLogMask(const char *newMask);
+/*
+ * Class to hold all the Instances
+ */
+class FPPLogger {
+public:
+    static FPPLogger INSTANCE;
+    const std::vector<FPPLoggerInstance*>& allInstances() { return all; }
+    void Init();
+    bool SetLevel(std::string name, LogLevel level);
+    bool SetLevel(const char* name, const char* level);
+    void SetAllLevel(LogLevel level);
+    int MinimumLogLevel();
+    std::string GetLogLevelString();
+    FPPLoggerInstance General = FPPLoggerInstance("General");
+    FPPLoggerInstance ChannelOut = FPPLoggerInstance("ChannelOut", false);
+    FPPLoggerInstance ChannelData = FPPLoggerInstance("ChannelData", false);
+    FPPLoggerInstance Command = FPPLoggerInstance("Command");
+    FPPLoggerInstance E131Bridge = FPPLoggerInstance("E131Bridge");
+    FPPLoggerInstance Effect = FPPLoggerInstance("Effect");
+    FPPLoggerInstance MediaOut = FPPLoggerInstance("MediaOut");
+    FPPLoggerInstance Playlist = FPPLoggerInstance("Playlist");
+    FPPLoggerInstance Schedule = FPPLoggerInstance("Schedule");
+    FPPLoggerInstance Sequence = FPPLoggerInstance("Sequence");
+    FPPLoggerInstance Settings = FPPLoggerInstance("Settings");
+    FPPLoggerInstance Control = FPPLoggerInstance("Control");
+    FPPLoggerInstance Sync = FPPLoggerInstance("Sync");
+    ;
+    FPPLoggerInstance Plugin = FPPLoggerInstance("Plugin");
+    FPPLoggerInstance GPIO = FPPLoggerInstance("GPIO");
+    FPPLoggerInstance HTTP = FPPLoggerInstance("HTTP");
+
+private:
+    std::vector<FPPLoggerInstance*> all;
+};
+
+#define VB_GENERAL FPPLogger::INSTANCE.General
+#define VB_ALL FPPLogger::INSTANCE.General /* Over Load */
+#define VB_CHANNELOUT FPPLogger::INSTANCE.ChannelOut
+#define VB_CHANNELDATA FPPLogger::INSTANCE.ChannelData
+#define VB_COMMAND FPPLogger::INSTANCE.Command
+#define VB_E131BRIDGE FPPLogger::INSTANCE.E131Bridge
+#define VB_EFFECT FPPLogger::INSTANCE.Effect
+#define VB_MEDIAOUT FPPLogger::INSTANCE.MediaOut
+#define VB_PLAYLIST FPPLogger::INSTANCE.Playlist
+#define VB_SCHEDULE FPPLogger::INSTANCE.Schedule
+#define VB_SEQUENCE FPPLogger::INSTANCE.Sequence
+#define VB_SETTING FPPLogger::INSTANCE.Settings
+#define VB_CONTROL FPPLogger::INSTANCE.Control
+#define VB_SYNC FPPLogger::INSTANCE.Sync
+#define VB_PLUGIN FPPLogger::INSTANCE.Plugin
+#define VB_GPIO FPPLogger::INSTANCE.GPIO
+#define VB_HTTP FPPLogger::INSTANCE.HTTP
+
+#define EXCESSIVE_LOG_LEVEL_WARNING "A Log Level is set to Excessive"
+#define DEBUG_LOG_LEVEL_WARNING "A Log Level is set to Debug"
+
+//extern int logLevel;
+//extern char logLevelStr[16];
+//extern int logMask;
+//extern char logMaskStr[1024];
+
+#define LogErr(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_ERR, facility, format, ##args)
+#define LogInfo(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_INFO, facility, format, ##args)
+#define LogWarn(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_WARN, facility, format, ##args)
+#define LogDebug(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_DEBUG, facility, format, ##args)
+#define LogExcess(facility, format, args...) _LogWrite(__FILE__, __LINE__, LOG_EXCESSIVE, facility, format, ##args)
+
+void _LogWrite(const char* file, int line, int level, FPPLoggerInstance& facility, const char* format, ...);
+void _LogWrite(const char* file, int line, int level, FPPLoggerInstance& facility, const std::string &str, ...);
+bool WillLog(int level, FPPLoggerInstance& facility);
+
+// Every log call reads a facility's level, on whatever thread it runs, while
+// the API and settings change it on others: read and write it through these.
+LogLevel FacilityLevel(FPPLoggerInstance& facility);
+void SetFacilityLevel(FPPLoggerInstance& facility, LogLevel level);
+
+// True when a line at this level/facility is retained in the crash-time ring
+// even though the configured log level would otherwise discard it.
+bool CrashLogRingWillCapture(int level, FPPLoggerInstance& facility);
+
+// Stop accepting new lines.  Called at the top of the crash handler so its own
+// logging does not evict the pre-crash history.
+void CrashLogRingFreeze();
+
+// Write the retained lines to fd, oldest first.  Async-signal-safe: no locks,
+// no allocation, write() only -- so it is usable from a crash handler that may
+// hold the very locks the normal log path needs.
+//
+// PRIVACY: these are log lines, and FPP's logs carry host names, LAN addresses
+// and discovered-device identifiers.  Treat the output as log content -- it
+// belongs in a crash report only at the share level that already ships
+// logs/fppd.log, never at "stack traces only".
+void CrashLogRingDump(int fd);
+
+// Truncates a value before it goes into a log line - use for anything whose
+// length isn't bounded by code (a Variable's value, a condition/command-list
+// JSON blob, raw command output), as opposed to things like names/paths that
+// are inherently short. Without this, e.g. an If condition checking a
+// Variable that happens to hold a fetched web page can turn a single log
+// line into hundreds of KB (found in practice: a 450KB Variable value logged
+// in full from Condition.cpp's per-leaf trace). Appends a size marker when
+// truncated so it's obvious data was cut, not silently dropped.
+std::string TruncateForLog(const std::string& s, size_t maxLen = 200);
+
+void SetLogFile(const char* filename, bool toStdOut = true);
+
+// Drop the stdout copy of any line that made it into the log file.  Only fppd
+// wants this: it runs as `fppd -f` under systemd, so every line it logs would
+// otherwise also be captured by journald, doubling the volume for a copy that
+// dies with the boot.  Leave it off (the default) in the small services -- their
+// output is what `journalctl -u <service>` is expected to show.  An interactive
+// run (stdout is a TTY) echoes to the console regardless.
+void SetSuppressDuplicateStdOut(bool suppress);
 int loggingToFile(void);
 void logVersionInfo(void);
 
-
-#define LogMaskIsSet(x)  (logMask & x)
-#define LogLevelIsSet(x) (logLevel >= x)
-
-#endif //__LOG_H__
+bool SetLogLevel(const char* newLevel);
+bool SetLogLevelComplex(std::string& input);  /*parse debug:schedule,player;excess:mqtt*/
+bool SetLogLevelComplex(const char* input);   /*parse debug:schedule,player;excess:mqtt*/
+std::string LogLevelToString(LogLevel level); /* Convert Level to String Equivilanent */

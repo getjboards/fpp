@@ -1,219 +1,260 @@
 /*
- *   Channel Test Pattern Base class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include <string.h>
-#include <strings.h>
-#include <stdlib.h>
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include "../common.h"
+#include "../log.h"
 
 #include "TestPatternBase.h"
-#include "common.h"
-#include "log.h"
+#include "channeloutput/ChannelOutputSetup.h"
+#include "overlays/PixelOverlay.h"
+#include "overlays/PixelOverlayModel.h"
 
 /*
  *
  */
-TestPatternBase::TestPatternBase()
-  : m_testEnabled(0),
-	m_testPatternName("basePattern"),
-	m_minChannels(2),
-	m_testData(NULL),
-	m_nextCycleTime(0),
-	m_cycleMS(0),
-	m_channelCount(0),
-	m_configChanged(0)
-{
-	LogExcess(VB_CHANNELOUT, "TestPatternBase::TestPatternBase()\n");
+TestPatternBase::TestPatternBase() :
+    m_testEnabled(0),
+    m_testPatternName("basePattern"),
+    m_minChannels(2),
+    m_testData(NULL),
+    m_nextCycleTime(0),
+    m_cycleMS(0),
+    m_channelCount(0),
+    m_configChanged(0) {
+    LogExcess(VB_CHANNELOUT, "TestPatternBase::TestPatternBase()\n");
 
-	// Give room for an extra RGB Triplet to make coding test patterns easier
-	m_testData = new char[FPPD_MAX_CHANNELS + 3];
+    // Give room for an extra RGBW Pixel to make coding test patterns easier
+    m_testData = new char[FPPD_MAX_CHANNELS + 4];
 }
 
 /*
  *
  */
-TestPatternBase::~TestPatternBase()
-{
-	LogExcess(VB_CHANNELOUT, "TestPatternBase::~TestPatternBase()\n");
+TestPatternBase::~TestPatternBase() {
+    LogExcess(VB_CHANNELOUT, "TestPatternBase::~TestPatternBase()\n");
 
-	delete [] m_testData;
+    delete[] m_testData;
 }
 
 /*
  *
  */
-int TestPatternBase::Init(std::string configStr)
-{
-	Json::Value config;
-	Json::Reader reader;
+int TestPatternBase::Init(std::string configStr) {
+    Json::Value config;
+    if (!LoadJsonFromString(configStr, config)) {
+        LogErr(VB_CHANNELOUT,
+               "Error parsing Test Pattern config string: '%s'\n",
+               configStr.c_str());
+        return 0;
+    }
 
-	bool success = reader.parse(configStr, config);
-	if (!success)
-	{
-		LogErr(VB_CHANNELOUT,
-			"Error parsing Test Pattern config string: '%s'\n",
-			configStr.c_str());
-		return 0;
-	}
-
-	return Init(config);
+    return Init(config);
 }
 
 /*
  *
  */
-int TestPatternBase::Init(Json::Value config)
-{
-	if (m_cycleMS != config["cycleMS"].asInt())
-	{
-		m_cycleMS = config["cycleMS"].asInt();
-		m_nextCycleTime = GetTime() + (m_cycleMS * 1000);
-	}
+int TestPatternBase::Init(Json::Value config) {
+    int cycleMS = JsonInt(config, "cycleMS");
+    if (m_cycleMS != cycleMS) {
+        m_cycleMS = cycleMS;
+        m_nextCycleTime = GetMonotonicTimeMicros() + (m_cycleMS * 1000);
+    }
 
-	if (m_channelSetStr != config["channelSet"].asString())
-	{
-		m_channelSetStr = config["channelSet"].asString();
-		SetChannelSet(m_channelSetStr);
-		m_configChanged = 1;
-	}
+    if (config.isMember("channelSet")) {
+        std::string channelSet = JsonString(config, "channelSet");
+        if (m_channelSetStr != channelSet) {
+            m_channelSetStr = channelSet;
+            SetChannelSet(m_channelSetStr);
+            m_configChanged = 1;
+        }
+    } else if (m_channelSetStr != "") {
+        m_channelSetStr = "";
+        m_configChanged = 1;
+        m_channelSet.clear();
+    }
 
-	if (m_configChanged)
-		SetupTest();
+    if (m_configChanged) {
+        SetupTest();
+    }
 
-	m_testEnabled = 1;
+    m_testEnabled = 1;
 
-	DumpConfig();
+    DumpConfig();
 
-	return 1;
+    return 1;
 }
 
 /*
  *
  */
-int TestPatternBase::SetChannelSet(std::string channelSetStr)
-{
-	int start = 0;
-	int end   = 0;
+int TestPatternBase::SetChannelSet(std::string channelSetStr) {
+    int start = 0;
+    int end = 0;
 
-	m_channelSet.clear();
-	m_channelCount = 0;
+    int max = 0;
+    auto outputRanges = GetOutputRangesSnapshot();
+    for (auto& a : *outputRanges) {
+        int e = a.first + a.second - 1;
+        max = std::max(max, e);
+    }
+    if (max < 8) {
+        max = 8;
+    }
 
-	std::vector<std::string> ranges = split(channelSetStr, ';');
+    m_channelSet.clear();
+    m_channelCount = 0;
 
-	for (int r = 0; r < ranges.size(); r++)
-	{
-		std::vector<std::string> parts = split(ranges[r], '-');
+    // Ranges may be separated by ';' or ','.  Only ';' was ever parsed, but the
+    // value the API advertises for this argument - GetOutputRangesAsString(),
+    // published as the ChannelRange contents by /api/fppd/testing/tests/<pattern>
+    // - joins its ranges with ',', so a caller sending that value back got only
+    // the first range: the rest were swallowed by the atoi() below without any
+    // error.  A token is looked up as a model name before being split on ',' so
+    // a model whose name contains one still resolves.
+    std::vector<std::string> ranges;
+    for (const auto& tok : split(channelSetStr, ';')) {
+        if (tok.find(',') == std::string::npos ||
+            PixelOverlayManager::INSTANCE.getModel(tok) != nullptr) {
+            ranges.push_back(tok);
+        } else {
+            for (const auto& sub : split(tok, ',')) {
+                ranges.push_back(sub);
+            }
+        }
+    }
 
-		if (parts.size())
-		{
-			start = atoi(parts[0].c_str());
-			if (start > 0)
-				start--;
+    for (int r = 0; r < ranges.size(); r++) {
+        auto model = PixelOverlayManager::INSTANCE.getModelShared(ranges[r]);
+        if (model != nullptr) {
+            start = model->getStartChannel();
+            end = start + model->getChannelCount() - 1;
+        } else {
+            std::vector<std::string> parts = split(ranges[r], '-');
 
-			if (parts.size() > 1)
-				end = atoi(parts[1].c_str());
-			else
-				end = start;
+            if (parts.size()) {
+                // atoi() wrapped "3000000000" to a negative start, which the
+                // checks below never caught, so OverlayTestData() copied to
+                // ~1.3 GB before the channel buffer every frame.  Parse wide
+                // and clamp into int range; a negative value is rejected below.
+                auto channelNum = [](const std::string& v) {
+                    long long n = strtoll(v.c_str(), nullptr, 10);
+                    return (int)std::clamp<long long>(n, -1, INT_MAX);
+                };
+                start = channelNum(parts[0]);
+                if (start > 0)
+                    start--;
 
-			if (end > 0)
-				end--;
+                if (parts.size() > 1)
+                    end = channelNum(parts[1]);
+                else
+                    end = start;
 
-			if (end > FPPD_MAX_CHANNELS)
-				end = FPPD_MAX_CHANNELS - 1;
+                if (end > 0)
+                    end--;
 
-			m_channelSet.push_back(std::make_pair(start, end));
-			m_channelCount += end - start + 1;
-		}
-	}
+                if (end > max)
+                    end = max;
+            }
+        }
+        if (end < start) {
+            end = start;
+        }
+        // Only end was clamped to the outputs, so a range starting past them
+        // ("99999999-99999999") put the copy in OverlayTestData() that far
+        // past the channel buffer: corruption, or a SIGSEGV on the output
+        // thread.  Such a range has nothing to test; drop it.  The total is
+        // capped at the test buffer too, which overlapping ranges could
+        // otherwise outgrow.
+        if (start < 0 || start > max) {
+            LogWarn(VB_CHANNELOUT, "Test channel range '%s' is outside the output channels (1-%d), ignoring it\n",
+                    ranges[r].c_str(), max + 1);
+            continue;
+        }
+        int room = (int)FPPD_MAX_CHANNELS - m_channelCount;
+        if (room <= 0) {
+            break;
+        }
+        end = std::min(end, start + room - 1);
+        m_channelSet.push_back(std::make_pair(start, end));
+        m_channelCount += end - start + 1;
+    }
 
-	return 1;
+    return 1;
 }
 
 /*
  *
  */
-int TestPatternBase::SetupTest(void)
-{
-	m_nextCycleTime = GetTime() + (m_cycleMS * 1000);
+int TestPatternBase::SetupTest(void) {
+    m_nextCycleTime = GetMonotonicTimeMicros() + (m_cycleMS * 1000);
 
-	return 1;
+    return 1;
 }
 
 /*
  *
  */
-int TestPatternBase::OverlayTestData(char *channelData)
-{
-	int count = 0;
-	int copied = 0;
+int TestPatternBase::OverlayTestData(char* channelData) {
+    int count = 0;
+    int copied = 0;
 
-	if (!m_testEnabled)
-	{
-		// Clear channels being tested
-		for (int s = 0; s < m_channelSet.size(); s++)
-		{
-			count = m_channelSet[s].second - m_channelSet[s].first + 1;
+    if (!m_testEnabled) {
+        // Clear channels being tested
+        for (int s = 0; s < m_channelSet.size(); s++) {
+            count = m_channelSet[s].second - m_channelSet[s].first + 1;
 
-			bzero(channelData + m_channelSet[s].first, count);
-		}
+            bzero(channelData + m_channelSet[s].first, count);
+        }
 
-		return 1;
-	}
+        return 1;
+    }
 
-	for (int s = 0; s < m_channelSet.size(); s++)
-	{
-		count = m_channelSet[s].second - m_channelSet[s].first + 1;
+    for (int s = 0; s < m_channelSet.size(); s++) {
+        count = m_channelSet[s].second - m_channelSet[s].first + 1;
 
-		memcpy(channelData + m_channelSet[s].first, m_testData + copied,
-			count);
+        memcpy(channelData + m_channelSet[s].first, m_testData + copied,
+               count);
 
-		copied += count;
-	}
+        copied += count;
+    }
 
-	if (GetTime() >= m_nextCycleTime)
-	{
-		CycleData();
-		m_nextCycleTime = GetTime() + (m_cycleMS * 1000);
-	}
+    // On the monotonic clock: on the wall clock a step back held the pattern
+    // still for as long as the step.  Nothing to cycle when every range was
+    // dropped (the patterns' shifts take a channel off the count, and would
+    // underflow).
+    if (m_channelCount > 0 && GetMonotonicTimeMicros() >= m_nextCycleTime) {
+        CycleData();
+        m_nextCycleTime = GetMonotonicTimeMicros() + (m_cycleMS * 1000);
+    }
 
-	return 1;
+    return 1;
 }
 
 /*
  *
  */
-void TestPatternBase::DumpConfig(void)
-{
-	LogDebug(VB_CHANNELOUT, "TestPatternBase::DumpConfig()\n");
-	LogDebug(VB_CHANNELOUT, "    cycleMS     : %d\n", m_cycleMS);
-	LogDebug(VB_CHANNELOUT, "    channelSet  : %s\n", m_channelSetStr.c_str());
-	LogDebug(VB_CHANNELOUT, "    channelCount: %d\n", m_channelCount);
+void TestPatternBase::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "TestPatternBase::DumpConfig()\n");
+    LogDebug(VB_CHANNELOUT, "    cycleMS     : %d\n", m_cycleMS);
+    LogDebug(VB_CHANNELOUT, "    channelSet  : %s\n", m_channelSetStr.c_str());
+    LogDebug(VB_CHANNELOUT, "    channelCount: %d\n", m_channelCount);
 
-	for (int s = 0; s < m_channelSet.size(); s++)
-	{
-		LogDebug(VB_CHANNELOUT, "                : %d-%d\n",
-			m_channelSet[s].first + 1, m_channelSet[s].second + 1);
-	}
+    for (int s = 0; s < m_channelSet.size(); s++) {
+        LogDebug(VB_CHANNELOUT, "                : %d-%d\n",
+                 m_channelSet[s].first + 1, m_channelSet[s].second + 1);
+    }
 }
-

@@ -5,7 +5,7 @@ BINDIR=$(cd $(dirname $0) && pwd)
 . ${BINDIR}/common
 . ${BINDIR}/functions
 
-export MEDIADIR FPPDIR CFGDIR CFGFILE SETTINGSFILE
+export MEDIADIR FPPDIR CFGDIR CFGFILE SETTINGSFILE LOGDIR
 EXT=$(basename $1 | sed -e "s/.*\.\([^\.]*\)/\1/")
 
 if [ "x${EXT}" = "xsh" ]
@@ -19,7 +19,7 @@ then
 	exec /usr/bin/php "$@"
 elif [ "x${EXT}" = "xpy" ]
 then
-	exec /usr/bin/python "$@"
+	exec /usr/bin/python3 "$@"
 elif [ -x $1 ]
 then
 	EXECUTABLE=$1

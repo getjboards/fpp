@@ -1,57 +1,45 @@
+#pragma once
 /*
- *   Playlist Entry Script Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _PLAYLISTENTRYSCRIPT_H
-#define _PLAYLISTENTRYSCRIPT_H
-
 #include <string>
+#include "fpp-json-fwd.h"
 
 #include "PlaylistEntryBase.h"
 
 class PlaylistEntryScript : public PlaylistEntryBase {
-  public:
-	PlaylistEntryScript(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryScript();
+public:
+    PlaylistEntryScript(Playlist* playlist, PlaylistEntryBase* parent = NULL);
+    ~PlaylistEntryScript();
 
-	int  Init(Json::Value &config);
+    virtual int Init(Json::Value& config) override;
 
-	int  StartPlaying(void);
-	int  Stop(void);
+    virtual int StartPlaying(void) override;
+    virtual int Process(void) override;
+    virtual int Stop(void) override;
 
-	int  HandleSigChild(pid_t pid);
+    bool isChildRunning();
+    virtual void Dump(void) override;
 
-	void Dump(void);
+    virtual Json::Value GetConfig(void) override;
+    virtual Json::Value GetMqttStatus(void) override;
+    std::string GetScriptName(void) { return m_scriptFilename; }
 
-	Json::Value GetConfig(void);
+    virtual uint64_t GetElapsedMS() override;
 
-	std::string GetScriptName(void) { return m_scriptFilename; }
-
-  private:
-	std::string        m_scriptFilename;
-	std::string        m_scriptArgs;
-	int                m_blocking;
+private:
+    std::string m_scriptFilename;
+    std::string m_scriptArgs;
+    bool m_blocking;
+    int m_scriptProcess;
+    long long m_startTime;
 };
-
-#endif

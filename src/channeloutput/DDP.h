@@ -1,53 +1,45 @@
+#pragma once
 /*
- *   DDP Channel Output driver for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _DDPOUTPUT_H
-#define _DDPOUTPUT_H
-
-#include <list>
 #include "UDPOutput.h"
+#include "fpp-json-fwd.h"
+#include <list>
 
 #define DDP_PORT 4048
 
 #define DDP_PUSH_FLAG 0x01
 #define DDP_TIMECODE_FLAG 0x10
 
-
 class DDPOutputData : public UDPOutputData {
 public:
-    DDPOutputData(const Json::Value &config);
+    explicit DDPOutputData(const Json::Value& config);
     virtual ~DDPOutputData();
-    
-    virtual bool IsPingable() { return true; }
-    virtual void PrepareData(unsigned char *channelData);
-    virtual void CreateMessages(std::vector<struct mmsghdr> &ipMsgs);
-    virtual void DumpConfig();
-    
-    char          sequenceNumber;
-    
-    sockaddr_in   ddpAddress;
-    int           pktCount;
-    
-    struct iovec *ddpIovecs = nullptr;
-    unsigned char **ddpBuffers = nullptr;
+
+    virtual bool IsPingable() override { return true; }
+    virtual void PrepareData(unsigned char* channelData, UDPOutputMessages& msgs) override;
+    virtual void DumpConfig() override;
+
+    virtual const std::string& GetOutputTypeString() const override;
+    virtual void FrameSent() override;
+
+    char sequenceNumber;
+    // what sequenceNumber becomes once the prepared frame is sent (FrameSent())
+    char pendingSequenceNumber = 1;
+    bool sequencePending = false;
+
+    sockaddr_in ddpAddress;
+    int pktCount;
+
+    struct iovec* ddpIovecs = nullptr;
+    unsigned char** ddpBuffers = nullptr;
 };
-
-
-#endif

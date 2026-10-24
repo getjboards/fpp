@@ -1,103 +1,240 @@
 /*
- *   OutputProcessor class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "../../log.h"
+
 #include "OutputProcessor.h"
+#include "../../Warnings.h"
 
-#include "RemapOutputProcessor.h"
-#include "SetValueOutputProcessor.h"
 #include "BrightnessOutputProcessor.h"
+#include "ClampValueOutputProcessor.h"
 #include "ColorOrderOutputProcessor.h"
-#include "log.h"
-
+#include "FoldOutputProcessor.h"
+#include "HoldValueOutputProcessor.h"
+#include "OverrideZeroOutputProcessor.h"
+#include "RemapOutputProcessor.h"
+#include "ScaleValueOutputProcessor.h"
+#include "SetValueOutputProcessor.h"
+#include "ThreeToFourOutputProcessor.h"
+#include "../../overlays/PixelOverlay.h"
+#include "../../overlays/PixelOverlayModel.h"
 
 OutputProcessors::OutputProcessors() {
 }
 OutputProcessors::~OutputProcessors() {
-    for (OutputProcessor *a : processors) {
-        delete a;
-    }
-    processors.clear();
+    removeAll();
 }
 
-void OutputProcessors::ProcessData(unsigned char *channelData) const {
+void OutputProcessors::ProcessData(unsigned char* channelData) const {
     std::lock_guard<std::mutex> lock(processorsLock);
-    for (OutputProcessor *a : processors) {
+    for (OutputProcessor* a : processors) {
         if (a->isActive()) {
             a->ProcessData(channelData);
         }
     }
 }
 
-void OutputProcessors::addProcessor(OutputProcessor*p) {
+// Whether the processor's channels lie inside the sequence buffer, recording a
+// warning when they do not.  Caller holds processorsLock.
+bool OutputProcessors::rangeIsValid(OutputProcessor* p) {
+    // ProcessData() writes straight into the sequence buffer, which is
+    // FPPD_MAX_CHANNELS long, over the channels the processor reports here.
+    // The UI only checks that numbers are positive, so a start or a count (or
+    // count * loops) can put that past the end - where it overwrites the
+    // off/white sentinel channels just past the buffer, or faults on every
+    // frame.  Refuse it rather than trust each processor to clamp.  An
+    // inverted range is how a processor with nothing to do reports.
+    bool bad = false;
+    int badMin = 0;
+    int badMax = -1;
+    p->GetRequiredChannelRanges([&bad, &badMin, &badMax](int m1, int m2) {
+        if (!bad && m2 >= m1 && (m1 < 0 || m2 >= (int)FPPD_MAX_CHANNELS)) {
+            bad = true;
+            badMin = m1;
+            badMax = m2;
+        }
+    });
+    if (!bad) {
+        return true;
+    }
+    std::string warning = "Output processor needs channels " + std::to_string(badMin + 1) + "-" +
+                          std::to_string(badMax + 1) + ", outside 1-" + std::to_string(FPPD_MAX_CHANNELS) +
+                          ". Processor disabled.";
+    LogErr(VB_CHANNELOUT, "%s\n", warning.c_str());
+    WarningHolder::AddWarning(warning);
+    rejectedWarnings.push_back(warning);
+    return false;
+}
+
+void OutputProcessors::addProcessor(OutputProcessor* p) {
     if (p == nullptr) {
         return;
     }
     std::lock_guard<std::mutex> lock(processorsLock);
-    processors.push_back(p);
+    if (rangeIsValid(p)) {
+        processors.push_back(p);
+    } else {
+        delete p; // rejected; nothing else owns it
+    }
 }
-void OutputProcessors::removeProcessor(OutputProcessor*p) {
+void OutputProcessors::removeProcessor(OutputProcessor* p) {
+    // ProcessData() walks the chain under processorsLock, so once the
+    // processor is out of the list (under the same lock) nothing can be using
+    // it.  Removed processors used to be leaked.
     std::lock_guard<std::mutex> lock(processorsLock);
-    processors.remove(p);
+    auto it = std::find(processors.begin(), processors.end(), p);
+    if (it != processors.end()) {
+        processors.erase(it);
+        // One loaded from outputprocessors.json (a playlist Remap "remove"
+        // matches those too) is also on fromJsonProcessors, which the next
+        // loadFromJSON() frees: take it off, or that frees it a second time.
+        fromJsonProcessors.remove(p);
+        delete p;
+    }
 }
 void OutputProcessors::removeAll() {
     std::lock_guard<std::mutex> lock(processorsLock);
-    for (OutputProcessor *a : processors) {
+    // Everything in the chain, and the JSON processors rangeIsValid() kept
+    // out of it, which are on fromJsonProcessors alone.
+    for (OutputProcessor* a : fromJsonProcessors) {
+        if (std::find(processors.begin(), processors.end(), a) == processors.end()) {
+            delete a;
+        }
+    }
+    fromJsonProcessors.clear();
+    for (OutputProcessor* a : processors) {
         delete a;
     }
     processors.clear();
 }
 
-void OutputProcessors::loadFromJSON(const Json::Value &config, bool clear) {
-    if (clear) {
-        removeAll();
-    }
-    for( Json::Value::const_iterator itr = config.begin() ; itr != config.end() ; itr++ ) {
+void OutputProcessors::loadFromJSON(const Json::Value& config) {
+    // Build the whole new chain first and swap it in under one lock: removing
+    // the old processors, unlocking and adding the new ones one at a time let
+    // the output thread run a frame with part of the chain (a brightness or
+    // current limit missing for a frame).  Only the processors created from
+    // JSON are replaced; plugins may have added their own.
+    std::list<OutputProcessor*> created;
+    // A processor whose JSON holds a value of the wrong type ("1" for a
+    // number, a list, null) threw Json::LogicError out of its constructor,
+    // past everything up to std::terminate -- at startup, so with the config
+    // saved fppd crash looped.  Refuse that one processor instead, with a
+    // warning (raised below, once last time's are retracted).
+    std::vector<std::string> failed;
+    auto tryCreate = [this, &created, &failed](const Json::Value& v) {
+        try {
+            if (OutputProcessor* p = create(v)) {
+                created.push_back(p);
+            }
+        } catch (const std::exception& e) {
+            std::string what;
+            if (v.isObject() && v["type"].isString()) {
+                what = v["type"].asString();
+            }
+            if (what.empty()) {
+                what = "an entry";
+            }
+            failed.push_back("Output processor " + what + " could not be loaded (" + e.what() +
+                             "). Processor disabled.");
+        }
+    };
+    for (Json::Value::const_iterator itr = config.begin(); itr != config.end(); ++itr) {
         std::string name = itr.key().asString();
         if (name == "outputProcessors") {
             Json::Value val = *itr;
             if (val.isArray()) {
                 for (int x = 0; x < val.size(); x++) {
-                    addProcessor(create(val[x]));
+                    tryCreate(val[x]);
                 }
             } else {
-                addProcessor(create(val));
+                tryCreate(val);
             }
         }
     }
+
+    std::list<OutputProcessor*> old;
+    {
+        std::lock_guard<std::mutex> lock(processorsLock);
+        for (auto& w : rejectedWarnings) {
+            WarningHolder::RemoveWarning(w);
+        }
+        rejectedWarnings.clear();
+        for (auto& w : failed) {
+            LogErr(VB_CHANNELOUT, "%s\n", w.c_str());
+            WarningHolder::AddWarning(w);
+            rejectedWarnings.push_back(w);
+        }
+        for (auto a : fromJsonProcessors) {
+            processors.remove(a);
+        }
+        old.swap(fromJsonProcessors);
+        for (auto p : created) {
+            if (rangeIsValid(p)) {
+                processors.push_back(p);
+            }
+            // owned either way, freed on the next reload
+            fromJsonProcessors.push_back(p);
+        }
+    }
+    // not running any more, and no longer reachable by the output thread
+    for (auto a : old) {
+        delete a;
+    }
 }
-OutputProcessor *OutputProcessors::create(const Json::Value &config) {
-    std::string type = config["type"].asString();
-    if (type == "Remap") {
-        return new RemapOutputProcessor(config);
-    } else if (type == "Brightness") {
-        return new BrightnessOutputProcessor(config);
-    } else if (type == "Set Value") {
-        return new SetValueOutputProcessor(config);
-    } else if (type == "Reorder Colors") {
-        return new ColorOrderOutputProcessor(config);
+OutputProcessor* OutputProcessors::create(const Json::Value& config) {
+    int active = config["active"].asInt();
+    if (active == 1) {
+        std::string type = config["type"].asString();
+        if (type == "Remap") {
+            return new RemapOutputProcessor(config);
+        } else if (type == "Brightness") {
+            return new BrightnessOutputProcessor(config);
+        } else if (type == "Hold Value") {
+            return new HoldValueOutputProcessor(config);
+        } else if (type == "Set Value") {
+            return new SetValueOutputProcessor(config);
+        } else if (type == "Clamp Value") {
+            return new ClampValueOutputProcessor(config);
+        } else if (type == "Scale Value") {
+            return new ScaleValueOutputProcessor(config);
+        } else if (type == "Reorder Colors") {
+            return new ColorOrderOutputProcessor(config);
+        } else if (type == "Three to Four") {
+            return new ThreeToFourOutputProcessor(config);
+        } else if (type == "Override Zero") {
+            return new OverrideZeroOutputProcessor(config);
+        } else if (type == "Fold") {
+            return new FoldOutputProcessor(config);
+        } else {
+            LogErr(VB_CHANNELOUT, "Unknown OutputProcessor type: %s\n", type.c_str());
+        }
     } else {
-        LogErr(VB_CHANNELOUT, "Unknown OutputProcessor type: %s\n", type.c_str());
+        LogDebug(VB_CHANNELOUT, "Skipping disabled OutputProcessor\n");
     }
     return nullptr;
 }
 
-
-OutputProcessor *OutputProcessors::find(std::function<bool(OutputProcessor*)> f) const {
+OutputProcessor* OutputProcessors::find(std::function<bool(OutputProcessor*)> f) const {
     std::lock_guard<std::mutex> lock(processorsLock);
-    for (OutputProcessor *a : processors) {
+    for (OutputProcessor* a : processors) {
         if (f(a)) {
             return a;
         }
@@ -105,20 +242,73 @@ OutputProcessor *OutputProcessors::find(std::function<bool(OutputProcessor*)> f)
     return nullptr;
 }
 
-void OutputProcessors::GetRequiredChannelRange(int &min, int & max) {
-    min = FPPD_MAX_CHANNELS;
-    max = 0;
-    int m1, m2;
-    for (OutputProcessor *a : processors) {
-        a->GetRequiredChannelRange(m1, m2);
-        min = std::min(min, m1);
-        max = std::max(max, m2);
+void OutputProcessors::GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) {
+    // a playlist Remap entry adds and removes processors from other threads
+    std::lock_guard<std::mutex> lock(processorsLock);
+    for (OutputProcessor* a : processors) {
+        a->GetRequiredChannelRanges(addRange);
     }
 }
 
-
-OutputProcessor::OutputProcessor() : description(), active(true) {
+OutputProcessor::OutputProcessor() :
+    description(),
+    active(true) {
 }
 
 OutputProcessor::~OutputProcessor() {
+}
+
+void ProcessModelConfig(const Json::Value& config, std::string& model, int& start, int& count) {
+    if (config.isMember("model")) {
+        model = config["model"].asString();
+        if (model != "<Use Start Channel>") {
+            auto m_model = PixelOverlayManager::INSTANCE.getModelShared(model);
+            if (!m_model) {
+                LogErr(VB_CHANNELOUT, "Invalid Pixel Overlay Model: '%s'\n", model.c_str());
+            } else {
+                int m_channel = m_model->getChannelCount();
+                LogDebug(VB_CHANNELOUT, "Before Model applied:   %d-%d => Model: %s (%d channels)\n",
+                         start, start + count - 1,
+                         model.c_str(), m_channel);
+
+                // start arrives 1-based within the model; getStartChannel() is the
+                // model's 0-based absolute start, so the span still available from
+                // offset is m_channel - offset + 1 channels.
+                int offset = start;
+                start = m_model->getStartChannel() + start - 1;
+
+                if (offset + count - 1 > m_channel) {
+                    count = m_channel - offset + 1;
+                    if (count < 0) {
+                        count = 0;
+                    }
+                    LogWarn(VB_CHANNELOUT, "Output processor for Model: %s starting at channel %d would run past the end of the model (%d channels).  Restricting to %d channels\n",
+                            model.c_str(), offset, m_channel, count);
+                } else if (offset + count - 1 < m_channel) {
+                    LogInfo(VB_CHANNELOUT, "Output processor for Model: %s is using less channels (%d starting at %d) than overlay model has (%d).  This may be intentional\n",
+                            model.c_str(), count, offset, m_channel);
+                }
+            }
+        } else {
+            model = "";
+            --start;
+        }
+    } else {
+        model = "";
+        --start;
+    }
+    // Processors report start + count * (1, 3 or 4) in an int.  A start or a
+    // count in the billions overflowed it into the inverted range that means
+    // "nothing to do", rangeIsValid() let the processor through, and its
+    // ProcessData() then wrote count channels from start: at boot, from
+    // outputprocessors.json, so fppd crash looped.  Pin both just outside the
+    // buffer instead, where the range still fails the check, and can't overflow.
+    if (start < 0) {
+        start = -1;
+    } else if (start > (int)FPPD_MAX_CHANNELS) {
+        start = FPPD_MAX_CHANNELS;
+    }
+    if (count > (int)FPPD_MAX_CHANNELS + 1) {
+        count = FPPD_MAX_CHANNELS + 1;
+    }
 }

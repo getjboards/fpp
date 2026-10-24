@@ -1,74 +1,112 @@
+#pragma once
 /*
- *   Playlist Entry Media Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _PLAYLISTENTRYMEDIA_H
-#define _PLAYLISTENTRYMEDIA_H
-
+#include <mutex>
 #include <string>
+#include "fpp-json-fwd.h"
 
 #include "PlaylistEntryBase.h"
-#include "mediaoutput.h"
+#include "mediaoutput/mediaoutput.h"
+#include "mediaoutput/StreamSlotManager.h"
 
 class PlaylistEntryMedia : public PlaylistEntryBase {
-  public:
-	PlaylistEntryMedia(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryMedia();
+public:
+    PlaylistEntryMedia(Playlist* playlist, PlaylistEntryBase* parent = NULL);
+    virtual ~PlaylistEntryMedia();
 
-	int  Init(Json::Value &config);
+    virtual int Init(Json::Value& config) override;
 
-    int  PreparePlay();
-	int  StartPlaying(void);
-	int  Process(void);
-	int  Stop(void);
+    virtual int PreparePlay();
+    virtual int StartPlaying(void) override;
+    virtual int Process(void) override;
+    virtual int Stop(void) override;
 
-	int  HandleSigChild(pid_t pid);
+    virtual void Pause() override;
+    virtual bool IsPaused() override;
+    virtual void Resume() override;
 
-	void Dump(void);
+    virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+    virtual Json::Value GetConfig(void) override;
+    virtual Json::Value GetMqttStatus(void) override;
 
-	std::string GetMediaName(void) { return m_mediaFilename; }
+    std::string GetMediaName(void) { return m_mediaFilename; }
+    int GetStreamSlot(void) { return m_streamSlot; }
+    bool IsBackgroundSlot(void) { return m_streamSlot > 1; }
 
-	int   m_status;
-	int   m_secondsElapsed;
-	int   m_subSecondsElapsed;
-	int   m_secondsRemaining;
-	int   m_subSecondsRemaining;
-	int   m_minutesTotal;
-	int   m_secondsTotal;
-	float m_mediaSeconds;
-	int   m_speedDelta;
+    // Companion streams started alongside this entry's own media and stopped
+    // with it -- e.g. a second language on another audio device, or a second
+    // video on a second HDMI.  Declared on the entry so they share its
+    // lifetime instead of having to be fired and cleaned up by hand.
+    struct ExtraMedia {
+        std::string mediaName;
+        int slot = 2;
+        std::string videoOut;
+        bool sync = false;
+    };
 
-  private:
-	int OpenMediaOutput(void);
-	int CloseMediaOutput(void);
+    virtual uint64_t GetLengthInMS() override;
+    virtual uint64_t GetElapsedMS() override;
 
-	std::string        m_mediaFilename;
-    std::string        m_videoOutput;
-	MediaOutputBase   *m_mediaOutput;
-	pthread_mutex_t    m_mediaOutputLock;
+    bool HasExtraAtEnd();
+    // Whether the media's sound has reached the output yet (see
+    // MediaOutputBase::IsAudible).  True when there is no media output.
+    bool IsAudible();
+    int32_t GetMediaOffsetMS();
+
+    int m_status;
+
+    long long m_openTime;
+    long long m_startTime;
+    // With a media offset the MultiSync start goes out from Process() once the
+    // offset has passed.  Once: there used to be no flag, so it was resent on
+    // every main-loop tick for the whole song and remotes restarted their media
+    // on each one.
+    bool m_syncStartSent = false;
+    // Set while Resume() reopens the paused media through PreparePlay(): the
+    // same file, not a new random pick, and no play-once check (the entry is
+    // already playing -- that check made Resume() finish a play-once entry).
+    bool m_resuming = false;
+    static int m_openStartDelay;
+
+private:
+    int OpenMediaOutput(void);
+    int CloseMediaOutput(void);
+
+    unsigned int m_fileSeed;
+    int GetFileList(void);
+    std::string GetNextRandomFile(void);
+
+    /// startMS > 0 resumes the companions at that offset instead of from zero.
+    void StartExtraMedia(int startMS = 0);
+    void StopExtraMedia(void);
+
+    std::vector<ExtraMedia> m_extraMedia;
+    bool m_extraMediaStarted = false;
+
+    std::string m_mediaFilename;
+    std::string m_mediaPrefix;
+    std::string m_videoOutput;
+    int m_streamSlot;         // stream slot (1-5), default 1
+    MediaOutputStatus* m_slotStatus; // per-slot status pointer
+    MediaOutputBase* m_mediaOutput;
+    std::mutex m_mediaOutputLock;
+
+    uint64_t m_duration;
+
+    std::string m_fileMode;
+    std::vector<std::string> m_files;
+
+    int m_pausedTime;
+    MediaOutputStatus m_pausedStatus;
 };
-
-#endif

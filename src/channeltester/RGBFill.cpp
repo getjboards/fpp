@@ -1,114 +1,123 @@
 /*
- *   Channel Test Pattern RGB Fill class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include "../log.h"
 
 #include "RGBFill.h"
-#include "common.h"
-#include "log.h"
 
 /*
  *
  */
-TestPatternRGBFill::TestPatternRGBFill()
-  : m_color1(0),
-	m_color2(0),
-	m_color3(0)
-{
-	LogExcess(VB_CHANNELOUT, "TestPatternRGBFill::TestPatternRGBFill()\n");
+TestPatternRGBFill::TestPatternRGBFill() :
+    m_color1(0),
+    m_color2(0),
+    m_color3(0),
+    m_color4(0),
+    m_channelsPerNode(3) {
+    LogExcess(VB_CHANNELOUT, "TestPatternRGBFill::TestPatternRGBFill()\n");
 
-	m_testPatternName = "RGBFill";
+    m_testPatternName = "RGBFill";
 }
 
 /*
  *
  */
-TestPatternRGBFill::~TestPatternRGBFill()
-{
-	LogExcess(VB_CHANNELOUT, "TestPatternRGBFill::~TestPatternRGBFill()\n");
+TestPatternRGBFill::~TestPatternRGBFill() {
+    LogExcess(VB_CHANNELOUT, "TestPatternRGBFill::~TestPatternRGBFill()\n");
 }
 
 /*
  *
  */
-int TestPatternRGBFill::Init(Json::Value config)
-{
-	m_configChanged = 0;
+int TestPatternRGBFill::Init(Json::Value config) {
+    m_configChanged = 0;
 
-	if (m_color1 != config["color1"].asInt())
-	{
-		m_color1 = config["color1"].asInt();
-		m_configChanged = 1;
-	}
+    int color1 = JsonInt(config, "color1");
+    if (m_color1 != color1) {
+        m_color1 = color1;
+        m_configChanged = 1;
+    }
 
-	if (m_color2 != config["color2"].asInt())
-	{
-		m_color2 = config["color2"].asInt();
-		m_configChanged = 1;
-	}
+    int color2 = JsonInt(config, "color2");
+    if (m_color2 != color2) {
+        m_color2 = color2;
+        m_configChanged = 1;
+    }
 
-	if (m_color3 != config["color3"].asInt())
-	{
-		m_color3 = config["color3"].asInt();
-		m_configChanged = 1;
-	}
+    int color3 = JsonInt(config, "color3");
+    if (m_color3 != color3) {
+        m_color3 = color3;
+        m_configChanged = 1;
+    }
 
-	return TestPatternBase::Init(config);
+    int color4 = JsonInt(config, "color4");
+    if (m_color4 != color4) {
+        m_color4 = color4;
+        m_configChanged = 1;
+    }
+
+    int cpn = JsonInt(config, "channelsPerNode", 3);
+    if (cpn != 3 && cpn != 4) {
+        cpn = 3;
+    }
+    if (m_channelsPerNode != cpn) {
+        m_channelsPerNode = cpn;
+        m_configChanged = 1;
+    }
+
+    return TestPatternBase::Init(config);
 }
 
 /*
  *
  */
-int TestPatternRGBFill::SetupTest(void)
-{
-	bzero(m_testData, m_channelCount);
+int TestPatternRGBFill::SetupTest(void) {
+    bzero(m_testData, m_channelCount);
 
-	char *c = m_testData;
-	int   offset = 0;
-	for (int i = 0; i < m_channelCount; i += 3)
-	{
-		*(c++) = m_color1;
-		*(c++) = m_color2;
-		*(c++) = m_color3;
-	}
+    char* c = m_testData;
 
-	return TestPatternBase::SetupTest();
+    // Stride is driven by the model/color order (3 for RGB, 4 for RGBW), not by
+    // whether the white value happens to be non-zero, so RGBW pixels stay aligned
+    // even when filling a pure color (W = 0).
+    //
+    // The channel set need not be a whole number of pixels - eight discrete
+    // channels ("151;167;...;263") tested as RGB is a channelCount of 8 with a
+    // stride of 3 - so the trailing partial pixel is filled too rather than
+    // left at the bzero() value, which used to leave those channels dark for
+    // the whole test.
+    const char colors[4] = { (char)m_color1, (char)m_color2, (char)m_color3, (char)m_color4 };
+    const int stride = m_channelsPerNode;
+
+    for (int i = 0; i < m_channelCount; i++) {
+        *(c++) = colors[i % stride];
+    }
+
+    return TestPatternBase::SetupTest();
 }
 
 /*
  *
  */
-void TestPatternRGBFill::DumpConfig(void)
-{
-	LogDebug(VB_CHANNELOUT, "TestPatternRGBFill::DumpConfig\n");
-	LogDebug(VB_CHANNELOUT, "    color1 : %02x\n", m_color1);
-	LogDebug(VB_CHANNELOUT, "    color2 : %02x\n", m_color2);
-	LogDebug(VB_CHANNELOUT, "    color3 : %02x\n", m_color3);
+void TestPatternRGBFill::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "TestPatternRGBFill::DumpConfig\n");
+    LogDebug(VB_CHANNELOUT, "    color1 : %02x\n", m_color1);
+    LogDebug(VB_CHANNELOUT, "    color2 : %02x\n", m_color2);
+    LogDebug(VB_CHANNELOUT, "    color3 : %02x\n", m_color3);
+    LogDebug(VB_CHANNELOUT, "    color4 : %02x\n", m_color4);
+    LogDebug(VB_CHANNELOUT, "    channelsPerNode : %d\n", m_channelsPerNode);
 
-	TestPatternBase::DumpConfig();
+    TestPatternBase::DumpConfig();
 }
-

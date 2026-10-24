@@ -1,22 +1,30 @@
 <?
 $pluginSettings = array();
 
-$pluginConfigFile = $settings['configDirectory'] . "/plugin." . $_GET['plugin'];
-if (file_exists($pluginConfigFile))
-    $pluginSettings = parse_ini_file($pluginConfigFile);
+$pluginName = htmlspecialchars($_GET['plugin'], ENT_QUOTES, 'UTF-8');
 
-$pluginSettings['plugin'] = $_GET['plugin'];
+$pluginConfigFile = $settings['configDirectory'] . "/plugin." . $pluginName;
+echo ($pluginConfigFile);
+if (file_exists($pluginConfigFile)) {
+    $fd = @fopen($pluginConfigFile, "c+");
+    flock($fd, LOCK_SH);
+    $pluginSettings = custom_parse_ini_file($pluginConfigFile);
+    flock($fd, LOCK_UN);
+    fclose($fd);
 
-if (!isset($skipJSsettings))
-{
-?>
+}
+
+$pluginSettings['plugin'] = $pluginName;
+
+if (!isset($skipJSsettings)) {
+    ?>
 <script type="text/javascript">
 var pluginSettings = new Array();
 <?
-foreach ($pluginSettings as $key => $value) {
-    printf("    pluginSettings['%s'] = \"%s\";\n", $key, $value);
-}
-?>
+    foreach ($pluginSettings as $key => $value) {
+        printf("    pluginSettings[%s] = %s;\n", json_encode((string) $key), json_encode((string) $value));
+    }
+    ?>
 </script>
 <?
 }

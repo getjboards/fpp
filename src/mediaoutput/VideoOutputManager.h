@@ -1,0 +1,518 @@
+#pragma once
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2026 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <arpa/inet.h>
+
+#include "DrmCards.h"
+
+#if __has_include(<gst/gst.h>)
+#define HAS_GSTREAMER_VIDEO_OUTPUT
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#endif
+
+class PixelOverlayModel;
+
+/**
+ * A sub-region of the source frame, as fractions (0.0-1.0) of its width and
+ * height.  Fractions rather than pixels so one configuration works for any
+ * source resolution — the pixel crop is computed from the negotiated caps at
+ * runtime, and re-computed if the source resolution changes mid-stream.
+ *
+ * Used to split one decoded video across several displays: give each output a
+ * different region (e.g. left half / right half of a 3840x1080 file) and each
+ * shows its own slice of a single decode.
+ */
+struct VideoCropRect {
+    double x = 0.0;
+    double y = 0.0;
+    double width = 1.0;
+    double height = 1.0;
+
+    /// When > 0, the selected region is narrowed further -- centred -- until
+    /// its width:height matches this ratio.  That is how "fill" scaling is
+    /// expressed: crop the source to the display's shape so the
+    /// aspect-preserving scale that follows covers the display exactly, with
+    /// nothing letterboxed.  Resolved against the negotiated caps alongside
+    /// the fractions above, so it costs no extra element.  0 leaves the
+    /// region exactly as selected ("fit").
+    double targetAspect = 0.0;
+
+    /// True when this selects the whole frame, i.e. no crop element is needed.
+    /// A target aspect always needs one: whether it actually trims anything
+    /// depends on the source resolution, which is not known until caps arrive.
+    bool IsFullFrame() const {
+        return targetAspect <= 0.0 &&
+               x <= 0.0 && y <= 0.0 && width >= 1.0 && height >= 1.0;
+    }
+
+    /// True when the values describe a usable region.  A zero/negative extent
+    /// or one starting past the right/bottom edge would crop everything away.
+    bool IsValid() const {
+        return width > 0.0 && height > 0.0 && x >= 0.0 && y >= 0.0 &&
+               (x + width) <= 1.0001 && (y + height) <= 1.0001;
+    }
+};
+
+/**
+ * VideoOutputManager — manages PipeWire video consumer pipelines.
+ *
+ * Each video output destination (HDMI display, pixel overlay, network stream)
+ * runs a GStreamer consumer pipeline:
+ *   pipewiresrc → videoconvert → videoscale → destination sink
+ *
+ * Consumer pipelines are started on-demand when a video producer appears
+ * (GStreamerOut calls StartConsumers after pipewiresink is attached) and
+ * stopped when playback ends (StopConsumers).  The pipewiresrc target-object
+ * is set to the producer's node name so PipeWire links them automatically.
+ *
+ * Config file: $mediaDirectory/config/pipewire-video-consumers.json
+ */
+class VideoOutputManager {
+public:
+    static VideoOutputManager& Instance();
+
+    /// Load config at startup.  Does NOT start consumer pipelines.
+    void Init();
+
+    /// Reload config (called when Apply is triggered from UI).
+    /// If consumers are currently running, restarts them with new config.
+    void Reload();
+
+    /// Stop all consumer pipelines and clean up.
+    void Shutdown();
+
+    /// Info about an HDMI consumer for direct kmssink attachment.
+    struct HdmiConsumerInfo {
+        int connectorId = -1;
+        std::string connector;   // e.g. "HDMI-A-2"
+        std::string cardPath;
+        int width = 0;
+        int height = 0;
+        int primaryPlaneId = -1; // DRM primary plane for this connector's CRTC
+        VideoCropRect crop;      // region of the source this display shows
+        // "fit", "fill" or "stretch".  "fill" needs nothing here -- it is
+        // already folded into `crop` as a target aspect -- but "stretch" has
+        // to defeat the aspect-preserving scale kmssink always does, so the
+        // caller needs to know about it.  See CreateScaleElements.
+        std::string scaling = "fit";
+    };
+
+    /// True when an overlay or RTP member of a playback group (no fixed
+    /// source) takes stream slot `streamSlot`.  Those read the slot's
+    /// intervideo channel, which media playback publishes only when asked.
+    bool HasSlotChannelConsumers(int streamSlot) const;
+
+    /// Return HDMI consumer info for consumers that match the given stream
+    /// slot but whose connectorId is NOT in skipConnectorIds.
+    std::vector<HdmiConsumerInfo> GetHdmiConsumers(
+        int streamSlot,
+        const std::set<int>& skipConnectorIds = {}) const;
+
+    /// Region configured for the display on `connectorId`, whole frame if none.
+    /// Unlike GetHdmiConsumers this does not skip the connector driven by the
+    /// primary pipeline — that display is one half of a split too, so its
+    /// kmssink needs the crop even though no consumer pipeline is started for
+    /// it.  Matches the on-demand consumer entries and the stream-slot filter
+    /// exactly as GetHdmiConsumers does.
+    VideoCropRect GetHdmiCropForConnector(int streamSlot, int connectorId) const;
+
+    /// Scaling mode configured for the display on `connectorId`, "fit" if none.
+    /// Matches entries exactly as GetHdmiCropForConnector does, and for the
+    /// same reason: the primary display is a configured output too.
+    std::string GetHdmiScalingForConnector(int streamSlot, int connectorId) const;
+
+#ifdef HAS_GSTREAMER_VIDEO_OUTPUT
+    /// Build a videocrop element that resolves `crop` against the negotiated
+    /// caps at runtime.  Returns nullptr when the whole frame is selected (no
+    /// element needed) or when the crop is invalid/videocrop is unavailable.
+    /// The caller owns the floating ref — add it to a bin as usual.
+    ///
+    /// Place it immediately upstream of kmssink: kmssink advertises
+    /// GstVideoCropMeta, so videocrop then crops by metadata (it becomes the
+    /// DRM plane's source rectangle, applied by the display hardware during
+    /// scanout) instead of copying pixels.  With any other element in between
+    /// it silently falls back to a full per-frame copy.
+    static GstElement* CreateCropElement(const VideoCropRect& crop,
+                                         const std::string& name);
+
+    /// Elements needed upstream of kmssink to honour `scaling`, in link order.
+    ///
+    /// Empty for "fit" and "fill": kmssink always scales its input to the
+    /// display preserving aspect ratio, which IS "fit", and "fill" is reached
+    /// by handing it an already display-shaped region (VideoCropRect::
+    /// targetAspect) so that same scale covers the display exactly.  Both are
+    /// free -- the DRM plane does the scaling during scanout.
+    ///
+    /// "stretch" is the one mode the sink cannot express: kmssink has no
+    /// force-aspect-ratio property, so the frame has to arrive already at the
+    /// display's exact size.  That costs a real videoscale pass, and the
+    /// display size has to be known -- with displayWidth/Height <= 0 the mode
+    /// is dropped back to "fit" rather than guessed at.
+    ///
+    /// Place these AFTER any crop element (the region must be selected at
+    /// source resolution, before anything rescales the frame) and before the
+    /// sink.  The caller owns the floating refs.
+    static std::vector<GstElement*> CreateScaleElements(const std::string& scaling,
+                                                        int displayWidth,
+                                                        int displayHeight,
+                                                        const std::string& namePrefix);
+#endif
+
+    /// Start all configured consumers targeting the given producer node.
+    /// Called by GStreamerOut after pipewiresink is attached to PipeWire graph.
+    /// HDMI connectors the producer's own kmssinks drive were claimed with
+    /// ClaimConnectorForMedia() and are skipped.
+    /// producerGeneration: ProducerGeneration() as read when the producer was
+    /// set up; if StopConsumers() has run since, the producer is gone and
+    /// nothing is started.  0 skips the check.
+    void StartConsumers(const std::string& producerNodeName,
+                        uint64_t producerGeneration = 0);
+
+    /// Stop all running consumer pipelines.
+    /// Called by GStreamerOut when video playback ends.  Overlay and RTP
+    /// members are parked rather than torn down -- PAUSED, showing nothing,
+    /// the model handed back -- and kept for LINGER_MS, so the next video
+    /// needn't build them again.
+    void StopConsumers();
+
+    /// Media is about to start on this slot (a video was opened, or a
+    /// scheduled playlist is near): build the slot's overlay and RTP members
+    /// now, PAUSED, so that StartConsumers() only has to set them PLAYING,
+    /// and keep them for holdMs if no video comes.  Building one takes about
+    /// half a second on a BeagleBone; done here it overlaps the producer's
+    /// own start.  Never blocks: the work is done on the warm worker.
+    void Prewarm(int streamSlot, int holdMs);
+
+    /// How long a parked or prewarmed member is kept, as the audio stream
+    /// lingers (PipeWireOutputStream::LINGER_MS).
+    static constexpr int LINGER_MS = 5000;
+
+    /// Bumped by every StopConsumers().  A producer reads it when it is set
+    /// up and hands it back to StartConsumers(), which then refuses to start
+    /// consumers for a producer that has been stopped in between.
+    uint64_t ProducerGeneration() const { return m_producerGeneration.load(); }
+
+    /// Called by VideoInputManager when a producer source pipeline reaches
+    /// PLAYING and is about to deliver its first video frames.  Starts any
+    /// persistent consumers that target the given intervideo channel.
+    void NotifyProducerReady(const std::string& channelName);
+
+    /// Retry the persistent consumers on a source's channel after a
+    /// backoff (2s, doubling to 60s; back to 2s after five quiet minutes):
+    /// one whose pipeline errored or ended while the source kept running,
+    /// or one that could not start (a display not connected yet).  Runs on
+    /// its own worker, and only while the source runs -- a dead source
+    /// restarts itself and fires NotifyProducerReady().  Never takes
+    /// m_mutex.
+    void ScheduleConsumerRestart(const std::string& channelName);
+    /// The same retry after a fixed delay, outside the failure backoff.
+    void ScheduleConsumerResume(const std::string& channelName, int delayMs);
+
+    /// Media playback is about to show on this HDMI connector.  A persistent
+    /// consumer there (a camera group, say) stops and waits; this returns
+    /// once its kmssink has let go of the connector, so the caller can take
+    /// it.  Refcounted: every call needs a ReleaseConnectorFromMedia().
+    void ClaimConnectorForMedia(int connectorId);
+
+    /// The media on this connector is gone (its kmssink released).  Once
+    /// nothing else holds it, what stood aside comes back after a moment --
+    /// long enough that the next video in a playlist claims the connector
+    /// first, rather than the consumer flashing up between them.
+    void ReleaseConnectorFromMedia(int connectorId);
+
+    /// Check if any consumers are configured.
+    bool HasConsumers() const;
+
+    /// Check if any consumers are currently running.
+    bool HasActiveConsumers() const;
+
+    /// Get count of running consumer pipelines.
+    int ActiveConsumerCount() const;
+
+private:
+    VideoOutputManager() = default;
+    ~VideoOutputManager();
+
+    VideoOutputManager(const VideoOutputManager&) = delete;
+    VideoOutputManager& operator=(const VideoOutputManager&) = delete;
+
+    /// Thread-safe overlay state shared between appsink callback and manager.
+    struct OverlayState {
+        std::mutex mtx;
+        PixelOverlayModel* model = nullptr;
+        int width = 0;
+        int height = 0;
+        bool wasDisabled = false;
+        std::atomic<bool> active{false};
+    };
+
+    struct ConsumerInfo {
+        int id = 0;
+        std::string name;
+        std::string type;           // "hdmi", "overlay", "rtp"
+        std::string pipeWireNodeName;
+
+        // HDMI-specific
+        std::string connector;
+        std::string cardPath;
+        int connectorId = -1;
+        int width = 0;
+        int height = 0;
+        std::string scaling;        // "fit", "fill", "stretch"
+        VideoCropRect crop;         // region of the source shown on this output
+        // The DRM lease this consumer's kmssink runs on (fd < 0: none --
+        // non-HDMI, or it couldn't get one).  Released in StopConsumer's
+        // teardown thread, strictly after the pipeline (and its kmssink) has
+        // been unreffed.
+        DrmCards::Lease drmLease;
+
+        // Overlay-specific
+        std::string overlayModel;
+        std::shared_ptr<OverlayState> overlayState;
+
+        // RTP-specific
+        std::string address;
+        int port = 5004;
+        std::string rtpEncoding;     // "raw", "h264", "h265", "mjpeg"
+
+        // Source video stream (e.g. "fppd_video_stream_1")
+        std::string sourceNode;
+
+        // Stream slots this consumer should receive (empty = all slots)
+        std::vector<int> streamSlots;
+
+        // When >= 0, this consumer is part of a grouped pipeline and
+        // the GstElement* pipeline is owned by m_consumers[groupPipelineOwnerIdx].
+        // -1 means standalone (owns its own pipeline or not grouped).
+        int groupPipelineOwnerIdx = -1;
+
+#ifdef HAS_GSTREAMER_VIDEO_OUTPUT
+        GstElement* pipeline = nullptr;
+#endif
+        std::thread startThread;
+        // Shared (not raw-pointer-captured) so the bus-monitor thread spawned
+        // in StartConsumer can safely outlive this ConsumerInfo: Reload()/
+        // Shutdown() clear() m_consumers, which would invalidate a raw
+        // `&consumer.shutdownRequested` pointer while the detached thread may
+        // still be inside gst_bus_timed_pop().  The thread captures this
+        // shared_ptr by value instead.  Re-assigned to a fresh instance each
+        // time StartConsumer runs so a still-draining prior thread can never
+        // have its flag reset out from under it by a later restart.
+        std::shared_ptr<std::atomic<bool>> shutdownRequested = std::make_shared<std::atomic<bool>>(false);
+        // Set by the bus-monitor thread when it exits due to
+        // GST_MESSAGE_ERROR/EOS (i.e. the pipeline died on its own, not via
+        // StopConsumer).  Without this, `running` stays true forever for
+        // persistent (sourceNode) consumers and nothing ever restarts them —
+        // a zombie that holds its DRM plane and CMA indefinitely.  Same
+        // shared_ptr-per-run rationale as shutdownRequested.
+        std::shared_ptr<std::atomic<bool>> pipelineDead = std::make_shared<std::atomic<bool>>(false);
+        bool running = false;
+        // Stood aside for media playback on its connector, to come back when
+        // the media releases it (ReleaseConnectorFromMedia).
+        bool suspendedForMedia = false;
+        // An on-demand overlay/RTP member that is built but PAUSED (Prewarm,
+        // or parked by StopConsumers), on `channel`, until holdUntilMs.
+        // `running` stays true: the pipeline exists.
+        bool parked = false;
+        std::string channel;
+        uint64_t holdUntilMs = 0;
+        // The PLAYING/PAUSED state the pipeline should be in, and the lock
+        // its start thread, ActivateConsumer and ParkConsumer take to set it,
+        // so a start thread can't PAUSE a member that was just activated.
+        // Fresh per run, like shutdownRequested.
+        std::shared_ptr<std::atomic<bool>> playing = std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<std::mutex> stateLock = std::make_shared<std::mutex>();
+
+        ConsumerInfo() = default;
+        ConsumerInfo(ConsumerInfo&& o) noexcept
+            : id(o.id), name(std::move(o.name)), type(std::move(o.type)),
+              pipeWireNodeName(std::move(o.pipeWireNodeName)),
+              connector(std::move(o.connector)), cardPath(std::move(o.cardPath)),
+              connectorId(o.connectorId), width(o.width), height(o.height),
+              scaling(std::move(o.scaling)), crop(o.crop),
+              drmLease(o.drmLease),
+              overlayModel(std::move(o.overlayModel)),
+              overlayState(std::move(o.overlayState)),
+              address(std::move(o.address)), port(o.port),
+              rtpEncoding(std::move(o.rtpEncoding)),
+              sourceNode(std::move(o.sourceNode)),
+              streamSlots(std::move(o.streamSlots)),
+              groupPipelineOwnerIdx(o.groupPipelineOwnerIdx),
+#ifdef HAS_GSTREAMER_VIDEO_OUTPUT
+              pipeline(o.pipeline),
+#endif
+              startThread(std::move(o.startThread)),
+              shutdownRequested(std::move(o.shutdownRequested)),
+              pipelineDead(std::move(o.pipelineDead)),
+              running(o.running), suspendedForMedia(o.suspendedForMedia),
+              parked(o.parked), channel(std::move(o.channel)), holdUntilMs(o.holdUntilMs),
+              playing(std::move(o.playing)), stateLock(std::move(o.stateLock)) {
+#ifdef HAS_GSTREAMER_VIDEO_OUTPUT
+            o.pipeline = nullptr;
+#endif
+        }
+        ConsumerInfo(const ConsumerInfo&) = delete;
+        ConsumerInfo& operator=(const ConsumerInfo&) = delete;
+    };
+
+    /// Load consumer config from JSON file.
+    bool LoadConfig();
+
+    /// Start a single consumer pipeline, on `channel` (default: its
+    /// sourceNode, or the active producer), PLAYING or (startPlaying false)
+    /// built and PAUSED.
+    bool StartConsumer(ConsumerInfo& consumer, const std::string& channel = "",
+                       bool startPlaying = true);
+
+    /// Set a parked member PLAYING and let it show again.
+    void ActivateConsumer(ConsumerInfo& consumer);
+    /// Pause a member, hand its overlay model back, and keep it until
+    /// holdUntilMs.
+    void ParkConsumer(ConsumerInfo& consumer, uint64_t holdUntilMs);
+    /// An on-demand overlay or RTP member that serves this stream slot.
+    static bool IsSlotChannelMember(const ConsumerInfo& c, int streamSlot);
+
+    /// Start a group of HDMI consumers sharing the same PipeWire source
+    /// as a single combined pipeline with tee.  PipeWire mode=provide
+    /// doesn't fan-out buffers to multiple consumers; this works around
+    /// that by using one pipewiresrc with a GStreamer tee.
+    bool StartHdmiConsumerGroup(const std::vector<size_t>& indices);
+
+    /// Stop a single consumer pipeline.
+    void StopConsumer(ConsumerInfo& consumer);
+
+    /// Stop all consumers.
+    void StopAllConsumers();
+
+    /// Write an SDP file for an RTP consumer so receivers (VLC, ffplay) can connect.
+    void WriteSdpFile(const ConsumerInfo& consumer, const std::string& encoding);
+
+    /// Build the SDP body for an RTP consumer.
+    std::string BuildSdp(const ConsumerInfo& consumer, const std::string& encoding);
+
+    /// Build a raw RFC 2974 SAP packet wrapping the given SDP.
+    static std::vector<uint8_t> BuildSAPPacket(const std::string& sourceIP,
+                                               uint16_t msgIdHash,
+                                               const std::string& sdp,
+                                               bool isDeletion = false);
+
+    /// Start/stop the SAP multicast announcer thread.
+    ///
+    /// Both MUST be called with m_mutex NOT held: they join m_sapThread, and
+    /// SAPAnnounceLoop() takes m_mutex, so joining under it deadlocks. Every
+    /// call site already does this deliberately.
+    void StartSAPAnnouncer();
+    bool HasRunningRtpLocked() const;  // caller holds m_mutex
+    void StopSAPAnnouncer();
+
+    /// SAP announcer background loop.
+    void SAPAnnounceLoop();
+
+    std::thread m_sapThread;
+    std::atomic<bool> m_sapRunning{false};
+    /// Serializes the announcer's lifecycle (m_sapThread + m_sapRunning as a
+    /// pair). Deliberately NOT m_mutex: SAPAnnounceLoop() takes m_mutex, and
+    /// Stop joins that thread, so the two must stay separate -- which is also
+    /// why the call sites all sit outside m_mutex. SAPAnnounceLoop() never
+    /// takes this lock, so there is no cycle.
+    ///
+    /// m_sapRunning alone was not enough: it was tested and set as two steps
+    /// from unsynchronized threads (a detached GStreamer start thread reaching
+    /// StartConsumers(), and the command/API thread reaching Reload()), so two
+    /// callers could both pass the check and both assign m_sapThread --
+    /// assigning over a joinable std::thread calls std::terminate().
+    std::mutex m_sapLock;
+
+#ifdef HAS_GSTREAMER_VIDEO_OUTPUT
+    /// Appsink callback for overlay consumers (runs on GStreamer streaming thread).
+    static GstFlowReturn OnOverlaySample(GstAppSink* appsink, gpointer userData);
+#endif
+
+    /// Wait for pending pipeline teardown threads to finish (releases DRM/CMA).
+    /// Returns true if all teardowns completed, false on timeout.
+    bool WaitForPendingTeardowns(int timeoutMs);
+    // CmaFree from /proc/meminfo in kB, or -1.
+    static long ReadCmaFreeKB();
+    static constexpr long CMA_WARN_KB = 20480;
+    // WaitForPendingTeardowns(), but only when CMA is short.  Never call it
+    // with m_mutex held.
+    void WaitForCmaIfLow();
+
+    // ScheduleConsumerRestart()'s worker.  m_restartMutex guards these; it
+    // is taken after m_mutex, never before.
+    struct RestartState {
+        std::chrono::steady_clock::time_point due;
+        std::chrono::steady_clock::time_point lastFailure;
+        int delayMs = 0;
+        bool pending = false;
+    };
+    std::mutex m_restartMutex;
+    std::condition_variable m_restartCv;
+    std::thread m_restartThread;
+    bool m_restartRunning = false;
+    bool m_stopRestarts = false;
+    std::map<std::string, RestartState> m_restarts;
+    static constexpr int RESTART_MIN_DELAY_MS = 2000;
+    static constexpr int RESTART_MAX_DELAY_MS = 60000;
+    static constexpr int RESTART_QUIET_RESET_MS = 5 * 60 * 1000;
+    void RestartWorker();
+
+    // Prewarm()'s worker: builds the requested slots' members and tears down
+    // parked ones whose hold has run out.  m_warmMutex guards these; it is
+    // taken after m_mutex, never before (the worker drops it first).
+    std::mutex m_warmMutex;
+    std::condition_variable m_warmCv;
+    std::thread m_warmThread;
+    bool m_stopWarm = false;
+    std::map<int, uint64_t> m_prewarmRequests;  // slot -> hold until (GetTimeMS)
+    void KickWarmWorker();
+    void WarmWorker();
+    void ServiceWarm(const std::map<int, uint64_t>& requests);
+
+    mutable std::mutex m_mutex;
+    std::vector<ConsumerInfo> m_consumers;
+    std::string m_activeProducer;  // node name of the current producer, empty if none
+    std::atomic<uint64_t> m_producerGeneration{ 1 };
+    // HDMI connectors media playback holds (ClaimConnectorForMedia), with how
+    // many claims each.  A persistent consumer stands aside on these.
+    std::map<int, int> m_mediaConnectors;
+    static constexpr int MEDIA_RESUME_DELAY_MS = 1500;
+    bool m_initialized = false;
+    // Guards Shutdown() so the destructor doesn't re-run it after main() already
+    // did (the "Shutdown complete" was logged twice). Harmless today since it
+    // only locks our own mutex, but keeps teardown single-shot and future-proof.
+    std::atomic<bool> m_shutdownDone{false};
+
+    // Pipeline teardown tracking — detached threads decrement the counter
+    // and notify the CV when done, so callers can wait for CMA to be freed.
+    std::mutex m_teardownMutex;
+    std::condition_variable m_teardownCV;
+    int m_pendingTeardowns = 0;
+    // Up while a teardown has outlived WaitForPendingTeardowns(); comes down
+    // when the last one finishes.  Under m_teardownMutex.
+    bool m_teardownStuckWarned = false;
+    static constexpr const char* TEARDOWN_STUCK_WARNING =
+        "Video output: a pipeline teardown is stuck (its display memory is not freed)";
+};

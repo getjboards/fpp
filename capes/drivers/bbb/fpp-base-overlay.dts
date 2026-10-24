@@ -1,0 +1,287 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/soc/ti,sci_pm_domain.h>
+#include <dt-bindings/pinctrl/am33xx.h>
+#include "am335x-bone-pins.h"
+    
+&{/} {
+    reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+        fpp_reserved: fpp_reserved@8f000000 {
+            reg = <0x8f000000 0x00400000>;
+            status = "okay";
+        };
+    };
+};
+
+&{/chosen} {
+    overlays {
+        fpp-base-overlay = "FPP_BASE_OVERLAY";
+    };
+};
+
+&rtc {
+    status = "disabled";
+};
+&wkup_m3 {
+    status = "disabled";
+};
+&wkup_m3_ipc {
+    status = "disabled";
+};
+
+/*
+ * i2c2 is the standard cape i2c bus (EEPROM at 0x50, plus cape RTCs, GPIO
+ * expanders, etc.). The bone-pinmux-helper used to mux it at boot via its
+ * "default" state; with the helper removed we mux it persistently here so the
+ * whole cape bus stays available with no runtime help. am335xpm can still
+ * re-mux these pins for the rare cape that repurposes them (it bypasses the
+ * pinctrl-single claim), so this does not lock them.
+ */
+&am33xx_pinmux {
+	i2c2_pins: pinmux_i2c2_pins {
+		pinctrl-single,pins = <
+			UART1_CTSN(PIN_OUTPUT_PULLUP | INPUT_EN | MUX_MODE3)  /* P9_20 i2c2_sda */
+			UART1_RTSN(PIN_OUTPUT_PULLUP | INPUT_EN | MUX_MODE3)  /* P9_19 i2c2_scl */
+		>;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+
+	clock-frequency = <400000>;
+	symlink = "bone/i2c/1";
+};
+
+&i2c2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c2_pins>;
+
+	clock-frequency = <400000>;
+	symlink = "bone/i2c/2";
+};
+
+&uart0 {
+	pinctrl-names = "default";
+	//pinctrl-0 = <&uart0_pins>;
+	pinctrl-0 = <>;
+
+	status = "okay";
+};
+
+&uart1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/uart/1";
+};
+
+&uart2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/uart/2";
+};
+
+&uart3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/uart/3";
+};
+
+&uart4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/uart/4";
+};
+
+&uart5 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/uart/5";
+};
+
+&dcan0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/can/0";
+};
+
+&dcan1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/can/1";
+};
+
+&eqep0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/eqep/0";
+};
+
+&eqep1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/eqep/1";
+};
+
+&eqep2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+	symlink = "bone/eqep/2";
+};
+
+&epwmss0 {
+	status = "okay";
+};
+
+&epwmss1 {
+	status = "okay";
+};
+
+&epwmss2 {
+	status = "okay";
+};
+
+&ehrpwm0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&ehrpwm1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&ehrpwm2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&ecap0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&ecap1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&ecap2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&spi0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+
+	channel@0 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		compatible = "rohm,dh2228fv";
+		symlink = "bone/spi/0.0";
+
+		reg = <0>;
+		spi-max-frequency = <16000000>;
+		spi-cpha;
+	};
+
+	channel@1 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		compatible = "rohm,dh2228fv";
+		symlink = "bone/spi/0.1";
+
+		reg = <1>;
+		spi-max-frequency = <16000000>;
+	};
+};
+
+&spi1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+
+	channel@0 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		compatible = "rohm,dh2228fv";
+		symlink = "bone/spi/1.0";
+
+		reg = <0>;
+		spi-max-frequency = <16000000>;
+		spi-cpha;
+	};
+
+	channel@1 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		compatible = "rohm,dh2228fv";
+		symlink = "bone/spi/1.1";
+
+		reg = <1>;
+		spi-max-frequency = <16000000>;
+	};
+};
+
+/*
+ * The PocketBeagle base dtb gives the PRUs a "default" pin group that muxes
+ * nine P1/P2 pads to PRU r30/r31 the moment the PRU device probes, before FPP
+ * runs. P2-28 is one of them, and as a PRU output it sits low; on a cape that
+ * gates its i2c2 buffer with that pin (PocketScroller v2's I2CEnable), the
+ * EEPROM and OLED disappear and detection falls back to the built-in config.
+ * FPP muxes PRU pins itself from the cape config, as with the peripherals
+ * above, so leave the pads at their reset state. No-op on the BeagleBone
+ * dtbs, which give the PRUs no pins.
+ */
+&pru0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+&pru1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <>;
+};
+
+/*
+ * The per-pin BONE_PIN pinmux definitions (under &am33xx_pinmux) and the
+ * bone-pinmux-helper device nodes (under &ocp) that used to follow here were
+ * removed: FPP now programs pin mux directly via the am335xpm kernel driver
+ * (/dev/am335xpm), so the cape-universal pinmux-helper machinery is no longer
+ * needed on am335xpm kernels. This shrinks the overlay ~86% (faster to compile
+ * and apply at boot). Peripherals above keep empty pinctrl-0; FPP muxes their
+ * pins at runtime (CapeUtils muxes i2c2 for cape-EEPROM detection; the pinctrl
+ * tool sets the rest).
+ */

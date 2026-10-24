@@ -1,78 +1,62 @@
+#pragma once
 /*
- *   MediaOutputBase class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
-
-#ifndef _MEDIAOUTPUTBASE_H
-#define _MEDIAOUTPUTBASE_H
 
 #include <string>
 #include <vector>
 
-#include <pthread.h>
 #include <sys/select.h>
+#include <pthread.h>
 #include <unistd.h>
-
-#include <jsoncpp/json/json.h>
 
 #include "MediaOutputStatus.h"
 
-#define MEDIAOUTPUTPIPE_READ       0
-#define MEDIAOUTPUTPIPE_WRITE      1
+#define MEDIAOUTPUTPIPE_READ 0
+#define MEDIAOUTPUTPIPE_WRITE 1
 
-#define MEDIAOUTPUTSTATUS_IDLE     0
-#define MEDIAOUTPUTSTATUS_PLAYING  1
+#define MEDIAOUTPUTSTATUS_IDLE 0
+#define MEDIAOUTPUTSTATUS_PLAYING 1
 
 #define MediaOutputSpeedDecrease -1
-#define MediaOutputSpeedNormal    0
+#define MediaOutputSpeedNormal 0
 #define MediaOutputSpeedIncrease +1
 
 class MediaOutputBase {
-  public:
-	MediaOutputBase();
-	virtual ~MediaOutputBase();
+public:
+    MediaOutputBase();
+    virtual ~MediaOutputBase();
 
-	virtual int   Start(void);
-	virtual int   Stop(void);
-	virtual int   Process(void);
-	virtual int   AdjustSpeed(int delta);
-	virtual void  SetVolume(int volume);
-	virtual int   Close(void);
+    virtual int Start(int msTime = 0);
+    virtual int Stop(void);
+    virtual int Process(void);
+    virtual int AdjustSpeed(float masterPos);
+    virtual void SetVolume(int volume);
+    virtual int Close(void);
 
-	virtual int   IsPlaying(void);
+    virtual int IsPlaying(void);
+    // Whether sound is actually coming out yet.  A sequence started with this
+    // media holds until it is, instead of running ahead while the output
+    // starts up.  Outputs that can't tell say yes.
+    virtual bool IsAudible(void) { return true; }
 
-	std::string        m_mediaFilename;
-	MediaOutputStatus *m_mediaOutputStatus;
-	pid_t              m_childPID;
+    float getMediaOffset() { return mediaOffset; };
+    int getMediaOffsetMS() { return mediaOffsetMS; };
 
-  protected:
+    std::string m_mediaFilename;
+    MediaOutputStatus* m_mediaOutputStatus;
 
-	unsigned int       m_isPlaying;
-	int                m_childPipe[2];
-	fd_set             m_activeFDSet;
-	fd_set             m_readFDSet;
+protected:
+    void setMediaElapsed(float curtime, float remaining);
 
-	pthread_mutex_t    m_outputLock;
+    float mediaOffset = 0.0;
+    int mediaOffsetMS = 0;
 };
-
-#endif /* #ifndef _MEDIAOUTPUTBASE_H */

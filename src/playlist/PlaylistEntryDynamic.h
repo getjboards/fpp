@@ -1,86 +1,96 @@
+#pragma once
 /*
- *   PlaylistEntryDynamic Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _PLAYLISTENTRYDYNAMIC_H
-#define _PLAYLISTENTRYDYNAMIC_H
-
+#include <mutex>
 #include <string>
+#include "fpp-json-fwd.h"
 #include <vector>
-
-#include <curl/curl.h>
-#include <jsoncpp/json/json.h>
 
 #include "PlaylistEntryBase.h"
 
 class PlaylistEntryDynamic : public PlaylistEntryBase {
-  public:
-	PlaylistEntryDynamic(PlaylistEntryBase *parent = NULL);
-	~PlaylistEntryDynamic();
+public:
+    PlaylistEntryDynamic(Playlist* playlist, PlaylistEntryBase* parent = NULL);
+    virtual ~PlaylistEntryDynamic();
 
-	int  Init(Json::Value &config);
+    virtual int Init(Json::Value& config) override;
 
-	int  StartPlaying(void);
-	int  Prep(void);
-	int  Process(void);
-	int  Stop(void);
+    virtual int StartPlaying(void) override;
+    virtual int Prep(void) override;
+    virtual int Process(void) override;
+    virtual int Stop(void) override;
 
-	void Dump(void);
+    virtual void Dump(void) override;
 
-	Json::Value GetConfig(void);
+    virtual Json::Value GetConfig(void) override;
 
-  private:
-	int ReadFromCommand(void);
-	int ReadFromFile(void);
-	int ReadFromPlugin(void);
-	int ReadFromURL(std::string url);
-	int ReadFromString(std::string jsonStr);
+    PlaylistEntryBase* GetCurrentEntry();
+private:
+    int ReadFromCommand(void);
+    int ReadFromFile(void);
+    int ReadFromString(std::string jsonStr);
 
-	int PrepPlugin(void);
+    int PrepPlugin(void);
+    void FireLoadNextItem(void); // chained from the prepNextItem callback
+    int FetchURL(void);
+    // Start the first loaded child; false if there is none to start.
+    bool BeginEntries(int loaded);
 
-	int Started(void);
-	int StartedPlugin(void);
+    int Started(void);
+    int StartedPlugin(void);
 
-	int ProcessData(void *buffer, size_t size, size_t nmemb);
-	void ClearPlaylistEntries(void);
+    std::string PluginCommandURL(const char* command) const;
+    void ClearPlaylistEntries(void);
 
-	static size_t write_data(void *ptr, size_t size, size_t nmemb,
-	                             void *ourpointer);
+    std::string m_subType;
+    std::string m_data;
 
-	std::string            m_subType;
-	std::string            m_data;
+    int m_drainQueue;
+    int m_currentEntry;
+    std::vector<PlaylistEntryBase*> m_playlistEntries;
 
-	CURL                  *m_curl;
+    std::string m_pluginHost;
+    std::string m_url;
+    std::string m_method;
 
-	int                    m_drainQueue;
-	int                    m_currentEntry;
-	std::vector<PlaylistEntryBase *> m_playlistEntries;
+    // Plugin and URL sources are fetched over HTTP through CurlManager instead
+    // of blocking on curl_easy_perform.  For a plugin the prep -> load pair is
+    // fired when the entry starts (or by an explicit Prep()) and chained (load
+    // starts from prep's completion callback); the response (loadNextItem's, or
+    // the URL's) is buffered here and consumed by Process().  The callbacks run
+    // on the main loop (processCurls()), but StartPlaying() can run on an API
+    // thread when a command starts the playlist, so m_pluginMutex guards the
+    // state below.
+    enum class PluginPrep { Idle,
+                            Running,
+                            Ready,
+                            Failed };
+    std::mutex m_pluginMutex;
+    PluginPrep m_pluginPrep = PluginPrep::Idle;
+    std::string m_pluginItem; // JSON from loadNextItem (or the URL), awaiting Process()
 
-	std::string            m_pluginHost;
-	std::string            m_url;
-	std::string            m_method;
-	std::string            m_response;
+    // Plugin and URL sources are fetched without waiting: StartPlaying()
+    // starts the request and the entry plays as "loading" until Process()
+    // finds the response.  StartPlaying() used to wait for it -- up to 15 s,
+    // with the playlist lock held, on whichever thread started the entry --
+    // pumping CurlManager there, which also ran other subsystems' curl
+    // callbacks off the main loop.
+    bool m_loading = false;
+    long long m_loadDeadline = 0;
+
+    // Unique per live instance: tags this entry's CurlManager requests (owner,
+    // for cancelRequests() in the dtor) and names its cookie session. A
+    // monotonic counter, never a reused pointer, so a freed+reallocated instance
+    // can never collide with a predecessor's still-in-flight request.
+    std::string m_curlToken;
 };
-
-#endif

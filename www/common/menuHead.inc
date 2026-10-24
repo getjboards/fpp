@@ -1,44 +1,184 @@
-
-	<!-- jquery -->
-	<script type="text/javascript" src="js/jquery-3.3.1.min.js"></script>
-    <script type="text/javascript" src="js/jquery-migrate-3.0.1.min.js"></script>
-	<script type="text/javascript" src="js/jquery-ui.min.js"></script>
-	<script type="text/javascript" src="js/jquery.ui.touch-punch.min.js"></script>
-	<script type="text/javascript" src="js/jquery.jgrowl.min.js"></script>
-	<link rel="stylesheet" href="css/jquery-ui.css" />
-	<link rel="stylesheet" href="css/jquery.jgrowl.min.css" />
-	<link rel="stylesheet" href="css/classicTheme/style.css" media="all" />
-
-	<!-- finally FPP stuff, here so our CSS is last so we can override anything above -->
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<link rel="stylesheet" href="css/fpp.css?ref=<?php echo filemtime('css/fpp.css'); ?>" />
-	<script type="text/javascript" src="js/fpp.js?ref=<?php echo filemtime('js/fpp.js'); ?>"></script>
-
-	<!-- menu -->
-	<link href="jquery/smartmenus/src/css/sm-core-css.css" rel="stylesheet" type="text/css" />
-	<link href="jquery/smartmenus/src/css/sm-clean/sm-clean.css" rel="stylesheet" type="text/css" />
-	<script type="text/javascript" src="jquery/smartmenus/src/jquery.smartmenus.js"></script>
-
-	<script type="text/javascript">
-	$(function() {
-		$('#fppMenu').smartmenus({subMenusMinWidth: "100%", showOnClick: true,
-			showFunction: function($ul, complete) { $ul.slideDown(250, complete); },
-			hideFunction: function($ul, complete) { $ul.slideUp(250, complete); },
-		});
-	});
-	</script>
-
 <?
-	if (isset($settings['backgroundColor']) && $settings['backgroundColor'] != "")
-	{
+// Switch to Initial Setup page if needed, but come back here when done.
+//
+// Two reasons to send someone there. The first is the original one: setup has
+// never been completed, tracked by initialSetup-02.
+//
+// The second is that the legal jurisdiction has never been answered. FPP has to
+// know whether a prior-opt-in regime applies before it can decide anything about
+// privacy defaults -- cape detection asks it at every boot, and the privacy step
+// is presented differently depending on the answer. Until it is recorded, both
+// halves fall back to the cautious branch, which is safe but means a box that
+// never visits this page is permanently treated as if it might be in the EU.
+// Asking once is better than guessing forever.
+//
+// Read from the settings FILE rather than $settings: $settings has settings.json
+// defaults merged in, so a default added to LegalJurisdiction later would
+// silently switch this gate off. That exact asymmetry is what made the C++ and
+// PHP jurisdiction halves disagree. The function_exists guard is because this
+// include runs before common.php on at least some pages.
+$fppNeedsSetup = (!isset($settings['initialSetup-02'])) || ($settings['initialSetup-02'] == '0');
+if (!$fppNeedsSetup) {
+    // Gating on the jurisdiction alone was not enough. Restoring a backup MERGES
+    // rather than replaces, so a box that already had a jurisdiction but restores
+    // a configuration carrying no privacy answers keeps the jurisdiction, passes
+    // the gate, and then runs on shipped defaults forever with nothing recorded
+    // and nothing left to ask it. MissingSetupSettings() in common.php is the one
+    // definition of what still needs answering; the restore handler uses the same
+    // one so the two cannot disagree.
+    if (function_exists('MissingSetupSettings')) {
+        $fppNeedsSetup = (count(MissingSetupSettings()) > 0);
+    } else {
+        // This include runs before common.php on at least some pages.
+        $fppNeedsSetup = empty($settings['LegalJurisdiction']);
+    }
+}
+if ($fppNeedsSetup && (basename($_SERVER['PHP_SELF']) != "initialSetup.php")) {
+    // SCRIPT_NAME, not PHP_SELF: PHP_SELF includes any PATH_INFO the
+    // requester tacked on, which would land unescaped in this attribute.
+    echo "<meta http-equiv='refresh' content='0;url=initialSetup.php?redirect=" .
+        htmlspecialchars(rawurlencode(ltrim($_SERVER['SCRIPT_NAME'], '/')), ENT_QUOTES, 'UTF-8') . "' />\n";
+    exit(0);
+}
 ?>
-		<style>
-			#bodyWrapper {
-				border: 50px;
-				border-style: solid;
-				border-color: #<? echo $settings['backgroundColor'] ?>;
-			}
-		</style>
+
+<!-- jquery -->
+<script type="text/javascript" src="js/jquery-latest.min.js?ref=<?= filemtime('js/jquery-latest.min.js'); ?>"></script>
+<script type="text/javascript" src="js/jquery4-compat.js?ref=<?= filemtime('js/jquery4-compat.js'); ?>"></script>
+<!-- <script src="https://code.jquery.com/jquery-migrate-3.4.1.js"></script> -->
+<script type="text/javascript" src="js/jquery-ui.min.js?ref=<?= filemtime('js/jquery-ui.min.js'); ?>"></script>
+<script type="text/javascript" src="js/jquery.ui.touch-punch.js?ref=<?= filemtime('js/jquery.ui.touch-punch.js'); ?>"></script>
 <?
-	}
+if ((!isset($settings['disableUIPopoverAlerts'])) || ($settings['disableUIPopoverAlerts'] == '0')) {
+    // Enable popover alerts
+    echo "<script type='text/javascript' src='js/jquery.jgrowl.min.js?ref=" . filemtime('js/jquery.jgrowl.min.js') . "'></script>";
+} elseif (isset($settings['disableUIPopoverAlerts']) && ($settings['disableUIPopoverAlerts'] == '1')) {
+    echo "<script type='text/javascript' src='js/jquery.jgrowl.disabled.js?ref=" . filemtime('js/jquery.jgrowl.disabled.js') . "'></script>";
+}
+?>
+
+<script type="text/javascript" src="js/zebra_pin.min.js?ref=<?= filemtime('js/zebra_pin.min.js'); ?>"></script>
+<script type="text/javascript" src="js/popper.min.js?ref=<?= filemtime('js/popper.min.js'); ?>"></script>
+<script type="text/javascript" src="jquery/jquery.floatThead/jquery.floatThead.min.js?ref=<?= filemtime('jquery/jquery.floatThead/jquery.floatThead.min.js'); ?>"></script>
+<script type="text/javascript"
+    src="js/bootstrap.bundle.min.js?ref=<?= filemtime('js/bootstrap.bundle.min.js'); ?>"></script>
+
+<link rel="stylesheet" href="css/jquery-ui.css?ref=<?= filemtime('css/jquery-ui.css'); ?>">
+<link rel="stylesheet" href="css/jquery.jgrowl.min.css?ref=<?= filemtime('css/jquery.jgrowl.min.css'); ?>">
+
+<link rel="icon" href="favicon.ico" type="image/x-icon">
+
+<!--
+        Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com
+        License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License)
+    -->
+<link rel="stylesheet" href="css/fontawesome.all.min.css?ref=<?= filemtime('css/fontawesome.all.min.css'); ?>">
+<link rel="stylesheet" href="webfonts/fpp-icons/styles.css?ref=<?= filemtime('webfonts/fpp-icons/styles.css'); ?>">
+
+<!--
+    ZERO-MD 3.1.2 - https://github.com/zerodevx/zero-md
+    License - https://github.com/zerodevx/zero-md/blob/main/LICENSE (ISC License)
+-->
+<script type="module">
+    import ZeroMdBase from '/js/zero-md/zero-md-base.js'
+    import ZeroMd from '/js/zero-md/zero-md.js'
+    import { STYLES, LOADERS } from '/js/zero-md/presets.js'
+
+    customElements.define('zero-md', class extends ZeroMd {
+        async load() {
+            await super.load()
+            const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+            this.template = `
+<style>:host { display: block; }</style>
+<link rel="stylesheet" href="/js/zero-md/css/${isDark ? 'github-markdown-dark' : 'github-markdown-light'}.min.css">
+<link rel="stylesheet" href="/js/zero-md/css/github-markdown.min.css">
+<link rel="stylesheet" href="/js/zero-md/css/katex.min.css">`
+            //this.template = STYLES.preset('light') // or STYLES.preset('dark')
+        }
+    })
+
+    export { ZeroMdBase, STYLES, LOADERS }
+    export default ZeroMd
+</script>
+
+<?
+if (isset($themeInfo["preFPPStyleSheet"])) {
+    foreach ($themeInfo["preFPPStyleSheet"] as $ss) {
+        if ($ss != "") {
+            echo "<link rel='stylesheet' href='" . $ss . "' >";
+        }
+    }
+}
+?>
+
+
+<!-- finally FPP stuff, here so our CSS is last so we can override anything above -->
+
+<link rel="stylesheet"
+    href="css/fpp-bootstrap/dist/fpp-bootstrap-5-3.css?ref=<?php echo filemtime('css/fpp-bootstrap/dist/fpp-bootstrap-5-3.css'); ?>">
+<link rel="stylesheet" href="css/fpp-system-design.css?ref=<?php echo filemtime('css/fpp-system-design.css'); ?>">
+<link rel="stylesheet" href="css/fpp.css?ref=<?php echo filemtime('css/fpp.css'); ?>">
+<link rel="stylesheet" href="css/fpp-dark.css?ref=<?php echo filemtime('css/fpp-dark.css'); ?>">
+
+<?
+if (isset($themeInfo["postFPPStyleSheet"])) {
+    foreach ($themeInfo["postFPPStyleSheet"] as $ss) {
+        if ($ss != "") {
+            echo "<link rel='stylesheet' href='" . $ss . "' >";
+        }
+    }
+}
+?>
+
+<? if (file_exists($mediaDirectory . "/config/custom.css")) { ?>
+<link rel="stylesheet"
+    href="api/configfile/custom.css?ref=<?php echo filemtime($mediaDirectory . '/config/custom.css'); ?>">
+<? } ?>
+<script type="text/javascript" src="js/fpp.js?ref=<?php echo filemtime('js/fpp.js'); ?>"></script>
+<script type="text/javascript" src="js/fpp-update.js?ref=<?php echo filemtime('js/fpp-update.js'); ?>"></script>
+<script type="text/javascript">fppShowPinGpioNumbers = <?php echo GPIOPlatformHasStablePinNumbers() ? 'true' : 'false'; ?>;</script>
+<?php
+// Pre-populate lastStatusJSON from the local API so the header renders
+// immediately on first page load instead of waiting for the AJAX call.
+$ctx = stream_context_create(['http' => ['timeout' => 2]]);
+$_fpp_status_raw = @file_get_contents('http://127.0.0.1/api/system/status', false, $ctx);
+if ($_fpp_status_raw !== false && $_fpp_status_raw !== '') {
+    echo '<script type="text/javascript">lastStatusJSON = ' . $_fpp_status_raw . '; lastStatus = lastStatusJSON.status;</script>' . "\n";
+}
+unset($_fpp_status_raw, $ctx);
+?>
+<? if (file_exists($mediaDirectory . "/config/custom.js")) { ?>
+<script type="text/javascript"
+    src="api/configfile/custom.js?ref=<?php echo filemtime($mediaDirectory . '/config/custom.js'); ?>"></script>
+<? } ?>
+
+<?
+if (isset($themeInfo["themeJS"])) {
+    foreach ($themeInfo["themeJS"] as $js) {
+        if ($js != "") {
+            echo "<script type='text/javascript' src='" . $js . "' />";
+        }
+    }
+}
+if (isset($settings['backgroundColor']) && $settings['backgroundColor'] != "") {
+    ?>
+<link rel="icon"
+    href="data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 96 96'%3e%3cg id='app-icon' transform='translate(-1977.763 -385.763)'%3e%3crect id='Rectangle_79' data-name='Rectangle 79' width='96' height='96' rx='25' transform='translate(1977.763 385.763)' fill='%23<? echo $settings['backgroundColor'] ?>'/%3e%3cg id='Group_124' data-name='Group 124' transform='translate(1994.608 402.675)'%3e%3cpath id='Path_23' data-name='Path 23' d='M424.977%2c584H397.358c-7.446%2c0-14.721%2c6.056-16.216%2c13.5l-7.047%2c35.063a11.489%2c11.489%2c0%2c0%2c0%2c2.073%2c9.641%2c11%2c11%2c0%2c0%2c0%2c8.8%2c3.971h9.153a.669.669%2c0%2c0%2c0%2c.636-.51.524.524%2c0%2c0%2c0-.357-.646c-5.5-1.54-8.5-6.814-7.289-12.828l2.452-12.2h28.345a6.037%2c6.037%2c0%2c0%2c1%2c4.8%2c2.142.554.554%2c0%2c0%2c0%2c.613.155.678.678%2c0%2c0%2c0%2c.444-.524%2c11.351%2c11.351%2c0%2c0%2c0-2.329-9.254%2c11.031%2c11.031%2c0%2c0%2c0-8.637-3.778H391.83l2.043-10.165a4.253%2c4.253%2c0%2c0%2c1%2c3.973-3.308h23.9c6.6%2c0%2c11.3%2c4.71%2c11.163%2c11.2a.515.515%2c0%2c0%2c0%2c.524.538h0a.676.676%2c0%2c0%2c0%2c.643-.533l1.78-8.857a11.494%2c11.494%2c0%2c0%2c0-2.073-9.641A11%2c11%2c0%2c0%2c0%2c424.977%2c584Z' transform='translate(-373.818 -584)' fill='white'/%3e%3c/g%3e%3c/g%3e%3c/svg%3e"
+    type="image/svg+xml">
+<style>
+    .header {
+        background-color: #<? echo $settings['backgroundColor'] ?>;
+    }
+
+    /* DarkOrange and Orange header colors make the upgrade icon hard to see - change the color to the text color*/
+    <?php if (in_array($settings['backgroundColor'], ['FF8C00', 'FFA500'], true)) { ?>
+    #navbarUpdateAvail a {
+        color: rgb(152, 152, 152);
+        font-size: 1.5em;
+    }
+
+    <?php } ?>
+</style>
+<?
+}
 ?>

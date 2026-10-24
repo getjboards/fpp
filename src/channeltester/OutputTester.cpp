@@ -1,0 +1,71 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include "../common.h"
+#include "../log.h"
+
+#include "OutputTester.h"
+#include "channeloutput/ChannelOutputSetup.h"
+
+OutputTester::OutputTester() {
+}
+OutputTester::~OutputTester() {
+}
+int OutputTester::Init(Json::Value config) {
+    // a test (re)started counts its cycles from 0: the string testers and the
+    // outputs key their start off cycle 0
+    cycleCount = 0;
+    startMS = GetMonotonicTimeMS();
+    outputTypes.clear();
+    testType = JsonInt(config, "type");
+    std::string s = JsonString(config, "outputs");
+    if (s != "--ALL--" && s != "") {
+        outputTypes.insert(s);
+    }
+    if (config.isMember("config")) {
+        extraConfig = config["config"];
+    }
+    return TestPatternBase::Init(config);
+}
+int OutputTester::SetupTest(void) {
+    return TestPatternBase::SetupTest();
+}
+void OutputTester::CycleData(void) {
+    // cycled in OverlayTestData(): TestPatternBase only cycles a pattern with
+    // channels of its own to copy, and this one has none -- each output draws
+    // its own test
+}
+int OutputTester::OverlayTestData(char* channelData) {
+    if (m_testEnabled) {
+        uint64_t now = GetMonotonicTimeMS(); // the same clock as startMS, which never steps
+        if (m_cycleMS > 0 && now >= startMS + m_cycleMS) {
+            cycleCount++;
+            startMS = now;
+        }
+        int offset = now - startMS;
+        float pct = offset;
+        pct /= m_cycleMS;
+        OverlayOutputTestData(outputTypes, (unsigned char*)channelData, cycleCount, pct, testType, extraConfig);
+    } else {
+        OverlayOutputTestData(outputTypes, (unsigned char*)channelData, 0, 0, 0, extraConfig);
+    }
+    return TestPatternBase::OverlayTestData(channelData);
+}
+void OutputTester::DumpConfig(void) {
+    LogDebug(VB_CHANNELOUT, "OutputTester::DumpConfig\n");
+    LogDebug(VB_CHANNELOUT, "    testType     : %d\n", testType);
+    TestPatternBase::DumpConfig();
+}

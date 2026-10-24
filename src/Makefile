@@ -1,340 +1,39 @@
-CC := g++
 
+FULLBASEDIR := $(shell echo `pwd`)
 BASEDIR := $(shell basename `pwd`)
-
 SRCDIRS := channeloutput channeloutput/processors channeltester fseq mediaoutput oled playlist pru sensors util
 
-SRCDIR = ./
+SRCDIR = /opt/fpp/src/
 ifneq '$(BASEDIR)' 'src'
 	VPATH = ../src/
 	SRCDIR = ../src/
 	MKDIROUT = $(shell mkdir $(SRCDIRS))
-endif
-
-ifneq ($(wildcard /usr/bin/ccache),)
-	CCACHE = ccache
-endif
-
-TARGETS = fpp fppmm fsequtils fppd fppoled
-SUBMODULES =
-
-INSTALL_PROGRAM = install -m 755 -p
-
-OBJECTS_fsequtils = \
-	fppversion.o \
-	log.o \
-    fseq/FSEQUtils.o \
-    fseq/FSEQFile.o \
-	$(NULL)
-LIBS_fsequtils = \
-    -lzstd -lz \
-	-lpthread \
-	$(NULL)
-
-OBJECTS_fpp = \
-	fpp.o \
-	fppversion.o \
-	$(NULL)
-LIBS_fpp = \
-	$(NULL)
-
-OBJECTS_fppmm = \
-	common.o \
-	log.o \
-	fppmm.o \
-	fppversion.o \
-	$(NULL)
-LIBS_fppmm = \
-	-ljsoncpp \
-	$(NULL)
-
-
-OBJECTS_fppoled = \
-	common.o \
-	log.o \
-	settings.o \
-	fppversion.o \
-	oled/I2C.o \
-	oled/SSD1306_OLED.o \
-	oled/FPPOLEDUtils.o \
-    oled/fppoled.o
-
-LIBS_fppoled = \
-	-ljsoncpp \
-	-lpthread \
-	-lcurl \
-	$(NULL)
-
-OBJECTS_fppd = \
-	channeloutput/ChannelOutputBase.o \
-	channeloutput/ThreadedChannelOutputBase.o \
-	channeloutput/channeloutput.o \
-	channeloutput/channeloutputthread.o \
-	channeloutput/ArtNet.o \
-	channeloutput/ColorOrder.o \
-	channeloutput/ColorLight-5a-75.o \
-	channeloutput/DebugOutput.o \
-	channeloutput/DDP.o \
-	channeloutput/E131.o \
-	channeloutput/FBMatrix.o \
-	channeloutput/FBVirtualDisplay.o \
-	channeloutput/FPD.o \
-	channeloutput/GenericSerial.o \
-	channeloutput/GPIO.o \
-	channeloutput/GPIO595.o \
-	channeloutput/HTTPVirtualDisplay.o \
-	channeloutput/UDPOutput.o \
-	channeloutput/Linsn-RV9.o \
-	channeloutput/LOR.o \
-	channeloutput/Matrix.o \
-	channeloutput/MAX7219Matrix.o \
-	channeloutput/MCP23017.o \
-	channeloutput/PanelMatrix.o \
-	channeloutput/PixelString.o \
-	channeloutput/RHL_DVI_E131.o \
-	channeloutput/serialutil.o \
-	channeloutput/SPInRF24L01.o \
-	channeloutput/SPIws2801.o \
-	channeloutput/Triks-C.o \
-	channeloutput/USBDMX.o \
-	channeloutput/USBPixelnet.o \
-	channeloutput/USBRelay.o \
-	channeloutput/USBRenard.o \
-	channeloutput/VirtualDisplay.o \
-    channeloutput/processors/OutputProcessor.o \
-    channeloutput/processors/RemapOutputProcessor.o \
-    channeloutput/processors/SetValueOutputProcessor.o \
-    channeloutput/processors/BrightnessOutputProcessor.o \
-    channeloutput/processors/ColorOrderOutputProcessor.o \
-	channeltester/ChannelTester.o \
-	channeltester/TestPatternBase.o \
-	channeltester/RGBChase.o \
-	channeltester/RGBFill.o \
-	channeltester/SingleChase.o \
-	command.o \
-	common.o \
-	e131bridge.o \
-	effects.o \
-	events.o \
-	falcon.o \
-	fppd.o \
-	fppversion.o \
-	FrameBuffer.o \
-	fseq/FSEQFile.o \
-	gpio.o \
-	httpAPI.o \
-	log.o \
-	MultiSync.o \
-	mediadetails.o \
-	mediaoutput/MediaOutputBase.o \
-	mediaoutput/mediaoutput.o \
-	mediaoutput/mpg123.o \
-	mediaoutput/ogg123.o \
-	mediaoutput/omxplayer.o \
-	mediaoutput/SDLOut.o \
-	mqtt.o \
-	ping.o \
-	PixelOverlay.o \
-	Playlist.o \
-	playlist/Playlist.o \
-	playlist/PlaylistEntryBase.o \
-	playlist/PlaylistEntryBoth.o \
-	playlist/PlaylistEntryBranch.o \
-	playlist/PlaylistEntryBrightness.o \
-	playlist/PlaylistEntryChannelTest.o \
-	playlist/PlaylistEntryDynamic.o \
-	playlist/PlaylistEntryEffect.o \
-	playlist/PlaylistEntryEvent.o \
-	playlist/PlaylistEntryImage.o \
-	playlist/PlaylistEntryMedia.o \
-	playlist/PlaylistEntryMQTT.o \
-	playlist/PlaylistEntryPause.o \
-	playlist/PlaylistEntryPixelOverlay.o \
-	playlist/PlaylistEntryPlaylist.o \
-	playlist/PlaylistEntryPlugin.o \
-	playlist/PlaylistEntryRemap.o \
-	playlist/PlaylistEntryScript.o \
-	playlist/PlaylistEntrySequence.o \
-	playlist/PlaylistEntryURL.o \
-	playlist/PlaylistEntryVolume.o \
-	Plugins.o \
-	Scheduler.o \
-	ScheduleEntry.o \
-	scripts.o \
-	sensors/Sensors.o \
-	Sequence.o \
-	settings.o \
-	SunSet.o \
-	$(NULL)
-LIBS_fppd = \
-	-lboost_filesystem \
-	-lboost_system \
-	-lpthread \
-    -lzstd -lz \
-	-lhttpserver \
-	-ljsoncpp \
-	-lm \
-	-lmosquitto \
-	-lutil \
-	-ltag \
-	-lSDL2 \
-	-lavformat \
-	-lavcodec \
-	-lavutil \
-	-lswresample \
-	-lswscale \
-	$(NULL)
-
-SUBDIRS = 
-
-ARCH := $(shell cat /etc/fpp/platform 2> /dev/null)
-ifeq '$(ARCH)' ''
-	ARCH = "UNKNOWN"
-endif
-$(shell echo "Building FPP on '$(ARCH)' platform" 1>&2)
-
-OLAFLAGS := $(shell pkg-config --cflags --libs libola 2> /dev/null)
-ifneq '$(OLAFLAGS)' ''
-	CFLAGS += -DUSEOLA
-	LDFLAGS_fppd += $(OLAFLAGS)
-	OBJECTS_fppd += channeloutput/OLAOutput.o
-endif
-
-CURLFLAGS := $(shell curl-config --libs)
-
-# Common CFLAGS
-CFLAGS += \
-	-I $(SRCDIR) \
-	-I $(SRCDIR)channeloutput \
-	-I $(SRCDIR)mediaoutput \
-	$(NULL)
-CXXFLAGS += -std=gnu++14
-
-CXXFLAGS += $(shell GraphicsMagick++-config --cppflags)
-LDFLAGS_fppd += -rdynamic $(CURLFLAGS) \
-	$(shell GraphicsMagick++-config --ldflags --libs) \
-	$(shell GraphicsMagickWand-config --ldflags --libs) \
-	$(NULL)
-
-DEPS_fppd += \
-	$(NULL)
-
-
-ifeq '$(ARCH)' 'Raspberry Pi'
-# do something RaspPi-y
-CFLAGS += \
-	-DPLATFORM_PI \
-	-DUSEWIRINGPI \
-	-DUSENRF \
-	-I../external/RF24/ \
-	-I../external/rpi-rgb-led-matrix/include/ \
-	-I../external/rpi_ws281x/ \
-	-I../external/spixels/include/ \
-	$(NULL)
-LIBS_fppd += \
-	-lwiringPi \
-	-lwiringPiDev \
-	-lrf24-bcm \
-	-lrgbmatrix \
-	-lws2811 \
-	-lspixels \
-	$(NULL)
-LDFLAGS_fppd += \
-	-L../external/RF24/ \
-	-L../external/rpi-rgb-led-matrix/lib/ \
-	-L../external/rpi_ws281x/ \
-	-L../external/spixels/lib/ \
-	$(NULL)
-OBJECTS_fppd += \
-	channeloutput/Hill320.o \
-	channeloutput/ILI9488.o \
-	channeloutput/RGBMatrix.o \
-	channeloutput/rpi_ws281x.o \
-	channeloutput/spixels.o \
-	$(NULL)
-DEPS_fppd += \
-	../external/RF24/librf24-bcm.so \
-	../external/rpi-rgb-led-matrix/lib/librgbmatrix.a \
-	../external/rpi_ws281x/libws2811.a \
-	../external/spixels/lib/libspixels.a \
-	$(NULL)
-SUBMODULES += \
-	external/RF24 \
-	external/rpi-rgb-led-matrix \
-	external/rpi_ws281x \
-	external/spixels \
-	$(NULL)
-else ifeq '$(ARCH)' 'ODROID'
-# do something for ODROID
-CFLAGS += \
-	-DPLATFORM_ODROID \
-	-DUSEWIRINGPI \
-	-I../external/rpi-rgb-led-matrix/include/ \
-	$(NULL)
-LIBS_fppd += \
-	-lrgbmatrix \
-	-lwiringPi \
-	-lwiringPiDev \
-	$(NULL)
-LDFLAGS_fppd += \
-	-L../external/rpi-rgb-led-matrix/lib/ \
-	$(NULL)
-OBJECTS_fppd += \
-	channeloutput/RGBMatrix.o \
-	$(NULL)
-DEPS_fppd += \
-	../external/rpi-rgb-led-matrix/lib/librgbmatrix.a \
-	$(NULL)
-SUBMODULES += \
-	external/RF24 \
-	external/rpi-rgb-led-matrix \
-	external/rpi_ws281x \
-	$(NULL)
-else ifeq '$(ARCH)' 'OrangePi'
-# do something for Orange Pi
-CFLAGS += \
-	-DPLATFORM_ORANGEPI \
-	-DUSEWIRINGPI \
-	$(NULL)
-LIBS_fppd += \
-	-lwiringPi \
-	-lwiringPiDev \
-	$(NULL)
-OBJECTS_fppd += \
-	channeloutput/Hill320.o \
-	$(NULL)
-else ifeq '$(ARCH)' 'BeagleBone Black'
-# BeagleBone Black
-CFLAGS += \
-	-DPLATFORM_BBB \
-    -I/usr/local/include
-LIBS_fppd += \
-	-lprussdrv
-LDFLAGS_fppd += \
-    -L/usr/local/lib/
-OBJECTS_fppd += \
-	channeloutput/BBB48String.o \
-	channeloutput/BBBSerial.o \
-    channeloutput/BBBUtils.o \
-    channeloutput/BBBPruUtils.o \
-    channeloutput/BBBMatrix.o
-OBJECTS_fppoled += channeloutput/BBBUtils.o
-DEPS_fppd += \
-	$(NULL)
-SUBMODULES += \
-	$(NULL)
 else
-# do something Linux-y
-CFLAGS += \
-	-DPLATFORM_UNKNOWN \
-	$(NULL)
-LDFLAGS_fppd += \
-    -L. \
-	$(NULL)
-LDFLAGS_fsequtils += \
-    -L. \
-    $(NULL)
+	ifneq '$(FULLBASEDIR)' '/opt/fpp/src'
+		SRCDIR = $(FULLBASEDIR)/
+	endif
 endif
+
+include  ${SRCDIR}/makefiles/common/setup.mk
+
+# Which of the optional libraries makefiles/common/setup.mk found.  It decides
+# more than flags: headers gate class MEMBERS on __has_include() (mediaoutput/
+# does, for gstreamer), so objects compiled before and after one appears or
+# disappears disagree about class layouts -- and makefiles/common/ is not a
+# prerequisite of anything, so installing gstreamer and running make rebuilt
+# nothing, or only some objects, and linked the mix.  Every object and the PCH
+# depend on this file (see the rule after DEPFILES), which is rewritten only
+# when the set changes.  Core only: plugins include setup.mk too, and must not
+# write into this tree.
+BUILD_FEATURES := gstreamer=$(HAVE_GSTREAMER) rtsp-server=$(HAVE_GST_RTSP_SERVER) libdrm=$(HAVE_LIBDRM) samplerate=$(HAVE_SAMPLERATE)
+BUILD_FEATURES_STAMP := .build-features
+ifneq ($(shell cat $(BUILD_FEATURES_STAMP) 2>/dev/null),$(BUILD_FEATURES))
+$(shell echo "$(BUILD_FEATURES)" > $(BUILD_FEATURES_STAMP))
+endif
+
+# include the platform fragments first....
+# Each will have an ifdef for itself
+include ${SRCDIR}/makefiles/platform/*.mk
 
 ##############################################################################
 # Include a local Makefile if one exists to modify any of the above
@@ -342,26 +41,47 @@ endif
 #
 # Examples of some entries that might exist in Makefile.local:
 #
-# LIBS_fppd += -lX11
-# CFLAGS += -DUSE_X11
-# OBJECTS_fppd += channeloutput/X11Matrix.o channeloutput/X11VirtualDisplay.o
+#LIBS_fpp_so += -lX11
+#CFLAGS += -DUSE_X11
+#OBJECTS_fpp_so += channeloutput/X11Matrix.o channeloutput/X11VirtualDisplay.o
 ##############################################################################
+
+# now include all the targets
+include ${SRCDIR}/makefiles/*.mk
+
+TARGETS_PHP := ../www/fppversion.php ../www/fppdefines.php
+
+# Header dependency files written by $(DEPFLAGS) (see makefiles/common/setup.mk).
+# -MMD puts each one next to its object, so this has to be expanded after every
+# fragment above has finished appending to OBJECTS_ALL.  Derived from the object
+# list rather than a */*.d wildcard because the core nests three deep
+# (channeloutput/processors, overlays/wled, non-gpl/BBShiftPanel).
+DEPFILES := $(OBJECTS_ALL:.o=.d)
+
+# Prerequisite-only, so it reaches every object whatever rule builds it --
+# several fragments (fppd.mk, fsequtils.mk, ...) have their own.
+$(OBJECTS_ALL) $(PCH_FILE): $(BUILD_FEATURES_STAMP)
 
 PWD := $(shell pwd)
 
+# Delete a target whose recipe failed. GNU Make keeps it by default, which on a
+# memory-tight board turns one OOM-killed compile into a permanently wrong tree:
+# when the OOM killer takes cc1plus partway through writing fpp-pch.h.gch, the
+# truncated .gch is left behind with a fresh mtime, so make reports it "up to
+# date" and never rebuilds it. GCC then silently ignores the invalid PCH (no
+# error, not even with -Winvalid-pch) and re-parses the header in every single
+# TU -- the build still succeeds, just slower, forever, with nothing to say why.
+.DELETE_ON_ERROR:
+
 .PHONY: all
-all: gitsubmodules FPP subdirs
+all: gitsubmodules $(TARGETS)
+.DEFAULT_GOAL := all
 
-subdirs:
-	@for dir in $(SUBDIRS); do \
-		$(MAKE) -C $$dir || exit 1; \
-	done
-
-FPP: $(TARGETS)
 
 .PHONY: gitsubmodules
+ifneq '$(SUBMODULES)' ''
 gitsubmodules:
-	@! ping -q -c 1 github.com > /dev/null 2>&1 || (cd ..; \
+	@! curl -S -s -o /dev/null -m 2 https://github.com/FalconChristmas/fpp/blob/master/README.md 2>&1 || (cd ..; \
 		for submodule in $(SUBMODULES); do \
 			git submodule sync $$submodule; \
 		done; \
@@ -369,114 +89,138 @@ gitsubmodules:
 		for submodule in $(SUBMODULES); do \
 			git submodule update --init $$submodule; \
 		done)
+else
+gitsubmodules:
 
+endif
 force:
 
-debug: $(TARGETS)
-debug: CFLAGS+=-g
-
-optimized: CFLAGS+=-O1
-optimized: $(TARGETS)
+optimized: all
 
 release: optimized
-	for dir in $(SUBDIRS); do \
-		$(MAKE) -C $$dir release || exit 1; \
+
+debug: all
+
+asan: all
+
+tsan: all
+
+ubsan: all
+
+local: $(TARGETS)
+
+fppversion.c: fppversion.sh
+	sh $(SRCDIR)fppversion.sh $(PWD)
+	php fppdefines.php > ../www/fppdefines.php
+	chmod 664 ../www/fppdefines.php
+
+fppversion_defines.h: fppversion.c
+
+# non-clang == g++ (incl. target-triplet g++ names); see note in setup.mk
+ifeq '$(findstring clang,$(CXXCOMPILER))' ''
+# Target-specific variables are inherited by a target's prerequisites, and
+# $(PCH_FILE) is a prerequisite of every %.o -- including the fppinit objects,
+# which do "CFLAGS := $(filter-out $(PCH_CFLAGS) -g1,$(CFLAGS))".  fppinit is
+# prepended to TARGETS, so it is built first and its objects are always what
+# pulls the shared .gch in, which means the .gch ends up built with flags that
+# no translation unit ever uses.  gcc then silently discards it for every TU
+# ("created with 'none' debug info, but used with 'dwarf-2'", or a _REENTRANT
+# mismatch where -pthread is also dropped -- visible only under -Winvalid-pch),
+# so the whole tree compiles as though there were no PCH while still paying to
+# build one.  Pin the .gch's own flags so no dependent's target-specific CFLAGS
+# can reach it.
+fpp-pch.h.gch: CFLAGS := $(CFLAGS)
+# The makefile fragments are prerequisites for the same reason they are on every
+# %.o rule: they decide the flags.  A CFLAGS edit that rebuilds every object but
+# leaves the .gch alone leaves the two disagreeing on macro state, and gcc then
+# drops the PCH for the whole tree (loudly now, thanks to -Winvalid-pch, but
+# still for the rest of that tree's life).  The headers, by contrast, come from
+# $(DEPFLAGS) below: the hand-written list this replaced named only what
+# fpp-pch.h included at the time and nothing transitive, so it had already
+# drifted (fpp-json.h and Events.h are included directly and were both absent,
+# as was common_mini.h one level under common.h).  Editing one of those left
+# make reporting the .gch up to date, and every TU then compiled against the
+# stale declarations in it.
+#
+# A .gch is only valid under the kernel page size it was written with: gcc lays
+# out its GC pages in it by getpagesize() and mmaps the body from a page-aligned
+# file offset, and checks neither when loading it.  One written under a 4K-page
+# kernel and loaded under a 16K one makes cc1plus segfault at a different place
+# in every TU.  Nothing else notices a kernel switch: make sees the .gch as up
+# to date, and ccache caches .gch creation (FPP images set sloppiness
+# pch_defines,time_macros) keyed on the compiler and inputs only, so even a
+# clean rebuild gets the old page size's .gch back.  Rebuild it when the page
+# size changes, and put the page size in its ccache key.  4K is the implicit
+# default for both -- no stamp means 4096, and a 4K .gch keeps an unchanged
+# ccache key -- so the common case never writes a stamp or rebuilds the .gch
+# for it, and still hits the published caches and every existing one.
+PCH_PAGESIZE := $(shell getconf PAGESIZE)
+PCH_PAGESIZE_STAMP := .pch-pagesize
+ifneq ($(shell cat $(PCH_PAGESIZE_STAMP) 2>/dev/null || echo 4096),$(PCH_PAGESIZE))
+$(shell echo "$(PCH_PAGESIZE)" > $(PCH_PAGESIZE_STAMP))
+endif
+ifneq '$(PCH_PAGESIZE)' '4096'
+PCH_CCACHE_NAMESPACE := CCACHE_NAMESPACE="$${CCACHE_NAMESPACE}pagesize$(PCH_PAGESIZE)"
+endif
+fpp-pch.h.gch: fpp-pch.h Makefile makefiles/*.mk makefiles/platform/*.mk $(wildcard $(PCH_PAGESIZE_STAMP))
+	$(PCH_CCACHE_NAMESPACE) CCACHE_NOHARDLINK=true CCACHE_COMPRESS=true $(CCACHE) $(CXXCOMPILER) $(CFLAGS) $(DEPFLAGS) $(CXXFLAGS) $(CXXFLAGS_$@) -c $(SRCDIR)$< -o $@
+	shasum $(PCH_FILE) > $(PCH_FILE).sum
+endif
+
+%.o: %.cpp %.h $(PCH_FILE) fppversion_defines.h Makefile makefiles/*.mk makefiles/platform/*.mk
+	$(CCACHE) $(CXXCOMPILER) $(CFLAGS) $(DEPFLAGS) $(CXXFLAGS) $(CXXFLAGS_$@) -c $(SRCDIR)$< -o $@
+
+%.o: %.cpp $(PCH_FILE) fppversion_defines.h Makefile makefiles/*.mk makefiles/platform/*.mk
+	$(CCACHE) $(CXXCOMPILER) $(CFLAGS) $(DEPFLAGS) $(CXXFLAGS) $(CXXFLAGS_$@) -c $(SRCDIR)$< -o $@
+
+%.o: %.c $(PCH_FILE) fppversion_defines.h Makefile makefiles/*.mk makefiles/platform/*.mk
+	$(CCACHE) $(CCOMPILER) $(CFLAGS) $(DEPFLAGS) $(CFLAGS_$@) -c $(SRCDIR)$< -o $@
+
+
+rebuildplugins: cleanplugins plugins
+
+plugins:
+	@for DIR in /home/fpp/media/plugins/* ; do \
+		if [ -d "$${DIR}" -a -f "$${DIR}/Makefile" ] ; then \
+			echo "Building plugin $${DIR}" ; \
+			make -C "$${DIR}" -f "$${DIR}/Makefile" ; \
+		fi ; \
 	done
 
-fpp: $(OBJECTS_fpp)
-	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
-
-fppmm: $(OBJECTS_fppmm)
-	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
-
-fppd: $(DEPS_fppd) $(OBJECTS_fppd)
-	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
-
-fsequtils: $(OBJECTS_fsequtils)
-	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
-
-fppoled: $(OBJECTS_fppoled)
-	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS_$@) -o $@
-
-fppversion.c: fppversion.sh force
-	@sh $(SRCDIR)fppversion.sh $(PWD)
-
-%.o: %.cpp %.h Makefile
-	$(CCACHE) $(CC) $(CFLAGS) $(CXXFLAGS) -c $< -o $@
-
-%.o: %.c %.h Makefile
-	$(CCACHE) $(CC) $(CFLAGS) $(CXXFLAGS) -c $< -o $@
+cleanplugins:
+	@for DIR in /home/fpp/media/plugins/* ; do \
+		if [ -d "$${DIR}" -a -f "$${DIR}/Makefile" ] ; then \
+			echo "Cleaning plugin $${DIR}" ; \
+			make -C "$${DIR}" -f "$${DIR}/Makefile" clean ; \
+		fi ; \
+	done
 
 cleanfpp:
-	rm -f fppversion.c $(OBJECTS_fpp) $(OBJECTS_fppmm) $(OBJECTS_fppd) $(OBJECTS_fppoled) $(OBJECTS_fsequtils) $(TARGETS)
+	rm -f fppversion.c fppversion_defines.h $(OBJECTS_ALL) $(DEPFILES) $(TARGETS) $(TARGETS_PHP)
 
-clean:
-	rm -f fppversion.c $(OBJECTS_fpp) $(OBJECTS_fppmm) $(OBJECTS_fppd) $(OBJECTS_fppoled) $(OBJECTS_fsequtils) $(TARGETS)
-	@if [ -e ../external/RF24/.git ]; then make -C ../external/RF24 clean; fi
-	@if [ -e ../external/rpi-rgb-led-matrix/.git ]; then make -C ../external/rpi-rgb-led-matrix clean; fi
-	@if [ -e ../external/rpi_ws281x/libws2811.a ]; then rm ../external/rpi_ws281x/*.o ../external/rpi_ws281x/*.a 2> /dev/null; fi
-	for dir in $(SUBDIRS); do \
-		$(MAKE) -C $$dir clean || exit 1; \
-	done
-
-util: force
-	$(MAKE) -C util
+# fpp-pch.h.gch is named literally rather than as $(PCH_FILE): when the PCH is
+# disabled, PCH_FILE is empty, and a .gch left behind by an
+# earlier PCH-enabled build in the same tree would survive every clean.  However
+# leave the PCH_FILE versions there so if a different filename contruct is used
+# in the future, it may be cleaned
+clean::
+	rm -f fppversion.c fppversion_defines.h $(OBJECTS_ALL) $(DEPFILES) $(TARGETS) $(TARGETS_PHP) $(PCH_FILE) $(PCH_FILE).sum fpp-pch.h.gch fpp-pch.h.gch.sum fpp-pch.h.d .pch-pagesize
 
 restart: fppd
 	sudo ../scripts/fppd_stop
 	sudo ../scripts/fppd_start
 
-#############################################################################
-# RF24 library on the Pi
-../external/RF24/.git:
-	@cd ../ && \
-		git submodule init && \
-		git submodule update
-
-../external/RF24/librf24-bcm.so: ../external/RF24/.git
-	@echo "Building RF24 library"
-	@CC="ccache gcc" CXX="ccache g++" make -C ../external/RF24/
-	@ln -s librf24-bcm.so.1.0 ../external/RF24/librf24-bcm.so.1
-	@ln -s librf24-bcm.so.1 ../external/RF24/librf24-bcm.so
-
-#############################################################################
-# RGBMatrix library on the Pi
-../external/rpi-rgb-led-matrix/.git:
-	@cd ../ && \
-		git submodule init && \
-		git submodule update
-
-../external/rpi-rgb-led-matrix/lib/librgbmatrix.a: ../external/rpi-rgb-led-matrix/.git
-	@echo "Building rpi-rgb-led-matrix library"
-	@if [ -e ../external/rpi-rgb-led-matrix/lib/librgbmatrix.so ]; then rm ../external/rpi-rgb-led-matrix/lib/librgbmatrix.so; fi
-	@CC="ccache gcc" CXX="ccache g++" make -C ../external/rpi-rgb-led-matrix/lib/ librgbmatrix.a
-
-#############################################################################
-# libws2811 on the Pi
-../external/rpi_ws281x/.git:
-	@cd ../ && \
-		git submodule init && \
-		git submodule update
-
-../external/rpi_ws281x/libws2811.a: ../external/rpi_ws281x/.git
-	@echo "Building libws2811"
-	@cd ../external/rpi_ws281x/ && \
-		gcc -c -o rpihw.o rpihw.c && \
-		gcc -c -o mailbox.o mailbox.c && \
-		gcc -c -o dma.o dma.c && \
-		gcc -c -o pcm.o pcm.c && \
-		gcc -c -o pwm.o pwm.c && \
-		gcc -c -o ws2811.o ws2811.c && \
-		ar rcs libws2811.a rpihw.o mailbox.o dma.o pwm.o pcm.o ws2811.o
-
-#############################################################################
-# spixels library on the Pi
-../external/spixels/.git:
-	@cd ../ && \
-		git submodule init && \
-		git submodule update
-
-../external/spixels/lib/libspixels.a: ../external/spixels/.git
-	@echo "Building spixels library"
-	@CC="ccache gcc" CXX="ccache g++" make -C ../external/spixels/lib/
-
+# Read back the header dependencies recorded by the last build.  Kept last so
+# the rules these files carry can never win GNU Make's "first target seen
+# becomes the default goal" race - .DEFAULT_GOAL is pinned above as well.
+#
+# Wrapped in $(wildcard ...) rather than left to -include: a bare -include of a
+# name that does not exist yet sends Make looking for a rule to build it, and
+# on a clean tree that is ~200 fruitless implicit-rule searches.  The wildcard
+# drops the missing ones up front, and -include keeps a build working if one is
+# deleted by hand.
+-include $(wildcard $(DEPFILES))
+# The PCH's own dep file needs its own -include: gcc names it after the -o
+# argument with the suffix replaced, so it is fpp-pch.h.d, which $(DEPFILES) -
+# built from the object list - never matches.
+-include $(wildcard fpp-pch.h.d)

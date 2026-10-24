@@ -1,107 +1,155 @@
+#pragma once
 /*
- *   BeagleBone Black PRU Matrix handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2018 the Falcon Player Developers
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _BBBMATRIX_H
-#define _BBBMATRIX_H
-
+#include "fpp-json-fwd.h"
 #include <string>
+#include <vector>
 
 #include "Matrix.h"
 #include "PanelMatrix.h"
-#include "BBBPruUtils.h"
+#include "util/BBBPruUtils.h"
 
-#include "ChannelOutputBase.h"
+#include "ChannelOutput.h"
 
-//16 rows (1/16 scan) * 8bits per row
+// 16 rows (1/16 scan) * 8bits per row
 #define MAX_STATS 16 * 8
 
-
-class InterleaveHandler;
+class PanelInterleaveHandler;
 
 // structure of the data at the start of the PRU ram
 // that the pru program expects to see
 typedef struct {
     // in the DDR shared with the PRU
-    uintptr_t address_dma;
-    
+    volatile uint32_t address_dma;
+
     // write 1 to start, 0xFF to abort. will be cleared when started
-    volatile unsigned command;
-    volatile unsigned response;
-    
-    uint32_t stats[3 * MAX_STATS]; //3 values per collection
+    volatile uint32_t command;
+    volatile uint32_t response;
+
+    volatile uint16_t pwmBrightness[8];
+    uint32_t stats[3 * MAX_STATS]; // 3 values per collection
 } __attribute__((__packed__)) BBBPruMatrixData;
 
-
-class BBBMatrix : public ChannelOutputBase {
-  public:
+class BBBMatrix : public ChannelOutput {
+public:
     BBBMatrix(unsigned int startChannel, unsigned int channelCount);
     virtual ~BBBMatrix();
-    
-    int Init(Json::Value config);
-    int Close(void);
-    
-    void PrepData(unsigned char *channelData);
-    
-    int SendData(unsigned char *channelData);
-    
-    void DumpConfig(void);
-    
-    virtual void GetRequiredChannelRange(int &min, int & max);
 
-  private:
-    void calcBrightnessFlags(std::vector<std::string> &sargs);
+    virtual std::string GetOutputType() const override {
+        return "BBB Panels";
+    }
+
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
+
+    virtual void PrepData(unsigned char* channelData) override;
+
+    virtual int SendData(unsigned char* channelData) override;
+
+    virtual void DumpConfig(void) override;
+
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
+
+    virtual void OverlayTestData(unsigned char* channelData, int cycleNum, float percentOfCycle, int testType, const Json::Value& config) override;
+    virtual bool SupportsTesting() const override { return true; }
+
+private:
+    void calcBrightnessFlags(std::vector<std::string>& sargs);
     void printStats();
-    
-    BBBPru      *m_pru;
-    BBBPru      *m_pruCopy;
-    BBBPruMatrixData *m_pruData;
-    Matrix      *m_matrix;
-    PanelMatrix *m_panelMatrix;
-    
-    int          m_panelWidth;
-    int          m_panelHeight;
-    int          m_outputs;
-    int          m_longestChain;
-    int          m_invertedData;
-    int          m_brightness;
-    int          m_colorDepth;
-    int          m_interleave;
-    bool         m_printStats;
-    int          m_panelScan; 
+    bool configureControlPin(const std::string& ctype, Json::Value& root, std::ofstream& outputFile, int pru, int& controlGPIO);
+    void configurePanelPins(int x, Json::Value& root, std::ofstream& outputFile, int* minPort);
+    void configurePanelPin(int x, const std::string& color, int row, Json::Value& root, std::ofstream& outputFile, int* minPort);
+
+    BBBPru* m_pru;
+    BBBPru* m_pruCopy;
+    BBBPruMatrixData* m_pruData;
+    Matrix* m_matrix;
+    PanelMatrix* m_panelMatrix;
+    bool m_singlePRU = false;
+    // dual PRU split output: the copy PRU also writes these GPIO banks
+    bool m_splitOutput = false;
+    bool m_splitCpyBanks[4] = { false, false, false, false };
+    size_t m_dataOffset = 0;
+
+    int m_panelWidth;
+    int m_panelHeight;
+    int m_panelScan;
+    std::string m_panelInterleave;
+
+    int m_outputs;
+    int m_longestChain;
+    int m_invertedData;
+    int m_brightness;
+    int m_colorDepth;
+    bool m_printStats;
     FPPColorOrder m_colorOrder;
 
-    uint8_t      *m_outputFrame;
-    int          m_panels;
-    int          m_rows;
-    int          m_width;
-    int          m_height;
-    int          m_rowSize;
-    
-    bool         m_evenFrame;
-    
-    int          m_timing;
-    InterleaveHandler *m_handler;
-    
-    uint32_t     brightnessValues[8];
-    uint32_t     delayValues[8];
-    uint8_t      gammaCurve[256];
-    
-};
+    uint32_t* m_gpioFrame;
+    int m_panels;
+    int m_rows;
+    int m_width;
+    int m_height;
+    int m_rowSize;
 
-#endif
+    bool m_outputByRow;
+    bool m_outputBlankData;
+    std::vector<int> m_bitOrder;
+
+    int m_timing;
+    PanelInterleaveHandler* m_handler;
+
+    uint32_t brightnessValues[12];
+    uint32_t delayValues[12];
+    uint16_t gammaCurve[256];
+
+    std::string m_autoCreatedModelName;
+
+    class GPIOPinInfo {
+    public:
+        class Pins {
+        public:
+            uint32_t r_pin = 0;
+            uint32_t g_pin = 0;
+            uint32_t b_pin = 0;
+
+            uint8_t r_gpio = 0;
+            uint8_t g_gpio = 0;
+            uint8_t b_gpio = 0;
+        } row[2];
+    } m_pinInfo[8];
+
+    uint8_t* m_frames[8];
+    int m_curFrame;
+    int m_numFrames;
+    int m_fullFrameLen;
+
+    // Precomputed acceleration structures for PrepData (see buildPrepTables):
+    // per output, the 4 GPIO bank words for each combination of the 6 pins
+    uint32_t m_pinLUT[8][64][4];
+    // bit-spread gamma: bit b of gammaCurve[v] lands in byte b (low 8 bits)
+    // or byte b-8 (bits 8-11) so all bit-plane indexes compute per pixel
+    uint64_t m_gammaSpreadLo[256];
+    uint32_t m_gammaSpreadHi[256];
+    // (output, panel) pairs grouped by chain position
+    std::vector<std::vector<std::pair<int, int>>> m_chainPanels;
+    // interleave handler results precomputed per panel row/pixel
+    std::vector<int> m_yOutMap;
+    std::vector<uint16_t> m_xOutMap;
+    // staging for the packed per-bitplane pin indexes
+    std::vector<uint8_t> m_stageLo;
+    std::vector<uint8_t> m_stageHi;
+    // set when the interleave map is not a clean bijection and PrepData must
+    // memset the frame and OR into it (the historical behavior)
+    bool m_prepNeedsMemset = false;
+    void buildPrepTables();
+};

@@ -1,0 +1,123 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include <sys/stat.h>
+
+#include "common.h"
+#include "settings.h"
+#include "commands/Commands.h"
+
+#include "FPPLocale.h"
+
+Json::Value LocaleHolder::locale;
+std::mutex LocaleHolder::localeLock;
+std::string LocaleHolder::localeKey;
+
+// The cache is rebuilt whenever what it was built from changes, whoever
+// changed it: the holiday editor writes user-holidays.json through the
+// config file API, and Locale can change from the UI, an upload or a
+// restored backup.  Only clearing it on request left fppd scheduling with the
+// old holidays until it restarted.
+static std::string LocaleSourceKey(const std::string& localeName, const std::string& userHolidaysFile) {
+    std::string key = localeName;
+    struct stat st;
+    if (stat(userHolidaysFile.c_str(), &st) == 0) {
+#ifdef PLATFORM_OSX
+        const struct timespec& mt = st.st_mtimespec;
+#else
+        const struct timespec& mt = st.st_mtim;
+#endif
+        key += "|" + std::to_string((long long)st.st_size) + "|" +
+               std::to_string((long long)mt.tv_sec) + "." + std::to_string((long long)mt.tv_nsec);
+    }
+    return key;
+}
+
+Json::Value LocaleHolder::GetLocale() {
+    std::unique_lock<std::mutex> lock(localeLock);
+
+    std::string localeName = getSetting("Locale");
+
+    if (localeName == "")
+        localeName = "Global";
+
+    std::string userHolidaysFile = FPP_DIR_CONFIG("/user-holidays.json");
+    std::string key = LocaleSourceKey(localeName, userHolidaysFile);
+    if (locale.size() && key == localeKey)
+        return locale;
+    locale.clear();
+    localeKey = key;
+
+    // From fppd's own tree, not /opt/fpp: an install anywhere else (macOS, a
+    // test tree) found no locale file, so every holiday name in the schedule
+    // was unknown.
+    std::string localeFile = getFPPDDir("/etc/locale/" + localeName + ".json");
+
+    if (!FileExists(localeFile)) {
+        localeFile = getFPPDDir("/etc/locale/Global.json");
+    }
+
+    bool result = LoadJsonFromFile(localeFile, locale, JsonRoot::Object);
+
+    if (result) {
+        // Load user-defined holidays and merge them with locale holidays
+        if (FileExists(userHolidaysFile)) {
+            Json::Value userHolidays;
+            if (LoadJsonFromFile(userHolidaysFile, userHolidays, JsonRoot::Array)) {
+                if (userHolidays.isArray() && userHolidays.size() > 0) {
+                    // Ensure the locale has a holidays array
+                    if (!locale.isMember("holidays")) {
+                        locale["holidays"] = Json::Value(Json::arrayValue);
+                    }
+                    
+                    // Append user-defined holidays to the locale holidays
+                    for (Json::ArrayIndex i = 0; i < userHolidays.size(); i++) {
+                        locale["holidays"].append(userHolidays[i]);
+                    }
+                }
+            }
+        }
+        return locale;
+    }
+
+    Json::Value empty;
+
+    return empty;
+}
+
+void LocaleHolder::ClearCache() {
+    std::unique_lock<std::mutex> lock(localeLock);
+    locale.clear();
+    localeKey.clear();
+}
+
+/**********************************************************************/
+// Command to clear the locale cache
+class ClearLocaleCacheCommand : public Command {
+public:
+    ClearLocaleCacheCommand() : Command("Clear Locale Cache") {
+        args.push_back(CommandArg("force", "bool", "Force Clear").setDefaultValue("true"));
+    }
+    
+    virtual std::unique_ptr<Command::Result> run(const std::vector<std::string>& args) override {
+        LocaleHolder::ClearCache();
+        return std::make_unique<Command::Result>("Locale cache cleared");
+    }
+};
+
+void LocaleHolder::RegisterCommands() {
+    CommandManager::INSTANCE.addCategorizedCommand(new ClearLocaleCacheCommand(), "System", 3);
+}

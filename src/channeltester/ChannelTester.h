@@ -1,54 +1,64 @@
+#pragma once
 /*
- *   Channel Test code for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef _CHANNELTESTER_H
-#define _CHANNELTESTER_H
-
+#include <atomic>
 #include <string>
+#include "fpp-json-fwd.h"
 
-#include <pthread.h>
+#include <mutex>
 
 #include "TestPatternBase.h"
-#include "Sequence.h"
+
+#include "fpphttp_types.h"
 
 class ChannelTester {
-  public:
+public:
     ChannelTester();
-	~ChannelTester();
+    virtual ~ChannelTester();
 
-	int  SetupTest(std::string configStr);
+    int SetupTest(const std::string configStr);
+    int SetupTest(const Json::Value& config);
+    void StopTest();
 
-	void OverlayTestData(char *channelData);
-	int  Testing(void);
+    void OverlayTestData(char* channelData);
+    int Testing(void);
 
-	std::string GetConfig(void);
+    std::string GetConfig(void);
+    // The running test's config as JSON for the /fppd/status payload.  Returns
+    // an empty (null) value when no test is running.  The bulky per-output
+    // "config" blob some tests carry is omitted; status readers only need to
+    // know which test is running.
+    Json::Value GetStatusJson(void);
 
-  private:
-	TestPatternBase *m_testPattern;
-	pthread_mutex_t  m_testLock;
-	std::string      m_configStr;
+    void RegisterCommands();
+    HttpResponsePtr render_GET(const HttpRequestPtr& req);
+    HttpResponsePtr render_POST(const HttpRequestPtr& req);
+
+    static ChannelTester INSTANCE;
+
+private:
+    // does the work; SetupTest() wraps it to contain the jsoncpp exceptions a
+    // malformed config can raise
+    int SetupTestInternal(const Json::Value& config);
+
+    // Atomic: Testing() and the status calls read it as "is a test running"
+    // from HTTP and output threads while SetupTest() replaces it under
+    // m_testLock.
+    std::atomic<TestPatternBase*> m_testPattern;
+    std::mutex m_testLock;
+    // Guards m_configStr only.  Written at the end of SetupTestInternal() and
+    // read from HTTP/WebSocket threads; it is deliberately not m_testLock so a
+    // status build never waits on the output loop.
+    std::mutex m_configLock;
+    std::string m_configStr;
 };
-
-#endif /* _CHANNELTESTER_H */

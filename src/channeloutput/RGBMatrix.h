@@ -1,82 +1,72 @@
+#pragma once
 /*
- *   librgbmatrix handler for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
  */
 
-#ifndef _RGBMATRIX_H
-#define _RGBMATRIX_H
-
 #include <string>
+#include "fpp-json-fwd.h"
 
 #include "Matrix.h"
 #include "PanelMatrix.h"
 
 #include "led-matrix.h"
 
-using rgb_matrix::GPIO;
-using rgb_matrix::RGBMatrix;
 using rgb_matrix::Canvas;
 using rgb_matrix::FrameCanvas;
+using rgb_matrix::RGBMatrix;
 
-#include "ChannelOutputBase.h"
+#include "ChannelOutput.h"
 
-class RGBMatrixOutput : public ChannelOutputBase {
-  public:
-	RGBMatrixOutput(unsigned int startChannel, unsigned int channelCount);
-	~RGBMatrixOutput();
+class RGBMatrixOutput : public ChannelOutput {
+public:
+    RGBMatrixOutput(unsigned int startChannel, unsigned int channelCount);
+    virtual ~RGBMatrixOutput();
 
-	int Init(Json::Value config);
-	int Close(void);
+    virtual std::string GetOutputType() const override {
+        return "Pi Panels";
+    }
 
-	void PrepData(unsigned char *channelData);
+    virtual int Init(Json::Value config) override;
+    virtual int Close(void) override;
 
-	int SendData(unsigned char *channelData);
+    virtual void PrepData(unsigned char* channelData) override;
 
-	void DumpConfig(void);
+    virtual int SendData(unsigned char* channelData) override;
 
-    virtual void GetRequiredChannelRange(int &min, int & max);
+    virtual void DumpConfig(void) override;
 
-  private:
-	GPIO        *m_gpio;
-	FrameCanvas *m_canvas;
-	RGBMatrix   *m_rgbmatrix;
-	std::string  m_layout;
-	std::string  m_colorOrder;
+    virtual void GetRequiredChannelRanges(const std::function<void(int, int)>& addRange) override;
 
-	int          m_panelWidth;
-	int          m_panelHeight;
-	int          m_panels;
-	int          m_width;
-	int          m_height;
-	int          m_rows;
-	int          m_outputs;
-	int          m_longestChain;
-	int          m_invertedData;
+    virtual void OverlayTestData(unsigned char* channelData, int cycleNum, float percentOfCycle, int testType, const Json::Value& config) override;
+    virtual bool SupportsTesting() const override { return true; }
 
-	Matrix      *m_matrix;
-	PanelMatrix *m_panelMatrix;
-    
-    uint8_t      m_gammaCurve[256];
+private:
+    FrameCanvas* m_canvas = nullptr;
+    RGBMatrix* m_rgbmatrix = nullptr;
+    std::string m_layout;
+    std::string m_colorOrder;
+
+    int m_panelWidth;
+    int m_panelHeight;
+    int m_panels;
+    int m_width;
+    int m_height;
+    int m_rows;
+    int m_outputs;
+    int m_longestChain;
+    int m_invertedData;
+
+    Matrix* m_matrix = nullptr;
+    PanelMatrix* m_panelMatrix = nullptr;
+    std::string m_autoCreatedModelName;
+
+    uint8_t m_gammaCurve[256];
 };
-
-#endif /* _RGBMATRIX_H */

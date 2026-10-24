@@ -1,122 +1,73 @@
+#pragma once
 /*
- *   Setting manager for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2025 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#ifndef __SETTINGS_H__
-#define __SETTINGS_H__
-
+#include <functional>
 #include <stdbool.h>
-#include <map>
 #include <string>
 
-#define MAXBUF 1024
+std::string getFPPDDir(const std::string& path = "");
+std::string getFPPMediaDir(const std::string& path = "");
+
+#define FPP_DIR getFPPDDir()
+#define FPP_DIR_MEDIA(a) getFPPMediaDir(a)
+#define FPP_DIR_CONFIG(a) getFPPMediaDir(std::string("/config") + a)
+#define FPP_DIR_EFFECT(a) getFPPMediaDir(std::string("/effects") + a)
+#define FPP_DIR_IMAGE(a) getFPPMediaDir(std::string("/images") + a)
+#define FPP_DIR_MUSIC(a) getFPPMediaDir(std::string("/music") + a)
+#define FPP_DIR_PLAYLIST(a) getFPPMediaDir(std::string("/playlists") + a)
+#define FPP_DIR_PLUGIN(a) getFPPMediaDir(std::string("/plugins") + a)
+#define FPP_DIR_SCRIPT(a) getFPPMediaDir(std::string("/scripts") + a)
+#define FPP_DIR_SEQUENCE(a) getFPPMediaDir(std::string("/sequences") + a)
+#define FPP_DIR_VIDEO(a) getFPPMediaDir(std::string("/videos") + a)
+#define FPP_DIR_CRASHES(a) getFPPMediaDir(std::string("/crashes") + a)
+#define FPP_FILE_LOG getFPPMediaDir("/logs/fppd.log")
+#define FPP_FILE_SETTINGS getFPPMediaDir("/settings")
 
 typedef enum fppMode {
-	BRIDGE_MODE = 0x01,
-	PLAYER_MODE = 0x02,
-	/* Skip 0x04 since MASTER_MODE is a bitmask of player 0x02 & master 0x04 */
-	MASTER_MODE = 0x06,
-	REMOTE_MODE = 0x08
+    UNKNOWN_MODE = 0x00,
+    BRIDGE_MODE = 0x01, // deprecated, not used by FPP 5.x+, but external controllers
+                        // may report this mode
+    PLAYER_MODE = 0x02,
+    MASTER_MODE = 0x06, // deprecated, FPP <=4.x instance may report
+                        // this mode
+    REMOTE_MODE = 0x08
 } FPPMode;
 
-class SettingsConfig {
-public:
-    SettingsConfig() {}
-    ~SettingsConfig();
-    
-    int        daemonize;
-    FPPMode    fppMode;
-    int        alwaysTransmit;
-    char    *binDirectory = nullptr;
-    char    *fppDirectory = nullptr;
-    char    *mediaDirectory = nullptr;
-    char    *musicDirectory = nullptr;
-    char    *sequenceDirectory = nullptr;
-    char    *eventDirectory = nullptr;
-    char    *videoDirectory = nullptr;
-    char    *effectDirectory = nullptr;
-    char    *scriptDirectory = nullptr;
-    char    *pluginDirectory = nullptr;
-    char    *playlistDirectory = nullptr;
-    char    *universeFile = nullptr;
-    char    *pixelnetFile = nullptr;
-    char    *scheduleFile = nullptr;
-    char    *logFile = nullptr;
-    char    *silenceMusic = nullptr;
-    char    *settingsFile = nullptr;
-    char    *bytesFile = nullptr;
-    char    *E131interface = nullptr;
-    
-    unsigned int controlMajor;
-    unsigned int controlMinor;
-    
-    std::map<std::string, char *> keyVal;
-};
-
 // Helpers
-void initSettings(int argc, char **argv);
-char *trimwhitespace(const char *str, int quotesAlso = 1);
-char *modeToString(int mode);
-void usage(char *appname);
-
+char* trimwhitespace(const char* str, int quotesAlso = 1);
+char* modeToString(int mode);
+const std::string getFPPmodeStr(FPPMode mode = UNKNOWN_MODE);
 
 // Action functions
-int parseArguments(int argc, char **argv);
-int loadSettings(const char *filename);
-void CreateSettingsFile(char * file);
-void CheckExistanceOfDirectoriesAndFiles(void);
-int saveSettingsFile(void);
-int parseSetting(char *key, char *value);
+int LoadSettings(const char* base, bool logChanges = false);
 
-// Getters
-const char *getSetting(const char *setting);
-int   getSettingInt(const char *setting);
+// Setters & Getters
+std::string getSetting(const char* setting, const char* defaultVal = "");
+int getSettingInt(const char* setting, int defaultVal = 0);
+int setSetting(const std::string& key, const std::string& value, bool persist = false);
+int setSetting(const std::string& key, const int value);
+int SetSetting(const std::string& key, const std::string& value);
+int SetSetting(const std::string& key, const int value);
 
-int getDaemonize(void);
+// Returns true if MediaBackend is using the PipeWire/GStreamer stack
+// (either Simple PipeWire or PipeWire Advanced — both share the same runtime).
+bool isPipeWireBackend();
+
+// listeners
+void registerSettingsListener(const std::string& id, const std::string& setting, std::function<void(const std::string&)>&& cb);
+// Waits for any call of that listener still running on another thread (so
+// the caller may free what it captured), except when called from inside a
+// listener. Don't call it holding a lock the listener takes.
+void unregisterSettingsListener(const std::string& id, const std::string& setting);
+
 FPPMode getFPPmode(void);
-int  getAlwaysTransmit(void);
-char *getBinDirectory(void);
-char *getFPPDirectory(void);
-char *getMediaDirectory(void);
-char *getMusicDirectory(void);
-char *getSequenceDirectory(void);
-char *getEventDirectory(void);
-char *getVideoDirectory(void);
-char *getEffectDirectory(void);
-char *getScriptDirectory(void);
-char *getPluginDirectory(void);
-char *getPlaylistDirectory(void);
-char *getUniverseFile(void);
-char *getPixelnetFile(void);
-char *getScheduleFile(void);
-char *getLogFile(void);
-char *getSilenceMusic(void);
-char *getBytesFile(void);
-char *getSettingsFile(void);
-char *getE131interface(void);
-unsigned int getControlMajor(void);
-unsigned int getControlMinor(void);
-
-
-#endif //__SETTINGS_H__

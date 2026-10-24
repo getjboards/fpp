@@ -1,0 +1,22 @@
+OBJECTS_fpp = \
+	fpp.o \
+	common.o \
+    log.o \
+	settings.o \
+	common_mini.o \
+	fppversion.o
+LIBS_fpp = \
+    -ljsoncpp \
+    -lcurl \
+	$(NULL)
+
+TARGETS+=fpp
+OBJECTS_ALL+=$(OBJECTS_fpp)
+
+ifneq ($(wildcard /usr/include/xf86drm.h),)
+LIBS_fpp += -ldrm
+endif
+
+fpp: $(OBJECTS_fpp)
+	$(CCACHE) $(CC) $(CFLAGS_$@) $(OBJECTS_$@) $(LIBS_$@) $(LDFLAGS) $(LDFLAGS_$@) -o $@
+

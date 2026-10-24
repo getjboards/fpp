@@ -1,0 +1,582 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the GPL v2 as described in the
+ * included LICENSE.GPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include <fcntl.h>
+
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <map>
+#include <set>
+
+#include "PiFaceUtils.h"
+#include "PiGPIOUtils.h"
+#include "Warnings.h"
+#include "common_mini.h"
+#include "log.h"
+
+static bool isPi5() {
+    static bool pi5 = [] {
+        std::string model = GetFileContents("/proc/device-tree/model");
+        return startsWith(model, "Raspberry Pi 5") ||
+               startsWith(model, "Raspberry Pi Compute Module 5");
+    }();
+    return pi5;
+}
+
+// Kernel 6.18 enabled strict pinmux mode for both pinctrl-rp1 and pinctrl-bcm2835
+// (raspberrypi/linux "pinctrl: rp1: enable strict pinmux mode", raspberrypi/linux#5870).
+// A header pin that a peripheral node claims in the device tree -- i2c1 on P1-3/5, spi0
+// on P1-19/21/23, uart0 on P1-8/10, i2s on P1-12/35/38/40 -- is now reported to gpiolib
+// as in use by the kernel, and every gpiod request against it fails with EINVAL. Through
+// FPP 9.x (kernel 6.12) those drivers were non-strict, so re-muxing the pad with
+// "pinctrl set" and then requesting it worked; on 6.18 it does not, because "pinctrl set"
+// writes FUNCSEL behind the pinctrl driver's back and leaves the kernel's claim in place.
+//
+// The supported way to get the pin back is to make the owning device release it, which
+// unbinding its driver does. That is safe when nothing has attached to the bus (the common
+// case for buttons wired straight to the header on a board with no cape), and decidedly
+// unsafe when something has: a child driver's remove path can wedge in the kernel and take
+// the whole bus with it. So we unbind only when the owner has no child driver bound other
+// than the ones known to detach cleanly, and warn with the offending driver named otherwise.
+//
+// On a non-strict kernel the debugfs format has no "device " prefix, so findPinMuxOwner()
+// finds nothing and none of this engages -- which is exactly right, since a non-strict
+// controller hands the pin over without help.
+static constexpr const char* PINMUX_DEBUG_DIR = "/sys/kernel/debug/pinctrl";
+
+struct PinMuxOwner {
+    std::string device;   // platform device holding the mux claim, e.g. "1f00074000.i2c"
+    std::string function; // mux function it selected, e.g. "i2c1"
+    bool hog = false;
+};
+
+// The pin controllers that drive the 40-pin header. Other pinctrl instances (the bcm2712
+// "aon" controller, expanders) enumerate overlapping pin numbers and must not be consulted.
+static bool isHeaderPinctrlDir(const std::string& dir) {
+    return endsWith(dir, "-pinctrl-rp1") || endsWith(dir, "-pinctrl-bcm2711") ||
+           endsWith(dir, "-pinctrl-bcm2835");
+}
+
+// debugfs files report a size of 0, so they have to be streamed rather than slurped.
+static bool findPinMuxOwner(int gpio, PinMuxOwner& owner) {
+    const std::string prefix = "pin " + std::to_string(gpio) + " (";
+    std::error_code ec;
+    std::filesystem::directory_iterator dir(PINMUX_DEBUG_DIR, ec);
+    if (ec) {
+        // Without debugfs there is no way to find out which device holds a pin, so a
+        // claimed pin can only be reported as unavailable by the failing request itself.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LogWarn(VB_GPIO, "%s is not readable; pins claimed by a kernel driver cannot be freed for GPIO use\n",
+                    PINMUX_DEBUG_DIR);
+        }
+        return false;
+    }
+    for (const auto& entry : dir) {
+        if (!isHeaderPinctrlDir(entry.path().filename().string())) {
+            continue;
+        }
+        std::ifstream in(entry.path().string() + "/pinmux-pins");
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!startsWith(line, prefix)) {
+                continue;
+            }
+            // strict format: "pin 2 (gpio2): device 1f00074000.i2c function i2c1 group gpio2"
+            size_t dpos = line.find("): device ");
+            if (dpos == std::string::npos) {
+                return false; // UNCLAIMED, GPIO-owned, or a non-strict kernel
+            }
+            std::string rest = line.substr(dpos + 10);
+            owner.device = rest.substr(0, rest.find(' '));
+            owner.hog = rest.find(" (HOG)") != std::string::npos;
+            size_t fpos = rest.find(" function ");
+            if (fpos != std::string::npos) {
+                std::string fn = rest.substr(fpos + 10);
+                owner.function = fn.substr(0, fn.find(' '));
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// A child that is still driver-bound means the bus is in use; removing the controller then
+// runs that driver's remove path, which is where an unbind can hang. spidev is the one
+// child FPP creates itself and is known to detach cleanly.
+static bool findBlockingChildDriver(const std::string& devPath, std::string& blocker) {
+    static const std::set<std::string> safeChildDrivers = { "spidev" };
+    const std::string ownDriver = devPath + "/driver";
+    std::error_code ec;
+    auto end = std::filesystem::recursive_directory_iterator();
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             devPath, std::filesystem::directory_options::skip_permission_denied, ec);
+         it != end; it.increment(ec)) {
+        if (ec) {
+            break;
+        }
+        if (it.depth() >= 5) {
+            it.disable_recursion_pending();
+        }
+        const std::filesystem::path& p = it->path();
+        if (p.filename() != "driver" || p.string() == ownDriver) {
+            continue;
+        }
+        std::filesystem::path target = std::filesystem::read_symlink(p, ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        std::string driver = target.filename().string();
+        if (!safeChildDrivers.count(driver)) {
+            blocker = driver;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Hand a pin back from the peripheral that claimed it in the device tree so FPP can
+// use it itself - as a GPIO, or re-muxed to another function such as DPI (a pixel
+// string output on the SPI header pins, say, with spi0 still enabled in config.txt).
+// "use" names what the caller wants the pin for, for the messages.  Returns true if
+// the pin is usable when it returns.
+static bool releasePinFromKernelDriver(int gpio, const std::string& pinName, const std::string& use = "GPIO") {
+    // configPin() is reachable from the REST API as well as from startup, so the
+    // once-per-pin bookkeeping needs to be serialized.
+    static std::mutex handledLock;
+    // What became of each pin already dealt with this boot: true if it was
+    // freed, false if it couldn't be (and was warned about).  A later caller
+    // gets the same answer; this used to say "freed" to every later caller,
+    // even for a pin that is still claimed.
+    static std::map<int, bool> handled;
+    std::unique_lock<std::mutex> lock(handledLock);
+    auto done = handled.find(gpio);
+    if (done != handled.end()) {
+        return done->second;
+    }
+
+    PinMuxOwner owner;
+    if (!findPinMuxOwner(gpio, owner)) {
+        return true; // unclaimed, or a kernel that doesn't enforce the claim
+    }
+    if (owner.hog || owner.function == "gpio") {
+        // A hog belongs to the pin controller itself, and a pin muxed as the GPIO
+        // function stays requestable under strict mode via .function_is_gpio.
+        return true;
+    }
+    handled[gpio] = false; // until it is shown to be free below
+
+    const std::string devPath = "/sys/bus/platform/devices/" + owner.device;
+    std::error_code ec;
+    std::filesystem::path driverLink = std::filesystem::read_symlink(devPath + "/driver", ec);
+    if (ec) {
+        std::string w = "Pin " + pinName + " is claimed by " + owner.device + " (" + owner.function +
+                        ") and cannot be used for " + use + "; no driver to unbind";
+        WarningHolder::AddWarning(51, w);
+        LogWarn(VB_GPIO, "%s\n", w.c_str());
+        return false;
+    }
+    std::string driver = driverLink.filename().string();
+
+    std::string blocker;
+    if (findBlockingChildDriver(devPath, blocker)) {
+        std::string w = "Pin " + pinName + " is claimed by " + owner.function + " (" + owner.device +
+                        "), which is in use by the " + blocker +
+                        " driver. Disable " + owner.function + " in config.txt to use this pin for " + use + ".";
+        WarningHolder::AddWarning(51, w);
+        LogWarn(VB_GPIO, "%s\n", w.c_str());
+        return false;
+    }
+
+    LogInfo(VB_GPIO, "Pin %s is claimed by %s (%s); unbinding %s to free it for %s use\n",
+            pinName.c_str(), owner.function.c_str(), owner.device.c_str(), driver.c_str(), use.c_str());
+    std::ofstream unbind("/sys/bus/platform/drivers/" + driver + "/unbind");
+    unbind << owner.device;
+    unbind.close();
+
+    PinMuxOwner check;
+    if (findPinMuxOwner(gpio, check)) {
+        std::string w = "Pin " + pinName + " is claimed by " + check.function + " (" + check.device +
+                        ") and could not be freed for " + use + " use";
+        WarningHolder::AddWarning(51, w);
+        LogWarn(VB_GPIO, "%s\n", w.c_str());
+        return false;
+    }
+    handled[gpio] = true;
+    return true;
+}
+
+class PiGPIODCapabilities : public GPIODCapabilities {
+public:
+    PiGPIODCapabilities(const std::string& n, uint32_t kg) :
+        GPIODCapabilities(n, kg) {
+        gpioIdx = getPinctrlRpiChip();
+        gpioName = pinctrlRpiChipName;
+        gpio = kg;
+    }
+
+    virtual ~PiGPIODCapabilities() {
+        if (dutyFile != nullptr) {
+            fclose(dutyFile);
+        }
+    }
+
+    PiGPIODCapabilities& setResetMode(const std::string& mode) {
+        resetMode = mode;
+        return *this;
+    }
+    PiGPIODCapabilities& setPwm(int p, int sub) {
+        GPIODCapabilities::setPwm(p, sub);
+        return *this;
+    }
+    PiGPIODCapabilities& setUART(const std::string& u, const std::string& um) {
+        uart = u;
+        uartMode = um;
+        return *this;
+    }
+    // The pin is a data line (MISO/MOSI/SCLK) of SPI bus b when muxed to alt.  Only
+    // for a bus the device tree enables with no pins claimed (fpp-spi1-nopins), the
+    // same way setUART() pairs with fpp-uart0-nopins.
+    PiGPIODCapabilities& setSPI(int b, const std::string& alt) {
+        spiBus = b;
+        spiMode = alt;
+        return *this;
+    }
+    virtual void releasePin() const override {
+        char buf[256];
+        if (dpiConfigured) {
+            // A pixel data (or latch) line.  Returning it to a plain input leaves
+            // it floating - or on the Pi 5, at "function none" with a weak
+            // pull-down - and the hat's buffer then amplifies whatever noise it
+            // picks up into random colours on the string for the rest of the
+            // shutdown/reboot (issue #2895).  Park it as a driven-low output
+            // instead: pinctrl writes the pad registers directly, so this
+            // survives fppd exiting, and low is idle for WS281x.  It holds until
+            // the next boot resets the pad; fppd's Init() then muxes the pin back
+            // to DPI only after a blank frame is already in the framebuffer.
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d op dl", gpio);
+            dpiConfigured = false;
+        } else {
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d %s", gpio, resetMode.c_str());
+        }
+        system(buf);
+        GPIODCapabilities::releasePin();
+    }
+    virtual int configPin(const std::string& mode = "gpio",
+                          bool directionOut = true,
+                          const std::string& desc = "") const override {
+        // see https://datasheets.raspberrypi.com/rp1/rp1-peripherals.pdf
+        // 1-3: https://elinux.org/RPi_BCM2835_GPIOs
+        // 4/5: https://elinux.org/RPi_BCM2711_GPIOs
+
+        // A data line of a bus the device tree enables with no pins claimed
+        // (fpp-spi1-nopins), so the spi controller never owns it here.  Anything
+        // else holding the pin -- i2s on P1-35/38/40 under an audio overlay, say
+        // -- has to let go before a "pinctrl set" to the SPI alt sticks, and a
+        // pin that cannot be freed is refused rather than half-muxed.
+        if (mode == "spi") {
+            if (spiBus == -1) {
+                LogWarn(VB_GPIO, "Pin %s has no SPI function\n", name.c_str());
+                return -1;
+            }
+            if (!releasePinFromKernelDriver(gpio, name, "SPI")) {
+                return -1;
+            }
+            char buf[256];
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d %s", gpio, spiMode.c_str());
+            system(buf);
+            return 0;
+        }
+
+        // Under strict pinmux a pin the device tree handed to a peripheral has to be
+        // reclaimed from that driver before any gpiod request on it can succeed, and
+        // before a "pinctrl set" to another alt function sticks: the pinctrl driver
+        // reasserts its claim, so a string output on a pin spi0 owns silently stayed
+        // SPI.  See releasePinFromKernelDriver() above.
+        if (startsWith(mode, "gpio") || mode == "dpi" || mode == "pwm" || mode == "uart") {
+            releasePinFromKernelDriver(gpio, name, mode == "dpi" ? "DPI" : mode == "pwm" ? "PWM" : mode == "uart" ? "UART" : "GPIO");
+        }
+
+        if (mode == "pwm" && pwm != -1) {
+            // alt3 is pwm
+            char buf[256];
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d a3", gpio);
+            system(buf);
+            return 0;
+        }
+
+        if (mode == "dpi") {
+            // Pi 5 (RP1): DPI is alt1, Pi 4 and earlier (BCM2711/BCM2835): DPI is alt2
+            const char* alt = isPi5() ? "a1" : "a2";
+            char buf[256];
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d %s", gpio, alt);
+            system(buf);
+            dpiConfigured = true;
+            return 0;
+        }
+        if (mode == "uart" && !uart.empty() && !uartMode.empty()) {
+            char buf[256];
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d %s", gpio, uartMode.c_str());
+            system(buf);
+            return 0;
+        }
+        if (mode == "gpio_od") {
+            // Open-drain (bit-banged I2C): set the pad to GPIO function with the
+            // input buffer + pull-up enabled via pinctrl, then create the
+            // open-drain gpiod request that actually drives/senses the line.
+            char buf[256];
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d ip pu", gpio);
+            system(buf);
+            return GPIODCapabilities::configPin("gpio_od", false, desc);
+        }
+        // Pins whose resetMode is an alt-function sentinel ("a0"/"a3" -- the
+        // i2c/uart/spi header pins the device tree hands to a peripheral) come out of
+        // reset muxed away from GPIO, so push the pad back to the gpio function with
+        // pinctrl first.  (gpio_pu/gpio_pd are left out: pinctrl's bare direction set
+        // carries no bias, and those pins are fine going straight to the request.)
+        //
+        // This must NOT return early.  A gpio* mode only becomes usable once
+        // GPIODCapabilities::configPin() has requested the line: without a live
+        // request setValue()/getValue() are silent no-ops and requestEventFile() has
+        // no lastBias/lastDesc to work from.  Returning here instead is a bug that has
+        // now surfaced three times -- P1-35/GPIO19 floating on Pi5 (the "no" sentinel,
+        // #2768), pull-up/down inputs coming up floating on any pin left at the
+        // class-default "a0", and a plain "gpio" OUTPUT on P1-10/GPIO15 (uart0 RX,
+        // which some Pi capes use as a port enable pin) muxing correctly but never
+        // driving, leaving that port permanently dark (#2979).
+        if (startsWith(mode, "gpio") && mode != "gpio_pu" && mode != "gpio_pd" &&
+            (resetMode == "a0" || resetMode == "a3")) {
+            char buf[256];
+            snprintf(buf, 256, "/usr/bin/pinctrl set %d %s", gpio, directionOut ? "op" : "ip");
+            system(buf);
+        }
+
+        if (mode == "pwm" || mode == "uart") {
+            return 0;
+        }
+        return GPIODCapabilities::configPin(mode, directionOut, desc);
+    }
+
+    virtual bool supportPWM() const override { return pwm != -1; }
+    virtual bool setupPWM(int maxValue = 25500) const override {
+        if (pwm != -1 && dutyFile != nullptr) {
+            // Already set up. Each call opened another duty_cycle stream and
+            // leaked the last; reopening instead would close a FILE* that
+            // setPWMValue() on an output thread may be writing to.  The pin
+            // itself is muxed again, though: an output reload closes the old
+            // output first, and its releasePin() put the pin back to its reset
+            // mode, so the new output's PWM never reached it.  A caller that
+            // wants another period (SetupExtGPIO vs the GPIO output) gets it.
+            configPin("pwm", true, "PWM");
+            if (maxValue != pwmPeriod) {
+                char name[128];
+                // duty_cycle may not exceed period: zero it before a shorter one
+                fprintf(dutyFile, "0");
+                fflush(dutyFile);
+                snprintf(name, sizeof(name), "/sys/class/pwm/pwmchip0/pwm%d/period", subPwm);
+                FILE* f = fopen(name, "w");
+                if (f) {
+                    fprintf(f, "%d", maxValue);
+                    fclose(f);
+                    pwmPeriod = maxValue;
+                }
+            }
+            return true;
+        }
+        if (pwm != -1) {
+            configPin("pwm", true, "PWM");
+            char dir_name[128];
+            FILE* dir = fopen("/sys/class/pwm/pwmchip0/export", "w");
+            if (!dir) {
+                return false;
+            }
+            fprintf(dir, "%d", subPwm);
+            fclose(dir);
+
+            snprintf(dir_name, sizeof(dir_name), "/sys/class/pwm/pwmchip0/pwm%d/period", subPwm);
+            dir = fopen(dir_name, "w");
+            if (!dir) {
+                return false;
+            }
+            fprintf(dir, "%d", maxValue);
+            fclose(dir);
+            pwmPeriod = maxValue;
+
+            snprintf(dir_name, sizeof(dir_name), "/sys/class/pwm/pwmchip0/pwm%d/duty_cycle", subPwm);
+            dutyFile = fopen(dir_name, "w");
+            if (!dutyFile) {
+                return false;
+            }
+            fprintf(dutyFile, "0");
+            fflush(dutyFile);
+
+            snprintf(dir_name, sizeof(dir_name), "/sys/class/pwm/pwmchip0/pwm%d/enable", subPwm);
+            dir = fopen(dir_name, "w");
+            if (!dir) {
+                return false;
+            }
+            fprintf(dir, "1");
+            fclose(dir);
+            return true;
+        }
+        return false;
+    }
+    virtual void setPWMValue(int valueNS) const override {
+        // dutyFile is only opened by a setupPWM() that succeeded; every caller
+        // (the GPIO output, the ExtGPIO command) reaches here regardless.
+        if (pwm != -1 && dutyFile) {
+            fprintf(dutyFile, "%d", valueNS);
+            fflush(dutyFile);
+        }
+    }
+
+    static int getPinctrlRpiChip() {
+        if (pinctrlRpiChip == -1) {
+            pinctrlRpiChip = 0; // Default fallback
+#ifdef IS_GPIOD_CXX_V2
+            int has54lineChip = -1;
+            std::string has54lineChipName;
+            for (const auto& entry : std::filesystem::directory_iterator("/dev/")) {
+                if (startsWith(entry.path().filename().string(), "gpiochip")) {
+                    try {
+                        auto chip = gpiod::chip(entry.path().string());
+                        auto info = chip.get_info();
+                        if (info.label() == "pinctrl-rp1" || info.label() == "pinctrl-bcm2711" || info.label() == "pinctrl-bcm2835") {
+                            pinctrlRpiChip = std::stoi(entry.path().filename().string().substr(8));
+                            pinctrlRpiChipName = info.name();
+                            return pinctrlRpiChip;
+                        } else if (info.num_lines() == 54) {
+                            has54lineChip = std::stoi(entry.path().filename().string().substr(8));
+                            has54lineChipName = info.name();
+                        }
+                    } catch (...) {
+                        // Chip doesn't exist, continue
+                    }
+                }
+            }
+            if (has54lineChip != -1) {
+                pinctrlRpiChip = has54lineChip;
+                pinctrlRpiChipName = has54lineChipName;
+                return pinctrlRpiChip;
+            }
+#else
+            for (auto& a : gpiod::make_chip_iter()) {
+                std::string label = a.label();
+                if (label == "pinctrl-rp1" || label == "pinctrl-bcm2711" || label == "pinctrl-bcm2835") {
+                    pinctrlRpiChipName = a.name();
+                    return pinctrlRpiChip;
+                }
+                pinctrlRpiChip++;
+            }
+            // didn't find it by name, try finding the chip with 54 lines
+            pinctrlRpiChip = 0;
+            for (auto& a : gpiod::make_chip_iter()) {
+                if (a.num_lines() == 54) {
+                    pinctrlRpiChipName = a.name();
+                    return pinctrlRpiChip;
+                }
+                pinctrlRpiChip++;
+            }
+#endif
+        }
+        return pinctrlRpiChip;
+    }
+    mutable FILE* dutyFile = nullptr;
+    mutable int pwmPeriod = 0; // ns, as last written to the period file
+    static int pinctrlRpiChip;
+    static std::string pinctrlRpiChipName;
+    std::string resetMode = "a0";
+    mutable bool dpiConfigured = false; // muxed for DPI; released as output-low, see releasePin()
+    std::string uartMode;
+    int spiBus = -1; // logical SPI bus this pin is a data line of, -1 if none
+    std::string spiMode;
+};
+int PiGPIODCapabilities::pinctrlRpiChip = -1;
+std::string PiGPIODCapabilities::pinctrlRpiChipName;
+static std::vector<PiGPIODCapabilities> PI_PINS;
+
+void PiGPIOPinProvider::Init() {
+    std::string ipOrNo = isPi5() ? "no" : "ip";
+    std::string i2c = isPi5() ? "a3" : "a0";
+    // SPI1 sits on the I2S pins; RP1 puts it on alt0 where the older SoCs use alt4
+    std::string spi1 = isPi5() ? "a0" : "a4";
+    PI_PINS.push_back(PiGPIODCapabilities("P1-3", 2).setResetMode(i2c));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-5", 3).setResetMode(i2c));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-7", 4));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-8", 14).setUART("ttyAMA0-tx", isPi5() ? "a4" : "a0"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-10", 15).setUART("ttyAMA0-rx", isPi5() ? "a4" : "a0"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-11", 17).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-12", 18).setPwm(0, 0).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-13", 27).setPwm(0, 1).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-15", 22).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-16", 23).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-18", 24).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-19", 10));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-21", 9));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-22", 25).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-23", 11));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-24", 8).setResetMode("op"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-26", 7).setResetMode("op"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-27", 0).setResetMode("ip"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-28", 1).setResetMode("ip"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-29", 5).setResetMode("ip"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-31", 6).setResetMode("ip"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-32", 12).setResetMode("ip").setPwm(0, 0));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-33", 13).setResetMode("ip"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-35", 19).setResetMode(ipOrNo).setPwm(0, 1).setSPI(1, spi1));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-36", 16).setResetMode(ipOrNo));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-37", 26).setResetMode("ip"));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-38", 20).setResetMode(ipOrNo).setSPI(1, spi1));
+    PI_PINS.push_back(PiGPIODCapabilities("P1-40", 21).setResetMode(ipOrNo).setSPI(1, spi1));
+
+    PiFacePinCapabilities::Init();
+}
+const PinCapabilities& PiGPIOPinProvider::getPinByName(const std::string& name) {
+    for (auto& a : PI_PINS) {
+        if (a.name == name) {
+            return a;
+        }
+    }
+    return PiFacePinCapabilities::getPinByName(name);
+}
+const PinCapabilities& PiGPIOPinProvider::getPinByGPIO(int chip, int gpio) {
+    if (chip == 0) {
+        for (auto& a : PI_PINS) {
+            if (a.gpioIdx == chip && a.gpio == gpio) {
+                return a;
+            }
+        }
+    }
+    return PiFacePinCapabilities::getPinByGPIO(chip, gpio);
+}
+
+std::vector<std::string> PiGPIOPinProvider::getPinNames() {
+    std::vector<std::string> ret;
+    for (auto& a : PI_PINS) {
+        ret.push_back(a.name);
+    }
+    PiFacePinCapabilities::getPinNames(ret);
+    return ret;
+}
+const PinCapabilities& PiGPIOPinProvider::getPinByUART(const std::string& n) {
+    for (auto& a : PI_PINS) {
+        if (a.uart == n) {
+            return a;
+        }
+    }
+    return PiFacePinCapabilities::getPinByUART(n);
+}

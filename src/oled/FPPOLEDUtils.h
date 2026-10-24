@@ -1,81 +1,79 @@
-#ifndef  __FPPOLEDUTILS__
-#define  __FPPOLEDUTILS__
+#pragma once
 
-#include <vector>
+#include <list>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include <curl/curl.h>
-#include <jsoncpp/json/json.h>
+class FPPStatusOLEDPage;
+class PinCapabilities;
+
+#include <atomic>
 
 class FPPOLEDUtils {
 public:
     FPPOLEDUtils(int ledType);
     ~FPPOLEDUtils();
 
-    bool doIteration(int count);
-  
-    
     void run();
-    void cycleTest();
-private:
-    int getLinesPage0(std::vector<std::string> &lines,
-                      Json::Value &result,
-                      bool allowBlank);
-    int getLinesPage1(std::vector<std::string> &lines,
-                      Json::Value &result,
-                      bool allowBlank);
-    void readImage();
+    void cleanup();
 
-    
-    void fillInNetworks();
-    int getSignalStrength(char *iwname);
-    void outputNetwork(int idx, int y);
-    
-    int outputTopPart(int startY, int count);
-    int outputBottomPart(int startY, int count);
+    // Set by fppoled's SIGINT/SIGTERM handlers (a lock-free atomic is all a
+    // handler may touch); run() returns once it is non-zero.
+    static std::atomic<int> exitSignal;
 
-    
-    int _ledType;
-    std::vector<std::string> networks;
-    std::vector<int> signalStrength;
-    
-    int _currentTest;
-    int _curPage;
-    bool _displayOn;
-    bool _doFullStatus;
-    
-    int _imageWidth;
-    int _imageHeight;
-    std::vector<uint8_t> _image;
-    
-    CURL *curl;
-    std::string buffer;
-    int sockfd;
-    
-    
     class InputAction {
     public:
+        InputAction() {}
+        ~InputAction();
+
         class Action {
         public:
-            Action(const std::string &a, int min, int max, long long mai)
-                : action(a), actionValueMin(min), actionValueMax(max), minActionInterval(mai), nextActionTime(0) {}
+            Action(const std::string& a, int min, int max, long long mai, const PinCapabilities* pin = nullptr) :
+                action(a),
+                actionValueMin(min),
+                actionValueMax(max),
+                minActionInterval(mai),
+                nextActionTime(0),
+                gpiodPin(pin) {}
+            virtual ~Action() {}
+
             std::string action;
             int actionValueMin;
             int actionValueMax;
             long long minActionInterval;
             long long nextActionTime;
+
+            virtual bool checkAction(int i, long long ntimeus);
+            const PinCapabilities* gpiodPin = nullptr;
         };
-        
+
         std::string pin;
         std::string mode;
         std::string edge;
-        int file;
-        std::vector<Action> actions;
-        
-        const std::string &checkAction(int i, long long time);
-    };
-    bool parseInputActions(const std::string &file, std::vector<InputAction> &actions);
-    bool checkStatusAbility();
-};
+        const PinCapabilities* gpiodPin = nullptr;
+        int file = -1;
+        int pollIndex = -1;
+        std::list<Action*> actions;
 
-#endif
+        virtual const std::string& checkAction(int i, long long time);
+    };
+
+private:
+    int _ledType;
+    FPPStatusOLEDPage* statusPage;
+
+    std::vector<InputAction*> actions;
+
+    bool setupControlPin(const std::string& file);
+    bool parseInputActions(const std::string& file);
+    bool parseInputActionFromGPIO(const std::string& file);
+
+    InputAction* configureGPIOPin(const std::string& pin,
+                                  const std::string& mode,
+                                  const std::string& edge,
+                                  const std::string& name = "");
+
+    void setInputFlag(const std::string& action);
+    int inputFlags = 0;
+};

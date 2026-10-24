@@ -1,0 +1,1673 @@
+/*
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
+ *
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
+ *
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
+ */
+
+#include "fpp-pch.h"
+
+#include <sys/stat.h>
+#include <atomic>
+#include <unordered_map>
+
+#include "fpp-json.h"
+#include "Warnings.h"
+
+#if __has_include(<sys/posix_shm.h>)
+#include <sys/posix_shm.h>
+#else
+#include <limits.h>
+#define PSHMNAMLEN NAME_MAX
+#endif
+
+#include <Magick++/Blob.h>
+#include <Magick++/Color.h>
+#include <Magick++/Geometry.h>
+#include <Magick++/Image.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <algorithm>
+#include <cstdint>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <list>
+#include <set>
+#include <memory>
+#include <mutex>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <time.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+#include "../Plugins.h"
+#include "../Sequence.h"
+#include "../commands/Commands.h"
+#include "../common.h"
+#include "../effects.h"
+#include "../log.h"
+#include "../settings.h"
+
+#include "PixelOverlay.h"
+#include "PixelOverlayEffects.h"
+#include "PixelOverlayModel.h"
+#include "PixelOverlayModelSub.h"
+#include "../channeloutput/channeloutputthread.h"
+
+// The channel order a model reads and writes.  This is the order of fppd's
+// channel data, not of the wire: setPixelValue() stores r, then g, then b,
+// then w into consecutive channels, and the output driver is what permutes
+// those into the hardware's colour order.  It therefore follows entirely from
+// how many channels a node occupies.
+static const char* ChannelDataOrder(int channelsPerNode) {
+    switch (channelsPerNode) {
+    case 1:
+        return "W";
+    case 2:
+        return "RG";
+    case 3:
+        return "RGB";
+    default:
+        return "RGBW";
+    }
+}
+
+// Both of a model's buffers (the channel data and the overlay buffer) are
+// allocated the same way and with the same fallbacks, so they share this.
+//
+// The buffer is shared memory when it can be, because external programs read
+// it; when it cannot be, a private anonymous mapping is just as good to us.
+// Each step is checked, and the caller is told which one won so it can release
+// the buffer the way it was allocated -- munmap() on a malloc()ed pointer is
+// not a no-op.
+//
+// Returns nullptr only if every allocator failed, which means the box is out of
+// memory. Callers must handle that: a model with no buffer draws nothing, which
+// is survivable, and the alternative here used to be a wild write through a
+// null pointer.
+static uint8_t* createModelMemory(const std::string& dataName, uint32_t size, bool& mapped) {
+    mapped = true;
+    if (size < 8) {
+        // cannot mmap 0 size which some models happen to have
+        size = 8;
+    }
+
+    mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+    // No name: private memory, for a model that has given its names up.
+    int f = dataName.empty() ? -1 : shm_open(dataName.c_str(), O_RDWR | O_CREAT, mode);
+    if (f != -1) {
+        int rc = ftruncate(f, size);
+        if (rc == -1) {
+            // if ftruncate fails, we need to completely reset
+            close(f);
+            shm_unlink(dataName.c_str());
+            f = shm_open(dataName.c_str(), O_RDWR | O_CREAT, mode);
+            if (f != -1 && ftruncate(f, size) == -1) {
+                close(f);
+                f = -1;
+            }
+        }
+    }
+    if (f == -1) {
+        if (!dataName.empty()) {
+            LogWarn(VB_CHANNELOUT, "Could not create shared memory block for %s:  %s\n",
+                    dataName.c_str(), FPPstrerror(errno));
+        }
+    } else {
+        uint8_t* data = (uint8_t*)mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+        close(f);
+        if (data != MAP_FAILED) {
+            return data;
+        }
+        LogWarn(VB_CHANNELOUT, "Could not mmap shared memory for %s:  %s\n",
+                dataName.c_str(), FPPstrerror(errno));
+        shm_unlink(dataName.c_str());
+    }
+
+    // Private memory instead: external programs lose their view of this model,
+    // but fppd itself works normally.  MAP_ANON has to be paired with one of
+    // MAP_PRIVATE/MAP_SHARED -- on its own mmap() returns EINVAL, so for as
+    // long as that pairing was missing this fallback could not succeed and
+    // every failure here landed on the unchecked malloc() below.
+    uint8_t* data = (uint8_t*)mmap(0, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (data != MAP_FAILED) {
+        return data;
+    }
+
+    mapped = false;
+    data = (uint8_t*)malloc(size);
+    if (data) {
+        // mmap() hands back zeroed pages and callers rely on that; malloc() does not.
+        memset(data, 0, size);
+    } else {
+        LogErr(VB_CHANNELOUT, "Out of memory allocating %u bytes for %s\n", size, dataName.c_str());
+    }
+    return data;
+}
+
+// Serializes the lazy overlay buffer allocation (see getOverlayBuffer()) and
+// guards s_namesReleased.
+static std::mutex s_overlayBufferAllocLock;
+// Models that have given up their shm names (releaseSharedMemoryNames()). A
+// member would change the plugin-visible layout. The destructor erases its
+// entry, so a new model at the same address starts with its names.
+static std::set<const PixelOverlayModel*> s_namesReleased;
+
+// The shm name for a model buffer, shortened where the system's limit demands it.
+static std::string modelMemoryName(const std::string& prefix, const std::string& shortPrefix,
+                                   const std::string& name) {
+    if (PSHMNAMLEN > 48) {
+        return prefix + name;
+    }
+    // system doesn't allow very long shared memory names, we'll use a shortened form
+    std::string n = shortPrefix + name;
+    if (n.size() > PSHMNAMLEN) {
+        n = n.substr(0, PSHMNAMLEN);
+    }
+    return n;
+}
+
+// Model definitions come from model-overlays.json, which POST /api/models
+// (xLights' FPP Connect) writes unchecked, and from xlights-submodels.json.
+// jsoncpp's asInt()/asString() throw on the wrong type, and nothing above the
+// constructor catches - at boot that was a crash on every start. These read a
+// field the way a hand-edited file might hold it (a number, or a number in a
+// string) and report anything else instead of throwing.
+bool PixelOverlayModel::configInt(const Json::Value& c, const char* key, int dflt, int& out) {
+    if (!c.isMember(key) || c[key].isNull()) {
+        out = dflt;
+        return true;
+    }
+    const Json::Value& v = c[key];
+    if (v.isBool()) {
+        out = v.asBool() ? 1 : 0;
+        return true;
+    }
+    if (v.isNumeric()) {
+        double d = v.asDouble();
+        if (d < INT_MIN || d > INT_MAX) {
+            return false;
+        }
+        out = (int)d;
+        return true;
+    }
+    if (v.isString()) {
+        std::string str = v.asString();
+        if (str.empty()) {
+            out = dflt;
+            return true;
+        }
+        char* end = nullptr;
+        errno = 0;
+        long l = strtol(str.c_str(), &end, 10);
+        if (errno || *end != '\0' || l < INT_MIN || l > INT_MAX) {
+            return false;
+        }
+        out = (int)l;
+        return true;
+    }
+    return false;
+}
+bool PixelOverlayModel::configString(const Json::Value& c, const char* key, std::string& out) {
+    if (!c.isMember(key) || c[key].isNull()) {
+        out.clear();
+        return true;
+    }
+    const Json::Value& v = c[key];
+    if (v.isObject() || v.isArray()) {
+        return false;
+    }
+    out = v.asString();
+    return true;
+}
+
+// Logs why and releases channelData, so isValid() is false and the manager
+// drops the model. For constructors only.
+void PixelOverlayModel::markInvalid(const std::string& why) {
+    LogErr(VB_CHANNELOUT, "Overlay model '%s' is not usable: %s\n", name.c_str(), why.c_str());
+    if (channelData) {
+        if (channelDataMapped) {
+            munmap(channelData, std::max(channelCount, 8));
+            shm_unlink(modelMemoryName("/FPP-Model-Data-", "/FPPMD-", name).c_str());
+        } else {
+            free(channelData);
+        }
+        channelData = nullptr;
+    }
+}
+
+// Largest buffer a model may describe, in cells (pixels). Above this the
+// channel map alone would run to hundreds of MB.
+static constexpr int64_t MAX_MODEL_CELLS = 4096 * 1024;
+
+PixelOverlayModel::PixelOverlayModel(const Json::Value& c) :
+    config(c),
+    overlayBufferData(nullptr),
+    channelData(nullptr),
+    runningEffect(nullptr) {
+    // Any definition this constructor cannot represent safely leaves
+    // channelData null and returns: isValid() is then false and the manager
+    // drops the model, with the reason in the log. Nothing below may throw.
+    if (!config.isObject()) {
+        markInvalid("its definition is not a JSON object");
+        return;
+    }
+    std::string orientation;
+    std::string startCorner;
+    int strings = 0;
+    int sps = 0;
+    int cfgWidth = 0;
+    int cfgHeight = 0;
+    int pixelSize = 0;
+    if (!configString(config, "Name", name) || !configString(config, "Type", type) ||
+        !configString(config, "BufferStyle", bufferStyle) ||
+        !configString(config, "Orientation", orientation) || !configString(config, "StartCorner", startCorner)) {
+        markInvalid("a text field (Name, Type, BufferStyle, Orientation or StartCorner) is not text");
+        return;
+    }
+    replaceAll(name, "/", "_");
+    if (!configInt(config, "StartChannel", 0, startChannel) || !configInt(config, "ChannelCount", 0, channelCount) ||
+        !configInt(config, "StringCount", 0, strings) || !configInt(config, "StrandsPerString", 0, sps) ||
+        !configInt(config, "ChannelCountPerNode", 3, channelsPerNode) ||
+        !configInt(config, "Width", 0, cfgWidth) || !configInt(config, "Height", 0, cfgHeight) ||
+        !configInt(config, "PixelSize", 0, pixelSize)) {
+        markInvalid("a numeric field is not a number");
+        return;
+    }
+    startChannel--; // need to be 0 based
+    if (sps == 0) {
+        sps = 1;
+    }
+
+    // An empty or one-letter StartCorner used to index past the string.
+    bool TtoB = startCorner.size() < 1 || startCorner[0] == 'T';
+    bool LtoR = startCorner.size() < 2 || startCorner[1] == 'L';
+
+    if (channelsPerNode == 0) {
+        channelsPerNode = 1;
+    }
+    if (type == "FB") {
+        // The framebuffer copies channelData as packed RGB, width*height*3
+        // bytes; any other node width under- or over-ran it.
+        channelsPerNode = 3;
+    }
+    if (channelsPerNode < 1 || channelsPerNode > 32) {
+        markInvalid("ChannelCountPerNode " + std::to_string(channelsPerNode) + " is out of range (1-32)");
+        return;
+    }
+    bytesPerPixel = (channelsPerNode >= 4) ? 4 : 3;
+
+    // A model addresses fppd's channel data, which is always R,G,B[,W] - the
+    // output driver is what applies the hardware wire order.  So the order the
+    // model sees is fully determined by the node width and is derived here
+    // rather than stored: any ColorOrder in the saved config is overwritten.
+    // Exported read-only through the API so the UI can show it.
+    config["ColorOrder"] = ChannelDataOrder(channelsPerNode);
+
+    if (type != "Channel") {
+        if (pixelSize > 1) {
+            width = cfgWidth / pixelSize;
+            height = cfgHeight / pixelSize;
+        } else {
+            width = cfgWidth;
+            height = cfgHeight;
+        }
+        if (width < 1 || height < 1 || (int64_t)width * height > MAX_MODEL_CELLS) {
+            markInvalid("size " + std::to_string(width) + "x" + std::to_string(height) + " is out of range");
+            return;
+        }
+        config["ChannelCount"] = channelCount = width * height * channelsPerNode;
+        config["StringCount"] = strings = height;
+        config["StrandsPerString"] = sps = 1;
+        config["StartChannel"] = startChannel = 0;
+        config["Orientation"] = orientation = "horizontal";
+        config["StartCorner"] = startCorner = "TL";
+        TtoB = true;
+        LtoR = true;
+    } else {
+        // doOverlay() copies channelCount bytes to channels[startChannel], in
+        // a buffer that ends at FPPD_MAX_CHANNELS: StartChannel 0 wrote
+        // channels[-1], and a range past the end wrote past the buffer, every
+        // frame, on the channel output thread.
+        if (startChannel < 0 || channelCount < 1 ||
+            (int64_t)startChannel + channelCount > FPPD_MAX_CHANNELS) {
+            markInvalid("channels " + std::to_string(startChannel + 1) + " + " + std::to_string(channelCount) +
+                    " do not fit in 1-" + std::to_string(FPPD_MAX_CHANNELS));
+            return;
+        }
+        if (strings < 0 || sps < 0) {
+            markInvalid("StringCount and StrandsPerString must not be negative");
+            return;
+        }
+        int64_t h = (int64_t)strings * sps;
+        height = (h < 1 || h > INT_MAX) ? 1 : (int)h;
+        width = channelCount / channelsPerNode;
+        width /= height;
+        if (width == 0) {
+            width = 1;
+        }
+    }
+
+    channelData = createModelMemory(modelMemoryName("/FPP-Model-Data-", "/FPPMD-", name),
+                                    channelCount, channelDataMapped);
+    if (!channelData) {
+        WarningHolder::AddWarning(WARNING_ID_MODEL_MEMORY, MODEL_MEMORY_WARNING);
+    }
+
+    if (orientation == "V" || orientation == "vertical") {
+        channelMap.resize(width * height * bytesPerPixel);
+
+        std::swap(width, height);
+        for (int x = 0; x < width; x++) {
+            int segment = x % sps;
+            for (int y = 0; y < height; y++) {
+                // pos in the normal overlay buffer
+                int ppos = y * width + x;
+                // Relative Input Pixel first channel
+                int inCh = (ppos * bytesPerPixel);
+
+                // X position in output
+                int outX = (LtoR) ? x : width - x - 1;
+                // Y position in output
+                int outY = (TtoB == (segment % 2)) ? height - y - 1 : y;
+
+                // Relative Mapped Output Pixel first channel
+                int mpos = outX * height + outY;
+                int outCh = (mpos * channelsPerNode);
+
+                for (int cho = 0; cho < bytesPerPixel; cho++) {
+                    if (cho < channelsPerNode) {
+                        channelMap[inCh + cho] = outCh + cho;
+                    } else {
+                        channelMap[inCh + cho] = FPPD_OFF_CHANNEL;
+                    }
+                }
+            }
+        }
+    } else if (orientation == "C" || orientation == "custom") {
+        // Two formats supported:
+        //   "data": dense format "n,n,n;n,n,n|n,n,n;n,n,n" (comma=col, semi=row, pipe=layer)
+        //   "compressedData": sparse format "node,row,col[,layer];..." (only non-empty cells)
+        std::string compressed;
+        std::string dense;
+        if (!configString(config, "compressedData", compressed) || !configString(config, "data", dense)) {
+            markInvalid("custom model data is not text");
+            return;
+        }
+        if (!compressed.empty()) {
+            // Parse compressed format: "node,row,col[,layer];node,row,col[,layer];..."
+            std::vector<std::string> entries = split(compressed, ';');
+
+            struct NodeEntry {
+                int node, row, col, layer;
+            };
+            std::vector<NodeEntry> nodes;
+            nodes.reserve(entries.size());
+
+            int maxRow = 0, maxCol = 0, maxLayer = 0;
+            for (auto& entry : entries) {
+                std::vector<std::string> parts = split(entry, ',');
+                if (parts.size() >= 3) {
+                    NodeEntry ne;
+                    ne.node = std::atoi(parts[0].c_str());
+                    ne.row = std::atoi(parts[1].c_str());
+                    ne.col = std::atoi(parts[2].c_str());
+                    ne.layer = (parts.size() >= 4) ? std::atoi(parts[3].c_str()) : 0;
+                    // Negative row/col/layer indexed channelMap before its
+                    // start (a heap write), and huge ones overflowed the int
+                    // size below; no real model is 4096 cells on a side.
+                    if (ne.node > 0 && ne.node <= FPPD_MAX_CHANNEL_NUM &&
+                        ne.row >= 0 && ne.row < 4096 && ne.col >= 0 && ne.col < 4096 &&
+                        ne.layer >= 0 && ne.layer < 4096) {
+                        nodes.push_back(ne);
+                        maxRow = std::max(maxRow, ne.row);
+                        maxCol = std::max(maxCol, ne.col);
+                        maxLayer = std::max(maxLayer, ne.layer);
+                    }
+                }
+            }
+
+            width = maxCol + 1;
+            int64_t allLayers = (int64_t)(maxRow + 1) * (maxLayer + 1);
+            height = allLayers > INT_MAX ? INT_MAX : (int)allLayers;
+            if (width < 1) width = 1;
+            if (height < 1) height = 1;
+            if ((int64_t)width * height > (600 * 600)) {
+                // Limit to first layer only
+                height = maxRow + 1;
+                if (height < 1) height = 1;
+            }
+            if ((int64_t)width * height > MAX_MODEL_CELLS) {
+                markInvalid("custom model is " + std::to_string(width) + "x" + std::to_string(height) + ", too large");
+                return;
+            }
+
+            channelMap.resize(width * height * bytesPerPixel);
+            // Initialize all to FPPD_OFF_CHANNEL
+            std::fill(channelMap.begin(), channelMap.end(), FPPD_OFF_CHANNEL);
+
+            int layerHeight = maxRow + 1;
+            for (auto& ne : nodes) {
+                int y = ne.row + ne.layer * layerHeight;
+                if (y >= height || ne.col >= width) {
+                    continue;
+                }
+                for (int cho = 0; cho < bytesPerPixel; cho++) {
+                    if (cho < channelsPerNode) {
+                        channelMap[(y * width * bytesPerPixel) + (ne.col * bytesPerPixel) + cho] = (ne.node - 1) * channelsPerNode + cho;
+                    }
+                }
+            }
+        } else {
+            // Parse dense format: "n,n,n;n,n,n|n,n,n;n,n,n"
+            std::string customData = ",;,";
+            if (config.isMember("data")) {
+                customData = dense;
+            }
+            int endOfFirstLayer = 0;
+            std::vector<std::string> layers = split(customData, '|');
+            std::vector<std::vector<std::string>> allData;
+            width = 1;
+            height = 0; // counted from the rows below, not StringCount
+            for (auto& layer : layers) {
+                std::vector<std::string> lines = split(layer, ';');
+                for (auto& l : lines) {
+                    allData.push_back(split(l, ','));
+                    width = std::max(width, (int)allData.back().size());
+                    height++;
+                }
+                if (endOfFirstLayer == 0) {
+                    endOfFirstLayer = allData.size();
+                }
+                lines.clear();
+                if ((int64_t)width * height > (600 * 600)) {
+                    height = endOfFirstLayer;
+                    allData.erase(allData.begin() + endOfFirstLayer, allData.end());
+                    break;
+                }
+            }
+            if (height < 1) {
+                height = 1;
+            }
+            if ((int64_t)width * height > MAX_MODEL_CELLS) {
+                markInvalid("custom model is " + std::to_string(width) + "x" + std::to_string(height) + ", too large");
+                return;
+            }
+            channelMap.resize(width * height * bytesPerPixel);
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int node = -1;
+                    if (y < allData.size() && x < allData[y].size()) {
+                        std::string& s = allData[y][x];
+                        if (s.empty() || s.length() > 10 || s == " ") {
+                            node = -1;
+                        } else {
+                            node = std::atoi(s.c_str());
+                            if (node == 0 && s != "0") {
+                                node = -1;
+                            }
+                            if (node > FPPD_MAX_CHANNEL_NUM) {
+                                node = -1;
+                            }
+                        }
+                    }
+
+                    for (int cho = 0; cho < bytesPerPixel; cho++) {
+                        if (node != -1 && cho < channelsPerNode) {
+                            channelMap[(y * width * bytesPerPixel) + (x * bytesPerPixel) + cho] = (node - 1) * channelsPerNode + cho;
+                        } else {
+                            channelMap[(y * width * bytesPerPixel) + (x * bytesPerPixel) + cho] = FPPD_OFF_CHANNEL;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        channelMap.resize(width * height * bytesPerPixel);
+        for (int y = 0; y < height; y++) {
+            int segment = y % sps;
+            for (int x = 0; x < width; x++) {
+                // pos in the normal overlay buffer
+                int ppos = y * width + x;
+                // Input Pixel first channel
+                int inCh = (ppos * bytesPerPixel);
+
+                // X position in output
+                int outX = (LtoR == (segment % 2)) ? width - x - 1 : x;
+                // Y position in output
+                int outY = (TtoB) ? y : height - y - 1;
+
+                // Relative Mapped Output Pixel first channel
+                int mpos = outY * width + outX;
+                int outCh = (mpos * channelsPerNode);
+
+                for (int cho = 0; cho < bytesPerPixel; cho++) {
+                    if (cho < channelsPerNode) {
+                        channelMap[inCh + cho] = outCh + cho;
+                    } else {
+                        channelMap[inCh + cho] = FPPD_OFF_CHANNEL;
+                    }
+                }
+            }
+        }
+    }
+
+    // channelData is exactly channelCount bytes, but a custom model's node
+    // numbers come straight from the config and can address well past it.
+    // Every setData()/doOverlay() indexes channelData through channelMap, so
+    // enforce the bound once here rather than at each use.
+    int outOfRange = 0;
+    for (auto& ch : channelMap) {
+        if (ch != FPPD_OFF_CHANNEL && ch >= (uint32_t)channelCount) {
+            ch = FPPD_OFF_CHANNEL;
+            outOfRange++;
+        }
+    }
+    if (outOfRange) {
+        LogWarn(VB_CHANNELOUT, "Overlay model '%s': %d node channel(s) exceed the model's %d channels and were disabled\n",
+                name.c_str(), outOfRange, channelCount);
+    }
+}
+PixelOverlayModel::~PixelOverlayModel() {
+    {
+        // The running effect used to be left behind, so every output reload
+        // leaked whatever was running on an auto-created model (a WLED effect
+        // is a whole strip). Nothing else can reach it now: the effect thread
+        // was drained (removeAutoOverlayModel) or stopped (loadModelMap,
+        // shutdown) before the model is freed.
+        std::unique_lock<std::recursive_mutex> l(effectLock);
+        delete runningEffect;
+        runningEffect = nullptr;
+    }
+    // A retired model can be freed long after its replacement took its name,
+    // so nothing here may act on the name: the shm names were unlinked at
+    // retirement if it was retired. Nor does it reset its submodels: the
+    // manager has reset them by parent name at retirement, and a full reload
+    // or shutdown frees them along with it. Resetting them here, by
+    // name, disabled the replacement's submodel, and took modelsLock on
+    // whatever thread dropped the last reference -- the effect thread holds a
+    // submodel's effectLock there, the reverse of the sanctioned order.
+    bool namesReleased;
+    {
+        std::lock_guard<std::mutex> l(s_overlayBufferAllocLock);
+        namesReleased = s_namesReleased.erase(this) != 0;
+    }
+    if (channelData) {
+        if (channelDataMapped) {
+            munmap(channelData, std::max(channelCount, 8));
+            if (!namesReleased) {
+                shm_unlink(modelMemoryName("/FPP-Model-Data-", "/FPPMD-", name).c_str());
+            }
+        } else {
+            free(channelData);
+        }
+    }
+    if (overlayBufferData) {
+        if (overlayBufferMapped) {
+            munmap(overlayBufferData, width * height * bytesPerPixel + sizeof(OverlayBufferData));
+            if (!namesReleased) {
+                shm_unlink(modelMemoryName("/FPP-Model-Overlay-Buffer-", "/FPPMB-", name).c_str());
+            }
+        } else {
+            free(overlayBufferData);
+        }
+    }
+}
+
+void PixelOverlayModel::releaseSharedMemoryNames() {
+    // Under the allocation lock, so a buffer allocated concurrently either
+    // exists to be unlinked here or sees the release and stays private.
+    std::lock_guard<std::mutex> l(s_overlayBufferAllocLock);
+    if (!s_namesReleased.insert(this).second) {
+        return;
+    }
+    if (channelData && channelDataMapped) {
+        shm_unlink(modelMemoryName("/FPP-Model-Data-", "/FPPMD-", name).c_str());
+    }
+    if (overlayBufferData && overlayBufferMapped) {
+        shm_unlink(modelMemoryName("/FPP-Model-Overlay-Buffer-", "/FPPMB-", name).c_str());
+    }
+}
+
+bool PixelOverlayModel::isAutoCreated() {
+    return config.isMember("autoCreated") && config["autoCreated"].isBool() && config["autoCreated"].asBool();
+}
+
+// The state is set from the API, commands and effect threads, and read on
+// the output thread and by anything reporting it, not all under one lock.
+// atomic_ref rather than an atomic member: this class's layout is compiled
+// into plugins (see the header).
+PixelOverlayState PixelOverlayModel::getState() const {
+    return std::atomic_ref<PixelOverlayState>(const_cast<PixelOverlayState&>(state)).load(std::memory_order_relaxed);
+}
+bool PixelOverlayModel::needsOutput() const {
+    return getState().getState() != PixelOverlayState::PixelState::Disabled || hasChildren();
+}
+
+void PixelOverlayModel::setState(const PixelOverlayState& st) {
+    if (st == getState())
+        return;
+
+    // Give the buffer a little time to flush before disabling -- but not on
+    // the output thread, which is what flushes it: an effect that ends by
+    // disabling its model after the next output (EFFECT_AFTER_NEXT_OUTPUT
+    // runs there) waited out the whole 100 ms, and every output stalled.
+    if (!st.getState() && needRefresh() && !IsChannelOutputThread()) {
+        int x = 0;
+        while (needRefresh() && (x++ < 10)) {
+            usleep(10000);
+        }
+    }
+
+    PixelOverlayState old = std::atomic_ref<PixelOverlayState>(state).exchange(st, std::memory_order_relaxed);
+    PixelOverlayManager::INSTANCE.modelStateChanged(this, old, st);
+}
+// Copy-on-write publish of the child list.  See the note on `children` in the
+// header for why this must not take (or be called under) any overlay lock.
+void PixelOverlayModel::setChildState(const std::string& n, const PixelOverlayState& in, int ox, int oy, int w, int h) {
+    // flushChildren() indexes this model's channelMap with the child's
+    // rectangle on every frame, so the rectangle has to lie inside this model.
+    // A submodel saved against a parent whose geometry has since changed can
+    // point anywhere; refuse it here, where the list is written, the same way
+    // setData() refuses an out-of-bounds region.
+    PixelOverlayState st = in;
+    // 64-bit sums: an XOffset near INT_MAX wrapped ox + w negative and passed.
+    if (st.getState() && (ox < 0 || oy < 0 || w < 0 || h < 0 ||
+                          (int64_t)ox + w > width || (int64_t)oy + h > height)) {
+        LogWarn(VB_CHANNELOUT, "Submodel '%s' (%dx%d @ %d,%d) lies outside its parent '%s' (%dx%d), ignoring it\n",
+                n.c_str(), w, h, ox, oy, name.c_str(), width, height);
+        st = PixelOverlayState(PixelOverlayState::Disabled);
+    }
+
+    bool hadChildren = false;
+    bool hasChildren = false;
+
+    {
+        // Leaf lock. Writers really are concurrent -- an HTTP/command thread
+        // holds modelsLock while an effect update thread holds only this
+        // model's effectLock -- so the read-copy-publish below has to be
+        // serialized or one update is lost.  Nothing inside this scope calls
+        // out to code that takes another lock.
+        std::lock_guard<std::mutex> lk(childrenWriteLock);
+
+        auto cur = children.load();
+        hadChildren = cur && !cur->empty();
+
+        ChildModelStateList next = cur ? *cur : ChildModelStateList();
+        bool changed = false;
+        bool found = false;
+
+        auto it = next.begin();
+        while (it != next.end()) {
+            if (it->name == n) {
+                found = true;
+                if (st.getState() == 0) {
+                    it = next.erase(it);
+                    changed = true;
+                } else {
+                    if (it->state != st || it->xoffset != ox || it->yoffset != oy ||
+                        it->width != w || it->height != h) {
+                        it->state = st;
+                        it->xoffset = ox;
+                        it->yoffset = oy;
+                        it->width = w;
+                        it->height = h;
+                        changed = true;
+                    }
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+
+        if (!found && st.getState()) {
+            ChildModelState cms;
+            cms.name = n;
+            cms.state = st;
+            cms.xoffset = ox;
+            cms.yoffset = oy;
+            cms.width = w;
+            cms.height = h;
+            next.push_back(cms);
+            changed = true;
+        }
+
+        hasChildren = !next.empty();
+        if (!changed) {
+            // Nothing to publish -- and with the list unchanged, hadChildren
+            // and hasChildren agree, so neither transition below could fire.
+            return;
+        }
+        children.store(std::make_shared<const ChildModelStateList>(std::move(next)));
+    }
+
+    // Deliberately outside childrenWriteLock: modelStateChanged() takes
+    // activeModelsLock, which the channel output thread holds while it is
+    // inside the readers of `children`.
+    if (hadChildren && !hasChildren) {
+        PixelOverlayManager::INSTANCE.modelStateChanged(this, PixelOverlayState::Enabled, getState());
+    } else if (!hadChildren && hasChildren) {
+        PixelOverlayManager::INSTANCE.modelStateChanged(this, getState(), PixelOverlayState::Enabled);
+    }
+}
+
+bool PixelOverlayModel::flushChildren(uint8_t* dst) {
+    // Snapshot: the list this iterates cannot be mutated or freed by a
+    // concurrent setChildState(), which publishes a whole new list instead.
+    auto snapshot = children.load();
+    if (!snapshot || snapshot->empty()) {
+        return false;
+    }
+    for (auto& c : *snapshot) {
+        int cst = c.state.getState();
+        for (int y = 0; y < c.height; y++) {
+            int yoff = (y + c.yoffset) * width * bytesPerPixel;
+            for (int x = 0; x < c.width; x++) {
+                int off0 = (x + c.xoffset) * bytesPerPixel + yoff;
+
+                switch (cst) {
+                case 1: // Opaque
+                    for (int ch = 0; ch < bytesPerPixel; ch++) {
+                        if (channelMap[off0 + ch] != FPPD_OFF_CHANNEL) {
+                            dst[channelMap[off0 + ch]] = channelData[channelMap[off0 + ch]];
+                        }
+                    }
+                    break;
+                case 2: // Transparent
+                    for (int ch = 0; ch < bytesPerPixel; ch++) {
+                        if (channelMap[off0 + ch] != FPPD_OFF_CHANNEL && channelData[channelMap[off0 + ch]]) {
+                            dst[channelMap[off0 + ch]] = channelData[channelMap[off0 + ch]];
+                        }
+                    }
+                    break;
+                case 3: { // TransparentRGB
+                    bool cp = false;
+                    for (int ch = 0; ch < bytesPerPixel; ch++) {
+                        cp |= (channelMap[off0 + ch] != FPPD_OFF_CHANNEL && channelData[channelMap[off0 + ch]]);
+                    }
+                    if (cp) {
+                        for (int ch = 0; ch < bytesPerPixel; ch++) {
+                            if (channelMap[off0 + ch] != FPPD_OFF_CHANNEL && channelData[channelMap[off0 + ch]]) {
+                                dst[channelMap[off0 + ch]] = channelData[channelMap[off0 + ch]];
+                            }
+                        }
+                    }
+                    break;
+                }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// A plain model owns one contiguous output range, so its channelData offset is
+// simply relative to where that range starts (doOverlay() below memcpy's the
+// whole thing to &channels[startChannel]).
+uint32_t PixelOverlayModel::outputChannelForData(uint32_t dataOffset) const {
+    return static_cast<uint32_t>(startChannel) + dataOffset;
+}
+uint32_t PixelOverlayModel::outputChannelForCell(int x, int y) const {
+    if (x < 0 || y < 0 || x >= width || y >= height) {
+        return FPPD_OFF_CHANNEL;
+    }
+    size_t off = ((size_t)y * width + x) * bytesPerPixel;
+    if (off >= channelMap.size() || channelMap[off] == FPPD_OFF_CHANNEL) {
+        return FPPD_OFF_CHANNEL;
+    }
+    return outputChannelForData(channelMap[off]);
+}
+
+/*
+ * Build (once) the polar view of this model's buffer.
+ *
+ * The join runs buffer cell -> channelData offset -> absolute output channel ->
+ * position, because the virtual display map is keyed by absolute channel and
+ * every model type can already say which channel one of its buffer cells ends
+ * up on (outputChannelForData, overridden by the scattering subclasses).
+ *
+ * Any failure returns nullptr and is remembered, so a model with no geometry
+ * costs one attempt rather than one per effect start. A submodel whose parent
+ * can't be resolved yet is not an attempt: it has no channels to join.
+ */
+const PolarBufferMap* PixelOverlayModel::getPolarMap(PolarMode mode) {
+    if (mode == PolarMode::None) {
+        return nullptr;
+    }
+    PixelOverlayModelSub* sub = dynamic_cast<PixelOverlayModelSub*>(this);
+    if (sub && !sub->readyForPolarJoin()) {
+        return nullptr;
+    }
+    // Rebuild when the layout has been re-uploaded since the map was built.
+    struct stat vst;
+    long long layoutVersion = 0;
+    if (stat(FPP_DIR_CONFIG("/virtualdisplaymap").c_str(), &vst) == 0) {
+        layoutVersion = (long long)vst.st_mtime;
+    }
+    auto key = std::make_pair(mode, layoutVersion);
+
+    auto cached = polarMaps.find(key);
+    if (cached != polarMaps.end()) {
+        return cached->second.valid() ? &cached->second : nullptr;
+    }
+    PolarBufferMap& polarMap = polarMaps[key];
+
+    std::vector<std::pair<uint32_t, std::pair<float, float>>> vdm;
+    if (!LoadVirtualDisplayPositions(vdm)) {
+        LogDebug(VB_CHANNELOUT,
+                 "No config/virtualdisplaymap; polar buffer mapping unavailable for %s\n",
+                 name.c_str());
+        return nullptr;
+    }
+    std::unordered_map<uint32_t, std::pair<float, float>> pos(vdm.begin(), vdm.end());
+
+    std::vector<PolarPixel> pixels;
+    pixels.reserve(static_cast<size_t>(width) * height);
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int off = (y * width + x) * bytesPerPixel;
+            if (off < 0 || off >= (int)channelMap.size()) {
+                continue;
+            }
+            uint32_t cd = channelMap[off];
+            if (cd == FPPD_OFF_CHANNEL) {
+                continue; // a hole in the buffer
+            }
+            uint32_t ch = outputChannelForData(cd);
+            if (ch == FPPD_OFF_CHANNEL) {
+                continue;
+            }
+            auto it = pos.find(ch);
+            if (it == pos.end()) {
+                continue; // this node was never exported to the layout
+            }
+            pixels.push_back({ it->second.first, it->second.second,
+                               static_cast<uint32_t>(y * width + x) });
+        }
+    }
+
+    if (pixels.size() < 2) {
+        LogDebug(VB_CHANNELOUT,
+                 "Model %s has %zu positioned pixels; polar buffer mapping unavailable\n",
+                 name.c_str(), pixels.size());
+        return nullptr;
+    }
+
+    polarMap = BuildPolarBufferMap(pixels, mode);
+    if (!polarMap.valid()) {
+        LogDebug(VB_CHANNELOUT, "Could not build a polar buffer for %s\n", name.c_str());
+        return nullptr;
+    }
+    LogDebug(VB_CHANNELOUT, "Polar buffer for %s: %d x %d from %zu positioned pixels\n",
+             name.c_str(), polarMap.width, polarMap.height, pixels.size());
+    return &polarMap;
+}
+
+void PixelOverlayModel::doOverlay(uint8_t* channels) {
+    int st = getState().getState();
+    uint8_t* dst = &channels[startChannel];
+    if (st == 0 && hasChildren()) {
+        // this model is disable, but we have children that are
+        // enabled.  Thus, we need to apply their blending
+        // to the channel data.
+        flushChildren(dst);
+        dirtyBuffer = false;
+        return;
+    }
+    if (((st == 2) || (st == 3)) &&
+        (!IsEffectRunning()) &&
+        (!sequence->IsSequenceRunning()) &&
+        !PluginManager::INSTANCE.hasPlugins()) {
+        // there is nothing running that we would be overlaying so do a straight copy
+        st = 1;
+    }
+
+    uint8_t* src = channelData;
+    switch (st) {
+    case 1: // Active - Opaque
+        memcpy(dst, src, channelCount);
+        break;
+    case 2: // Active Transparent
+        for (int j = 0; j < channelCount; j++, src++, dst++) {
+            if (*src) {
+                *dst = *src;
+            }
+        }
+        break;
+    case 3: // Active Transparent RGB(W)
+        for (int j = 0; j < channelCount; j += channelsPerNode, src += channelsPerNode, dst += channelsPerNode) {
+            // A channel count that is not a whole number of nodes leaves a
+            // short last node; reading and writing a full node there ran past
+            // channelData and past the model's channels.
+            const int n = std::min(channelsPerNode, channelCount - j);
+            bool any = false;
+            for (int k = 0; k < n; k++) {
+                any |= src[k];
+            }
+            if (any) {
+                for (int k = 0; k < n; k++) {
+                    dst[k] = src[k];
+                }
+            }
+        }
+        break;
+    }
+
+    dirtyBuffer = false;
+}
+
+void PixelOverlayModel::setData(const uint8_t* data) {
+    for (int c = 0; c < (width * height * bytesPerPixel); c++) {
+        if (channelMap[c] != FPPD_OFF_CHANNEL) {
+            channelData[channelMap[c]] = data[c];
+        }
+    }
+    dirtyBuffer = true;
+}
+
+void PixelOverlayModel::setData(const uint8_t* data, int xOffset, int yOffset, int w, int h, const PixelOverlayState& st) {
+    if (((int64_t)w + xOffset > width) ||
+        ((int64_t)h + yOffset > height) ||
+        (xOffset < 0) || (yOffset < 0) || (w < 0) || (h < 0)) {
+        LogErr(VB_CHANNELOUT, "Error: region is out of bounds, model is %dx%d, region is %dx%d @ %d,%d\n",
+               width, height, w, h, xOffset, yOffset);
+        return;
+    }
+
+    if ((w == width) &&
+        (h == height) &&
+        (xOffset == 0) &&
+        (yOffset == 0) &&
+        (st.getState() == 1)) {
+        setData(data);
+        return;
+    }
+
+    int cst = st.getState();
+    int rowWrap = (width - w) * bytesPerPixel;
+    int s = 0;
+    int c = (yOffset * width * bytesPerPixel) + (xOffset * bytesPerPixel);
+    for (int yPos = 0; yPos < h; yPos++) {
+        for (int xPos = 0; xPos < w; xPos++) {
+            if (cst == 1 || cst == 0) {
+                for (int i = 0; i < bytesPerPixel; i++, c++, s++) {
+                    if (channelMap[c] != FPPD_OFF_CHANNEL) {
+                        channelData[channelMap[c]] = data[s];
+                    }
+                }
+            } else if (cst == 2) {
+                for (int i = 0; i < bytesPerPixel; i++, c++, s++) {
+                    if (data[s] && channelMap[c] != FPPD_OFF_CHANNEL) {
+                        channelData[channelMap[c]] = data[s];
+                    }
+                }
+            } else if (cst == 3) {
+                bool b = false;
+                for (int i = 0; i < bytesPerPixel; i++) {
+                    b |= data[s + i];
+                }
+                if (b) {
+                    for (int i = 0; i < bytesPerPixel; i++, c++, s++) {
+                        if (channelMap[c] != FPPD_OFF_CHANNEL) {
+                            channelData[channelMap[c]] = data[s];
+                        }
+                    }
+                } else {
+                    s += bytesPerPixel;
+                    c += bytesPerPixel;
+                }
+            }
+        }
+        c += rowWrap;
+    }
+    dirtyBuffer = true;
+}
+
+// Clip a srcW x srcH rect placed at (xOffset, yOffset) against a w x h model.
+// On success sx/sy are the first source pixel to read, dx/dy where it lands,
+// and cw/ch the visible size. Returns false when nothing is visible.
+static bool clipBlitRect(int srcW, int srcH, int xOffset, int yOffset,
+                         int w, int h,
+                         int& sx, int& sy, int& dx, int& dy, int& cw, int& ch) {
+    sx = 0;
+    sy = 0;
+    dx = xOffset;
+    dy = yOffset;
+    cw = srcW;
+    ch = srcH;
+    if (dx < 0) {
+        sx = -dx;
+        cw += dx;
+        dx = 0;
+    }
+    if (dy < 0) {
+        sy = -dy;
+        ch += dy;
+        dy = 0;
+    }
+    if (cw > (w - dx)) {
+        cw = w - dx;
+    }
+    if (ch > (h - dy)) {
+        ch = h - dy;
+    }
+    return (cw > 0) && (ch > 0);
+}
+
+// Expand one source pixel to the model's channel layout. srcBpp 1 is greyscale
+// (replicated to RGB), 3 is RGB, 4 is RGBW. When an RGBW source lands on an RGB
+// model the white is folded into RGB the same way getOverlayPixelValue() does,
+// so it dims rather than disappearing.
+static inline void convertPixel(const uint8_t* s, int srcBpp, uint8_t* d, int dstBpp) {
+    uint8_t px[4] = { 0, 0, 0, 0 };
+    if (srcBpp == 1) {
+        px[0] = px[1] = px[2] = s[0];
+    } else {
+        px[0] = s[0];
+        px[1] = s[1];
+        px[2] = s[2];
+        if (srcBpp > 3) {
+            px[3] = s[3];
+        }
+    }
+    if (dstBpp < 4 && px[3]) {
+        px[0] = std::min(px[0] + px[3], 255);
+        px[1] = std::min(px[1] + px[3], 255);
+        px[2] = std::min(px[2] + px[3], 255);
+    }
+    for (int i = 0; i < dstBpp && i < 4; i++) {
+        d[i] = px[i];
+    }
+}
+
+bool PixelOverlayModel::blitData(const uint8_t* src, int srcW, int srcH, int srcBpp,
+                                 int xOffset, int yOffset, const PixelOverlayState& st) {
+    if (!src || srcW <= 0 || srcH <= 0 || srcBpp < 1 || srcBpp > 4) {
+        return false;
+    }
+    int sx, sy, dx, dy, cw, ch;
+    if (!clipBlitRect(srcW, srcH, xOffset, yOffset, width, height, sx, sy, dx, dy, cw, ch)) {
+        return false;
+    }
+
+    // setData()'s rect form wants a tightly packed cw x ch buffer in the
+    // model's own pixel format, so convert into a temporary rather than
+    // duplicating its channelMap walk here.
+    const int bpp = bytesPerPixel;
+    std::vector<uint8_t> rect((size_t)cw * ch * bpp, 0);
+    for (int y = 0; y < ch; y++) {
+        const uint8_t* s = src + (((size_t)(sy + y) * srcW) + sx) * srcBpp;
+        uint8_t* d = &rect[(size_t)y * cw * bpp];
+        for (int x = 0; x < cw; x++, s += srcBpp, d += bpp) {
+            convertPixel(s, srcBpp, d, bpp);
+        }
+    }
+    setData(rect.data(), dx, dy, cw, ch, st);
+    return true;
+}
+
+bool PixelOverlayModel::blitOverlayBuffer(const uint8_t* src, int srcW, int srcH, int srcBpp,
+                                          int xOffset, int yOffset) {
+    if (!src || srcW <= 0 || srcH <= 0 || srcBpp < 1 || srcBpp > 4) {
+        return false;
+    }
+    int sx, sy, dx, dy, cw, ch;
+    if (!clipBlitRect(srcW, srcH, xOffset, yOffset, width, height, sx, sy, dx, dy, cw, ch)) {
+        return false;
+    }
+
+    const int bpp = bytesPerPixel;
+    uint8_t* buf = getOverlayBuffer();
+    if (!buf) {
+        return false;
+    }
+    for (int y = 0; y < ch; y++) {
+        const uint8_t* s = src + (((size_t)(sy + y) * srcW) + sx) * srcBpp;
+        uint8_t* d = buf + ((size_t)(dy + y) * width + dx) * bpp;
+        for (int x = 0; x < cw; x++, s += srcBpp, d += bpp) {
+            convertPixel(s, srcBpp, d, bpp);
+        }
+    }
+    setOverlayBufferDirty(true);
+    return true;
+}
+
+// Sets absolute (0-based) channels startChannel..endChannel of this model to
+// value; -1 for either end means the model's own first or last channel. No
+// caller in FPP; protected, so kept for plugin subclasses. It used to index channelMap - laid out by
+// buffer cell, not by channel - with channel numbers, compute the end from
+// the shadowed startChannel parameter, and run an omitted end to -1.
+void PixelOverlayModel::setValue(uint8_t value, int startChannel, int endChannel) {
+    if (!channelData || channelCount <= 0) {
+        return;
+    }
+    int64_t start = (startChannel == -1) ? 0 : (int64_t)startChannel - this->startChannel;
+    int64_t end = (endChannel == -1) ? channelCount - 1 : (int64_t)endChannel - this->startChannel;
+    start = std::max<int64_t>(start, 0);
+    end = std::min<int64_t>(end, channelCount - 1);
+    if (start > end) {
+        return;
+    }
+    memset(channelData + start, value, (size_t)(end - start + 1));
+    dirtyBuffer = true;
+}
+void PixelOverlayModel::setPixelValue(int x, int y, int r, int g, int b) {
+    setPixelValue(x, y, r, g, b, 0);
+}
+void PixelOverlayModel::setPixelValue(int x, int y, int r, int g, int b, int w) {
+    if (y >= height || x >= width || x < 0 || y < 0) {
+        return;
+    }
+    int c = (y * width * bytesPerPixel) + x * bytesPerPixel;
+    int mapSize = width * height * bytesPerPixel;
+    if (c >= mapSize || c < 0) {
+        return;
+    }
+    if (channelMap[c] != FPPD_OFF_CHANNEL) {
+        channelData[channelMap[c]] = r;
+    }
+    c++;
+    if (channelsPerNode > 1 && c < mapSize && channelMap[c] != FPPD_OFF_CHANNEL) {
+        channelData[channelMap[c]] = g;
+    }
+    c++;
+    if (channelsPerNode > 2 && c < mapSize && channelMap[c] != FPPD_OFF_CHANNEL) {
+        channelData[channelMap[c]] = b;
+    }
+    c++;
+    if (channelsPerNode > 3 && c < mapSize && channelMap[c] != FPPD_OFF_CHANNEL) {
+        channelData[channelMap[c]] = w;
+    }
+    dirtyBuffer = true;
+}
+void PixelOverlayModel::getPixelValue(int x, int y, int& r, int& g, int& b) {
+    int w = 0;
+    getPixelValue(x, y, r, g, b, w);
+    if (w) {
+        r = std::min(r + w, 255);
+        g = std::min(g + w, 255);
+        b = std::min(b + w, 255);
+    }
+}
+void PixelOverlayModel::getPixelValue(int x, int y, int& r, int& g, int& b, int& w) {
+    if (y >= height || x >= width || x < 0 || y < 0) {
+        return;
+    }
+    int c = (y * width * bytesPerPixel) + x * bytesPerPixel;
+    int mapSize = width * height * bytesPerPixel;
+    if (c >= mapSize || c < 0) {
+        return;
+    }
+    if (channelMap[c] != FPPD_OFF_CHANNEL) {
+        r = channelData[channelMap[c]];
+    }
+    c++;
+    if (channelsPerNode > 1 && c < mapSize && channelMap[c] != FPPD_OFF_CHANNEL) {
+        g = channelData[channelMap[c]];
+    }
+    c++;
+    if (channelsPerNode > 2 && c < mapSize && channelMap[c] != FPPD_OFF_CHANNEL) {
+        b = channelData[channelMap[c]];
+    }
+    c++;
+    if (channelsPerNode > 3 && c < mapSize && channelMap[c] != FPPD_OFF_CHANNEL) {
+        w = channelData[channelMap[c]];
+    }
+}
+
+void PixelOverlayModel::setScaledData(uint8_t* data, int w, int h) {
+    float ydiff = (float)h / (float)height;
+    float xdiff = (float)w / (float)width;
+
+    float newy = 0.0f;
+    float newx = 0.0f;
+    int x, y;
+
+    for (y = 0, newy = 0.0f; y < height; y++, newy += ydiff) {
+        int srcY = newy;
+        for (x = 0, newx = 0.0f; x < width; x++, newx += xdiff) {
+            int srcX = newx;
+
+            int idx = y * width * bytesPerPixel + x * bytesPerPixel;
+            int srcidx = srcY * w * bytesPerPixel + srcX * bytesPerPixel;
+
+            for (int ch = 0; ch < bytesPerPixel; ch++) {
+                if (ch < channelsPerNode && channelMap[idx] != FPPD_OFF_CHANNEL) {
+                    channelData[channelMap[idx]] = data[srcidx];
+                }
+                idx++;
+                srcidx++;
+            }
+        }
+    }
+    dirtyBuffer = true;
+}
+void PixelOverlayModel::clearData() {
+    memset(channelData, 0, channelCount);
+    dirtyBuffer = true;
+}
+void PixelOverlayModel::fillData(int r, int g, int b) {
+    fillData(r, g, b, 0);
+}
+void PixelOverlayModel::fillData(int r, int g, int b, int w) {
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            setPixelValue(x, y, r, g, b, w);
+        }
+    }
+}
+
+void PixelOverlayModel::getDataJson(Json::Value& v, bool rle) {
+    int bpp = bytesPerPixel;
+    if (rle) {
+        std::vector<unsigned char> cur(bpp, 0);
+        std::vector<unsigned char> last(bpp, 0);
+        int count = 0;
+        for (int c = 0; c < height * width * bpp; c += bpp) {
+            for (int ch = 0; ch < bpp; ch++) {
+                cur[ch] = (channelMap[c + ch] != FPPD_OFF_CHANNEL) ? channelData[channelMap[c + ch]] : 0;
+            }
+
+            if (cur == last) {
+                count++;
+            } else {
+                if (count) {
+                    v.append(count);
+                    for (int ch = 0; ch < bpp; ch++) {
+                        v.append(last[ch]);
+                    }
+                }
+                count = 1;
+                last = cur;
+            }
+        }
+
+        if (count) {
+            v.append(count);
+            for (int ch = 0; ch < bpp; ch++) {
+                v.append(cur[ch]);
+            }
+        }
+    } else {
+        for (int c = 0; c < height * width * bpp; c++) {
+            unsigned char i = 0;
+            if (channelMap[c] != FPPD_OFF_CHANNEL) {
+                i = channelData[channelMap[c]];
+            }
+            v.append(i);
+        }
+    }
+}
+
+void PixelOverlayModel::getData(std::vector<uint8_t>& out) {
+    const int bpp = bytesPerPixel;
+    const size_t sz = (size_t)width * height * bpp;
+    out.resize(sz);
+    for (size_t c = 0; c < sz; c++) {
+        out[c] = (channelMap[c] != FPPD_OFF_CHANNEL) ? channelData[channelMap[c]] : 0;
+    }
+}
+
+bool PixelOverlayModel::needRefresh() {
+    return (dirtyBuffer || overlayBufferIsDirty());
+}
+
+void PixelOverlayModel::setBufferIsDirty(bool dirty) {
+    dirtyBuffer = dirty;
+}
+
+// Created on first use, which can be an HTTP thread and an effect thread at
+// once: both saw null, both created it, and one mapping was lost - along with
+// whatever that thread had already drawn into it. Serialized here (allocation
+// happens once per model, so one lock for all of them is fine; a member would
+// change the plugin-visible layout), and published with release so the
+// channel output thread, which reads the pointer unlocked, never sees it
+// before its header is filled in.
+uint8_t* PixelOverlayModel::getOverlayBuffer() {
+    OverlayBufferData* ob = __atomic_load_n(&overlayBufferData, __ATOMIC_ACQUIRE);
+    if (!ob) {
+        std::lock_guard<std::mutex> l(s_overlayBufferAllocLock);
+        ob = overlayBufferData;
+        if (!ob) {
+            uint32_t size = width * height * bytesPerPixel + sizeof(OverlayBufferData);
+            // A retired model's name may be its replacement's by now.
+            std::string shmName = s_namesReleased.count(this) ? std::string()
+                                                              : modelMemoryName("/FPP-Model-Overlay-Buffer-", "/FPPMB-", name);
+            ob = (OverlayBufferData*)createModelMemory(shmName, size, overlayBufferMapped);
+            if (!ob) {
+                // Nothing left to hand back. Callers check, because the alternative
+                // was dereferencing this null a few instructions from here.
+                WarningHolder::AddWarning(WARNING_ID_MODEL_MEMORY, MODEL_MEMORY_WARNING);
+                return nullptr;
+            }
+            ob->width = width;
+            ob->height = height;
+            ob->flags = (bytesPerPixel << 8); // store bytesPerPixel in bits 8-15
+            __atomic_store_n(&overlayBufferData, ob, __ATOMIC_RELEASE);
+        }
+    }
+    return ob->data;
+}
+
+void PixelOverlayModel::clearOverlayBuffer() {
+    if (uint8_t* buf = getOverlayBuffer()) {
+        memset(buf, 0, width * height * bytesPerPixel);
+    }
+}
+void PixelOverlayModel::fillOverlayBuffer(int r, int g, int b) {
+    fillOverlayBuffer(r, g, b, 0);
+}
+void PixelOverlayModel::fillOverlayBuffer(int r, int g, int b, int w) {
+    uint8_t* data = getOverlayBuffer();
+    if (!data) {
+        return;
+    }
+    for (int p = 0; p < (width * height); p++) {
+        data[0] = r;
+        data[1] = g;
+        data[2] = b;
+        if (bytesPerPixel > 3) {
+            data[3] = w;
+        }
+        data += bytesPerPixel;
+    }
+}
+
+void PixelOverlayModel::setOverlayPixelValue(int x, int y, int r, int g, int b) {
+    setOverlayPixelValue(x, y, r, g, b, 0);
+}
+void PixelOverlayModel::setOverlayPixelValue(int x, int y, int r, int g, int b, int w) {
+    if (y >= height || x >= width || x < 0 || y < 0) {
+        return;
+    }
+    int idx = y * width * bytesPerPixel + x * bytesPerPixel;
+    uint8_t* buf = getOverlayBuffer();
+    if (!buf) {
+        return;
+    }
+    buf[idx++] = r;
+    buf[idx++] = g;
+    buf[idx++] = b;
+    if (bytesPerPixel > 3) {
+        buf[idx] = w;
+    }
+}
+void PixelOverlayModel::getOverlayPixelValue(int x, int y, int& r, int& g, int& b) {
+    int w = 0;
+    getOverlayPixelValue(x, y, r, g, b, w);
+    if (w) {
+        r = std::min(r + w, 255);
+        g = std::min(g + w, 255);
+        b = std::min(b + w, 255);
+    }
+}
+void PixelOverlayModel::getOverlayPixelValue(int x, int y, int& r, int& g, int& b, int& w) {
+    if (y >= height || x >= width || x < 0 || y < 0) {
+        r = g = b = w = 0;
+        return;
+    }
+    int idx = y * width * bytesPerPixel + x * bytesPerPixel;
+    uint8_t* buf = getOverlayBuffer();
+    if (!buf) {
+        r = g = b = w = 0;
+        return;
+    }
+    r = buf[idx++];
+    g = buf[idx++];
+    b = buf[idx++];
+    w = (bytesPerPixel > 3) ? buf[idx] : 0;
+}
+
+// Neither of these allocates the overlay buffer. One that nobody has written
+// to is all zeros, and copying it out blanked whatever the model's channels
+// held: PUT .../fill with RGB filled the channels directly (the model had no
+// overlay buffer yet), then flushed, and the model went black.
+void PixelOverlayModel::flushOverlayBuffer() {
+    OverlayBufferData* ob = __atomic_load_n(&overlayBufferData, __ATOMIC_ACQUIRE);
+    if (!ob) {
+        return;
+    }
+    setData(ob->data);
+    ob->flags &= ~0x1;
+}
+
+bool PixelOverlayModel::overlayBufferIsDirty() {
+    // Allocated on first use from any thread (getOverlayBuffer()), so read the
+    // pointer the way it is published.
+    OverlayBufferData* ob = __atomic_load_n(&overlayBufferData, __ATOMIC_ACQUIRE);
+    return ob && (ob->flags & 0x1);
+}
+
+void PixelOverlayModel::setOverlayBufferDirty(bool dirty) {
+    OverlayBufferData* ob = __atomic_load_n(&overlayBufferData, __ATOMIC_ACQUIRE);
+    if (!ob) {
+        return;
+    }
+    if (dirty)
+        ob->flags |= 0x1;
+    else
+        ob->flags &= ~0x1;
+}
+
+void PixelOverlayModel::setOverlayBufferScaledData(uint8_t* data, int w, int h) {
+    float ydiff = (float)h / (float)height;
+    float xdiff = (float)w / (float)width;
+    uint8_t* buf = getOverlayBuffer();
+    if (!buf) {
+        return;
+    }
+
+    float newy = 0.0f;
+    float newx = 0.0f;
+    int x, y;
+
+    for (y = 0, newy = 0.0f; y < height; y++, newy += ydiff) {
+        int srcY = newy;
+        for (x = 0, newx = 0.0f; x < width; x++, newx += xdiff) {
+            int srcX = newx;
+
+            int idx = y * width * bytesPerPixel + x * bytesPerPixel;
+            int srcidx = srcY * w * bytesPerPixel + srcX * bytesPerPixel;
+
+            for (int ch = 0; ch < bytesPerPixel; ch++) {
+                buf[idx + ch] = data[srcidx + ch];
+            }
+        }
+    }
+}
+
+// A file name the image directory can hold: no directory part, nothing
+// hidden or relative ("..", ".foo"), no control characters. fppd runs as
+// root, so "../../boot/firmware/config.txt" overwrote that file with PNG data.
+bool PixelOverlayModel::isPlainImageFileName(const std::string& f) {
+    if (f.empty() || f[0] == '.') {
+        return false;
+    }
+    for (unsigned char c : f) {
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void PixelOverlayModel::saveOverlayAsImage(std::string filename) {
+    if (filename != "" && !isPlainImageFileName(filename)) {
+        LogWarn(VB_CHANNELOUT, "Not saving model \"%s\" as \"%s\": the name must be a plain file name\n",
+                name.c_str(), filename.c_str());
+        return;
+    }
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    Magick::Blob blob;
+    Magick::Image image(Magick::Geometry(width, height), Magick::Color("black"));
+
+    if (filename == "") {
+        struct timeval tv;
+        struct tm tm;
+        char timeStr[32];
+
+        gettimeofday(&tv, nullptr);
+        localtime_r(&tv.tv_sec, &tm);
+
+        snprintf(timeStr, sizeof(timeStr),
+                 "%4d%02d%02d_%02d%02d%02d",
+                 1900 + tm.tm_year, tm.tm_mon + 1,
+                 tm.tm_mday, tm.tm_hour, tm.tm_min,
+                 tm.tm_sec);
+
+        filename = name + "-" + timeStr + ".png";
+    }
+
+    filename = FPP_DIR_IMAGE("/") + filename;
+
+    LogDebug(VB_CHANNELOUT, "Saving %dx%d PixelOverlayModel image to: %s\n",
+             width, height, filename.c_str());
+
+    // Always save as RGB (3 bytes per pixel) for image compatibility
+    // For RGBW models, blend the W channel into RGB so white pixels render correctly
+    std::vector<uint8_t> data(width * height * 3, 0);
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int mapIdx = (y * width + x) * bytesPerPixel;
+            int imgIdx = (y * width + x) * 3;
+            for (int ch = 0; ch < 3; ch++) {
+                if (ch < bytesPerPixel && channelMap[mapIdx + ch] != FPPD_OFF_CHANNEL) {
+                    data[imgIdx + ch] = channelData[channelMap[mapIdx + ch]];
+                }
+            }
+            if (bytesPerPixel > 3 && channelMap[mapIdx + 3] != FPPD_OFF_CHANNEL) {
+                uint8_t w = channelData[channelMap[mapIdx + 3]];
+                if (w) {
+                    for (int ch = 0; ch < 3; ch++) {
+                        int v = data[imgIdx + ch] + w;
+                        data[imgIdx + ch] = (v > 255) ? 255 : v;
+                    }
+                }
+            }
+        }
+    }
+    blob.update(&data[0], width * height * 3);
+
+    try {
+        image.magick("RGB");
+        image.depth(8);
+        image.quiet(true);
+        image.read(blob, Magick::Geometry(width, height));
+
+        image.write(filename.c_str());
+    } catch (const std::exception& e) {
+        LogErr(VB_CHANNELOUT, "Could not save model \"%s\" to %s: %s\n", name.c_str(), filename.c_str(), e.what());
+        return;
+    }
+
+    SetFilePerms(filename);
+}
+
+void PixelOverlayModel::clear() {
+    if (__atomic_load_n(&overlayBufferData, __ATOMIC_ACQUIRE)) {
+        clearOverlayBuffer();
+        flushOverlayBuffer();
+    } else {
+        clearData();
+    }
+}
+void PixelOverlayModel::fill(int r, int g, int b) {
+    fill(r, g, b, 0);
+}
+void PixelOverlayModel::fill(int r, int g, int b, int w) {
+    if (__atomic_load_n(&overlayBufferData, __ATOMIC_ACQUIRE)) {
+        fillOverlayBuffer(r, g, b, w);
+        flushOverlayBuffer();
+    } else {
+        fillData(r, g, b, w);
+    }
+}
+
+int PixelOverlayModel::getStartChannel() const {
+    return startChannel;
+}
+int PixelOverlayModel::getChannelCount() const {
+    return channelCount;
+}
+void PixelOverlayModel::toJson(Json::Value& result) {
+    result = config;
+}
+
+int32_t PixelOverlayModel::updateRunningEffects() {
+    std::unique_lock<std::recursive_mutex> l(effectLock);
+    if (runningEffect) {
+        int32_t v = runningEffect->update();
+        if (v == 0) {
+            delete runningEffect;
+            runningEffect = nullptr;
+        }
+        return v;
+    }
+    return 0;
+}
+
+void PixelOverlayModel::setRunningEffect(RunningEffect* ef, int32_t firstUpdateMS) {
+    std::unique_lock<std::recursive_mutex> l(effectLock);
+    if (runningEffect) {
+        if (runningEffect != ef) {
+            delete runningEffect;
+        }
+        PixelOverlayManager::INSTANCE.removePeriodicUpdate(this);
+    }
+    runningEffect = ef;
+    PixelOverlayManager::INSTANCE.addPeriodicUpdate(firstUpdateMS, this);
+}
+
+void PixelOverlayModel::clearRunningEffect() {
+    std::unique_lock<std::recursive_mutex> l(effectLock);
+    if (runningEffect) {
+        delete runningEffect;
+        runningEffect = nullptr;
+        PixelOverlayManager::INSTANCE.removePeriodicUpdate(this);
+    }
+}
+
+bool PixelOverlayModel::applyEffect(const std::string& autoState, const std::string& effect, const std::vector<std::string>& args) {
+    PixelOverlayEffect* pe = PixelOverlayEffect::GetPixelOverlayEffect(effect);
+    if (pe) {
+        // Every effect indexes args[] positionally with no bounds check of its
+        // own, so a caller that supplies fewer than the effect declares walks
+        // off the end -- "Overlay Model Effect,<model>,Enabled,Text" with no
+        // further arguments is a one-line HTTP request that segfaults fppd in
+        // TextEffect::apply's args[0].  Validate once here, at the single point
+        // that dispatches to any effect, rather than bounds-checking every
+        // effect body.  The effect's own declared arg list is the authority,
+        // and trailing args marked optional may legitimately be omitted.
+        size_t required = 0;
+        size_t idx = 0;
+        for (const auto& a : pe->args) {
+            ++idx;
+            if (!a.optional) {
+                required = idx;
+            }
+        }
+        if (args.size() < required) {
+            LogErr(VB_CHANNELOUT,
+                   "Pixel Overlay effect '%s' needs at least %zu argument(s), %zu given -- ignoring\n",
+                   effect.c_str(), required, args.size());
+            return false;
+        }
+        return pe->apply(this, autoState, args);
+    }
+    LogWarn(VB_CHANNELOUT, "Pixel Overlay effect '%s' does not exist -- ignoring\n", effect.c_str());
+    return false;
+}

@@ -1,139 +1,114 @@
 /*
- *   MediaOutputBase class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include <vector>
+#include "fpp-pch.h"
 
-#include <errno.h>
-#include <string.h>
 #include <sys/time.h>
-#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+
+#include <cmath> 
+
+#include "../log.h"
+#include "../settings.h"
 
 #include "MediaOutputBase.h"
-#include "common.h"
-#include "log.h"
 
-MediaOutputBase::MediaOutputBase(void)
-  : m_isPlaying(0),
-	m_childPID(0)
-{
-	LogDebug(VB_MEDIAOUT, "MediaOutputBase::MediaOutputBase()\n");
+MediaOutputBase::MediaOutputBase(void) {
+    LogDebug(VB_MEDIAOUT, "MediaOutputBase::MediaOutputBase()\n");
 
-	pthread_mutex_init(&m_outputLock, NULL);
-
-	m_childPipe[0] = 0;
-	m_childPipe[1] = 0;
+    if (getFPPmode() != REMOTE_MODE) {
+        mediaOffsetMS = getSettingInt("globalMediaOffset", 0);
+        mediaOffset = (float)mediaOffsetMS * 0.001;
+    }
 }
 
-MediaOutputBase::~MediaOutputBase()
-{
-	LogDebug(VB_MEDIAOUT, "MediaOutputBase::~MediaOutputBase()\n");
-
-	Close();
-
-	pthread_mutex_destroy(&m_outputLock);
+MediaOutputBase::~MediaOutputBase() {
+    LogDebug(VB_MEDIAOUT, "MediaOutputBase::~MediaOutputBase()\n");
+    Close();
 }
 
 /*
  *
  */
-int MediaOutputBase::Start(void)
-{
-	return 0;
+int MediaOutputBase::Start(int msTime) {
+    return 0;
 }
 
 /*
  *
  */
-int MediaOutputBase::Stop(void)
-{
-	return 0;
+int MediaOutputBase::Stop(void) {
+    return 0;
 }
 
 /*
  *
  */
-int MediaOutputBase::Process(void)
-{
-	return 0;
+int MediaOutputBase::Process(void) {
+    return 0;
 }
 
 /*
  *
  */
-int MediaOutputBase::Close(void)
-{
-	LogDebug(VB_MEDIAOUT, "MediaOutputBase::Close\n");
+int MediaOutputBase::Close(void) {
+    LogDebug(VB_MEDIAOUT, "MediaOutputBase::Close\n");
 
-	pthread_mutex_lock(&m_outputLock);
-
-	for (int i = 0; i < 2; i++)
-	{
-		if (m_childPipe[i])
-		{
-			close(m_childPipe[i]);
-			m_childPipe[i] = 0;
-		}
-	}
-
-	pthread_mutex_unlock(&m_outputLock);
-
-	return 1;
+    return 1;
 }
 
 /*
  *
  */
-int MediaOutputBase::AdjustSpeed(int delta)
-{
-	(void)delta;
-
-	return 1;
+int MediaOutputBase::AdjustSpeed(float masterPos) {
+    return 1;
 }
 
 /*
  *
  */
-void MediaOutputBase::SetVolume(int volume)
-{
-	(void)volume;
+void MediaOutputBase::SetVolume(int volume) {
 }
 
 /*
  *
  */
-int MediaOutputBase::IsPlaying(void)
-{
-	int result = 0;
-
-	pthread_mutex_lock(&m_outputLock);
-
-	if (m_childPID > 0)
-		result = 1;
-
-	pthread_mutex_unlock(&m_outputLock);
-
-	return result;
+int MediaOutputBase::IsPlaying(void) {
+    return 0;
 }
 
+void MediaOutputBase::setMediaElapsed(float curtime, float remaining) {
+    float secs = curtime;
+    float rem = remaining;
+    if (mediaOffset > 0) {
+        secs -= mediaOffset;
+    } else {
+        rem -= mediaOffset;
+    }
+    if (secs < 0.0) {
+        secs = 0.0;
+    }
+    if (rem < 0.0) {
+        rem = 0.0;
+    }
+    float elapsed, elapsedSub, remain, remainSub;
+    elapsedSub = std::modf(secs, &elapsed) * 100;
+    remainSub = std::modf(rem, &remain) * 100;
+
+    std::lock_guard<std::mutex> lock(MediaOutputStatus::FieldsLock());
+    m_mediaOutputStatus->mediaSeconds = secs;
+    m_mediaOutputStatus->secondsElapsed = elapsed;
+    m_mediaOutputStatus->subSecondsElapsed = elapsedSub;
+    m_mediaOutputStatus->secondsRemaining = remain;
+    m_mediaOutputStatus->subSecondsRemaining = remainSub;
+}

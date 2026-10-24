@@ -1,0 +1,3750 @@
+{
+	"settingGroups": {
+		"BBBLeds": {
+			"description": "BeagleBone LEDs",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64"
+			],
+			"settings": [
+				"BBBLeds0",
+				"BBBLeds1",
+				"BBBLeds2",
+				"BBBLeds3",
+				"BBBLedPWR"
+			]
+		},
+		"DeviceInstanceInfo": {
+			"description": "Device Instance Information",
+			"settings": [
+				"Platform",
+				"Variant",
+				"SubPlatform",
+				"OSImagePrefix",
+				"IsDesktop",
+				"BeaglePlatform",
+				"AudioCardType",
+				"AudioCard0Type"
+			]
+		},
+		"email": {
+			"description": "Outbound Email Configuration",
+			"settings": [
+				"emailserver",
+				"emailport",
+				"emailuser",
+				"emailpass",
+				"emailfromuser",
+				"emailfromtext",
+				"emailtoemail"
+			]
+		},
+		"fileDirLocations": {
+			"description": "File Directory Locations",
+			"settings": [
+				"fppBinDir",
+				"wwwDir",
+				"fppDir",
+				"playlistDirectory",
+				"pluginDirectory",
+				"mediaDirectory",
+				"bootDirectory",
+				"configDirectory",
+				"channelOutputsJSON",
+				"co-other",
+				"co-pixelStrings",
+				"co-bbbStrings",
+				"co-pwm",
+				"universeOutputs",
+				"universeInputs",
+				"dmxInputs",
+				"model-overlays",
+				"scheduleJsonFile",
+				"scriptDirectory",
+				"sequenceDirectory",
+				"musicDirectory",
+				"videoDirectory",
+				"imageDirectory",
+				"effectDirectory",
+				"eventDirectory",
+				"logDirectory",
+				"uploadDirectory",
+				"docsDirectory",
+				"exim4Directory",
+				"outputProcessorsFile",
+				"statsFile"
+			]
+		},
+		"host": {
+			"description": "Host Settings",
+			"settings": [
+				"HostName",
+				"HostDescription"
+			]
+		},
+		"hostDesktop": {
+			"description": "Host Settings",
+			"settings": [
+				"HostDescription"
+			]
+		},
+		"log-levels": {
+			"description": "Log Levels",
+			"settings": [
+				"LogLevel_General",
+				"LogLevel_ChannelOut",
+				"LogLevel_ChannelData",
+				"LogLevel_Command",
+				"LogLevel_Control",
+				"LogLevel_E131Bridge",
+				"LogLevel_Effect",
+				"LogLevel_GPIO",
+				"LogLevel_HTTP",
+				"LogLevel_MediaOut",
+				"LogLevel_Playlist",
+				"LogLevel_Plugin",
+				"LogLevel_Schedule",
+				"LogLevel_Settings",
+				"LogLevel_Sequence",
+				"LogLevel_Sync"
+			]
+		},
+		"regionallocation": {
+			"description": "Regional Settings",
+			"settings": [
+				"Locale",
+				"DateFormat",
+				"TimeFormat",
+				"temperatureInF",
+				"Latitude",
+				"Longitude"
+			]
+		},
+		"avModes": {
+			"description": "A/V Mode",
+			"settings": [
+				"MediaBackend"
+			]
+		},
+		"generalAudio": {
+			"description": "General Audio",
+			"settings": [
+				"WLEDAudioInput",
+				"WLEDAudioSyncMode",
+				"WLEDAudioSyncDest",
+				"WLEDAudioSyncPort",
+				"disableIPAnnouncement",
+				"disableAudioVolumeSlider",
+				"PipeWireKeepOutputOpen",
+				"globalMediaOffset",
+				"AudioCardAliases"
+			]
+		},
+		"simplePipeWireAudio": {
+			"description": "Simple Audio",
+			"settings": [
+				"AudioOutput",
+				"AudioFormat",
+				"AudioPeriodSize"
+			]
+		},
+		"pipeWireAudio": {
+			"description": "PipeWire Audio",
+			"settings": [
+				"PipeWireInputMixing",
+				"PipeWireAudioGroups"
+			]
+		},
+		"pipeWireStreams": {
+			"description": "PipeWire Audio Network Streams",
+			"settings": [
+				"PipeWireAES67Config",
+				"PipeWireOpusRTPConfig",
+				"PipeWireVBANConfig"
+			]
+		},
+		"pipeWireVideo": {
+			"description": "PipeWire Video",
+			"settings": [
+				"PipeWireVideoInputSources",
+				"PipeWireVideoOutputs",
+				"PipeWireRTSPOutputs"
+			]
+		},
+		"pipeWireGeneral": {
+			"description": "General PipeWire",
+			"settings": [
+				"PipeWirePassiveSinks",
+				"PipeWireRoutingMatrix",
+				"PipeWireGraph"
+			]
+		},
+		"simplePipeWireVideo": {
+			"description": "Simple Video",
+			"settings": [
+				"VideoOutput",
+				"ForceHDMI",
+				"EnableBBBHDMI",
+				"ForceHDMIResolution",
+				"ForceHDMIResolutionPort2",
+				"HardwareDecoding",
+				"mediaOffset",
+				"remoteIgnoreSync"
+			]
+		},
+		"generalPlayback": {
+			"description": "Playback",
+			"settings": [
+				"MultiSyncEnabled",
+				"pauseBackgroundEffects",
+				"blankBetweenSequences",
+				"screensaver",
+				"screensaverTimeout",
+				"openStartDelay",
+				"remoteOffset"
+			]
+		},
+		"generalScheduler": {
+			"description": "Scheduler",
+			"settings": [
+				"DisableScheduler",
+				"UIStartedPlaylistsProtected",
+				"ScheduleDistance",
+				"ScheduleSeconds"
+			]
+		},
+		"initialSetup": {
+			"description": "Device",
+			"settings": [
+				"fppMode",
+				"HostName",
+				"HostDescription",
+				"InstalledCape",
+				"uiLevel"
+			]
+		},
+		"initialSetup-privacy": {
+			"description": "Privacy Setup",
+			"settings": [
+				"ShareCrashData",
+				"emailAddress",
+				"FetchVendorLogos",
+				"SendVendorSerial",
+				"statsPublish"
+			]
+		},
+		"initialSetup-location": {
+			"description": "Location",
+			"settings": [
+				"Locale",
+				"TimeZone",
+				"Latitude",
+				"Longitude",
+				"WifiRegulatoryDomain",
+				"LegalJurisdiction"
+			]
+		},
+		"input": {
+			"description": "Input Control",
+			"settings": [
+				"DisableFakeNetworkBridges",
+				"BridgeSourcePriority",
+				"bridgeDataPriority"
+			]
+		},
+		"mqtt": {
+			"description": "MQTT",
+			"settings": [
+				"MQTTHost",
+				"MQTTPort",
+				"MQTTClientId",
+				"MQTTPrefix",
+				"MQTTUsername",
+				"MQTTPassword",
+				"MQTTCaFile",
+				"MQTTFrequency",
+				"MQTTPortStatusFrequency",
+				"MQTTStatusFrequency",
+				"MQTTSubscribe"
+			]
+		},
+		"multiSyncCopyFiles": {
+			"description": "Copy Files",
+			"settings": [
+				"MultiSyncCopySequences",
+				"MultiSyncCopyEffects",
+				"MultiSyncCopyMusic",
+				"MultiSyncCopyVideos",
+				"MultiSyncCopyImages",
+				"MultiSyncCopyEvents",
+				"MultiSyncCopyScripts",
+				"CompressMultiSyncTransfers"
+			]
+		},
+		"output": {
+			"description": "Output Control",
+			"settings": [
+				"AutoEnableOutputs",
+				"eFuseRetryCount",
+				"eFuseRetryInterval",
+				"alwaysTransmit",
+				"E131BridgingInterval"
+			]
+		},
+		"privacy": {
+			"description": "Privacy",
+			"settings": [
+				"emailAddress",
+				"statsPublish",
+				"ShareCrashData",
+				"FetchVendorLogos",
+				"SendVendorSerial"
+			]
+		},
+		"services": {
+			"description": "OS Services",
+			"settings": [
+				"Service_rsync",
+				"Service_smbd_nmbd",
+				"Service_vsftpd",
+				"Service_MQTT_localbroker",
+				"AllowCrossOriginAPI"
+			]
+		},
+		"kiosk": {
+			"description": "Kiosk Mode",
+			"settings": [
+				"KioskUrl",
+				"KioskTimeout",
+				"KioskRotate"
+			]
+		},
+		"system": {
+			"description": "System Settings",
+			"settings": [
+				"GPIOFan",
+				"DisableHDMICECInit",
+				"LEDDisplayType",
+				"bootDelay",
+				"FPP_UUID"
+			]
+		},
+		"tethering": {
+			"description": "Tethering",
+			"settings": [
+				"EnableTethering",
+				"TetherInterface",
+				"TetherSSID",
+				"TetherPSK"
+			]
+		},
+		"time": {
+			"description": "Time Config",
+			"settings": [
+				"ClockDate",
+				"ClockTime",
+				"piRTC",
+				"DisablePiRTC",
+				"ntpServer",
+				"UseNTPFromDHCP",
+				"TimeZone"
+			]
+		},
+		"ui": {
+			"description": "User Interface",
+			"settings": [
+				"uiLevel",
+				"themeOverride",
+				"showAllOptions",
+				"disableUIWarnings",
+				"disableUIPopoverAlerts",
+				"fileManagerThumbnailSize",
+				"fileManagerTableFilter",
+				"fileManagerHideEmptyTabs",
+				"gpioHideCapePins"
+			]
+		},
+		"uiColors": {
+			"description": "UI Colors",
+			"settings": [
+				"backgroundColor",
+				"tableColorPair1A",
+				"tableColorPair1B",
+				"tableColorPair2A",
+				"tableColorPair2B",
+				"tableColorPair3A",
+				"tableColorPair3B",
+				"tableColorPair4A",
+				"tableColorPair4B"
+			]
+		},
+		"uiBehavior": {
+			"description": "UI Behavior",
+			"settings": [
+				"LogoLink",
+				"Logo",
+				"hideExternalURLs",
+				"currentHeaderSensor",
+				"initialSetup-02",
+				"locale",
+				"volume"
+			]
+		},
+		"wifiDomainGroup": {
+			"description": "WIFI Domain",
+			"settings": [
+				"WifiRegulatoryDomain",
+				"WifiAntenna",
+				"AutoRebootOnUSBNetworkFailure"
+			]
+		},
+		"advNetworkSettingsGroup": {
+			"description": "Advanced Interface Settings",
+			"level": 1,
+			"settings": [
+				"routeMetric",
+				"ipForwarding",
+				"dhcpServer",
+				"dhcpOffset",
+				"dhcpPoolSize"
+			]
+		},
+		"UsageStats": {
+			"description": "Usage Statistics",
+			"settings": [
+				"statsPublishUrl"
+			]
+		}
+	},
+	"attributes": {
+		"level": 0,
+		"gatherStats": false,
+		"restart": 0,
+		"reboot": 0,
+		"default": ""
+	},
+	"settings": {
+		"routeMetric": {
+			"name": "routeMetric",
+			"description": "Route Metric",
+			"gatherStats": false,
+			"tip": "IP Routing metric.  Lower number is higher priority.  0 is default.",
+			"level": 1,
+			"reboot": 1,
+			"default": 0,
+			"onChange": "NoSaveSettingCallback",
+			"type": "number",
+			"min": 0,
+			"max": 10000,
+			"step": 1
+		},
+		"dhcpServer": {
+			"name": "dhcpServer",
+			"description": "DHCP Server",
+			"tip": "Enable DHCP Server on selected interface.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 0,
+			"onChange": "dhcpServerEnabledCallback",
+			"type": "checkbox",
+			"children": {
+				"1": [
+					"dhcpOffset",
+					"dhcpPoolSize"
+				]
+			}
+		},
+		"dhcpOffset": {
+			"name": "dhcpOffset",
+			"description": "DHCP Pool Offset",
+			"gatherStats": true,
+			"tip": "Offset for first entry in DHCP Pool.",
+			"level": 1,
+			"reboot": 1,
+			"default": 100,
+			"onChange": "NoSaveSettingCallback",
+			"type": "number",
+			"min": 1,
+			"max": 254,
+			"step": 1
+		},
+		"dhcpPoolSize": {
+			"name": "dhcpPoolSize",
+			"description": "DHCP Pool Size",
+			"gatherStats": true,
+			"tip": "Number of IP addresses in DHCP Pool.",
+			"level": 1,
+			"reboot": 1,
+			"default": 50,
+			"onChange": "NoSaveSettingCallback",
+			"type": "number",
+			"min": 1,
+			"max": 254,
+			"step": 1
+		},
+		"ipForwarding": {
+			"name": "ipForwarding",
+			"description": "IP Forwarding",
+			"tip": "Enable forwarding of IP packets through this interface.  Optionally support IP Masquerading/NAT",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 0,
+			"onChange": "NoSaveSettingCallback",
+			"type": "select",
+			"options": {
+				"Off": 0,
+				"Forwarding": 1,
+				"Masquerading/NAT": 2
+			}
+		},
+		"AutoRebootOnUSBNetworkFailure": {
+			"name": "AutoRebootOnUSBNetworkFailure",
+			"description": "Reboot If USB WiFi Adapter Fails",
+			"tip": "Some USB WiFi adapters intermittently lose their USB connection while booting. The adapter is detected and the interface appears, but the radio never connects, leaving FPP running normally while unreachable over the network. When FPP sees this specific failure it reboots to recover, at most twice before giving up so it can never boot loop. A reboot is only triggered when USB errors are present AND no other connection has an IP address, so an access point being out of range or turned off will not cause one.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 0,
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"default": "1",
+			"type": "checkbox"
+		},
+		"WifiAntenna": {
+			"name": "WifiAntenna",
+			"description": "WiFi Antenna",
+			"tip": "Compute Module 4 and 5 only.  Selects the onboard PCB antenna or the external U.FL antenna socket on the module (dtparam=ant2 in config.txt).  External switches the onboard antenna off completely, so only choose it with an antenna connected to the socket, otherwise WiFi will have almost no range.",
+			"gatherStats": true,
+			"level": 0,
+			"restart": 0,
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"checkFile": [
+				"/proc/device-tree/__overrides__/ant2"
+			],
+			"default": "internal",
+			"type": "select",
+			"options": {
+				"Internal (onboard)": "internal",
+				"External (U.FL socket)": "external"
+			}
+		},
+		"WifiRegulatoryDomain": {
+			"name": "WifiRegulatoryDomain",
+			"description": "WIFI Regulatory Domain",
+			"platforms": [
+				"!MacOS"
+			],
+			"tip": "The regulatory domain controls the frequencies/channels that WIFI adapaters are allowed to use.",
+			"comment": "list from https://www.arubanetworks.com/techdocs/InstantWenger_Mobile/Advanced/Content/Instant%20User%20Guide%20-%20volumes/Country_Codes_List.htm#regulatory_domain_3737302751_1017918",
+			"gatherStats": true,
+			"level": 0,
+			"restart": 0,
+			"reboot": 1,
+			"default": "US",
+			"type": "select",
+			"options": {
+				"United States": "US",
+				"Australia": "AU",
+				"Canada": "CA",
+				"New Zealand": "NZ",
+				"United Kingdom": "GB",
+				"Algeria": "DZ",
+				"Argentina": "AR",
+				"Austria": "AT",
+				"Bahrain": "BH",
+				"Bermuda": "BM",
+				"Bolivia": "BO",
+				"Brazil": "BR",
+				"Bulgaria": "BG",
+				"Chile": "CL",
+				"China": "CN",
+				"Colombia": "CO",
+				"Costa Rica": "CR",
+				"Cyprus": "CY",
+				"Czech Republic": "CZ",
+				"Denmark": "DK",
+				"Dominican Republic": "DO",
+				"Ecuador": "EC",
+				"Egypt": "EG",
+				"El Salvador": "SV",
+				"Estonia": "EE",
+				"Finland": "FI",
+				"France": "FR",
+				"Germany": "DE",
+				"Greece": "GR",
+				"Guatemala": "GT",
+				"Honduras": "HN",
+				"Hong Kong": "HK",
+				"Iceland": "IS",
+				"India": "IN",
+				"Indonesia": "ID",
+				"Ireland": "IE",
+				"Islamic Republic of Pakistan": "PK",
+				"Israel": "IL",
+				"Italy": "IT",
+				"Jamaica": "JM",
+				"Japan": "JP3",
+				"Jordan": "JO",
+				"Kenya": "KE",
+				"Kuwait": "KW",
+				"Lebanon": "LB",
+				"Liechtenstein": "LI",
+				"Lithuania": "LT",
+				"Luxembourg": "LU",
+				"Mauritius": "MU",
+				"Mexico": "MX",
+				"Morocco": "MA",
+				"Netherlands": "NL",
+				"Norway": "NO",
+				"Oman": "OM",
+				"Panama": "PA",
+				"Peru": "PE",
+				"Philippines": "PH",
+				"Poland": "PL",
+				"Portugal": "PT",
+				"Puerto Rico": "PR",
+				"Qatar": "QA",
+				"Republic of Korea (South Korea)": "KR",
+				"Romania": "RO",
+				"Russia": "RU",
+				"Saudi Arabia": "SA",
+				"Serbia and Montenegro": "CS",
+				"Singapore": "SG",
+				"Slovak Republic": "SK",
+				"Slovenia": "SI",
+				"South Africa": "ZA",
+				"Spain": "ES",
+				"Sri Lanka": "LK",
+				"Switzerland": "CH",
+				"Taiwan": "TW",
+				"Thailand": "TH",
+				"Trinidad and Tobago": "TT",
+				"Tunisia": "TN",
+				"Turkey": "TR",
+				"Ukraine": "UA",
+				"United Arab Emirates": "AE",
+				"Uruguay": "UY",
+				"Venezuela": "VE",
+				"Vietnam": "VN"
+			}
+		},
+		"AutoEnableOutputs": {
+			"name": "AutoEnableOutputs",
+			"description": "Automatically turn on/off outputs",
+			"tip": "If controllers can control the power to the pixel ports, allows FPP to automatically control the power when there is no data to output. Will be overridden by Always transmit channel data",
+			"level": 1,
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 0,
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"default": "1",
+			"type": "checkbox"
+		},
+		"eFuseRetryCount": {
+			"name": "eFuseRetryCount",
+			"description": "eFuse Retry Count",
+			"tip": "For controllers that use eFuse, this will allow FPP to automatically reset the eFuse and retry.  Useful for intermittent trips, particularly at port startup.  Default is disabled (0).",
+			"level": 1,
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 0,
+			"type": "number",
+			"default": 0,
+			"min": 0,
+			"max": 20,
+			"step": 1
+		},
+		"eFuseRetryInterval": {
+			"name": "eFuseRetryInterval",
+			"description": "eFuse Retry Time Interval",
+			"tip": "For controllers that use eFuse, time between retries when the eFuse triggers.",
+			"level": 1,
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 0,
+			"type": "number",
+			"default": 100,
+			"suffix": "ms",
+			"min": 100,
+			"max": 5000,
+			"step": 100
+		},
+		"alwaysTransmit": {
+			"name": "alwaysTransmit",
+			"description": "Always transmit channel data",
+			"tip": "Always transmit channel output data even when no sequence or effect is playing.  Some controllers may need constant data coming in to prevent them from going into a built in test mode.",
+			"level": 1,
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 0,
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"default": "0",
+			"type": "checkbox"
+		},
+		"AudioFormat": {
+			"name": "AudioFormat",
+			"description": "Audio Sample Rate",
+			"tip": "The sample rate PipeWire's audio graph runs at.  Default lets FPP use 44100 unless the selected sound card clocks at something else.  The sample format (bit depth) is not set here; FPP probes the card and uses the widest format it can hold the rate in.  In Advanced (Full PipeWire) mode, per-card rates are configured in the PipeWire Audio Groups settings instead.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 0,
+			"type": "select",
+			"options": {
+				"Default": 0,
+				"44100": 1,
+				"48000": 4,
+				"96000": 7
+			}
+		},
+		"AudioPeriodSize": {
+			"name": "AudioPeriodSize",
+			"description": "Audio Period Size",
+			"tip": "The number of samples PipeWire hands to the sound card at a time (the graph quantum).  Smaller values lower latency, larger values are less likely to glitch on a busy player.  In Advanced (Full PipeWire) mode, per-card period sizes are configured in the PipeWire Audio Groups settings instead.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 1024,
+			"type": "select",
+			"options": {
+				"1024": 1024,
+				"1536": 1536,
+				"2048": 2048,
+				"2560": 2560,
+				"3072": 3072,
+				"3584": 3584,
+				"4096": 4096,
+				"5120": 5120,
+				"6144": 6144,
+				"7168": 7168,
+				"8192": 8192
+			}
+		},
+		"AudioMixerDevice": {
+			"name": "AudioMixerDevice",
+			"description": "Audio Output Mixer Device",
+			"tip": "The Audio Mixer Device specifies the mixer device which should be used by FPP to control the volume of audio playback.",
+			"gatherStats": true,
+			"restart": 2,
+			"default": "PCM",
+			"type": "select",
+			"optionsURL": "api/settings/AudioMixerDevice/options",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AudioOutput": {
+			"name": "AudioOutput",
+			"description": "Audio Output Device",
+			"tip": "The Audio Output Device determines which audio device is used for audio playback.  This may be an onboard analog audio device, the HDMI output on a Raspberry Pi, or a USB sound card.  The selection is stored by the sound card's stable ALSA name rather than its index, so it is retained even if cards are probed in a different order (e.g. a USB device is added or removed).",
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 1,
+			"default": "",
+			"type": "select",
+			"optionsURL": "api/settings/AudioOutput/options"
+		},
+		"AudioCardAliases": {
+			"name": "AudioCardAliases",
+			"description": "Sound Card Aliases",
+			"tip": "Assign friendly names to your sound cards (e.g. 'Transmitter', 'Amplifier') so they are easier to identify in audio device dropdowns. Aliases apply to both Hardware Direct (ALSA) and PipeWire backends.",
+			"type": "modal",
+			"modalUrl": "audio-card-aliases.php?modal=1",
+			"icon": "fas fa-tag",
+			"buttonText": "Configure Sound Card Aliases",
+			"modalTitle": "Sound Card Aliases",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"MediaBackend": {
+			"name": "MediaBackend",
+			"description": "Media Backend",
+			"tip": "Select how FPP handles audio and video playback. Simple Mode gives automatic single-card / single-display selection (recommended for most users). Advanced (Full PipeWire) exposes the full PipeWire stack with multi-device audio groups, video fan-out, AES67, and routing matrix.",
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 1,
+			"default": "pipewire-simple",
+			"type": "select",
+			"options": {
+				"Simple": "pipewire-simple",
+				"Advanced (Full PipeWire)": "pipewire"
+			},
+			"children": {
+				"pipewire": [
+					"PipeWireAudioGroups",
+					"PipeWireInputMixing",
+					"PipeWireRoutingMatrix",
+					"PipeWireVideoOutputs",
+					"PipeWireVideoInputSources",
+					"PipeWireAES67Config",
+					"PipeWireOpusRTPConfig",
+					"PipeWireVBANConfig",
+					"PipeWireGraph"
+				],
+				"pipewire-simple": [
+					"ForceHDMIResolution",
+					"ForceHDMIResolutionPort2"
+				]
+			},
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireAudioGroups": {
+			"name": "PipeWireAudioGroups",
+			"description": "Audio Output Groups",
+			"tip": "Combine multiple sound cards into virtual sinks with per-card EQ and channel mapping.",
+			"type": "modal",
+			"modalUrl": "pipewire-audio.php?modal=1",
+			"icon": "fas fa-layer-group",
+			"buttonText": "Configure Output Audio Groups",
+			"modalTitle": "PipeWire Audio Output Groups",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireInputMixing": {
+			"name": "PipeWireInputMixing",
+			"description": "Input Mixing (Mix Buses)",
+			"tip": "Create input groups to mix multiple audio sources (fppd streams, ALSA line-in, AES67 receives) and route them to output groups.",
+			"type": "modal",
+			"modalUrl": "pipewire-input-mixing.php?modal=1",
+			"icon": "fas fa-sliders-h",
+			"buttonText": "Configure Input Mixing",
+			"modalTitle": "Input Mixing",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireRoutingMatrix": {
+			"name": "PipeWireRoutingMatrix",
+			"description": "PipeWire Routing Matrix",
+			"tip": "Visual routing matrix showing all input group to output group connections with per-path volume, mute, effects, and presets.",
+			"type": "modal",
+			"modalUrl": "pipewire-routing-matrix.php?modal=1",
+			"icon": "fas fa-th",
+			"buttonText": "Configure Routing Matrix",
+			"modalTitle": "PipeWire Routing Matrix",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireGraph": {
+			"name": "PipeWireGraph",
+			"description": "PipeWire Graph",
+			"tip": "Visual graph of the current PipeWire audio and video topology, including all sources, sinks, and processing nodes. Useful for troubleshooting and understanding how media is flowing through the system.",
+			"type": "link",
+			"linkUrl": "pipewire-graph.php",
+			"icon": "fas fa-project-diagram",
+			"buttonText": " Visualise Current Pipeline"
+		},
+		"PipeWireVideoOutputs": {
+			"name": "PipeWireVideoOutputs",
+			"description": "Video Output Groups",
+			"tip": "Configure video output groups routed through PipeWire. Each group fans out a video signal to multiple destinations (HDMI ports, pixel overlays, network streams). All members of a group receive the same video signal.",
+			"type": "modal",
+			"modalUrl": "pipewire-video.php?modal=1",
+			"icon": "fas fa-tv",
+			"buttonText": "Configure Video Output Groups",
+			"modalTitle": "PipeWire Video Output Groups",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireRTSPOutputs": {
+			"name": "PipeWireRTSPOutputs",
+			"description": "RTSP Video Outputs",
+			"tip": "Serve a video output, with its audio, as an RTSP stream that a player opens by URL. Unlike the RTP network outputs, no SDP file has to be copied to the receiver. The server listens on every interface without a password, like FPP's other network media outputs.",
+			"type": "modal",
+			"modalUrl": "pipewire-rtsp-outputs.php?modal=1",
+			"icon": "fas fa-satellite-dish",
+			"buttonText": "Configure RTSP Outputs",
+			"modalTitle": "RTSP Video Outputs",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireVideoInputSources": {
+			"name": "PipeWireVideoInputSources",
+			"description": "Video Input Sources",
+			"tip": "Configure persistent video input sources (test patterns, cameras) that appear in the PipeWire graph. Video Output Groups can target these sources to display them on HDMI outputs, pixel overlays, or network streams.",
+			"type": "modal",
+			"modalUrl": "pipewire-video-inputs.php?modal=1",
+			"icon": "fas fa-video",
+			"buttonText": "Configure Video Input Sources",
+			"modalTitle": "PipeWire Video Input Sources",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireAES67Config": {
+			"name": "PipeWireAES67Config",
+			"description": "AES67 Audio-over-IP",
+			"tip": "Send and receive professional audio streams over the network. Each instance becomes a virtual sound card.",
+			"type": "modal",
+			"modalUrl": "aes67-config.php?modal=1",
+			"icon": "fas fa-broadcast-tower",
+			"buttonText": "Configure AES67 Instances",
+			"modalTitle": "AES67 Audio-over-IP Instances",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireOpusRTPConfig": {
+			"name": "PipeWireOpusRTPConfig",
+			"description": "Opus RTP Audio Streaming",
+			"tip": "Send and receive compressed audio streams over WiFi or wired networks using the Opus codec. Ideal for wireless audio and instances where AES67 is not a valid cost option.",
+			"type": "modal",
+			"modalUrl": "opus-rtp-config.php?modal=1",
+			"icon": "fas fa-wifi",
+			"buttonText": "Configure Opus RTP Instances",
+			"modalTitle": "Opus RTP Audio Streaming Instances",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireVBANConfig": {
+			"name": "PipeWireVBANConfig",
+			"description": "VBAN Audio Streaming",
+			"tip": "Send and receive uncompressed audio over the local network using VBAN, the protocol spoken by Voicemeeter and the VB-Audio tools. A received stream becomes a PipeWire source you can route in Input Mixing or use as the WLED Sound Reactive Source.",
+			"type": "modal",
+			"modalUrl": "vban-config.php?modal=1",
+			"icon": "fas fa-network-wired",
+			"buttonText": "Configure VBAN Streams",
+			"modalTitle": "VBAN Audio Streaming",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67Enabled": {
+			"name": "AES67Enabled",
+			"description": "Enable AES67 Audio",
+			"tip": "Enable AES67 audio-over-IP streaming via PipeWire RTP modules. AES67 allows sending and/or receiving professional-quality audio over the local network using standard multicast RTP. Requires the PipeWire audio backend to be active.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "0",
+			"type": "checkbox",
+			"children": {
+				"1": [
+					"AES67Mode",
+					"AES67Interface",
+					"AES67MulticastIP",
+					"AES67Port",
+					"AES67Channels",
+					"AES67SessionName",
+					"AES67Latency",
+					"AES67SAPEnabled",
+					"AES67PTPEnabled"
+				]
+			},
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67Mode": {
+			"name": "AES67Mode",
+			"description": "AES67 Stream Mode",
+			"tip": "Select whether this FPP instance sends audio out over the network (Send), receives AES67 streams from other devices (Receive), or does both simultaneously.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "send",
+			"type": "select",
+			"options": {
+				"Send (Transmit)": "send",
+				"Receive": "receive",
+				"Both (Send & Receive)": "both"
+			},
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67Interface": {
+			"name": "AES67Interface",
+			"description": "Network Interface",
+			"tip": "The network interface to use for AES67 multicast traffic. Select the wired Ethernet interface for best results. If left empty, PipeWire will use the default route.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "",
+			"type": "select",
+			"optionsURL": "api/settings/AES67Interface/options",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67MulticastIP": {
+			"name": "AES67MulticastIP",
+			"pii": true,
+			"description": "Multicast IP Address",
+			"tip": "The multicast group IP address for AES67 RTP streams. The AES67 standard uses the 239.69.x.x range. Default is 239.69.0.1.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "239.69.0.1",
+			"type": "text",
+			"size": 15,
+			"maxlength": 15,
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67Port": {
+			"name": "AES67Port",
+			"description": "RTP Port",
+			"tip": "The UDP port for AES67 RTP traffic. The AES67 standard default is 5004.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 5004,
+			"type": "number",
+			"min": 1024,
+			"max": 65535,
+			"step": 1,
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67Channels": {
+			"name": "AES67Channels",
+			"description": "Audio Channels",
+			"tip": "The number of audio channels in the AES67 stream. Standard AES67 supports up to 8 channels. Most use cases require 2 (stereo).",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 2,
+			"type": "select",
+			"options": {
+				"2 (Stereo)": 2,
+				"4": 4,
+				"6 (5.1)": 6,
+				"8 (7.1)": 8
+			},
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67SessionName": {
+			"name": "AES67SessionName",
+			"pii": true,
+			"description": "Session Name",
+			"tip": "A descriptive name for this AES67 stream that will be visible to other AES67 devices on the network via SAP announcements.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "FPP AES67",
+			"type": "text",
+			"size": 40,
+			"maxlength": 64,
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67Latency": {
+			"name": "AES67Latency",
+			"description": "Network Latency",
+			"tip": "Target network latency in milliseconds for AES67 receive streams. Lower values reduce delay but may cause dropouts on congested networks. AES67 specifies a minimum of 1ms, typical values are 1-20ms.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": 10,
+			"type": "number",
+			"min": 1,
+			"max": 100,
+			"step": 1,
+			"suffix": "ms",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67SAPEnabled": {
+			"name": "AES67SAPEnabled",
+			"description": "Enable SAP Discovery",
+			"tip": "Enable SAP (Session Announcement Protocol) for automatic discovery of AES67 streams on the network. When enabled, sent streams are announced via SAP and incoming SAP announcements are used to auto-create receive streams.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "1",
+			"type": "checkbox",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AES67PTPEnabled": {
+			"name": "AES67PTPEnabled",
+			"description": "Enable PTP Clock Sync",
+			"tip": "Enable IEEE 1588 Precision Time Protocol (PTP) clock synchronization. AES67 requires PTP for sample-accurate synchronization between devices. This starts ptp4l on the selected network interface.",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 0,
+			"reboot": 1,
+			"default": "1",
+			"type": "checkbox",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"backgroundColor": {
+			"name": "backgroundColor",
+			"description": "Header Background Color",
+			"tip": "The header background color of the FPP User Interface can be changed to make it easier to distinguish visually between multiple installed FPP instances.",
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 1,
+			"gatherStats": true,
+			"default": "",
+			"type": "select",
+			"options": {
+				"Default": "",
+				"Red": "FF0000",
+				"Crimson": "DC143C",
+				"FireBrick": "B22222",
+				"Tomato": "FF6347",
+				"OrangeRed": "FF4500",
+				"DarkOrange": "FF8C00",
+				"Orange": "FFA500",
+				"Coral": "FF7F50",
+				"Gold": "FFD700",
+				"Yellow": "FFFF00",
+				"LightYellow": "FFFFE0",
+				"Khaki": "F0E68C",
+				"Green": "008000",
+				"Lime": "00FF00",
+				"ForestGreen": "228B22",
+				"SpringGreen": "00FF7F",
+				"Olive": "808000",
+				"Chartreuse": "7FFF00",
+				"SeaGreen": "2E8B57",
+				"MediumSeaGreen": "3CB371",
+				"Teal": "008080",
+				"Aqua": "00FFFF",
+				"Cyan": "00FFFF",
+				"Turquoise": "40E0D0",
+				"LightSeaGreen": "20B2AA",
+				"SkyBlue": "87CEEB",
+				"DeepSkyBlue": "00BFFF",
+				"DodgerBlue": "1E90FF",
+				"Blue": "0000FF",
+				"MediumBlue": "0000CD",
+				"RoyalBlue": "4169E1",
+				"Navy": "000080",
+				"Indigo": "4B0082",
+				"Purple": "800080",
+				"MediumPurple": "9370DB",
+				"Orchid": "DA70D6",
+				"Violet": "EE82EE",
+				"Magenta": "FF00FF",
+				"Black": "000000",
+				"Gray": "808080",
+				"Silver": "C0C0C0"
+			}
+		},
+		"BBBLedPWR": {
+			"name": "BBBLedPWR",
+			"description": "Power",
+			"tip": "Controls whether the power indicator LED on the BeagleBone is enabled or disabled",
+			"default": "1",
+			"gatherStats": true,
+			"platforms": [
+				"BeagleBone Black"
+			],
+			"type": "select",
+			"options": {
+				"Disabled": "0",
+				"Enabled": "1"
+			}
+		},
+		"BBBLeds0": {
+			"name": "BBBLeds0",
+			"description": "USR0",
+			"tip": "Controls the function of the USR0 LED indicator on the BeagleBone",
+			"default": "heartbeat",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64"
+			],
+			"type": "select",
+			"optionsURL": "api/settings/BBBLeds/options"
+		},
+		"BBBLeds1": {
+			"name": "BBBLeds1",
+			"description": "USR1",
+			"tip": "Controls the function of the USR1 LED indicator on the BeagleBone",
+			"default": "mmc0",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64"
+			],
+			"type": "select",
+			"optionsURL": "api/settings/BBBLeds/options"
+		},
+		"BBBLeds2": {
+			"name": "BBBLeds2",
+			"description": "USR2",
+			"tip": "Controls the function of the USR2 LED indicator on the BeagleBone",
+			"default": "cpu",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64"
+			],
+			"type": "select",
+			"optionsURL": "api/settings/BBBLeds/options"
+		},
+		"BBBLeds3": {
+			"name": "BBBLeds3",
+			"description": "USR3",
+			"tip": "Controls the function of the USR3 LED indicator on the BeagleBone",
+			"default": "mmc1",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64"
+			],
+			"type": "select",
+			"optionsURL": "api/settings/BBBLeds/options"
+		},
+		"blankBetweenSequences": {
+			"name": "blankBetweenSequences",
+			"description": "Blank between sequences",
+			"gatherStats": true,
+			"tip": "Blank Between Sequences instructs FPP to send blanking data out all channel outputs between each sequence played in a playlist.  This can be used to turn off all the lights after each sequence if the sequences do not end with all channels turned off.",
+			"restart": 0,
+			"type": "checkbox"
+		},
+		"bridgeDataPriority": {
+			"name": "bridgeDataPriority",
+			"description": "Bridge Data Priority",
+			"tip": "Describes how to handle if bridge data (E131 or DDP) is received while a sequence is playing.",
+			"level": 0,
+			"gatherStats": true,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 0,
+			"type": "select",
+			"default": "Warn If Sequence Running",
+			"options": {
+				"Warn If Sequence Running": "Warn If Sequence Running",
+				"Prioritize Bridge": "Prioritize Bridge",
+				"Prioritize Sequence": "Prioritize Sequence"
+			}
+		},
+		"bootDelay": {
+			"name": "bootDelay",
+			"description": "FPPD Boot Delay",
+			"gatherStats": true,
+			"tip": "The time that FPP waits after system boot up to start fppd.  For environments that are powered down regularly, fppd may start up quicker than the network environment fully starts up which may cause E1.31 multicast to not work properly.  Setting a Boot Delay will cause the system to wait the specified amount of time during startup which can give the network switches and routers time to fully start up.  If Auto is selected, the system will wait until a valid time has been retrieved via NTP or a RTC (real-time clock) OR a maximum of 5 minutes.",
+			"default": "0",
+			"type": "select",
+			"options": {
+				"0s": 0,
+				"1s": 1,
+				"2s": 2,
+				"3s": 3,
+				"4s": 4,
+				"5s": 5,
+				"6s": 6,
+				"7s": 7,
+				"8s": 8,
+				"9s": 9,
+				"10s": 10,
+				"15s": 15,
+				"20s": 20,
+				"25s": 25,
+				"30s": 30,
+				"1 min": 60,
+				"2 min": 120,
+				"3 min": 180,
+				"5 min": 300,
+				"Auto": -1
+			},
+			"platforms": [
+				"!MacOS"
+			],
+			"checkFile": [
+				"!/etc/fpp/container"
+			]
+		},
+		"ClockDate": {
+			"name": "ClockDate",
+			"description": "Set Date",
+			"tip": "Current Date to use to set the system date.",
+			"suffix": "(YYYY-MM-DD)",
+			"type": "date",
+			"alwaysReset": 1
+		},
+		"ClockTime": {
+			"name": "ClockTime",
+			"description": "Set Time",
+			"tip": "Current Time to use to set the system time.  Time must be in 24-hour format.",
+			"suffix": "(HH:MM:SS)",
+			"type": "time",
+			"alwaysReset": 1
+		},
+		"CompressMultiSyncTransfers": {
+			"name": "CompressMultiSyncTransfers",
+			"gatherStats": true,
+			"description": "Compress files during copy to Remotes to speed up file sync process",
+			"tip": "Compress files during copy to speed up the sync process.  NOTE: Newer xLights versions already used a compressed FSEQ format, so this option may only slow down the transfer as FPP tries to recompress already-compressed data.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"DateFormat": {
+			"name": "DateFormat",
+			"description": "Date Format",
+			"tip": "Format of displayed dates",
+			"type": "select",
+			"reloadUI": 1,
+			"default": "%a %b %e",
+			"gatherStats": true,
+			"options": {
+				"YYYY-MM-DD (2021-12-25)": "%Y-%m-%d",
+				"MM/DD/YYYY (12/25/2021)": "%m/%d/%Y",
+				"DD/MM/YYYY (25/12/2021)": "%d/%m/%Y",
+				"Weekday Month Day (Sat Dec 25)": "%a %b %e",
+				"Month Day (Dec 25)": "%b %e"
+			}
+		},
+		"DisableFakeNetworkBridges": {
+			"name": "DisableFakeNetworkBridges",
+			"description": "Disable Network Bridge Monitoring (E1.31/DDP/ArtNet)",
+			"gatherStats": true,
+			"tip": "FPP normally listens on the network bridge ports for incoming data even when not running in Bridge mode to monitor for and identify misconfigurations in the environment.  The disable setting is provided to allow the user to disable these listeners if they need to spin up their own listener software.",
+			"level": 1,
+			"restart": 0,
+			"reboot": 0,
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"default": "0",
+			"type": "checkbox"
+		},
+		"BridgeSourcePriority": {
+			"name": "BridgeSourcePriority",
+			"description": "Bridge Input Source Priority",
+			"gatherStats": true,
+			"tip": "When multiple senders transmit to the same input universe, lock onto a single source and suppress the others.  For E1.31, the priority byte in the packet header is honored so a higher-priority source always wins.  For ArtNet (which has no priority field), the first source seen wins.  In both cases, if the active source stops sending for longer than the input timeout, the next packet from any source takes over.  DDP is unaffected.",
+			"level": 1,
+			"restart": 0,
+			"reboot": 0,
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"default": "0",
+			"type": "checkbox"
+		},
+		"disableIPAnnouncement": {
+			"name": "disableIPAnnouncement",
+			"description": "Disable IP announcement",
+			"gatherStats": true,
+			"tip": "During boot, the current IP addresses will be announced over the audio output.  This setting allows disabling this announcement for production use when FPP is connected to a FM transmitter or speakers.",
+			"type": "checkbox",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWirePassiveSinks": {
+			"name": "PipeWirePassiveSinks",
+			"description": "Suspend Audio Device When Idle",
+			"gatherStats": true,
+			"tip": "Lets PipeWire suspend the sound card while nothing is playing. Without this the audio graph runs continuously and keeps the card clocked, which costs roughly 4-5% of a CPU core on single-core boards even when the player is idle. Turn this off if a sound card does not resume correctly when playback starts.",
+			"level": 1,
+			"default": "1",
+			"type": "checkbox",
+			"restart": 0,
+			"reboot": 1,
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"disableAudioVolumeSlider": {
+			"name": "disableAudioVolumeSlider",
+			"description": "Disable Volume Slider",
+			"gatherStats": true,
+			"tip": "This setting will remove the Audio Volume Slider on the Status Page to prevent accidental unwanted volume changes.",
+			"default": "0",
+			"type": "checkbox",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"PipeWireKeepOutputOpen": {
+			"name": "PipeWireKeepOutputOpen",
+			"description": "Keep Audio Output Open",
+			"gatherStats": true,
+			"tip": "Keep FPP's audio output running all the time instead of starting it when media is about to play and stopping it a few seconds after.  Media that starts with no warning -- sound effects triggered by GPIO inputs, commands or the API -- then plays without the start-up delay, which can be most of a second on a BeagleBone.  Scheduled playlists and back-to-back media do not need this.  Costs a little CPU all the time, since the sound card never idles.",
+			"level": 1,
+			"restart": 0,
+			"default": "0",
+			"type": "checkbox",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"disableUIWarnings": {
+			"name": "disableUIWarnings",
+			"description": "Disable restart/reboot UI Warnings",
+			"tip": "Disable the 'restart required' and 'reboot required' warnings that appear at the top of the page when settings are changed.",
+			"level": 3,
+			"gatherStats": true,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 0,
+			"default": "0",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"disableUIPopoverAlerts": {
+			"name": "disableUIPopoverAlerts",
+			"description": "Disable UI Popover Event Alerts",
+			"tip": "Disable the popover alerts that appear in the UI top right when an alert fires, these alerts are useful for providing feedback to the user so this setting should only be used in special circumstances.",
+			"level": 1,
+			"gatherStats": true,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 1,
+			"default": "0",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"DisableScheduler": {
+			"name": "DisableScheduler",
+			"gatherStats": true,
+			"description": "Disable Scheduler",
+			"tip": "The Disable Scheduler setting allows disabling all scheduling rather than having to go to each schedule entry and deactivate.",
+			"type": "checkbox",
+			"level": 1,
+			"restart": 1,
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"UIStartedPlaylistsProtected": {
+			"name": "UIStartedPlaylistsProtected",
+			"gatherStats": true,
+			"description": "Protect UI-Started Playlists from Schedule Override",
+			"tip": "When enabled, playlists/sequences/media started from the UI will be protected from being stopped by scheduled playlists. This is useful when manually testing shows. Note: Playlists started via API/MQTT can still specify their own protection level.",
+			"type": "checkbox",
+			"level": 1,
+			"restart": 0,
+			"default": 0,
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"E131BridgingInterval": {
+			"name": "E131BridgingInterval",
+			"description": "E1.31 Bridging Transmit Interval",
+			"gatherStats": true,
+			"tip": "The default Transmit Interval in E1.31 Bridge Mode is 50ms.  This setting allows changing this to match the rate the player is outputting.",
+			"level": 1,
+			"restart": 0,
+			"type": "select",
+			"default": "50",
+			"options": {
+				"10ms": "10",
+				"25ms": "25",
+				"40ms": "40",
+				"50ms": "50",
+				"100ms": "100"
+			}
+		},
+		"emailfromtext": {
+			"name": "emailfromtext",
+			"pii": true,
+			"description": "From Name",
+			"tip": "Text to use in From field of emails.",
+			"type": "text",
+			"size": 30,
+			"maxlength": 64
+		},
+		"emailfromuser": {
+			"name": "emailfromuser",
+			"pii": true,
+			"description": "From Email Address",
+			"tip": "Email address to be used to send emails.",
+			"type": "text",
+			"size": 30,
+			"maxlength": 64
+		},
+		"emailpass": {
+			"name": "emailpass",
+			"description": "SMTP Server Password",
+			"tip": "Password to be used to authenticate with email server.",
+			"type": "password",
+			"size": 30,
+			"maxlength": 100
+		},
+		"emailport": {
+			"name": "emailport",
+			"description": "SMTP Server Port",
+			"gatherStats": true,
+			"tip": "TCP Port used on SMTP server.  Most server use 587 for encrypted traffic, some servers may still use 25 for non-encrypted SMTP traffic.",
+			"restart": 0,
+			"type": "select",
+			"options": {
+				"25": "25",
+				"465": "465",
+				"587": "587"
+			},
+			"default": "587"
+		},
+		"emailserver": {
+			"name": "emailserver",
+			"pii": true,
+			"description": "SMTP Server Hostname",
+			"tip": "Server used to send outbound email.",
+			"type": "text",
+			"size": 30,
+			"maxlength": 64,
+			"children": {
+				"*": [
+					"emailport",
+					"emailuser",
+					"emailpass",
+					"emailfromuser",
+					"emailtoemail",
+					"emailfromtext"
+				]
+			}
+		},
+		"emailtoemail": {
+			"name": "emailtoemail",
+			"pii": true,
+			"description": "Default TO Address",
+			"tip": "Default destination email address to send all emails.",
+			"type": "text",
+			"size": 30,
+			"maxlength": 64
+		},
+		"emailuser": {
+			"name": "emailuser",
+			"pii": true,
+			"description": "SMTP Server Login",
+			"tip": "Login for SMTP server, may be the same as the from address.",
+			"type": "text",
+			"size": 30,
+			"maxlength": 64
+		},
+		"EnableTethering": {
+			"name": "EnableTethering",
+			"description": "Tethering Mode",
+			"tip": "Enable or disable FPP WiFi tethering mode",
+			"gatherStats": true,
+			"default": 0,
+			"type": "select",
+			"options": {
+				"If no connection": 0,
+				"Enabled": 1,
+				"Disabled": 2
+			}
+		},
+		"fileManagerThumbnailSize": {
+			"name": "fileManagerThumbnailSize",
+			"description": "File Manager Thumbnail Size",
+			"tip": "The max height and width of the thumbnail preview for image files in the FPP File Manager UI.  The UI will preserve the aspect ratio to fit the image within this height and width.",
+			"level": 1,
+			"default": 75,
+			"gatherStats": true,
+			"type": "select",
+			"options": {
+				"Disabled": 0,
+				"25 pixels": 25,
+				"50 pixels": 50,
+				"75 pixels": 75,
+				"100 pixels": 100,
+				"125 pixels": 125,
+				"150 pixels": 150,
+				"175 pixels": 175,
+				"200 pixels": 200
+			},
+			"exposedAsJSToPages": [
+				"filemanager",
+				"all"
+			]
+		},
+		"fileManagerTableFilter": {
+			"name": "fileManagerTableFilter",
+			"description": "File Manager Enable Filter",
+			"tip": "This setting allows filtering to be turned on in FileManager.",
+			"level": 1,
+			"default": "1",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"exposedAsJSToPages": [
+				"filemanager"
+			]
+		},
+		"fileManagerHideEmptyTabs": {
+			"name": "fileManagerHideEmptyTabs",
+			"description": "File Manager Hide Empty Tabs",
+			"tip": "Hide File Manager tabs that contain no files. A tab reappears once a file of that type is uploaded.",
+			"level": 1,
+			"default": "0",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"exposedAsJSToPages": [
+				"filemanager"
+			]
+		},
+		"gpioHideCapePins": {
+			"name": "gpioHideCapePins",
+			"description": "Hide Cape Controlled GPIO Pins",
+			"tip": "Hide GPIO pins that are controlled by the currently installed cape from the GPIO Pin Control page to prevent accidental changes to pins that are in use by the cape.",
+			"level": 1,
+			"default": "1",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"exposedAsJSToPages": [
+				"gpio"
+			]
+		},
+		"FPP_UUID": {
+			"name": "FPP_UUID",
+			"pii": true,
+			"description": "Override UUID",
+			"gatherStats": true,
+			"tip": "FPP UUID to use for FPP Connect de-duplication, stats, and services.  This will override using the serial number from /proc/cpuinfo or dmidecode.",
+			"level": 1,
+			"type": "text",
+			"size": 30,
+			"maxlength": 30,
+			"default": "",
+			"reboot": 1
+		},
+		"fppMode": {
+			"name": "fppMode",
+			"description": "FPP Player Mode",
+			"tip": "FPP can run either as a Player where it can schedule and run various playlists, sequences, etc... or in Remote mode where another FPP instance will be in control of scheduling.",
+			"gatherStats": true,
+			"restart": 2,
+			"type": "select",
+			"reloadUI": 1,
+			"options": {
+				"Player": "player",
+				"Remote": "remote"
+			},
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"FetchVendorLogos": {
+			"name": "FetchVendorLogos",
+			"transmitRank": {
+				"0": 0,
+				"1": 1
+			},
+			"description": "Fetch cape logos from vendors",
+			"gatherStats": true,
+			"tip": "Some capes/hats fetch the vendor logo from their website when using the FPP UI.  This discloses your IP address to the vendor.",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64",
+				"Raspberry Pi"
+			],
+			"type": "checkbox",
+			"default": 1
+		},
+		"ForceHDMI": {
+			"name": "ForceHDMI",
+			"description": "Force HDMI Display",
+			"gatherStats": true,
+			"tip": "Force the Raspberry Pi to use the HDMI output as the default display.  This is sometimes required if the HDMI display is not detected properly or is not powered when the Pi is booted.  Turning this setting on will prevent using the Composite output on the Pi until the setting is disabled.",
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"type": "checkbox"
+		},
+		"DisableHDMICECInit": {
+			"name": "DisableHDMICECInit",
+			"description": "Prevent HDMI CEC at Boot",
+			"gatherStats": true,
+			"tip": "Adds hdmi_ignore_cec_init=1 to config.txt, suppressing the CEC \"Active Source\" broadcast the Pi firmware sends at boot.  That broadcast is what wakes a TV or projector out of standby and switches it to the Pi's input after a power cut, so enabling this gives that up: FPP never sends CEC itself, and a display left in standby will stay dark until someone picks up its remote.  Only enable it if you would rather the display did not come on by itself.  A plain monitor is unaffected either way, since it wakes on signal rather than on CEC.  Note that a display asleep at boot may also drop hot plug detect, in which case HDMI audio is unavailable and FPP falls back to another audio output.  Not applicable on Pi 5 (kernel KMS, no firmware HDMI).",
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"variants": {
+				"Raspberry Pi": [
+					"!Pi 5"
+				]
+			},
+			"type": "checkbox",
+			"default": "0"
+		},
+		"GPIOFan": {
+			"name": "GPIOFan",
+			"description": "GPIO 14 Fan Control",
+			"gatherStats": true,
+			"tip": "Allow the Raspberry Pi to control the speed of cooling fans by using the GPIO 14 PWM.",
+			"level": 1,
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"type": "checkbox"
+		},
+		"GPIOFanTemperature": {
+			"name": "GPIOFanTemperature",
+			"description": "    Fan On Temperature",
+			"gatherStats": true,
+			"tip": "Temperature above which the cooling fan will turn on.",
+			"level": 1,
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"type": "number",
+			"default": 70,
+			"min": 30,
+			"max": 85,
+			"step": 1,
+			"suffix": " C"
+		},
+		"EnableBBBHDMI": {
+			"name": "EnableBBBHDMI",
+			"description": "Enable HDMI Display",
+			"gatherStats": true,
+			"tip": "Enables the HDMI port on the BeagleBone.  WARNING: when enabled, many of the GPIO pins are disabled which will prevent most Capes from functioning.",
+			"reboot": 1,
+			"level": 1,
+			"platforms": [
+				"BeagleBone Black"
+			],
+			"variants": {
+				"BeagleBone Black": [
+					"BeagleBone Black",
+					"BeagleBone Black Wireless",
+					"SanCloud BeagleBone Enhanced"
+				]
+			},
+			"children": {
+				"1": [
+					"ForceHDMIResolution"
+				]
+			},
+			"type": "checkbox"
+		},
+		"ForceHDMIResolution": {
+			"name": "ForceHDMIResolution",
+			"description": "Force HDMI Resolution",
+			"gatherStats": true,
+			"tip": "Force the HDMI output to the given resolution.  The default is whatever settings the monitor reports at bootup time.",
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi",
+				"BeagleBone Black"
+			],
+			"variants": {
+				"BeagleBone Black": [
+					"BeagleBone Black",
+					"BeagleBone Black Wireless",
+					"SanCloud BeagleBone Enhanced"
+				]
+			},
+			"type": "select",
+			"optionsURL": "hdmi_table.json.php"
+		},
+		"ForceHDMIResolutionPort2": {
+			"name": "ForceHDMIResolutionPort2",
+			"gatherStats": true,
+			"description": "Force Port 2 HDMI Resolution",
+			"tip": "Force the Raspberry Pi 4/5's second HDMI to the given resolution.  The default is whatever settings the monitor reports at bootup time.",
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"variants": {
+				"Raspberry Pi": [
+					"Pi 4",
+					"Pi 5"
+				]
+			},
+			"type": "select",
+			"optionsURL": "hdmi_table.json.php"
+		},
+		"gitRemote": {
+			"name": "gitRemote",
+			"description": "Git Remote Repository",
+			"gatherStats": true,
+			"tip": "Select the git remote repository to use for branch selection. 'FPP Releases' is the main FPP repository, 'FPP New Feature Testing' is for new feature testing. 'GitHub User Fork' is for user forks if valid GitHub credentials containing a fork is detected. 'Pull Requests' lists open pull requests on FalconChristmas/fpp; the branch dropdown then shows PRs by number and author.",
+			"default": "origin",
+			"type": "select",
+			"options": {
+				"FPP Releases": "origin",
+				"FPP New Feature Testing": "newfeatures",
+				"Pull Requests": "pull-requests"
+			},
+			"level": 3
+		},
+		"gitHubUser": {
+			"name": "gitHubUser",
+			"pii": true,
+			"description": "GitHub User Name",
+			"tip": "GitHub user name used together with the GitHub Personal Access Token below to install/upgrade plugins hosted in private GitHub repositories. Only used when 'Use Credentials' is selected on the Plugin Manager page.",
+			"level": 3,
+			"type": "text",
+			"size": 32,
+			"maxlength": 64
+		},
+		"gitHubPAT": {
+			"name": "gitHubPAT",
+			"description": "GitHub Personal Access Token",
+			"tip": "GitHub Personal Access Token (classic or fine-grained) with read access to the private repositories you wish to install plugins from. Stored locally in /home/fpp/media/settings. Only used when 'Use Credentials' is selected on the Plugin Manager page.",
+			"level": 3,
+			"type": "password",
+			"size": 48,
+			"maxlength": 256
+		},
+		"DistributedCompile": {
+			"name": "DistributedCompile",
+			"description": "Distributed Compile",
+			"tip": "Distribute FPP source compiles to a helper host to speed up full rebuilds (e.g. after a branch switch or a header change that invalidates ccache). RECOMMENDED: run 'sudo scripts/setup_nocc_host.sh' on a fast machine and pick 'nocc + mdns' here -- the helper advertises itself on the LAN, so Compile Hosts can stay empty. 'nocc' is the same thing with the helper named by hand in Compile Hosts (use it when mDNS does not reach this board). nocc does NOT preprocess locally, so it is far faster on slow single-core boards (BeagleBone Black, Pi Zero). The distcc modes ('distcc', 'distcc + zeroconf', helper set up with scripts/setup_distcc_host.sh) preprocess locally and are the fallback when a helper cannot run nocc-server. Client and helper must run the same compiler major version, and any distributed mode disables the precompiled header.",
+			"level": 3,
+			"restart": 0,
+			"reboot": 0,
+			"default": "off",
+			"type": "select",
+			"options": {
+				"Off": "off",
+				"distcc": "distcc",
+				"distcc + zeroconf": "distcc-zeroconf",
+				"nocc": "nocc",
+				"nocc + mdns": "nocc-zeroconf"
+			},
+			"children": {
+				"distcc": [
+					"DistccHosts"
+				],
+				"nocc": [
+					"DistccHosts"
+				],
+				"nocc-zeroconf": [
+					"NoccDiscoverWireless"
+				]
+			}
+		},
+		"DistccHosts": {
+			"name": "DistccHosts",
+			"pii": true,
+			"description": "Compile Hosts",
+			"tip": "Space separated list of helper hosts. distcc: host[:port][/jobs][,options], e.g. 'myhelper:3632/6,lzo'. nocc: host[:port] (default port 43210), e.g. 'myhelper'. Not used for 'distcc + zeroconf' or 'nocc + mdns' (helpers are discovered via mDNS).",
+			"level": 3,
+			"restart": 0,
+			"reboot": 0,
+			"default": "",
+			"type": "text",
+			"size": 60,
+			"maxlength": 256
+		},
+		"NoccDiscoverWireless": {
+			"name": "NoccDiscoverWireless",
+			"description": "Enable NOCC discovery across Wireless Networks",
+			"tip": "When enabled this will add an additional 3 seconds to allow NOCC helper discovery over Wi-Fi networks.",
+			"level": 3,
+			"restart": 0,
+			"reboot": 0,
+			"default": "0",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0"
+		},
+		"Pi16KPageKernel": {
+			"name": "Pi16KPageKernel",
+			"description": "Use 16K-Page Kernel",
+			"tip": "Pi 5 family only, 64-bit images only.  Boots the Pi 5's 16K-page kernel (kernel_2712.img) instead of the 4K-page kernel8.img.  The 64-bit image ships it disabled, as some libraries FPP uses are not compatible with 16K pages; this is for testing them.  Reboot required.",
+			"level": 3,
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 1,
+			"default": "0",
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"checkFile": [
+				"/boot/firmware/kernel_2712.img.fpp-disabled"
+			],
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0"
+		},
+		"gitBranch": {
+			"name": "gitBranch",
+			"description": "Git Branch",
+			"gatherStats": true,
+			"tip": "Switch code branches to test features outside the current release branch.  The 'master' branch is the main development branch for the next version of FPP.  There may also be a 'master-vY.x' branch were 'Y' is the major FPP version.  These master-v* branches are created to allow development on the next major release to continue in the master branch while bugfixes for the 'Y' release are applied only to the master-vY.x branch.",
+			"level": 2
+		},
+		"HostDescription": {
+			"name": "HostDescription",
+			"pii": true,
+			"description": "Host description",
+			"tip": "Description of host",
+			"default": "FPP",
+			"type": "text",
+			"size": 30,
+			"maxlength": 48
+		},
+		"HostName": {
+			"name": "HostName",
+			"pii": true,
+			"description": "Host Name",
+			"tip": "Host names must contain only letters, numbers, and hyphens and must begin with a letter or a number",
+			"reboot": 1,
+			"default": "fpp",
+			"type": "text",
+			"size": 30,
+			"maxlength": 30,
+			"regex": "^\\([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\\-]*[a-zA-Z0-9])$",
+			"regexDesc": "Host names must contain only letters, numbers and hyphens",
+			"platforms": [
+				"!MacOS"
+			],
+			"exposedAsJSToPages": [
+				"index"
+			]
+		},
+		"Latitude": {
+			"name": "Latitude",
+			"pii": true,
+			"description": "Latitude",
+			"tip": "Latitude of geographic location of FPP system.  The latitude/longitude can be used by the FPP scheduler to calculate the sunrise/sunset times.  The default values provided are for Falcon, Colorado.",
+			"restart": 2,
+			"default": "38.938524",
+			"type": "text",
+			"size": 15,
+			"maxlength": 15
+		},
+		"LEDDisplayType": {
+			"name": "LEDDisplayType",
+			"description": "Status Display",
+			"tip": "Status Display type.  There are several OLED/LCD displays which can be attached to the i2c bus on the Pi and BeagleBone.  This setting is used to configure the size and type of display installed.",
+			"gatherStats": true,
+			"reboot": 1,
+			"checkFile": [
+				"/dev/i2c-1",
+				"/dev/i2c-2"
+			],
+			"type": "select",
+			"options": {
+				"Disabled": 0,
+				"128x64 I2C (SSD1306)": 1,
+				"128x64 Flipped I2C (SSD1306)": 2,
+				"128x64 H-Flipped I2C (SSD1306)": 32,
+				"128x64 2 Color I2C (SSD1306)": 7,
+				"128x64 2 Color Flipped I2C (SSD1306)": 8,
+				"128x64 2 Color H-Flipped I2C (SSD1306)": 33,
+				"128x32 I2C (SSD1306)": 3,
+				"128x32 Flipped I2C (SSD1306)": 4,
+				"128x64 I2C (SH1106)": 5,
+				"128x64 Flipped I2C (SH1106)": 6,
+				"128x128 I2C (SSD1327)": 9,
+				"128x128 Flipped I2C (SSD1327)": 10,
+				"128x128 I2C (SH1107)": 34,
+				"128x128 Flipped I2C (SH1107)": 35,
+				"Adafruit 16x2 LCD (I2C 0x20)": 11,
+				"PCF8574A 16x2 LCD (I2C 0x3F)": 12,
+				"PCF8574A 20x4 LCD (I2C 0x3F)": 13,
+				"PCF8574 16x2 LCD (I2C 0x27)": 14,
+				"PCF8574 20x4 LCD (I2C 0x27)": 15
+			}
+		},
+		"LegalJurisdiction": {
+			"name": "LegalJurisdiction",
+			"description": "Legal Jurisdiction",
+			"tip": "Which privacy rules apply where this device is used.  Some regions require that a device ask before it sends anything; others do not.  FPP uses this only to decide whether the privacy questions during setup start unanswered or pre-filled -- it does not change what any given setting does.  Options come from etc/jurisdictions.json.",
+			"gatherStats": true,
+			"type": "select",
+			"optionsURL": "api/settings/LegalJurisdiction/options",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"Locale": {
+			"name": "Locale",
+			"description": "Holiday List",
+			"gatherStats": true,
+			"tip": "Which set of holidays the FPP Scheduler knows about, so a playlist can be scheduled on Thanksgiving or Boxing Day without working out the date every year.  This is all it does: it does not change the language, the time zone, or how dates, times and numbers are formatted anywhere in FPP.  Pick Global if you would rather the scheduler offered no country-specific holidays.",
+			"restart": 2,
+			"default": "Global",
+			"type": "select",
+			"optionsURL": "api/settings/Locale/options",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"LogLevel_General": {
+			"name": "LogLevel_General",
+			"description": "General",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for General Functions. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_ChannelOut": {
+			"name": "LogLevel_ChannelOut",
+			"description": "ChannelOut",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Channel Testing and Overlays. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_ChannelData": {
+			"name": "LogLevel_ChannelData",
+			"description": "ChannelData",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Serial and LOR output. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Command": {
+			"name": "LogLevel_Command",
+			"description": "Command",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Commands. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_E131Bridge": {
+			"name": "LogLevel_E131Bridge",
+			"gatherStats": true,
+			"description": "E131Bridge",
+			"tip": "The Log Level controls the detail amount included in the FPP logs for E131 and DDP input Bridge. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Effect": {
+			"name": "LogLevel_Effect",
+			"gatherStats": true,
+			"description": "Effect",
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Effects. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_MediaOut": {
+			"name": "LogLevel_MediaOut",
+			"gatherStats": true,
+			"description": "MediaOut",
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Audio and Video Output. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Playlist": {
+			"name": "LogLevel_Playlist",
+			"gatherStats": true,
+			"description": "Playlist",
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Playlists. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Schedule": {
+			"name": "LogLevel_Schedule",
+			"description": "Schedule",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for the Scheduler. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Sequence": {
+			"name": "LogLevel_Sequence",
+			"description": "Sequence",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Sequence Parsing. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Settings": {
+			"name": "LogLevel_Settings",
+			"description": "Settings",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs when parsing Settings. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Control": {
+			"name": "LogLevel_Control",
+			"description": "Control",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for MQTT input ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Sync": {
+			"name": "LogLevel_Sync",
+			"description": "Sync",
+			"tip": "The Log Level controls the detail amount included in the FPP logs for MultiSync. ",
+			"gatherStats": true,
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_Plugin": {
+			"name": "LogLevel_Plugin",
+			"description": "Plugin",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for Plugin Management. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_GPIO": {
+			"name": "LogLevel_GPIO",
+			"description": "GPIO",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for GPIO Input/Output. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"LogLevel_HTTP": {
+			"name": "LogLevel_HTTP",
+			"description": "HTTP",
+			"gatherStats": true,
+			"tip": "The Log Level controls the detail amount included in the FPP logs for fppd Rest API. ",
+			"default": "info",
+			"type": "select",
+			"options": {
+				"Errors Only": "error",
+				"Warn": "warn",
+				"Info": "info",
+				"Debug": "debug",
+				"Excessive": "excess"
+			}
+		},
+		"Longitude": {
+			"name": "Longitude",
+			"pii": true,
+			"description": "Longitude",
+			"tip": "Longitude of geographic location of FPP system.  The latitude/longitude can be used by the FPP scheduler to calculate the sunrise/sunset times.  The default values provided are for Falcon, Colorado.",
+			"restart": 2,
+			"default": "-104.600945",
+			"type": "text",
+			"size": 15,
+			"maxlength": 15
+		},
+		"masqUIPlatform": {
+			"name": "masqUIPlatform",
+			"description": "UI Platform Masq",
+			"tip": "UI Masquerade allows a developer to have a system masquerade as another platform to help test different UI configurations.  This may not work in all situations where the actual platform is required such as if the detection of certain hardware is required to configure the UI.",
+			"level": 3,
+			"gatherStats": true,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 1,
+			"type": "select",
+			"options": {
+				"Default": "",
+				"Raspberry Pi": "Raspberry Pi",
+				"BeagleBone Black": "BeagleBone Black",
+				"BeagleBone 64": "BeagleBone 64",
+				"CHIP": "CHIP",
+				"Armbian": "Armbian",
+				"Debian": "Debian",
+				"FreeBSD": "FreeBSD",
+				"Linux": "Linux",
+				"ODROID": "ODROID",
+				"OrangePi": "OrangePi",
+				"Pine64": "Pine64",
+				"PogoPlug": "PogoPlug",
+				"qemu": "qemu",
+				"Ubuntu": "Ubuntu"
+			}
+		},
+		"mediaOffset": {
+			"name": "mediaOffset",
+			"description": "Local Media/Sequence Offset",
+			"gatherStats": true,
+			"tip": "The Media Offset value allows adjusting the synchronization of the media and sequences being played on the local device.  The value is specified in milliseconds.  A positive value moves the media ahead, a negative value moves the media back.  Changing this value requires a FPPD restart.  WARNING - This offset applies to all media files played.  If your media files require different offsets per file then you will have to edit the audio files or sequences to bring them into sync.",
+			"level": 1,
+			"restart": 2,
+			"fppModes": [
+				"player"
+			],
+			"default": 0,
+			"type": "number",
+			"min": -9999,
+			"max": 9999,
+			"step": 1,
+			"suffix": "ms"
+		},
+		"globalMediaOffset": {
+			"name": "globalMediaOffset",
+			"description": "Global Audio/Sequence Offset",
+			"gatherStats": true,
+			"tip": "The Global Audio/Sequence Offset value allows adjusting the synchronization of the audio and sequences being played.  This affects the Multi Sync packets and thus will adjust the timing across all synchronized devices.  The value is specified in milliseconds.  A positive value moves the audio ahead, a negative value moves the audio back.  Changing this value requires a FPPD restart.  WARNING - This offset applies to all audio files played.  If your audio files require different offsets per file then you will have to edit the audio files or sequences to bring them into sync.",
+			"level": 1,
+			"restart": 2,
+			"fppModes": [
+				"player"
+			],
+			"default": 0,
+			"type": "number",
+			"min": -9999,
+			"max": 9999,
+			"step": 1,
+			"suffix": "ms"
+		},
+		"MQTTCaFile": {
+			"name": "MQTTCaFile",
+			"description": "CA File",
+			"tip": "Optional CA File to authenticate the MQTT broker's certificate.  Only required when using SSL encryption and self-signed certificates.",
+			"restart": 2,
+			"type": "text",
+			"size": 32,
+			"maxlength": 64
+		},
+		"MQTTFrequency": {
+			"name": "MQTTFrequency",
+			"description": "Publish Playlist Frequency",
+			"gatherStats": true,
+			"tip": "Optional frequency in seconds to publish FPP Playlist status to MQTT Broker.  Zero indicates that the status will not be published but is available on demand",
+			"restart": 2,
+			"default": 0,
+			"type": "number",
+			"min": 0,
+			"max": 3600,
+			"step": 1
+		},
+		"MQTTClientId": {
+			"name": "MQTTClientId",
+			"pii": true,
+			"description": "Client ID",
+			"tip": "If not set, one will be generated",
+			"restart": 2,
+			"type": "text",
+			"size": 32,
+			"maxlength": 64
+		},
+		"MQTTHost": {
+			"name": "MQTTHost",
+			"pii": true,
+			"description": "Broker Host",
+			"tip": "Hostname or IP of your MQTT broker",
+			"restart": 2,
+			"type": "text",
+			"size": 32,
+			"maxlength": 64,
+			"children": {
+				"*": [
+					"MQTTPort",
+					"MQTTClientId",
+					"MQTTPrefix",
+					"MQTTUsername",
+					"MQTTPassword",
+					"MQTTCaFile",
+					"MQTTFrequency",
+					"MQTTSubscribe"
+				]
+			}
+		},
+		"MQTTPassword": {
+			"name": "MQTTPassword",
+			"description": "Password",
+			"tip": "Password to use to authenticate with the MQTT broker",
+			"restart": 2,
+			"type": "password",
+			"size": 32,
+			"maxlength": 300
+		},
+		"MQTTPort": {
+			"name": "MQTTPort",
+			"description": "Broker Port",
+			"tip": "TCP Port number on which your MQTT broker is listening",
+			"restart": 2,
+			"gatherStats": true,
+			"default": 1883,
+			"type": "number",
+			"min": 1,
+			"max": 65535,
+			"step": 1
+		},
+		"MQTTPortStatusFrequency": {
+			"name": "MQTTPortStatusFrequency",
+			"description": "Publish Port Status Frequency",
+			"gatherStats": true,
+			"tip": "Optional frequency in seconds to publish Port Monitoring status Json to MQTT Broker.  Zero indicates that the status will not be published",
+			"restart": 2,
+			"default": 0,
+			"type": "number",
+			"min": 0,
+			"max": 3600,
+			"step": 1
+		},
+		"MQTTPrefix": {
+			"name": "MQTTPrefix",
+			"pii": true,
+			"description": "Topic Prefix",
+			"tip": "Topic prefix to use when sending messages to the MQTT broker",
+			"restart": 2,
+			"type": "text",
+			"size": 32,
+			"maxlength": 64
+		},
+		"MQTTSubscribe": {
+			"name": "MQTTSubscribe",
+			"pii": true,
+			"description": "Subscribe Topics",
+			"tip": "Subscribe to one or more additional MQTT topics (optional).  Use '#' (without the quotes) to subscribe to all topics from MQTT server.  Use 'smartthings/#' to subscribe to all topics starting with 'smartthings', or use an exact topic to subscribe to a single topic.  You can sepereate multiple topics with \";\"",
+			"restart": 2,
+			"size": 32,
+			"maxlength": 100,
+			"type": "text"
+		},
+		"MQTTStatusFrequency": {
+			"name": "MQTTStatusFrequency",
+			"description": "Publish FPPD Status Frequency",
+			"gatherStats": true,
+			"tip": "Optional frequency in seconds to publish FPP status Json to MQTT Broker.  Zero indicates that the status will not be published",
+			"restart": 2,
+			"default": 0,
+			"type": "number",
+			"min": 0,
+			"max": 3600,
+			"step": 1
+		},
+		"MQTTUsername": {
+			"name": "MQTTUsername",
+			"pii": true,
+			"description": "Username",
+			"tip": "Username to use to authenticate with the MQTT broker",
+			"restart": 2,
+			"size": 32,
+			"maxlength": 100,
+			"type": "text",
+			"children": {
+				"*": [
+					"MQTTPassword"
+				]
+			}
+		},
+		"MultiSyncEnabled": {
+			"name": "MultiSyncEnabled",
+			"description": "Send MultiSync Packets",
+			"tip": "When enabled, FPP will send packets to FPP remotes to keep them in sync.",
+			"gatherStats": true,
+			"restart": 2,
+			"type": "checkbox",
+			"reloadUI": 1,
+			"fppModes": [
+				"player"
+			],
+			"exposedAsJSToPages": [
+				"multisync"
+			]
+		},
+		"MultiSyncExternalIPAddress": {
+			"name": "MultiSyncExternalIPAddress",
+			"pii": true,
+			"description": "External IP Address For Multisync Packets",
+			"tip": "The External IP address that other hosts see for this FPP instance.  Leave blank for default.",
+			"gatherStats": true,
+			"restart": 2,
+			"type": "text",
+			"platforms": [
+				"Docker"
+			]
+		},
+		"MultiSyncBroadcast": {
+			"name": "MultiSyncBroadcast",
+			"gatherStats": true,
+			"description": "Send MultiSync to ALL remotes via Broadcast",
+			"tip": "Use a network broadcast to send MultiSync messages to all remotes.",
+			"type": "checkbox",
+			"fppModes": [
+				"player"
+			],
+			"settingValues": {
+				"MultiSyncEnabled": 1
+			}
+		},
+		"MultiSyncUnicast": {
+			"name": "MultiSyncUnicast",
+			"gatherStats": true,
+			"description": "Send MultiSync to ALL KNOWN remotes via Unicast",
+			"tip": "Unicast MultiSync messages individually to every known FPP remote that is running in Remote mode.  Remotes are added to the list automatically as they are discovered (via mDNS or the normal FPP discovery).  Non-FPP devices (WLED, ESPixelStick, Falcon controllers, etc.) and FPP instances not in Remote mode are skipped.  Useful when multicast/broadcast is unreliable across your network.",
+			"type": "checkbox",
+			"default": 1,
+			"fppModes": [
+				"player"
+			],
+			"settingValues": {
+				"MultiSyncEnabled": 1
+			}
+		},
+		"MultiSyncCopyEffects": {
+			"name": "MultiSyncCopyEffects",
+			"gatherStats": true,
+			"description": "Copy Effects",
+			"tip": "Copy Effects from this FPP instance to Remote.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"MultiSyncCopyEvents": {
+			"name": "MultiSyncCopyEvents",
+			"description": "Copy Events",
+			"gatherStats": true,
+			"tip": "Copy Events from this FPP instance to Remote.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"MultiSyncCopyImages": {
+			"name": "MultiSyncCopyImages",
+			"description": "Copy Images",
+			"gatherStats": true,
+			"tip": "Copy Images from this FPP instance to Remote.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"MultiSyncCopyScripts": {
+			"name": "MultiSyncCopyScripts",
+			"description": "Copy Scripts",
+			"gatherStats": true,
+			"tip": "Copy Scripts from this FPP instance to Remote.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"MultiSyncMaxParallelJobs": {
+			"name": "MultiSyncMaxParallelJobs",
+			"description": "Max Systems Updated at Once",
+			"gatherStats": true,
+			"tip": "The most remote systems the MultiSync page upgrades, changes branch on, or copies files to at the same time. The rest wait their turn. Raise it if your build helpers can take more parallel rebuilds; 0 means no limit. Not shown in the UI; set it through the settings API.",
+			"level": 3,
+			"type": "number",
+			"default": 10,
+			"min": 0,
+			"max": 100
+		},
+		"MultiSyncCopySequences": {
+			"name": "MultiSyncCopySequences",
+			"description": "Copy Sequences",
+			"gatherStats": true,
+			"tip": "Copy FSEQ sequence files from this FPP instance to Remotes.  WARNING: Newer xLights versions create host-specific .fseq files which only contain the channels for each individual FPP instance.  If you are using these newer files, the .fseq on the FPP player may not contain all the channel data needed to properly play on each FPP Remote instance",
+			"type": "checkbox",
+			"default": "1",
+			"textOnRight": 1
+		},
+		"MultiSyncCopyVideos": {
+			"name": "MultiSyncCopyVideos",
+			"description": "Copy Videos",
+			"gatherStats": true,
+			"tip": "Copy Videos from this FPP instance to Remote.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"MultiSyncCopyMusic": {
+			"name": "MultiSyncCopyMusic",
+			"description": "Copy Music",
+			"gatherStats": true,
+			"tip": "Copy Music from this FPP instance to Remote.",
+			"type": "checkbox",
+			"textOnRight": 1
+		},
+		"MultiSyncExtraRemotes": {
+			"name": "MultiSyncExtraRemotes",
+			"pii": true,
+			"description": "MultiSync Unicast Discovery IPs (CSV list)",
+			"tip": "FPP will send unicast MultiSync discovery messages to the IPs in this list to allow discovery of devices which are unable to be discovered via FPP's normal multicast discovery.  This may include systems on remote networks or connected to certain routers which do not pass multicast packets between wired and wireless interfaces.",
+			"level": 1,
+			"size": 64,
+			"maxlength": 128,
+			"type": "text",
+			"exposedAsJSToPages": [
+				"multisync"
+			]
+		},
+		"MultiSyncHide10": {
+			"name": "MultiSyncHide10",
+			"gatherStats": true,
+			"description": "Hide 10.x.x.x/8 Subnets in systems list",
+			"tip": "Hide subnets in private 10.0.0.0/8 IP space.",
+			"type": "checkbox",
+			"exposedAsJSToPages": [
+				"multisync"
+			]
+		},
+		"MultiSyncHide172": {
+			"name": "MultiSyncHide172",
+			"gatherStats": true,
+			"description": "Hide 172.16.x.x/12 Subnets in systems list",
+			"tip": "Hide subnets in private 172.16.0.0/12 IP space.",
+			"type": "checkbox",
+			"exposedAsJSToPages": [
+				"multisync"
+			]
+		},
+		"MultiSyncHide192": {
+			"name": "MultiSyncHide192",
+			"gatherStats": true,
+			"description": "Hide 192.168.x.x/16 Subnets in systems list",
+			"tip": "Hide subnets in private 192.168.0.0/16 IP space.",
+			"type": "checkbox",
+			"exposedAsJSToPages": [
+				"multisync"
+			]
+		},
+		"MultiSyncHTTPSubnets": {
+			"name": "MultiSyncHTTPSubnets",
+			"description": "HTTP Discovery IPs &amp; subnets (CSV list)",
+			"tip": "List of comma separated subnets or IPs to scan looking for network attached pixel controllers.  Individual IPs may be listed as either A.B.C.D/32 or just A.B.C.D.  Subnets are listed as A.B.C.D/X.  FPP will attempt to discover these controllers using the HTTP protocol over port 80.",
+			"type": "text",
+			"level": 1,
+			"restart": 2,
+			"size": 64,
+			"maxlength": 128
+		},
+		"MultiSyncMulticast": {
+			"name": "MultiSyncMulticast",
+			"description": "Send MultiSync to ALL remotes via Multicast (239.70.80.80)",
+			"tip": "Send MultiCast to 239.70.80.80 to send MultiSync messages to all remotes.",
+			"type": "checkbox",
+			"fppModes": [
+				"player"
+			],
+			"settingValues": {
+				"MultiSyncEnabled": 1
+			}
+		},
+		"MultiSyncRefreshStatus": {
+			"name": "MultiSyncRefreshStatus",
+			"description": "Auto refresh Multisync Screen",
+			"tip": "Auto refresh status of FPP Systems.",
+			"type": "checkbox"
+		},
+		"ntpServer": {
+			"name": "ntpServer",
+			"pii": true,
+			"description": "Override default NTP Server",
+			"tip": "NTP server to sync time from. Leave blank to use falconplayer.pool.ntp.org. Every FPP also runs its own NTP server, so you can enter the IP of another FPP (or any NTP server) here to sync all controllers to one on the local network - useful when the internet path blocks NTP or one controller has a real-time clock.",
+			"level": 1,
+			"type": "text",
+			"size": 30,
+			"maxlength": 64
+		},
+		"UseNTPFromDHCP": {
+			"name": "UseNTPFromDHCP",
+			"description": "Use NTP Server from DHCP",
+			"tip": "When enabled, allows DHCP to provide NTP server information which will override the configured NTP server above. When disabled (default), only the configured NTP server will be used.",
+			"level": 1,
+			"type": "checkbox",
+			"default": 0
+		},
+		"openStartDelay": {
+			"name": "openStartDelay",
+			"description": "Open/Start Delay",
+			"gatherStats": true,
+			"tip": "An extra delay (in ms) between the Player sending the 'Open' command and actually starting the sequence.  This can be used to allow the remotes to have extra time to open the sequence, process videos, etc...   This requires master and remote to both be running FPP 3.2 or newer.  For complex MP4 files on remotes, a value of around 650-800 is likely needed for the remote video to be loaded and buffers filled prior to first frame being displayed.",
+			"level": 1,
+			"restart": 2,
+			"fppModes": [
+				"player"
+			],
+			"settingValues": {
+				"MultiSyncEnabled": 1
+			},
+			"default": 0,
+			"type": "number",
+			"min": 0,
+			"max": 9999,
+			"step": 1,
+			"suffix": "ms"
+		},
+		"osPassword": {
+			"name": "osPassword",
+			"description": "OS Password",
+			"tip": "OS Password for 'fpp' user, used when logging in via SSH.",
+			"type": "password",
+			"size": 32,
+			"maxlength": 32,
+			"onChange": "CheckOSPassword"
+		},
+		"osPasswordEnable": {
+			"name": "osPasswordEnable",
+			"description": "OS password",
+			"tip": "Changing the OS password is not normally needed unless your FPP instance is connected to a public network.  The default password is 'falcon', but you may select 'Custom' to allow choosing a custom password.  The OS password can always be changed via the FPP UI even if you do not remember the OS password.",
+			"gatherStats": true,
+			"type": "select",
+			"options": {
+				"falcon (Default)": "0",
+				"Enter a Password": "1"
+			},
+			"onChange": "ConfirmOSPasswordEnable",
+			"children": {
+				"1": [
+					"osPassword",
+					"osPasswordVerify"
+				]
+			},
+			"exposedAsJSToPages": [
+				"initialSetup"
+			]
+		},
+		"osPasswordVerify": {
+			"name": "osPasswordVerify",
+			"description": "OS Verify Password",
+			"tip": "Verify the OS Password.",
+			"type": "password",
+			"size": 32,
+			"maxlength": 32,
+			"onChange": "CheckOSPasswordVerify"
+		},
+		"pauseBackgroundEffects": {
+			"name": "pauseBackgroundEffects",
+			"description": "Pause background effects during FSEQ playback",
+			"gatherStats": true,
+			"tip": "Background effects normally continue to run when a sequence is playing.  This setting instructs FPP to pause all background effects when a sequence is running.  When the sequence stops running, the background effects resume playback.",
+			"type": "checkbox"
+		},
+		"password": {
+			"name": "password",
+			"description": "Password",
+			"tip": "Password to protect the User Interface.",
+			"type": "password",
+			"size": 32,
+			"maxlength": 32,
+			"onChange": "CheckPassword",
+			"exposedAsJSToPages": [
+				"initialSetup"
+			]
+		},
+		"passwordEnable": {
+			"name": "passwordEnable",
+			"description": "UI password",
+			"tip": "Enabling UI Password is not normally needed unless you are connected to a public network. If you set a UI password, you will need to make sure that you remember this password so you and other applications, like xLights, will be able to access the UI when needed. Select 'Disabled' to disable password protection. Select 'Enabled' to allow choosing a UI password",
+			"gatherStats": true,
+			"type": "select",
+			"options": {
+				"No Password (Default)": "0",
+				"Enter a Password": "1"
+			},
+			"onChange": "ConfirmPasswordEnable",
+			"children": {
+				"1": [
+					"password",
+					"passwordVerify"
+				]
+			},
+			"exposedAsJSToPages": [
+				"initialSetup"
+			]
+		},
+		"passwordVerify": {
+			"name": "passwordVerify",
+			"description": "Verify Password",
+			"tip": "Verify the UI Password.",
+			"type": "password",
+			"size": 32,
+			"maxlength": 32,
+			"onChange": "CheckPasswordVerify"
+		},
+		"playlistAutoScroll": {
+			"name": "playlistAutoScroll",
+			"description": "Auto Scroll Playlist Item",
+			"tip": "If enabled, Automatically scroll to Active Playlist Item on Main screen",
+			"gatherStats": true,
+			"restart": 0,
+			"default": 0,
+			"type": "checkbox",
+			"exposedAsJSToPages": [
+				"index, all"
+			]
+		},
+		"piRTC": {
+			"name": "piRTC",
+			"description": "Real Time Clock",
+			"gatherStats": true,
+			"tip": "The Real Time Clock (RTC) is a hardware clock used by FPP to track time when the Pi or BeagleBone is powered off.  At boot time, the operating system reads the RTC to set the system time.",
+			"reboot": 1,
+			"type": "select",
+			"optionsURL": "api/settings/RTC/options"
+		},
+		"DisablePiRTC": {
+			"name": "DisablePiRTC",
+			"description": "Disable Pi 5 Built-in RTC",
+			"gatherStats": true,
+			"tip": "The Pi 5 has a built-in RTC, but it only keeps time across a power cycle if a battery is fitted to the Pi's RTC header.  With no battery it still claims rtc0 and the system clock is set from it early in boot, before FPP can read the cape's clock.  If there is no battery on the Pi's header, disable it here so the cape's RTC is the only clock the system uses.",
+			"reboot": 1,
+			"default": 0,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"variants": {
+				"Raspberry Pi": [
+					"Pi 5"
+				]
+			},
+			"type": "checkbox"
+		},
+		"remoteIgnoreSync": {
+			"name": "remoteIgnoreSync",
+			"description": "Ignore Media Sync Packets",
+			"gatherStats": true,
+			"tip": "When enabled, videos/music played on the remote will be started and stopped when the main player sends the start/stop events, but no attempt will be made to keep the media in sync with the player during playback.  The media will run smoother, but may get out of sync with the main player.",
+			"level": 1,
+			"restart": 2,
+			"fppModes": [
+				"remote"
+			],
+			"type": "checkbox"
+		},
+		"remoteOffset": {
+			"name": "remoteOffset",
+			"description": "Remote Media/Sequence Offset",
+			"gatherStats": true,
+			"tip": "The Remote Offset value allows adjusting the synchronization of a FPP Remote.  The value is specified in milliseconds.  A positive value moves the remote ahead, a negative value moves the remote back.  Changing this value requires a FPPD restart on the remote.  WARNING - This offset applies to both sequence and media files.  If your media files require different offsets per file then you will need to edit the media files to bring them into sync.",
+			"level": 1,
+			"restart": 2,
+			"fppModes": [
+				"remote"
+			],
+			"default": 0,
+			"type": "number",
+			"min": -9999,
+			"max": 9999,
+			"step": 1,
+			"suffix": "ms"
+		},
+		"ScheduleDistance": {
+			"name": "ScheduleDistance",
+			"description": "Scheduler max timeframe to schedule out",
+			"tip": "This setting allows adjusting the approximate timeframe into the future that the scheduler will look when calculating the next scheduled items.  The default is 4 weeks but may be slightly longer based on the current weekday.",
+			"type": "select",
+			"gatherStats": true,
+			"level": 1,
+			"restart": 2,
+			"options": {
+				"4 Weeks": "28",
+				"8 Weeks": "56",
+				"3 Months": "92",
+				"6 Months": "183",
+				"1 Year": "365"
+			},
+			"default": "28"
+		},
+		"ScheduleSeconds": {
+			"name": "ScheduleSeconds",
+			"gatherStats": true,
+			"description": "Granular Scheduling",
+			"tip": "Allow scheduling down to the second instead of scheduling on minute boundaries.  Enabling this setting will show the seconds value in the Scheduler UI for the Start and End times on schedule entries.",
+			"type": "checkbox",
+			"level": 1,
+			"reloadUI": 1,
+			"exposedAsJSToPages": [
+				"scheduler"
+			]
+		},
+		"screensaver": {
+			"name": "screensaver",
+			"description": "Blank screen on startup",
+			"gatherStats": true,
+			"tip": "Enable screensaver to blank the Raspberry Pi display after startup.  This is useful when you have a projector attached to the HDMI/composite output and do not want the boot screen text console to display on the projector when no video is playing.",
+			"type": "checkbox",
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"children": {
+				"1": [
+					"screensaverTimeout"
+				]
+			}
+		},
+		"screensaverTimeout": {
+			"name": "screensaverTimeout",
+			"description": "Inactivity timeout for screen blanking",
+			"tip": "If 'Blank screen on startup' is enabled, the screen will be blanked after this many minutes of inactivity.",
+			"reboot": 1,
+			"platforms": [
+				"Raspberry Pi"
+			],
+			"level": 3,
+			"default": 1,
+			"type": "number",
+			"min": 0,
+			"max": 60,
+			"step": 1,
+			"unit": "minute"
+		},
+		"KioskUrl": {
+			"name": "KioskUrl",
+			"pii": true,
+			"description": "Kiosk Start URL",
+			"gatherStats": true,
+			"tip": "By default kiosk mode will open the main FPP page, you can place a URL in here to get it to open that URL directly, eg big buttons plugin. http://localhost/plugin.php?_menu=status&plugin=fpp-BigButtons&page=bigbuttons.php&nopage=1",
+			"type": "text",
+			"size": 64,
+			"maxlength": 256,
+			"level": 1,
+			"reboot": 1,
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"KioskTimeout": {
+			"name": "KioskTimeout",
+			"description": "Kiosk Screen DPMS Timeout",
+			"gatherStats": true,
+			"tip": "The timeout (in seconds) for when the Kiosk screen will turn off.  A touch on the screen should turn it back on.",
+			"type": "number",
+			"min": 0,
+			"max": 600,
+			"step": 15,
+			"level": 1,
+			"reboot": 1,
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"KioskRotate": {
+			"name": "KioskRotate",
+			"description": "Rotate Kiosk if using Raspberry Pi Touch Display 2",
+			"tip": "Click here if you have a Raspberry Pi Touch Display 2 (5-inch or 7-inch)",
+			"level": 1,
+			"gatherStats": true,
+			"restart": 0,
+			"reboot": 1,
+			"checkedValue": "1",
+			"uncheckedValue": "0",
+			"default": "0",
+			"type": "checkbox",
+			"platforms": [
+				"Raspberry Pi"
+			]
+		},
+		"keyBindings": {
+			"name": "keyBindings",
+			"description": "Keyboard Shortcuts",
+			"tip": "Custom keyboard shortcuts. JSON array of {key, action, ...} objects where action is 'preset' (trigger a Command Preset by name), 'command' (run an FPP Command with args) or 'page' (navigate to an FPP page). Edited from Settings -> UI -> Keyboard Shortcuts. F1 (Help) is reserved; F2 (Settings) and F8 (Error Reporting) keep their default action unless a shortcut is assigned to them.",
+			"default": "[]",
+			"type": "text",
+			"size": 64,
+			"maxlength": 8192,
+			"level": 1,
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"Service_rsync": {
+			"name": "Service_rsync",
+			"description": "Enable rsync",
+			"gatherStats": true,
+			"tip": "The rsync daemon is used to receive synced files from other FPP systems.  You must enable rsync on the <b>destination</b> FPP system if you are using the MultiSync page to copy sequences, media, OS, and other files between FPP instances.",
+			"type": "checkbox",
+			"default": "0",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"Service_smbd_nmbd": {
+			"name": "Service_smbd_nmbd",
+			"description": "Enable Samba/CIFS",
+			"gatherStats": true,
+			"tip": "The Samba daemon can be used to remotely access the files on a FPP system via the SMB/CIFS protocol.",
+			"level": 1,
+			"type": "checkbox",
+			"default": "0",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"Service_vsftpd": {
+			"name": "Service_vsftpd",
+			"description": "Enable FTP",
+			"gatherStats": true,
+			"tip": "The FTP daemon can be used to remotely access the files on a FPP system via the FTP protocol.",
+			"level": 1,
+			"type": "checkbox",
+			"default": "0",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"Service_MQTT_localbroker": {
+			"name": "Service_MQTT_localbroker",
+			"description": "Enable Local MQTT Broker",
+			"gatherStats": true,
+			"tip": "The Local MQTT Broker can be used to publish and subscribe to MQTT messages on the local FPP system.  The username and password are the same as the normal fpp user. Will run on localhost port 1883",
+			"level": 1,
+			"type": "checkbox",
+			"default": "0",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"AllowCrossOriginAPI": {
+			"name": "AllowCrossOriginAPI",
+			"description": "Let other websites read the API",
+			"gatherStats": true,
+			"tip": "Lets a web page served from somewhere else (a dashboard on another computer, say) read this player's API from the browser.  Any web site you visit can then read it too, including the cape serial number and the settings, unless a UI password is set.  FPP's own pages, xLights and other apps that are not web pages do not need this.",
+			"level": 1,
+			"type": "checkbox",
+			"default": "0"
+		},
+		"ShareCrashData": {
+			"name": "ShareCrashData",
+			"transmitRank": {
+				"-1": 0,
+				"0": 0,
+				"1": 1,
+				"2": 2,
+				"3": 3
+			},
+			"description": "Share Crash Data with FPP Developers",
+			"gatherStats": true,
+			"tip": "Create a crash report if fppd crashes, and send it to the FPP developers.  'Keep locally' still writes a full report to the crashes folder so you can look at it or submit it yourself, but sends nothing; 'Disabled' does not write one at all.  'Send stack traces only' sends the crash stack, the fault registers, the playlist position, the list of installed plugins and - if you gave one - the contact email address below, so we can ask you about it; it does not send this device's name, network addresses or settings.  The other options add settings and configuration files that help reproduce the problem; passwords, Wi-Fi passphrases, e-mail addresses and location are removed, and the network interface configuration is never included.",
+			"type": "select",
+			"options": {
+				"Disabled - do not create a report": "-1",
+				"Keep locally, do not send": "0",
+				"Send stack traces only": "1",
+				"Send, include settings": "2",
+				"Send, include settings and configurations": "3"
+			},
+			"default": 3
+		},
+		"SendVendorSerial": {
+			"name": "SendVendorSerial",
+			"transmitRank": {
+				"0": 0,
+				"1": 1
+			},
+			"description": "Send cape serial numbers to vendors",
+			"gatherStats": true,
+			"tip": "Some capes/hats send an identifying serial number to the vendor each time you load the FPP UI.  The vendor can use this information to personally identify you.",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64",
+				"Raspberry Pi"
+			],
+			"type": "checkbox",
+			"default": 1
+		},
+		"InstalledCape": {
+			"Name": "InstalledCape",
+			"description": "Installed Cape/Hat",
+			"tip": "Select any cape/hat installed onto this FPP device so the UI can be setup appropriately.",
+			"platforms": [
+				"BeagleBone Black",
+				"BeagleBone 64",
+				"Raspberry Pi"
+			],
+			"checkFile": [
+				"!/home/fpp/media/tmp/cape-info.json"
+			],
+			"restart": 1,
+			"type": "select",
+			"optionsURL": "api/cape/options"
+		},
+		"showAllOptions": {
+			"name": "showAllOptions",
+			"description": "Display all hardware options/settings",
+			"gatherStats": true,
+			"tip": "If FPPD can detect what hardware (cape/hat/etc...) is connected, certain options that are either incompatible with the hardware or are rarely used may not be displayed.  This setting forces FPP to display to display all options even for hardware that was not detected.",
+			"level": 1,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 1,
+			"default": "0",
+			"type": "checkbox",
+			"checkedValue": "1",
+			"uncheckedValue": "0"
+		},
+		"emailAddress": {
+			"name": "emailAddress",
+			"pii": true,
+			"piiPurpose": "crash-report",
+			"description": "Email Address",
+			"tip": "Email address to contact you.  In the case of FPP crashes, the developers may need to contact you to help diagnose the cause of the crash.  This email address would only be used for that purpose.",
+			"level": 0,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 0,
+			"default": "",
+			"type": "text",
+			"size": 64,
+			"maxlength": 256
+		},
+		"statsPublish": {
+			"name": "statsPublish",
+			"transmitRank": {
+				"Disabled": 0,
+				"Banner": 0,
+				"Enabled": 1
+			},
+			"description": "Share Statistics",
+			"tip": "Configures if anonymous hardware and feature statistics are shared with the FPP Development team. (FPP must have access to the Internet.) A value of \"Banner\" will result in a prompt being displayed on the user's screen. Setting this to \"Enabled\" or \"Disabled\" removes the banner",
+			"level": 0,
+			"reboot": 0,
+			"restart": 2,
+			"reloadUI": 0,
+			"default": "Banner",
+			"type": "select",
+			"options": {
+				"Enabled": "Enabled",
+				"Disabled": "Disabled",
+				"Banner": "Banner"
+			},
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"tableColorPair1A": {
+			"name": "tableColorPair1A",
+			"description": "Color Pair 1-A",
+			"tip": "Color Pair 1-A and 1-B are used for alternating colors in tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "b0efbc"
+		},
+		"tableColorPair1B": {
+			"name": "tableColorPair1B",
+			"description": "Color Pair 1-B",
+			"tip": "Color Pair 1-A and 1-B are used for alternating colors in tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "7be38f"
+		},
+		"tableColorPair2A": {
+			"name": "tableColorPair2A",
+			"description": "Color Pair 2-A",
+			"tip": "Color Pair 2-A and 2-B are used for alternating colors in nested tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "cae7fb"
+		},
+		"tableColorPair2B": {
+			"name": "tableColorPair2B",
+			"description": "Color Pair 2-B",
+			"tip": "Color Pair 2-A and 2-B are used for alternating colors in nested tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "a6d7f8"
+		},
+		"tableColorPair3A": {
+			"name": "tableColorPair3A",
+			"description": "Color Pair 3-A",
+			"tip": "Color Pair 3-A and 3-B are used for alternating colors in nested tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "e9beed"
+		},
+		"tableColorPair3B": {
+			"name": "tableColorPair3B",
+			"description": "Color Pair 3-B",
+			"tip": "Color Pair 3-A and 3-B are used for alternating colors in nested tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "da92e1"
+		},
+		"tableColorPair4A": {
+			"name": "tableColorPair4A",
+			"description": "Color Pair 4-A",
+			"tip": "Color Pair 4-A and 4-B are used for alternating colors in nested tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "fcefbb"
+		},
+		"tableColorPair4B": {
+			"name": "tableColorPair4B",
+			"description": "Color Pair 4-B",
+			"tip": "Color Pair 4-A and 4-B are used for alternating colors in nested tables in the FPP UI",
+			"reboot": 0,
+			"restart": 0,
+			"type": "color",
+			"default": "f9e077"
+		},
+		"temperatureInF": {
+			"name": "temperatureInF",
+			"description": "Temperature display units",
+			"tip": "Display temperatures in Fahrenheit or Celsius",
+			"gatherStats": true,
+			"reloadUI": 1,
+			"default": 0,
+			"type": "select",
+			"options": {
+				"Celsius": 0,
+				"Fahrenheit": 1
+			},
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"TetherInterface": {
+			"name": "TetherInterface",
+			"description": "Tethering Interface",
+			"tip": "WiFi interface to use for tethering.",
+			"type": "select",
+			"optionsCommand": "/sbin/ifconfig -a | cut -f1 | cut -f1 -d' ' | grep -v ^$ | grep  wl | sed -r 's/:+$//'"
+		},
+		"TetherPSK": {
+			"name": "TetherPSK",
+			"description": "Tethering Pre Shared Key (PSK)",
+			"tip": "Pre Shared Key to use to connect to FPP WiFi tethering.",
+			"type": "password",
+			"size": 32,
+			"maxlength": 32,
+			"default": "Christmas"
+		},
+		"TetherSSID": {
+			"name": "TetherSSID",
+			"pii": true,
+			"description": "Tethering SSID",
+			"tip": "SSID to use for FPP WiFi tethering.",
+			"type": "text",
+			"size": 32,
+			"maxlength": 32,
+			"default": "FPP"
+		},
+		"themeOverride": {
+			"name": "themeOverride",
+			"description": "Theme",
+			"tip": "Controls the FPP user interface theme.  'System Default' follows the browser/OS dark mode preference.  Selecting 'Light' or 'Dark' overrides the browser/OS preference and forces FPP to always use that theme.",
+			"gatherStats": true,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 1,
+			"default": "",
+			"type": "select",
+			"options": {
+				"System Default": "",
+				"Light": "light",
+				"Dark": "dark"
+			},
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"TimeFormat": {
+			"name": "TimeFormat",
+			"description": "Time Format",
+			"tip": "Format of displayed time",
+			"gatherStats": true,
+			"reloadUI": 1,
+			"type": "select",
+			"default": "%I:%M %p",
+			"options": {
+				"HH:MM (23:40)": "%H:%M",
+				"HH:MM AM/PM (11:40 PM)": "%I:%M %p"
+			},
+			"note": "Any addition of a new format in the options array here will need corresponding additions in js/fpp.js to the Convert24H*UIFormat functions",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"uiLevel": {
+			"name": "uiLevel",
+			"description": "User Interface Level",
+			"tip": "The UI Level setting controls the level of settings that are exposed in the UI.  The default 'Basic' level exposes settings which are used by most users.  The 'Advanced' level provides additional settings to control most features within FPP.  'Experimental' is for experts only and exposes settings which may negatively affect system performance or cause issues if incorrectly used.  'Developer' is for developer and beta tester use.",
+			"gatherStats": true,
+			"reboot": 0,
+			"restart": 0,
+			"reloadUI": 1,
+			"default": 0,
+			"fppModes": [
+				"ALL"
+			],
+			"platforms": [
+				"Raspberry Pi",
+				"Linux",
+				"ALL"
+			],
+			"type": "select",
+			"options": {
+				"Basic": 0,
+				"Advanced": 1,
+				"Experimental": 2,
+				"Developer": 3
+			},
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"verbosePlaylistItemDetails": {
+			"name": "verbosePlaylistItemDetails",
+			"description": "Verbose Playlist Item Details",
+			"tip": "Show verbose playlist item details in Playlist Editor and Status UIs",
+			"gatherStats": true,
+			"restart": 0,
+			"type": "checkbox"
+		},
+		"VideoOutput": {
+			"name": "VideoOutput",
+			"description": "Default Video Output Device",
+			"gatherStats": true,
+			"tip": "The Default Video Output device to be used when playing a video.  On all FPP systems, video played in a playlist can be displayed on a Pixel Overlay model.  On the Raspberry Pi, video can also be played on the HDMI/Composite video outputs.",
+			"type": "select",
+			"restart": 2,
+			"optionsURL": "api/settings/VideoOutput/options",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"HardwareDecoding": {
+			"name": "HardwareDecoding",
+			"description": "Hardware Decoding",
+			"gatherStats": true,
+			"tip": "Use the Hardware Decoder for decoding videos.  Disabling will cause much higher CPU usage, but may allow better control over the video output.",
+			"type": "checkbox",
+			"default": 1,
+			"level": 1,
+			"restart": 2
+		},
+		"WLEDAudioInput": {
+			"name": "WLEDAudioInput",
+			"description": "WLED Sound Reactive Source",
+			"tip": "The WLED Sound Reactive Source is used to set the source of the sound reactive data for WLED Sound Reactive Effects.",
+			"restart": 1,
+			"reboot": 0,
+			"default": "-- Playing Media --",
+			"type": "select",
+			"optionsURL": "api/settings/AudioInputListAllowMedia/options",
+			"optionCanBeBlank": false,
+			"level": 1
+		},
+		"WLEDAudioSyncMode": {
+			"name": "WLEDAudioSyncMode",
+			"description": "WLED Audio Sync",
+			"tip": "Bridge FPP's audio reactive data with other WLED devices on the network using the standard WLED sound sync UDP protocol on port 11988. <b>Send</b>: broadcast FPP's FFT/volume so external WLED nodes react to whatever FPP is playing. <b>Receive</b>: feed FPP's WLED&#9834; reactive effects from another device's microphone instead of FPP's local audio. <b>Off</b>: no sync.",
+			"restart": 0,
+			"reboot": 0,
+			"default": "off",
+			"type": "select",
+            "gatherStats": true,
+			"options": {
+				"Off": "off",
+				"Send": "send",
+				"Receive": "receive"
+			},
+			"optionCanBeBlank": false,
+			"level": 1
+		},
+		"WLEDAudioSyncDest": {
+			"name": "WLEDAudioSyncDest",
+			"description": "WLED Audio Sync Address",
+			"tip": "Destination address for sent audio sync packets, and (for receive mode) the multicast group to join. <b>239.0.0.1</b> is WLED's default multicast group. Use a unicast IP (e.g. 192.168.1.70) or a broadcast address (e.g. 192.168.1.255) on networks where multicast is filtered.",
+			"restart": 0,
+			"reboot": 0,
+			"default": "239.0.0.1",
+			"type": "text",
+			"size": 24,
+			"maxlength": 64,
+			"level": 1
+		},
+		"WLEDAudioSyncPort": {
+			"name": "WLEDAudioSyncPort",
+			"description": "WLED Audio Sync Port",
+			"tip": "UDP port for WLED audio sync. The WLED default is 11988; only change this if you've reconfigured your other WLED devices.",
+			"restart": 0,
+			"reboot": 0,
+			"default": "11988",
+			"type": "number",
+			"min": 1,
+			"max": 65535,
+			"level": 2
+		},
+		"TimeZone": {
+			"name": "TimeZone",
+			"description": "Time Zone",
+			"gatherStats": true,
+			"tip": "The Time Zone is used to set the local time zone of this FPP instance.",
+			"restart": 2,
+			"default": "Europe/London",
+			"type": "select",
+			"optionsURL": "api/settings/TimeZone/options",
+			"platforms": [
+				"!MacOS"
+			]
+		},
+		"fppBinDir": {
+			"name": "fppBinDir",
+			"description": "FPP Binary Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"wwwDir": {
+			"name": "wwwDir",
+			"description": "FPP Web Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"fppDir": {
+			"name": "fppDir",
+			"description": "FPP Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"playlistDirectory": {
+			"name": "playlistDirectory",
+			"description": "Playlist Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"pluginDirectory": {
+			"name": "pluginDirectory",
+			"description": "Plugin Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"mediaDirectory": {
+			"name": "mediaDirectory",
+			"description": "Media Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"bootDirectory": {
+			"name": "bootDirectory",
+			"description": "Boot Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"configDirectory": {
+			"name": "configDirectory",
+			"description": "Configuration Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"channelOutputsJSON": {
+			"name": "channelOutputsJSON",
+			"description": "Channel Outputs JSON File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"co-other": {
+			"name": "co-other",
+			"description": "Other Channel Outputs",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"co-pixelStrings": {
+			"name": "co-pixelStrings",
+			"description": "Pixel Strings Channel Outputs",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"co-bbbStrings": {
+			"name": "co-bbbStrings",
+			"description": "BBB Strings Channel Outputs",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"co-pwm": {
+			"name": "co-pwm",
+			"description": "PWM Channel Outputs",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"universeOutputs": {
+			"name": "universeOutputs",
+			"description": "Universe Outputs File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"universeInputs": {
+			"name": "universeInputs",
+			"description": "Universe Inputs File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"dmxInputs": {
+			"name": "dmxInputs",
+			"description": "DMX Inputs File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"model-overlays": {
+			"name": "model-overlays",
+			"description": "Model Overlays File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"scheduleJsonFile": {
+			"name": "scheduleJsonFile",
+			"description": "Schedule JSON File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"scriptDirectory": {
+			"name": "scriptDirectory",
+			"description": "Script Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"sequenceDirectory": {
+			"name": "sequenceDirectory",
+			"description": "Sequence Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"musicDirectory": {
+			"name": "musicDirectory",
+			"description": "Music Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"videoDirectory": {
+			"name": "videoDirectory",
+			"description": "Video Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"imageDirectory": {
+			"name": "imageDirectory",
+			"description": "Image Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"effectDirectory": {
+			"name": "effectDirectory",
+			"description": "Effect Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"eventDirectory": {
+			"name": "eventDirectory",
+			"description": "Event Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"logDirectory": {
+			"name": "logDirectory",
+			"description": "Log Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"uploadDirectory": {
+			"name": "uploadDirectory",
+			"description": "Upload Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"docsDirectory": {
+			"name": "docsDirectory",
+			"description": "Documentation Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"exim4Directory": {
+			"name": "exim4Directory",
+			"description": "Exim4 Directory",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"outputProcessorsFile": {
+			"name": "outputProcessorsFile",
+			"description": "Output Processors File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"statsFile": {
+			"name": "statsFile",
+			"description": "Statistics File",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"statsPublishUrl": {
+			"name": "statsPublishUrl",
+			"description": "Statistics Publish URL",
+			"tip": "The URL to which FPP will send anonymous hardware and feature statistics.  This is used by the FPP developers to determine what hardware is being used and what features are popular.",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"Platform": {
+			"name": "Platform",
+			"description": "Platform",
+			"tip": "The Platform setting is used to determine what hardware FPP is running on.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"Variant": {
+			"name": "Variant",
+			"description": "Variant",
+			"tip": "The Variant setting is used to determine what variant of the platform FPP is running on.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"SubPlatform": {
+			"name": "SubPlatform",
+			"description": "Sub Platform",
+			"tip": "The Sub Platform setting is used to determine what sub platform FPP is running on.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"OSImagePrefix": {
+			"name": "OSImagePrefix",
+			"description": "OS Image Prefix",
+			"tip": "The OS Image Prefix setting is used to determine the prefix of the OS image that FPP is running on.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"IsDesktop": {
+			"name": "IsDesktop",
+			"description": "Is Desktop",
+			"tip": "The Is Desktop setting is used to determine if FPP is running on a desktop system.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"BeaglePlatform": {
+			"name": "BeaglePlatform",
+			"description": "Beagle Platform",
+			"tip": "The Beagle Platform setting is used to determine what Beagle platform FPP is running on.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"all"
+			]
+		},
+		"LogoLink": {
+			"name": "LogoLink",
+			"description": "Logo Link",
+			"tip": "The URL to which the FPP logo will link.  This is used in the header of the FPP UI.",
+			"exposedAsJSToPages": [
+				"index",
+				"all"
+			]
+		},
+		"Logo": {
+			"name": "Logo",
+			"description": "Logo",
+			"tip": "The URL to the logo image to display in the header of the FPP UI.",
+			"exposedAsJSToPages": [
+				"index",
+				"all"
+			]
+		},
+		"hideExternalURLs": {
+			"name": "hideExternalURLs",
+			"description": "Hide External URLs",
+			"tip": "If enabled, external URLs will not be displayed in the FPP UI.  This is useful for kiosk mode or if you do not want users to be able to access external sites.",
+			"exposedAsJSToPages": [
+				"index",
+				"all"
+			]
+		},
+		"currentHeaderSensor": {
+			"name": "currentHeaderSensor",
+			"description": "Current Header Sensor",
+			"tip": "The current header sensor is used to display the current sensor in the header of the FPP UI.",
+            "gatherStats": true,
+			"exposedAsJSToPages": [
+				"index",
+				"all"
+			]
+		},
+		"initialSetup-02": {
+			"name": "initialSetup-01",
+			"description": "Initial Setup Step 1",
+			"tip": "This setting is used to track if the initial setup step 1 has been completed.  This is used to determine if the initial setup page should be displayed.",
+			"exposedAsJSToPages": [
+				"index",
+				"all"
+			]
+		},
+		"locale": {
+			"name": "locale",
+			"description": "Locale",
+			"tip": "The locale setting is used to determine the language and region settings for FPP.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"index",
+				"all"
+			]
+		},
+		"AudioCardType": {
+			"name": "AudioCardType",
+			"description": "Audio Card Type",
+			"tip": "The Audio Card Type setting is used to determine the type of audio card that FPP is using.  This setting is automatically set by FPP and should not be changed manually.",
+            "gatherStats": true,
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"AudioCard0Type": {
+			"name": "AudioCard0Type",
+			"description": "Audio Card 0 Type",
+			"tip": "The Audio Card 0 Type setting is used to determine the type of audio card 0 that FPP is using.  This setting is automatically set by FPP and should not be changed manually.",
+			"exposedAsJSToPages": [
+				"none"
+			]
+		},
+		"volume": {
+			"name": "volume",
+			"description": "Volume",
+			"tip": "The volume setting is used to control the volume of the audio output.",
+			"exposedAsJSToPages": [
+				"index"
+			]
+		}
+	}
+}

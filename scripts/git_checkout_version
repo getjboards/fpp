@@ -1,0 +1,137 @@
+#!/bin/bash
+
+BINDIR=$(cd $(dirname $0) && pwd)
+
+. ${BINDIR}/common
+. ${BINDIR}/functions
+
+if [ "x$1" = "x" ]
+then
+    echo "USAGE: $0 SHA1_HASH"
+    exit 1
+fi
+
+# Unified upgrade logging -> logs/fpp_system_upgrades.log (a version checkout is an
+# upgrade path; it ends in a rebuild).
+startUpgradeLog "fpp-version-checkout" "$1"
+
+VERS=$1
+
+# Mirror the allow-list in www/gitCheckoutVersion.php (letters, numbers, _, ., -, / only, no .. or leading -).
+case "${VERS}" in ""|-*|*..*|*[!A-Za-z0-9_./-]*) echo "ERROR: Invalid version '${VERS}'"; exit 1 ;; esac
+
+cd "${FPPDIR}/src" || exit 1
+
+echo "Current Info:"
+
+SHA1=$(git log | head -1 | awk '{print $2}')
+BRANCH=$(git branch -a | grep "^\*" | awk '{print $2}' | sed -e "s/[^a-zA-Z0-9\.]*//")
+if [ "x${BRANCH}" != "xHEAD" ]
+then
+    echo "    Branch : ${BRANCH}"
+    echo "    SHA1   : ${SHA1}"
+    echo "${BRANCH}" > /home/fpp/media/tmp/gitbranch
+else
+    BRANCH=$(cat /home/fpp/media/tmp/gitbranch)
+    # Same allow-list as VERS above; the file is world-writable scratch.
+    # Empty is allowed here (missing/wiped file after reboot on detached HEAD);
+    # it restores pre-hardening behavior and fails safely at `git checkout ""`
+    # only on the VERS==HEAD path. VERS itself must never be empty (line 21).
+    case "${BRANCH}" in -*|*..*|*[!A-Za-z0-9_./-]*) echo "ERROR: Invalid branch '${BRANCH}'"; exit 1 ;; esac
+    echo "Previous Branch: ${BRANCH}"
+    echo "Current SHA1  : ${SHA1}"
+fi
+
+# clear any local changes
+## FIXME before commit
+#${SUDO} git reset --hard HEAD
+
+/bin/echo -n "    Version: "
+git describe --dirty
+
+echo "======================================================================"
+if [ "x${VERS}" = "xHEAD" ]
+then
+    echo "Attempting to switch to HEAD on ${BRANCH} branch"
+else
+    echo "Attempting to switch to SHA1 ${VERS} on ${BRANCH} branch"
+fi
+
+# Is this version already in our local clone
+DIFF=$(git show "${VERS}" 2> /dev/null)
+
+if [ "x${DIFF}" = "x" ]
+then
+    # we need to fetch to find this version (a checkout of a specific SHA
+    # follows, so a fetch -- not a rebasing pull -- is all that is needed here)
+    echo "${VERS} not found, running 'git fetch' to sync with origin repository"
+    runGitLocked "cd \"${FPPDIR}\" && git fetch -p -P && git fetch --tags -f"
+fi
+
+DIFF=$(git show "${VERS}" 2> /dev/null)
+
+if [ "x${DIFF}" = "x" ]
+then
+    echo "ERROR: Unable to find git SHA1 ${VERS}"
+    exit 1
+fi
+
+echo "======================================================================"
+if [ "x${VERS}" = "xHEAD" ]
+then
+    echo "Checking out HEAD version"
+    echo "Pulling in latest changes"
+    # rebase onto the branch's upstream tracking ref rather than a bare pull
+    # (see runGitLocked in scripts/functions).
+    # NOTE: no `--` after checkout here on purpose -- everything after `--`
+    # would be treated as a path, not a branch. VERS/BRANCH are allow-listed
+    # above (no leading `-`, no spaces), so option injection is impossible.
+    runGitLocked "cd \"${FPPDIR}\" && git checkout \"${BRANCH}\" && git fetch && git rebase @{u}"
+else
+    echo "Checking out SHA1 ${VERS}"
+    ${SUDO} git checkout "${VERS}"
+fi
+
+${SUDO} git branch -a | grep "^\*"
+${SUDO} git log | head -10
+
+echo "======================================================================"
+echo "Rebuilding binaries"
+# Embed this code here instead of using a script because we may
+# revert to an older version that doesn't have that script.
+# SetupBuildEnv was sourced (from functions) at the top of this script, so it
+# stays defined in memory even after the checkout above swapped the files on
+# disk. ${SUDO} is "sudo -E", so the exported DISTCC_HOSTS reaches make, which
+# then handles ccache/distcc, NOPCH, and the triplet compiler itself.
+${SUDO} make clean
+
+SetupBuildEnv
+
+${SUDO} make -j ${BUILD_CPUS} optimized
+BUILD_RC=$?
+# Flush the new binaries before fppd restarts; a power loss can zero them (#3120).
+sync
+
+echo "======================================================================"
+echo "Restarting fppd"
+
+# Embed this code here instead of using a script because we may
+# revert to an older version that doesn't have that script
+# Clear any restart flag
+sed -i -e "s/^restartFlag .*/restartFlag = \"0\"/" ${FPPHOME}/media/settings
+
+if [ -f "/etc/fpp/container" ]
+then
+    /opt/fpp/scripts/fppd_stop
+    /opt/fpp/scripts/fppd_start
+else
+    systemctl restart fppd
+fi
+
+# A failed build must fail the run (FINISH rc) instead of reporting success
+# with no fppd binary. fppd is restarted above regardless.
+if [ "${BUILD_RC:-0}" != "0" ]; then
+    echo "ERROR: build failed (rc=${BUILD_RC}) -- version was checked out but binaries were NOT rebuilt."
+    exit ${BUILD_RC}
+fi
+

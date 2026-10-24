@@ -1,161 +1,242 @@
 /*
- *   Playlist Entry Sequence Class for Falcon Player (FPP)
+ * This file is part of the Falcon Player (FPP) and is Copyright (C)
+ * 2013-2022 by the Falcon Player Developers.
  *
- *   Copyright (C) 2013-2018 the Falcon Player Developers
- *      Initial development by:
- *      - David Pitts (dpitts)
- *      - Tony Mace (MyKroFt)
- *      - Mathew Mrosko (Materdaddy)
- *      - Chris Pinkham (CaptainMurdoch)
- *      For additional credits and developers, see credits.php.
+ * The Falcon Player (FPP) is free software, and is covered under
+ * multiple Open Source licenses.  Please see the included 'LICENSES'
+ * file for descriptions of what files are covered by each license.
  *
- *   The Falcon Player (FPP) is free software; you can redistribute it
- *   and/or modify it under the terms of the GNU General Public License
- *   as published by the Free Software Foundation; either version 2 of
- *   the License, or (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * This source file is covered under the LGPL v2.1 as described in the
+ * included LICENSE.LGPL file.
  */
 
-#include "log.h"
-#include "mqtt.h"
-//#include "Player.h"
-#include "Sequence.h"
+#include "fpp-pch.h"
+
+#include "fpp-json.h"
+
+#include "../common.h"
+#include "../log.h"
+#include "../settings.h"
+
+#include "../Sequence.h"
+#include "../channeloutput/ChannelOutputSetup.h"
+#include "../channeloutput/channeloutputthread.h"
+#include "../fseq/FSEQFile.h"
+
 #include "PlaylistEntrySequence.h"
 
-PlaylistEntrySequence::PlaylistEntrySequence(PlaylistEntryBase *parent)
-  : PlaylistEntryBase(parent),
-	m_duration(0),
-	m_sequenceID(0),
-	m_priority(0),
-	m_startSeconds(0)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::PlaylistEntrySequence()\n");
+#include "Events.h"
 
-	m_type = "sequence";
+#include <chrono>
+
+// Monotonic millisecond stopwatch used for sequence frame-timing sync.
+// Must NOT use wall-clock time (gettimeofday/GetTimeMS): RTC-less boards (e.g. a
+// Pi with no RTC) start a playlist via FPPD_STARTED with an incorrect clock, and
+// the NTP correction that lands mid-playback would jump the wall clock and wedge
+// the channel output thread into a permanent hold/skip (see issue #2678).
+static inline long long SeqMonotonicMS() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
-PlaylistEntrySequence::~PlaylistEntrySequence()
-{
+PlaylistEntrySequence::PlaylistEntrySequence(Playlist* playlist, PlaylistEntryBase* parent) :
+    PlaylistEntryBase(playlist, parent),
+    m_duration(0),
+    m_prepared(false),
+    m_adjustTiming(true),
+    m_sequenceFrameTime(0),
+    m_pausedFrame(-1) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::PlaylistEntrySequence()\n");
+
+    m_type = "sequence";
 }
 
-/*
- *
- */
-int PlaylistEntrySequence::Init(Json::Value &config)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::Init()\n");
-
-	if (!config.isMember("sequenceName"))
-	{
-		LogErr(VB_PLAYLIST, "Missing sequenceName entry\n");
-		return 0;
-	}
-
-	m_sequenceName = config["sequenceName"].asString();
-
-	return PlaylistEntryBase::Init(config);
+PlaylistEntrySequence::~PlaylistEntrySequence() {
 }
 
 /*
  *
  */
-int PlaylistEntrySequence::StartPlaying(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::StartPlaying()\n");
+int PlaylistEntrySequence::Init(Json::Value& config) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::Init()\n");
 
-	if (!CanPlay())
-	{
-		FinishPlay();
-		return 0;
-	}
+    if (!config.isMember("sequenceName")) {
+        LogErr(VB_PLAYLIST, "Missing sequenceName entry\n");
+        return 0;
+    }
 
-// FIXME
-//	m_sequenceID = player->StartSequence(m_sequenceName, m_priority, m_startSeconds);
+    m_sequenceName = config["sequenceName"].asString();
+    m_pausedFrame = -1;
+    return PlaylistEntryBase::Init(config);
+}
 
-//	if (!m_sequenceID)
-//		return 0;
-
-	if (sequence->OpenSequenceFile(m_sequenceName.c_str(), 0) <= 0)
-	{
-		LogErr(VB_PLAYLIST, "Error opening sequence %s\n", m_sequenceName.c_str());
-		return 0;
-	}
-
-	LogDebug(VB_PLAYLIST, "Started Sequence, ID: %d\n", m_sequenceID);
-
-	if (mqtt)
-		mqtt->Publish("playlist/sequence/status", m_sequenceName);
-
-	return PlaylistEntryBase::StartPlaying();
+int PlaylistEntrySequence::PreparePlay(int frame) {
+    if (sequence->OpenSequenceFile(m_sequenceName, frame) <= 0) {
+        // OpenSequenceFile() has logged why (once per name); a playlist that
+        // keeps coming round to a missing sequence must not log it each time.
+        LogDebug(VB_PLAYLIST, "Error opening sequence %s\n", m_sequenceName.c_str());
+        return 0;
+    }
+    m_prepared = true;
+    m_duration = sequence->m_seqMSDuration;
+    m_sequenceFrameTime = sequence->GetSeqStepTime();
+    return 1;
 }
 
 /*
  *
  */
-int PlaylistEntrySequence::Process(void)
-{
-// FIXME
-//	if (!player->SequenceIsRunning(m_sequenceID))
-//		FinishPlay();
+int PlaylistEntrySequence::StartPlaying(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::StartPlaying()\n");
 
-	if (!sequence->IsSequenceRunning())
-	{
-		FinishPlay();
+    if (!CanPlay()) {
+        m_prepared = false;
+        FinishPlay();
+        return 0;
+    }
 
-		if (mqtt)
-			mqtt->Publish("playlist/sequence/status", "");
-	}
+    if (!m_prepared) {
+        PreparePlay();
+    }
+    m_pausedFrame = -1;
+    ResetChannelOutputFrameNumber();
+    sequence->StartSequence();
+    m_startTme = SeqMonotonicMS();
+    LogDebug(VB_PLAYLIST, "Started Sequence, ID: %s\n", m_sequenceName.c_str());
 
-	return PlaylistEntryBase::Process();
+    Events::Publish("playlist/sequence/status", m_sequenceName);
+    if (m_duration > 0) {
+        Events::Publish("playlist/sequence/secondsTotal", m_duration / 1000);
+    } else {
+        Events::Publish("playlist/sequence/secondsTotal", "");
+    }
+
+    return PlaylistEntryBase::StartPlaying();
 }
 
 /*
  *
  */
-int PlaylistEntrySequence::Stop(void)
-{
-	LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::Stop()\n");
+int PlaylistEntrySequence::Process(void) {
+    if (!sequence->IsSequenceRunning()) {
+        FinishPlay();
+        m_prepared = false;
 
-// FIXME
-//	if (!player->StopSequence(m_sequenceName))
-//		return 0;
+        Events::Publish("playlist/sequence/status", "");
+        Events::Publish("playlist/sequence/secondsTotal", "");
+    } else if (m_adjustTiming) {
+        long long now = SeqMonotonicMS();
+        int total = (now - m_startTme);
+        int frame = total / sequence->GetSeqStepTime();
+        CalculateNewChannelOutputDelayForFrame(frame);
+    }
 
-	sequence->CloseSequenceFile();
-
-	if (mqtt)
-		mqtt->Publish("playlist/sequence/status", "");
-
-	return PlaylistEntryBase::Stop();
+    return PlaylistEntryBase::Process();
 }
 
 /*
  *
  */
-void PlaylistEntrySequence::Dump(void)
-{
-	PlaylistEntryBase::Dump();
+int PlaylistEntrySequence::Stop(void) {
+    LogDebug(VB_PLAYLIST, "PlaylistEntrySequence::Stop()\n");
 
-	LogDebug(VB_PLAYLIST, "Sequence Filename: %s\n", m_sequenceName.c_str());
+    sequence->CloseSequenceFile();
+    m_prepared = false;
+    Events::Publish("playlist/sequence/status", "");
+    Events::Publish("playlist/sequence/secondsTotal", "");
+
+    return PlaylistEntryBase::Stop();
+}
+
+uint64_t PlaylistEntrySequence::GetLengthInMS() {
+    if (m_duration == 0) {
+        std::string n = FPP_DIR_SEQUENCE("/" + m_sequenceName);
+        if (FileExists(n)) {
+            FSEQFile* fs = FSEQFile::openFSEQFile(n);
+            if (fs) {
+                m_duration = fs->getTotalTimeMS();
+                delete fs;
+            }
+        }
+    }
+    return m_duration;
+}
+uint64_t PlaylistEntrySequence::GetElapsedMS() {
+    if (m_prepared) {
+        return sequence->m_seqMSElapsed;
+    }
+    return 0;
 }
 
 /*
  *
  */
-Json::Value PlaylistEntrySequence::GetConfig(void)
-{
-	Json::Value result = PlaylistEntryBase::GetConfig();
+void PlaylistEntrySequence::Dump(void) {
+    PlaylistEntryBase::Dump();
 
-	result["sequenceName"]     = m_sequenceName;
-	result["secondsElapsed"]   = sequence->m_seqSecondsElapsed;
-	result["secondsRemaining"] = sequence->m_seqSecondsRemaining;
-
-	return result;
+    LogDebug(VB_PLAYLIST, "Sequence Filename: %s\n", m_sequenceName.c_str());
 }
 
+/*
+ *
+ */
+Json::Value PlaylistEntrySequence::GetConfig(void) {
+    Json::Value result = PlaylistEntryBase::GetConfig();
+
+    result["sequenceName"] = m_sequenceName;
+    if (sequence->GetSeqFilenameCopy() == m_sequenceName) {
+        if (IsPaused()) {
+            int pos = m_pausedFrame * m_sequenceFrameTime;
+            result["millisecondsElapsed"] = pos;
+            result["secondsElapsed"] = pos / 1000;
+            result["secondsRemaining"] = (m_duration - pos) / 1000;
+        } else {
+            result["millisecondsElapsed"] = sequence->m_seqMSElapsed.load();
+            result["secondsElapsed"] = sequence->m_seqMSElapsed / 1000;
+            result["secondsRemaining"] = sequence->m_seqMSRemaining / 1000;
+        }
+    }
+    return result;
+}
+Json::Value PlaylistEntrySequence::GetMqttStatus(void) {
+    Json::Value result = PlaylistEntryBase::GetMqttStatus();
+    result["sequenceName"] = m_sequenceName;
+    if (IsPaused()) {
+        int pos = m_pausedFrame * m_sequenceFrameTime;
+        result["millisecondsElapsed"] = pos;
+        result["secondsElapsed"] = pos / 1000;
+        result["secondsRemaining"] = (m_duration - pos) / 1000;
+        result["secondsTotal"] = m_duration / 1000;
+    } else {
+        result["secondsElapsed"] = sequence->m_seqMSElapsed / 1000;
+        result["secondsRemaining"] = sequence->m_seqMSRemaining / 1000;
+        result["secondsTotal"] = sequence->m_seqMSDuration / 1000;
+        result["millisecondsElapsed"] = sequence->m_seqMSElapsed.load();
+    }
+    return result;
+}
+
+void PlaylistEntrySequence::Pause() {
+    if (sequence->GetSeqStepTime() == 0) {
+        m_pausedFrame = 0;
+    } else {
+        m_pausedFrame = sequence->m_seqMSElapsed / sequence->GetSeqStepTime();
+    }
+    sequence->CloseSequenceFile();
+    sequence->SendBlankingData();
+    m_prepared = false;
+}
+bool PlaylistEntrySequence::IsPaused() {
+    return m_pausedFrame != -1;
+}
+void PlaylistEntrySequence::Resume() {
+    if (m_pausedFrame >= 0) {
+        PreparePlay(m_pausedFrame);
+        sequence->StartSequence();
+        m_startTme = SeqMonotonicMS() - m_pausedFrame * sequence->GetSeqStepTime();
+        LogDebug(VB_PLAYLIST, "Started Sequence, ID: %s\n", m_sequenceName.c_str());
+        m_pausedFrame = -1;
+        Events::Publish("playlist/sequence/status", m_sequenceName);
+    }
+}
